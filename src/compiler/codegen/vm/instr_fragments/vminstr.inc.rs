@@ -1395,6 +1395,23 @@ pub enum VmInstr {
         width: SimdWidth,
     },
 
+    /// Q5_K 单步解码 (BCE-20260710-Q5_K-HIGHBITS, Q5_0/Q6_K 同类高 bit plane bug).
+    /// 修复通用 NibbleWithHighBits 把 qh 当连续 bit stream 的错 — Q5_K 是转置高位平面.
+    /// 委托 q5k_decode_step_native (d+dmin+scales+qh 转置+qs SPLIT per 64-group + get_scale_min_k4).
+    /// block_base: pointer to Q5_K block (d,dmin,scales[12],qh[32],qs[128] = 176B)
+    /// qs_offset: byte offset to qs[] (48 for Q5_K)
+    /// qh_offset: byte offset to qh[] (16 for Q5_K)
+    Q5KDecodeStep {
+        dst: VRegId,
+        block_base: VRegId,
+        lane_offset: VRegId,
+        d_vreg: VRegId,
+        qs_offset: usize,
+        qh_offset: usize,
+        lanes: usize,
+        width: SimdWidth,
+    },
+
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // SPEC 23-QUANT-CODEGEN-ALGO §4.3: 原生 Dot-Product VmInstr
     // 硬件无关语义，ISA lowering 决定具体指令

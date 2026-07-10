@@ -638,6 +638,8 @@ fn is_pure_write_to_quanta(instr: &VmInstr, vreg: VRegId) -> bool {
             VmProgram::pure_write_check(*dst, vreg, &[*block_base, *lane_offset, *d_vreg]),
         VmInstr::Q5DecodeStep { dst, block_base, lane_offset, d_vreg, .. } =>
             VmProgram::pure_write_check(*dst, vreg, &[*block_base, *lane_offset, *d_vreg]),
+        VmInstr::Q5KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } =>
+            VmProgram::pure_write_check(*dst, vreg, &[*block_base, *lane_offset, *d_vreg]),
         VmInstr::QuantScalarCvtLoad { dst, base, .. } => VmProgram::pure_write_check(*dst, vreg, &[*base]),
         _ => is_pure_write_to_quantb(instr, vreg),
     }
@@ -1399,6 +1401,7 @@ fn collect_src_vregs_quantb(instr: &VmInstr) -> Vec<VRegId> {
         VmInstr::Q3KDecodeStep { block_base, lane_offset, d_vreg, .. } => vec![*block_base, *lane_offset, *d_vreg],
         VmInstr::Q6KDecodeStep { block_base, lane_offset, d_vreg, .. } => vec![*block_base, *lane_offset, *d_vreg],
         VmInstr::Q5DecodeStep { block_base, lane_offset, d_vreg, .. } => vec![*block_base, *lane_offset, *d_vreg],
+        VmInstr::Q5KDecodeStep { block_base, lane_offset, d_vreg, .. } => vec![*block_base, *lane_offset, *d_vreg],
         VmInstr::QuantScalarCvtLoad { base, .. } => vec![*base],
         VmInstr::QuantBlockLoad { base, offset, .. } => {
                         let mut v = vec![*base];
@@ -1665,6 +1668,7 @@ fn collect_dst_vreg(instr: &VmInstr) -> Option<VRegId> {
         | VmInstr::Q3KDecodeStep { dst, .. }
         | VmInstr::Q6KDecodeStep { dst, .. }
         | VmInstr::Q5DecodeStep { dst, .. }
+        | VmInstr::Q5KDecodeStep { dst, .. }
         | VmInstr::DotProduct { acc: dst, .. }
         | VmInstr::ScaleApply { dst, .. }
         | VmInstr::SharedMemSwizzle { dst, .. }

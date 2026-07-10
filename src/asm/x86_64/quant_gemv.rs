@@ -2039,6 +2039,79 @@ pub unsafe extern "C" fn q6k_decode_step_native(
     }
 }
 
+/// Q5_K 单步解码 (BCE-20260710-Q5_K-HIGHBITS, Q5_0/Q6_K 同类高 bit plane bug).
+///
+/// Q5_K: d(f16,off0) + dmin(f16,off2) + scales[12](off4) + qh[32](off16) + qs[128](off48) = 176B, block=256.
+/// value = d * sc * q5 - dmin * m   (无 bias, min 是减法)
+///   q5 = lo4 | (hi1 << 4)
+///   lo4: SPLIT per 64-element group — half=0: qs[group*32+l] & 0xF; half=1: qs[group*32+l] >> 4
+///   hi1 = (qh[l] >> mini) & 1   (转置高位平面: qh[l=local] bit[mini] —— 非 Q5_0 的 qh[i/8] bit(i%8))
+///   mini = i/32 (0..7, 8 mini-blocks), l = i%32, group = mini/2, half = mini%2
+///   (sc, m) = get_scale_min_k4(mini, scales): mini<4 直接; mini>=4 交错拼
+/// 旧通用 NibbleWithHighBits 把 qh 当连续 bit stream (qh[i/8] bit(i%8)) → 转置关系丢失, 高1bit 全错.
+/// ABI 对齐 q6k/q5_0: (block, lane_offset, _d, _qs_off, _qh_off, lanes, out).
+pub unsafe extern "C" fn q5k_decode_step_native(
+    block: *const u8,
+    lane_offset: u64,
+    _d_f32: f32,
+    _qs_offset: u64,
+    _qh_offset: u64,
+    lanes: u64,
+    out: *mut f32,
+) {
+    if block.is_null() {
+        return;
+    }
+
+    // d (f16) at block+0, dmin (f16) at block+2
+    let d_bits = (*block.add(0) as u16) | ((*block.add(1) as u16) << 8);
+    let d = half::f16::from_bits(d_bits).to_f32();
+    let dmin_bits = (*block.add(2) as u16) | ((*block.add(3) as u16) << 8);
+    let dmin = half::f16::from_bits(dmin_bits).to_f32();
+
+    // scales[12] at block+4, qh[32] at block+16, qs[128] at block+48
+    let scales = block.add(4);   // scales[0..12]
+    let qh = block.add(16);      // qh[0..32]
+    let qs = block.add(48);      // qs[0..128]
+
+    for i in 0..lanes as usize {
+        let global_elem = (lane_offset as usize) + i;
+        debug_assert!(global_elem < 256);
+
+        let mini = global_elem / 32;   // 0..7 (8 mini-blocks)
+        let l = global_elem % 32;      // mini-block 内位置
+        let group = mini / 2;          // 0..3 (4 qs groups of 32)
+        let half = mini % 2;           // 0=low nibble, 1=high nibble
+
+        // lo4: SPLIT per 64-element group (low nibble → mini even, high nibble → mini odd)
+        let packed = *qs.add(group * 32 + l);
+        let lo4 = if half == 0 {
+            packed & 0x0F
+        } else {
+            packed >> 4
+        };
+
+        // hi1: 转置高位平面 — qh[l] 的 bit(mini) (非 qh[i/8] bit(i%8))
+        let hi1 = (*qh.add(l) >> mini) & 1;
+        let q5 = (lo4 as i32) | ((hi1 as i32) << 4);
+
+        // get_scale_min_k4(mini, scales)
+        let (sc, m) = if mini < 4 {
+            (
+                (*scales.add(mini) & 63) as f32,
+                (*scales.add(mini + 4) & 63) as f32,
+            )
+        } else {
+            let sc = ((*scales.add(mini + 4) & 0x0F) | ((*scales.add(mini - 4) >> 6) << 4)) as f32;
+            let m = ((*scales.add(mini + 4) >> 4) | ((*scales.add(mini) >> 6) << 4)) as f32;
+            (sc, m)
+        };
+
+        // value = d * sc * q5 - dmin * m   (无 bias, min 减法)
+        *out.add(i) = d * sc * (q5 as f32) - dmin * m;
+    }
+}
+
 /// Q5_0 单步解码 (BCE-20260710-Q5_0-HIGHBITS 同类横扫).
 ///
 /// Q5_0: d(f16) + qh[4](32 high bits, bit-index plane) + qs[16](SPLIT low 4bit) = 22B.

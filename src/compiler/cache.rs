@@ -549,6 +549,7 @@ impl SerializedTraceOp {
             TraceOp::QuantQ3KDecode { block_base, lane_offset, d_slot, .. } => Self { tag: 130, operands: [block_base.0, lane_offset.0, d_slot.0, 0], float_val: 0.0 },
             TraceOp::QuantQ6KDecode { block_base, lane_offset, d_slot, .. } => Self { tag: 131, operands: [block_base.0, lane_offset.0, d_slot.0, 0], float_val: 0.0 },
             TraceOp::QuantQ5Decode { block_base, lane_offset, d_slot, has_min, .. } => Self { tag: 132, operands: [block_base.0, lane_offset.0, d_slot.0, if *has_min {1} else {0}], float_val: 0.0 },
+            TraceOp::QuantQ5KDecode { block_base, lane_offset, d_slot, .. } => Self { tag: 133, operands: [block_base.0, lane_offset.0, d_slot.0, 0], float_val: 0.0 },
         }
     }
 
@@ -646,6 +647,13 @@ impl SerializedTraceOp {
                 qs_offset: 6,
                 qh_offset: 2,
                 has_min: o[3] != 0,
+            }),
+            133 => Some(TraceOp::QuantQ5KDecode {
+                block_base: ValueId(o[0]),
+                lane_offset: ValueId(o[1]),
+                d_slot: ValueId(o[2]),
+                qs_offset: 48,
+                qh_offset: 16,
             }),
             _ => None,
         }

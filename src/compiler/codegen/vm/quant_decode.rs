@@ -220,8 +220,14 @@ impl<'a> DecodeTraceBuilder<'a> {
             return self.build_q5_decode(trace, block_base_slot, lane_offset_slot);
         }
 
+        // Q5_K (Hierarchical + NibbleWithHighBits high_bits=1): monolithic decode
+        // (BCE-20260710-Q5_K-HIGHBITS: 旧 NibbleWithHighBits 当连续 bit stream, 丢转置高位平面)
+        if self.is_q5k_format() {
+            return self.build_q5k_decode(trace, block_base_slot, lane_offset_slot);
+        }
+
         // Input(3): high_bits_ptr for NibbleWithHighBits (only for non-monolithic paths).
-        // Q6_K/Q5_0/Q5_1 走单片 build_q*_decode (early return above), 不需 Input(3).
+        // Q6_K/Q5_0/Q5_1/Q5_K 走单片 build_q*_decode (early return above), 不需 Input(3).
         // When unused, alias block_base_slot.
         let high_bits_ptr_slot = if self.needs_high_bits_ptr() {
             push_op(trace, TraceOp::Input(3))
@@ -256,9 +262,17 @@ impl<'a> DecodeTraceBuilder<'a> {
 
     /// Whether this format uses Q5_0/Q5_1 monolithic decode (BCE-20260710-Q5_0-HIGHBITS 同类).
     /// Q5_0/Q5_1 高1bit 是 bit-index plane (位置相关), 旧 NibbleWithHighBits qh<<7 & 0x10 丢高 bit + phase 无关.
-    /// 仅 Classic Q5_0/Q5_1 (BlockScalar/BlockScalarWithMin); Q5_K (Hierarchical) 不在此, 走旧路径.
+    /// 仅 Classic Q5_0/Q5_1 (BlockScalar/BlockScalarWithMin); Q5_K (Hierarchical) 不在此, 走 build_q5k_decode.
     fn is_q5_format(&self) -> bool {
         matches!(self.desc.quant_type, crate::quant::QuantType::Q5_0 | crate::quant::QuantType::Q5_1)
+            && matches!(&self.desc.data_layout, DataLayout::NibbleWithHighBits { high_bits_per_elem: 1, .. })
+    }
+
+    /// Whether this format uses Q5_K monolithic decode (BCE-20260710-Q5_K-HIGHBITS, Q5_0/Q6_K 同类).
+    /// Q5_K 高1bit 是转置高位平面 (hi=(qh[i%32]>>(i/32))&1), 旧 NibbleWithHighBits 当连续 bit stream 错.
+    /// Q5_K: Hierarchical scale + Hierarchical zero + NibbleWithHighBits(high_bits=1) + QuantType::Q5K.
+    fn is_q5k_format(&self) -> bool {
+        matches!(self.desc.quant_type, crate::quant::QuantType::Q5K)
             && matches!(&self.desc.data_layout, DataLayout::NibbleWithHighBits { high_bits_per_elem: 1, .. })
     }
 
@@ -360,6 +374,40 @@ impl<'a> DecodeTraceBuilder<'a> {
             qs_offset,
             qh_offset,
             has_min,
+        })
+    }
+
+    /// Q5_K combined decode (BCE-20260710-Q5_K-HIGHBITS, Q5_0/Q6_K 同类高 bit plane bug).
+    /// Q5_K 高1bit 是转置高位平面 (hi=(qh[i%32]>>(i/32))&1), 旧 NibbleWithHighBits 当连续 bit stream 错.
+    /// value = d * sc * q5 - dmin * m (无 bias, min 减法), (sc,m)=get_scale_min_k4(mini, scales).
+    /// 委托 q5k_decode_step_native. d/dmin 都在 block 头 (offset 0/2), native 内部读取.
+    fn build_q5k_decode(
+        &self,
+        trace: &mut Vec<TraceOp>,
+        block_base_slot: ValueId,
+        lane_offset_slot: ValueId,
+    ) -> ValueId {
+        let (qs_offset, qh_offset) = match &self.desc.data_layout {
+            DataLayout::NibbleWithHighBits { low_offset, high_offset, .. } => (*low_offset, *high_offset),
+            _ => unreachable!("is_q5k_format guarantees NibbleWithHighBits high_bits=1"),
+        };
+        // d (f16) at block+0 (Hierarchical block_d_offset for Q5_K = 0)
+        let d_offset = match &self.desc.scale_layout {
+            ScaleLayout::Hierarchical { block_d_offset, .. } => *block_d_offset,
+            _ => 0,
+        };
+        let d_ptr = push_op(trace, TraceOp::QuantPtrAddOffset {
+            base: block_base_slot,
+            offset_bytes: d_offset as i64,
+        });
+        let d_slot = push_op(trace, TraceOp::QuantLoadF16toF32 { ptr: d_ptr, offset_bytes: 0 });
+
+        push_op(trace, TraceOp::QuantQ5KDecode {
+            block_base: block_base_slot,
+            lane_offset: lane_offset_slot,
+            d_slot,
+            qs_offset,
+            qh_offset,
         })
     }
 
@@ -1419,7 +1467,7 @@ mod tests {
 
     // @trace TEST-QD-03 [req:REQ-QCG] [level:unit]
     // Q5_K: Hierarchical scale + Hierarchical zero + NibbleWithHighBits (1 high bit).
-    // Tests the full K-quant hierarchical path with 5-bit high bits.
+    // BCE-20260710-Q5_K-HIGHBITS: 走单片 QuantQ5KDecode (转置高位平面, 非 Q5_0 bit-index, 非连续 bit stream).
     #[test]
     fn test_q5k_trace() {
         // Arrange
@@ -1439,13 +1487,13 @@ mod tests {
         assert_trace_valid(&trace);
         assert!(final_slot.0 < trace.len() as u32);
 
-        // Q5_K: Hierarchical scale → QuantKQuantPackedScaleLookup
-        let has_packed_lookup = trace.iter().any(|op| matches!(op, TraceOp::QuantKQuantPackedScaleLookup { .. }));
-        assert!(has_packed_lookup, "Q5_K should have QuantKQuantPackedScaleLookup for hierarchical scale");
+        // BCE-20260710-Q5_K-HIGHBITS: Q5_K 走单片 QuantQ5KDecode (转置高位平面 + get_scale_min_k4).
+        let has_q5k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ5KDecode { .. }));
+        assert!(has_q5k_decode, "Q5_K should emit QuantQ5KDecode (monolithic, replaces 旧 QuantKQuantPackedScaleLookup+Add)");
 
-        // Q5_K: Hierarchical zero → PostScaleAdd (dmin * sub_m)
-        let has_add = trace.iter().any(|op| matches!(op, TraceOp::Add(_, _)));
-        assert!(has_add, "Q5_K should have Add for post-scale min addition (dmin * sub_m)");
+        // 禁止旧路径残留: 不应再有 QuantKQuantPackedScaleLookup (旧 Hierarchical scale trace)
+        let has_packed_lookup = trace.iter().any(|op| matches!(op, TraceOp::QuantKQuantPackedScaleLookup { .. }));
+        assert!(!has_packed_lookup, "Q5_K monolithic 不应再 emit QuantKQuantPackedScaleLookup (旧 buggy 路径)");
     }
 
     // @trace TEST-QD-04 [req:REQ-QCG] [level:unit]
@@ -3219,16 +3267,16 @@ mod tests {
     }
 
     // @trace TEST-QD-58 [req:REQ-QCG] [level:unit]
-    // Q5_K: verifies Q5_K trace has all expected components:
-    // Hierarchical scale, Hierarchical zero (PostScaleAdd), NibbleWithHighBits,
-    // and the final Add comes after FMA.
+    // Q5_K: BCE-20260710-Q5_K-HIGHBITS — 走单片 QuantQ5KDecode (转置高位平面 + get_scale_min_k4).
+    // 旧路径 (QuantKQuantPackedScaleLookup + FMA + Add post-scale min) 已废, 因通用 NibbleWithHighBits
+    // 把 qh 当连续 bit stream, 丢转置关系 (hi=(qh[i%32]>>(i/32))&1) → 高1bit 全错.
     #[test]
     fn test_q5k_full_hierarchical_structure() {
         // Arrange
         let r = registry();
         let desc = r.get(&QuantType::Q5K).expect("Q5_K must be registered");
 
-        // Verify Q5_K uses Hierarchical zero layout
+        // Verify Q5_K uses Hierarchical zero layout (descriptor 不变, 但 decode 走单片)
         match &desc.zero_layout {
             ZeroLayout::Hierarchical { .. } => {}
             other => panic!("Q5_K should use Hierarchical zero layout, got {:?}", other),
@@ -3238,35 +3286,15 @@ mod tests {
         let mut trace = Vec::new();
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
-        // Assert: has QuantKQuantPackedScaleLookup for scale (not is_min)
-        let has_scale_lookup = trace.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantKQuantPackedScaleLookup { selector: ScaleSelector::Scale, .. }
-        ));
-        assert!(has_scale_lookup, "Q5_K should have packed scale lookup for sub-scale");
+        // Assert: BCE-20260710-Q5_K-HIGHBITS — 走单片 QuantQ5KDecode
+        let has_q5k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ5KDecode { .. }));
+        assert!(has_q5k_decode, "Q5_K should emit QuantQ5KDecode (monolithic 转置高位平面)");
 
-        // Assert: has QuantKQuantPackedScaleLookup for min (is_min=true)
-        let has_min_lookup = trace.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantKQuantPackedScaleLookup { selector: ScaleSelector::Min, .. }
-        ));
-        assert!(has_min_lookup, "Q5_K should have packed scale lookup for sub_m (is_min=true)");
-
-        // Assert: Mul for dmin * sub_m
-        let mul_count = trace.iter().filter(|op| matches!(op, TraceOp::Mul(_, _))).count();
-        assert!(mul_count >= 2,
-            "Q5_K should have at least 2 Mul ops (block_d*sub_scale + dmin*sub_m), got {}", mul_count);
-
-        // Assert: Add after FMA for post-scale min
-        let add_pos = trace.iter().position(|op| matches!(op, TraceOp::Add(_, _)));
-        let fma_pos = trace.iter().position(|op| matches!(op, TraceOp::QuantDequantFma { .. }));
-        assert!(add_pos.is_some(), "Q5_K should have Add for post-scale min");
-        assert!(fma_pos.is_some(), "Q5_K should have QuantDequantFma");
-        assert!(
-            add_pos.unwrap() > fma_pos.unwrap(),
-            "Q5_K Add (slot {}) must be after FMA (slot {})",
-            add_pos.unwrap(), fma_pos.unwrap()
-        );
+        // 禁止旧路径残留: 无 QuantKQuantPackedScaleLookup / QuantDequantFma / Add post-scale min
+        let has_old_lookup = trace.iter().any(|op| matches!(op, TraceOp::QuantKQuantPackedScaleLookup { .. }));
+        assert!(!has_old_lookup, "Q5_K monolithic 不应再 emit QuantKQuantPackedScaleLookup (旧 buggy 路径)");
+        let has_old_fma = trace.iter().any(|op| matches!(op, TraceOp::QuantDequantFma { .. }));
+        assert!(!has_old_fma, "Q5_K monolithic 不应再 emit QuantDequantFma (旧 buggy 路径)");
     }
 
     // @trace TEST-QD-59 [req:REQ-QCG] [level:unit]

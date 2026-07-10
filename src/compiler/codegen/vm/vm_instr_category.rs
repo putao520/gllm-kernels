@@ -176,6 +176,7 @@ impl VmInstr {
             | VmInstr::Q3KDecodeStep { .. }
             | VmInstr::Q6KDecodeStep { .. }
             | VmInstr::Q5DecodeStep { .. }
+            | VmInstr::Q5KDecodeStep { .. }
             | VmInstr::HwQuantDequant { .. }
             | VmInstr::BitwiseGemm { .. }
             | VmInstr::SparseGemm { .. }

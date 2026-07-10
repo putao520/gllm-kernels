@@ -318,6 +318,7 @@ fn trace_op_flops(op: &TraceOp) -> u64 {
         TraceOp::QuantQ3KDecode { .. } => 8,
         TraceOp::QuantQ6KDecode { .. } => 8,
         TraceOp::QuantQ5Decode { .. } => 8,
+        TraceOp::QuantQ5KDecode { .. } => 8,
         // ── SPEC 27 AT-002: 结构型扩展 ──
         TraceOp::Loop { .. } => 0,
         TraceOp::PanelLoad { .. } | TraceOp::PanelStore { .. } => 0,

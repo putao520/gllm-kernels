@@ -1701,4 +1701,247 @@ mod quant_gemv_tests {
         }
         assert!(pass_split0 && pass1, "Q5_1 SPLIT+min oracle: got [{}, {}] want [74, 74]; 若 [72,74] 说明 INTERLEAVED 误判", out_f32[0], out_f32[1]);
     }
+
+    // BCE-20260710-Q5_K-HIGHBITS: Q5_K 转置高位平面 oracle (architect 权威: hi=(qh[i%32]>>(i/32))&1).
+    // Q5_K: d(f16,0)+dmin(f16,2)+scales[12](4)+qh[32](16)+qs[128](48)=176B, block=256.
+    // value = d * sc * q5 - dmin * m   (无 bias, min 减法)
+    //   q5 = lo4 | (hi1<<4); lo4 SPLIT per 64-group; hi1 转置 (qh[l=i%32] bit(i/32)); (sc,m)=get_scale_min_k4(mini).
+    // 覆盖: mini 0/1/2/3 (group 0/1 qs, low/high nibble, j<4 scale branch).
+    #[test]
+    fn test_q5_k_quant_gemm_x86_oracle() {
+        // k=256 (1 block), m=2, n=2. block_bytes=176.
+        let m = 2; let n = 2; let k = 256;
+        let block_bytes: usize = 176;
+
+        // d=f16(1.0), dmin=f16(2.0).
+        // 手算 sc/m: 设 scales[12] 使 get_scale_min_k4(mini) 对每个 mini 返回 (sc, m).
+        // scales 编码 (6-bit sc | 6-bit m, 复杂交叉). 为简化手算, 用一种可精确反推的 scales 编码.
+        //
+        // 选 scales (12 bytes), 使:
+        //   mini 0: sc=1, m=1   (val_0 = 1*q5 - 2*1 = q5 - 2)
+        //   mini 1: sc=1, m=1   (val_1 = q5 - 2)
+        //   mini 2: sc=2, m=1   (val_2 = 2*q5 - 2)
+        //   mini 3: sc=2, m=1   (val_3 = 2*q5 - 2)
+        //   mini 4-7: sc=1, m=0 (不影响, act 只测 mini 0-3)
+        //
+        // get_scale_min_k4 编码 (scales[0..11], mini 0..7):
+        //   j<4:  sc = scales[j] & 63,     m = scales[j+4] & 63
+        //   j>=4: sc = (scales[j+4] & 0xF) | ((scales[j-4]>>6)<<4),  m = (scales[j+4]>>4) | ((scales[j]>>6)<<4)
+        //
+        // 为 mini 0..3 (j<4): sc=scales[j]&63, m=scales[j+4]&63.
+        //   mini 0: scales[0]&63=1, scales[4]&63=1 → scales[0]=1, scales[4]=1
+        //   mini 1: scales[1]&63=1, scales[5]&63=1 → scales[1]=1, scales[5]=1
+        //   mini 2: scales[2]&63=2, scales[6]&63=1 → scales[2]=2, scales[6]=1
+        //   mini 3: scales[3]&63=2, scales[7]&63=1 → scales[3]=2, scales[7]=1
+        //   mini 4-7: j>=4, 用 scales[8..11]. 设 scales[4..7] 高 2bit=0 (不污染 mini 4-7 sc).
+        //     mini 4: sc=(scales[8]&0xF)|((scales[0]>>6)<<4), scales[0]=1→高2bit=0, scales[8]&0xF=1 → sc=1
+        //             m=(scales[8]>>4)|((scales[4]>>6)<<4), scales[4]=1→高2bit=0, scales[8]>>4=0 → m=0. 设 scales[8]=1.
+        //   mini 5-7: 类似, 设 scales[9..11]=1 (sc=1,m=0).
+        // 但 mini 4-7 act=0 不影响 dot. 只需 scales[0..7] 正确.
+        let d_f16 = f16::from_f32(1.0);
+        let dmin_f16 = f16::from_f32(2.0);
+        let d_bits = d_f16.to_bits();
+        let dmin_bits = dmin_f16.to_bits();
+        let d_lo = (d_bits & 0xFF) as u8; let d_hi = ((d_bits >> 8) & 0xFF) as u8;
+        let dm_lo = (dmin_bits & 0xFF) as u8; let dm_hi = ((dmin_bits >> 8) & 0xFF) as u8;
+
+        let mut weight = vec![0u8; n * block_bytes];
+        {
+            let r0 = &mut weight[0..block_bytes];
+            r0[0] = d_lo; r0[1] = d_hi;          // d=1.0
+            r0[2] = dm_lo; r0[3] = dm_hi;        // dmin=2.0
+            // scales[12] at offset 4
+            let scales_off = 4;
+            r0[scales_off + 0] = 1;  // mini 0 sc=1
+            r0[scales_off + 1] = 1;  // mini 1 sc=1
+            r0[scales_off + 2] = 2;  // mini 2 sc=2
+            r0[scales_off + 3] = 2;  // mini 3 sc=2
+            r0[scales_off + 4] = 1;  // mini 0 m=1
+            r0[scales_off + 5] = 1;  // mini 1 m=1
+            r0[scales_off + 6] = 1;  // mini 2 m=1
+            r0[scales_off + 7] = 1;  // mini 3 m=1
+            r0[scales_off + 8] = 1;  // mini 4 (sc=1,m=0) — act=0 不影响
+            r0[scales_off + 9] = 1; r0[scales_off + 10] = 1; r0[scales_off + 11] = 1;
+
+            // qh[32] at offset 16: 转置高位平面. qh[l] bit(mini) = elem[mini*32+l] 的 hi1.
+            //   设 elem[0] (mini0,l0): hi1=1 → qh[0] bit0=1
+            //   elem[32] (mini1,l0): hi1=0 → qh[0] bit1=0
+            //   elem[64] (mini2,l0): hi1=1 → qh[0] bit2=1
+            //   elem[96] (mini3,l0): hi1=0 → qh[0] bit3=0
+            //   → qh[0] = 0b00000101 = 0x05 (bit0=1, bit2=1)
+            let qh_off = 16;
+            r0[qh_off + 0] = 0x05;  // elem0 hi=1, elem32 hi=0, elem64 hi=1, elem96 hi=0
+            // 其余 qh[l] = 0 (elem[l] for mini 0-3, l>0: hi=0)
+
+            // qs[128] at offset 48: SPLIT per 64-group.
+            //   group 0 (mini 0,1): qs[0..31]. mini0 low nibble, mini1 high nibble.
+            //     elem[0] (mini0,l0): lo4 = qs[0] & 0xF. 设 lo4=1. q5 = 1 | (1<<4) = 17. val = 1*17 - 2*1 = 15.
+            //     elem[32] (mini1,l0): lo4 = qs[0] >> 4. 设 hi nibble=0. q5=0|(0<<4)=0. val=1*0-2*1=-2.
+            //     → qs[0] = 0x01 (low=1 elem0, high=0 elem32)
+            //   group 1 (mini 2,3): qs[32..63]. mini2 low, mini3 high.
+            //     elem[64] (mini2,l0): lo4 = qs[32] & 0xF. 设 lo4=1. q5=1|(1<<4)=17. val=2*17-2*1=32.
+            //     elem[96] (mini3,l0): lo4 = qs[32] >> 4. 设 hi=0. q5=0. val=2*0-2*1=-2.
+            //     → qs[32] = 0x01
+            let qs_off = 48;
+            r0[qs_off + 0] = 0x01;   // group 0: elem0 lo=1, elem32 lo=0
+            r0[qs_off + 32] = 0x01;  // group 1: elem64 lo=1, elem96 lo=0
+            // 其余 qs = 0 (elem[l>0] for all mini: lo4=0, hi1=0 → q5=0)
+        }
+        // row1: 全 0 block (所有 q5=0, hi=0): val = d*sc*0 - dmin*m = -dmin*m. 但 act=0 不影响.
+        // 为简化, row1 同 row0.
+        let row0_copy: Vec<u8> = weight[0..block_bytes].to_vec();
+        weight[block_bytes..2*block_bytes].copy_from_slice(&row0_copy);
+
+        // act: elem0=1, elem32=1, elem64=1, elem96=1 → dot(row0) = 1*15 + 1*(-2) + 1*32 + 1*(-2) = 43
+        let mut act = vec![0.0f32; m * k];
+        act[0] = 1.0; act[32] = 1.0; act[64] = 1.0; act[96] = 1.0;
+
+        let mut output = vec![0.0f32; m * n];
+
+        let mut prog = VmProgram::new();
+        let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadPtr { dst: input_ptr, src: PtrExpr::AbiArg(0) });
+        prog.emit(VmInstr::LoadPtr { dst: weight_ptr, src: PtrExpr::AbiArg(1) });
+        prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: PtrExpr::StackArg(24) });
+
+        emit_quant_gemm_inline(
+            &mut prog, BoundExpr::Const(m), n, k,
+            QuantType::Q5K, SimdWidth::W256,
+            input_ptr, weight_ptr, output_ptr,
+            QuantPrecision::F32, DotProductCap::SimdAssisted,
+        ).expect("emit should succeed");
+
+        let code = compile_vm_prog(&prog);
+        eprintln!("[Q5_K-ORACLE] JIT {} bytes, {} instrs", code.len(), prog.instrs.len());
+
+        let (exec_ptr, exec_len) = make_exec_buffer(&code);
+        type GemmFn = unsafe extern "C" fn(*const u8, *const u8, usize, usize, usize, usize, usize, *mut u8) -> usize;
+        let f: GemmFn = unsafe { std::mem::transmute(exec_ptr) };
+        let _ret = unsafe { f(act.as_ptr() as *const u8, weight.as_ptr() as *const u8, 0,0,0,0,0, output.as_mut_ptr() as *mut u8) };
+
+        let out_f32: &[f32] = &output;
+        // SPLIT 转置正解: dot = 15 + (-2) + 32 + (-2) = 43
+        // 旧 NibbleWithHighBits (连续 bit stream) 会错取 hi1 → 各 elem val 全错 → dot ≠ 43
+        eprintln!("[Q5_K-ORACLE] out = {:?} (want [43.0, 43.0])", out_f32);
+        eprintln!("[Q5_K-ORACLE] row0: elem0=15, elem32=-2, elem64=32, elem96=-2, dot=43 (转置+SPLIT+get_scale_min_k4)");
+
+        unsafe { libc::munmap(exec_ptr as *mut _, exec_len); }
+
+        let pass0 = (out_f32[0] - 43.0).abs() < 1e-1;
+        let pass1 = (out_f32[1] - 43.0).abs() < 1e-1;
+        if pass0 && pass1 {
+            eprintln!("[Q5_K-ORACLE] PASS — Q5_K 转置高位平面 + SPLIT + get_scale_min_k4 解码正确 (out=[43,43])");
+        } else {
+            eprintln!("[Q5_K-ORACLE] FAIL — Q5_K 解码错, got [{}, {}] want [43, 43] (转置+SPLIT)", out_f32[0], out_f32[1]);
+        }
+        assert!(pass0 && pass1, "Q5_K 转置 oracle: got [{}, {}] want [43, 43]; 旧 NibbleWithHighBits 连续 bit stream 会错", out_f32[0], out_f32[1]);
+    }
+
+    // BCE-20260710-Q5_K-HIGHBITS: Q5_K mini 4-7 (j>=4 scale branch) oracle.
+    // 验证 get_scale_min_k4 的 j>=4 交错拼分支: sc=(scales[j+4]&0xF)|((scales[j-4]>>6)<<4), m=(scales[j+4]>>4)|((scales[j]>>6)<<4).
+    // 第一个 oracle 只测 mini 0-3 (j<4), 本 oracle 测 mini 4-7 (j>=4).
+    #[test]
+    fn test_q5_k_j4_scale_branch_oracle() {
+        let m = 2; let n = 2; let k = 256;
+        let block_bytes: usize = 176;
+
+        // d=f16(1.0), dmin=f16(1.0).
+        // 设 scales[0..7] 高 2bit = 0 (不污染 mini 4-7 的 sc/m 高半).
+        // mini 4: sc=scales[8]&0xF | (scales[0]>>6)<<4, m=scales[8]>>4 | (scales[4]>>6)<<4
+        //   设 scales[8]=0x21 → sc=1, m=2. (scales[0]>>6=0, scales[4]>>6=0)
+        //   mini 4 (j=4>=4): val_4 = 1*q5 - 1*2 = q5 - 2
+        // mini 5: sc=scales[9]&0xF | (scales[1]>>6)<<4, m=scales[9]>>4 | (scales[5]>>6)<<4
+        //   设 scales[9]=0x12 → sc=2, m=1. val_5 = 2*q5 - 1
+        // mini 6: scales[10]=0x41 → sc=1, m=4. val_6 = 1*q5 - 4
+        // mini 7: scales[11]=0x14 → sc=4, m=1. val_7 = 4*q5 - 1
+        let d_f16 = f16::from_f32(1.0);
+        let dmin_f16 = f16::from_f32(1.0);
+        let d_bits = d_f16.to_bits();
+        let dmin_bits = dmin_f16.to_bits();
+        let d_lo = (d_bits & 0xFF) as u8; let d_hi = ((d_bits >> 8) & 0xFF) as u8;
+        let dm_lo = (dmin_bits & 0xFF) as u8; let dm_hi = ((dmin_bits >> 8) & 0xFF) as u8;
+
+        let mut weight = vec![0u8; n * block_bytes];
+        {
+            let r0 = &mut weight[0..block_bytes];
+            r0[0] = d_lo; r0[1] = d_hi;          // d=1.0
+            r0[2] = dm_lo; r0[3] = dm_hi;        // dmin=1.0
+            let scales_off = 4;
+            // scales[0..7] = 0 (高2bit=0, 不污染 mini 4-7; mini 0-3 sc/m=0 但 act=0 不影响)
+            // scales[8..11] 编码 mini 4-7 (sc 低4, m 高4)
+            r0[scales_off + 8] = 0x21;  // mini 4: sc=1, m=2
+            r0[scales_off + 9] = 0x12;  // mini 5: sc=2, m=1
+            r0[scales_off + 10] = 0x41; // mini 6: sc=1, m=4
+            r0[scales_off + 11] = 0x14; // mini 7: sc=4, m=1
+
+            // qh[32] at offset 16: 转置. qh[l] bit(mini) = elem[mini*32+l] hi1.
+            //   elem[128] (mini4,l0): hi1=1 → qh[0] bit4=1
+            //   elem[160] (mini5,l0): hi1=0 → qh[0] bit5=0
+            //   elem[192] (mini6,l0): hi1=1 → qh[0] bit6=1
+            //   elem[224] (mini7,l0): hi1=0 → qh[0] bit7=0
+            //   → qh[0] = 0b01010000 = 0x50 (bit4=1, bit6=1)
+            let qh_off = 16;
+            r0[qh_off + 0] = 0x50;
+
+            // qs[128] at offset 48: SPLIT per 64-group.
+            //   group 2 (mini 4,5): qs[64..95]. mini4 low nibble, mini5 high nibble.
+            //     elem[128] (mini4,l0): lo4 = qs[64] & 0xF. 设 lo4=1. q5=1|(1<<4)=17. val=1*17-1*2=15.
+            //     elem[160] (mini5,l0): lo4 = qs[64] >> 4. 设 hi=0. q5=0. val=2*0-1*1=-1.
+            //     → qs[64] = 0x01
+            //   group 3 (mini 6,7): qs[96..127]. mini6 low, mini7 high.
+            //     elem[192] (mini6,l0): lo4 = qs[96] & 0xF. 设 lo4=1. q5=1|(1<<4)=17. val=1*17-1*4=13.
+            //     elem[224] (mini7,l0): lo4 = qs[96] >> 4. 设 hi=0. q5=0. val=4*0-1*1=-1.
+            //     → qs[96] = 0x01
+            let qs_off = 48;
+            r0[qs_off + 64] = 0x01;
+            r0[qs_off + 96] = 0x01;
+        }
+        let row0_copy: Vec<u8> = weight[0..block_bytes].to_vec();
+        weight[block_bytes..2*block_bytes].copy_from_slice(&row0_copy);
+
+        // act: elem128=1, elem160=1, elem192=1, elem224=1 → dot = 15 + (-1) + 13 + (-1) = 26
+        let mut act = vec![0.0f32; m * k];
+        act[128] = 1.0; act[160] = 1.0; act[192] = 1.0; act[224] = 1.0;
+
+        let mut output = vec![0.0f32; m * n];
+        let mut prog = VmProgram::new();
+        let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadPtr { dst: input_ptr, src: PtrExpr::AbiArg(0) });
+        prog.emit(VmInstr::LoadPtr { dst: weight_ptr, src: PtrExpr::AbiArg(1) });
+        prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: PtrExpr::StackArg(24) });
+
+        emit_quant_gemm_inline(
+            &mut prog, BoundExpr::Const(m), n, k,
+            QuantType::Q5K, SimdWidth::W256,
+            input_ptr, weight_ptr, output_ptr,
+            QuantPrecision::F32, DotProductCap::SimdAssisted,
+        ).expect("emit should succeed");
+
+        let code = compile_vm_prog(&prog);
+        eprintln!("[Q5_K-J4-ORACLE] JIT {} bytes", code.len());
+        let (exec_ptr, exec_len) = make_exec_buffer(&code);
+        type GemmFn = unsafe extern "C" fn(*const u8, *const u8, usize, usize, usize, usize, usize, *mut u8) -> usize;
+        let f: GemmFn = unsafe { std::mem::transmute(exec_ptr) };
+        let _ret = unsafe { f(act.as_ptr() as *const u8, weight.as_ptr() as *const u8, 0,0,0,0,0, output.as_mut_ptr() as *mut u8) };
+
+        let out_f32: &[f32] = &output;
+        // j>=4 正解: dot = 15 + (-1) + 13 + (-1) = 26
+        eprintln!("[Q5_K-J4-ORACLE] out = {:?} (want [26.0, 26.0])", out_f32);
+        eprintln!("[Q5_K-J4-ORACLE] mini4=15, mini5=-1, mini6=13, mini7=-1 (j>=4 交错拼 sc/m)");
+
+        unsafe { libc::munmap(exec_ptr as *mut _, exec_len); }
+
+        let pass0 = (out_f32[0] - 26.0).abs() < 1e-1;
+        let pass1 = (out_f32[1] - 26.0).abs() < 1e-1;
+        if pass0 && pass1 {
+            eprintln!("[Q5_K-J4-ORACLE] PASS — Q5_K j>=4 scale branch (get_scale_min_k4 交错拼) 正确 (out=[26,26])");
+        } else {
+            eprintln!("[Q5_K-J4-ORACLE] FAIL — Q5_K j>=4 解码错, got [{}, {}] want [26, 26]", out_f32[0], out_f32[1]);
+        }
+        assert!(pass0 && pass1, "Q5_K j>=4 oracle: got [{}, {}] want [26, 26] (get_scale_min_k4 交错拼分支)", out_f32[0], out_f32[1]);
+    }
 }

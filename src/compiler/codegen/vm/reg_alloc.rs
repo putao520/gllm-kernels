@@ -930,6 +930,7 @@ impl<'a> RegAllocator<'a> {
             VmInstr::Q3KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } => vec![*dst, *block_base, *lane_offset, *d_vreg],
             VmInstr::Q6KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } => vec![*dst, *block_base, *lane_offset, *d_vreg],
             VmInstr::Q5DecodeStep { dst, block_base, lane_offset, d_vreg, .. } => vec![*dst, *block_base, *lane_offset, *d_vreg],
+            VmInstr::Q5KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } => vec![*dst, *block_base, *lane_offset, *d_vreg],
             VmInstr::BitwiseGemm { dst, sign_bits, input_sign_bits, scale, .. } => vec![*dst, *sign_bits, *input_sign_bits, *scale],
             VmInstr::SparseGemm { acc, a_sparse, b_dense, sparse_mask_ptr, .. } => vec![*acc, *a_sparse, *b_dense, *sparse_mask_ptr],
             _ => Self::referenced_vregs_quantc(instr),
@@ -1836,6 +1837,9 @@ fn validate_spill_is_pure_write_quantb(instr: &VmInstr, vreg: VRegId) -> bool {
                         *dst == vreg && *block_base != vreg && *lane_offset != vreg && *d_vreg != vreg
                     },
         VmInstr::Q5DecodeStep { dst, block_base, lane_offset, d_vreg, .. } => {
+                        *dst == vreg && *block_base != vreg && *lane_offset != vreg && *d_vreg != vreg
+                    },
+        VmInstr::Q5KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } => {
                         *dst == vreg && *block_base != vreg && *lane_offset != vreg && *d_vreg != vreg
                     },
         VmInstr::QuantScalarCvtLoad { dst, base, .. } => *dst == vreg && *base != vreg,
