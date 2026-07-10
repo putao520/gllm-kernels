@@ -570,6 +570,7 @@ fn dispatch_trace_op(
         TraceOp::QuantInterleave { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
         TraceOp::QuantConcatSeq { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
         TraceOp::QuantQ3KDecode { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantQ6KDecode { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
         TraceOp::QuantPtrAddOffset { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
         TraceOp::QuantPtrAddDynamic { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
         TraceOp::QuantScalarLoad { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
@@ -1521,6 +1522,22 @@ fn dispatch_quant_decode(
                 d_vreg: slots[d_slot.0 as usize],
                 qs_offset: *qs_offset,
                 hmask_offset: *hmask_offset,
+                lanes,
+                width,
+            });
+            Ok(r)
+        }
+
+        TraceOp::QuantQ6KDecode { block_base, lane_offset, d_slot, qs_offset, qh_offset } => {
+            let r = prog.alloc_vreg(VRegKind::Vec, width);
+            let lanes = if matches!(width, SimdWidth::W512) { 16 } else if matches!(width, SimdWidth::W256) { 8 } else { 4 };
+            prog.emit(VmInstr::Q6KDecodeStep {
+                dst: r,
+                block_base: slots[block_base.0 as usize],
+                lane_offset: slots[lane_offset.0 as usize],
+                d_vreg: slots[d_slot.0 as usize],
+                qs_offset: *qs_offset,
+                qh_offset: *qh_offset,
                 lanes,
                 width,
             });

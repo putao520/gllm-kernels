@@ -928,6 +928,7 @@ impl<'a> RegAllocator<'a> {
             VmInstr::QuantInterleave { dst, lo, hi, .. } => vec![*dst, *lo, *hi],
             VmInstr::QuantConcatSeq { dst, lo, hi, .. } => vec![*dst, *lo, *hi],
             VmInstr::Q3KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } => vec![*dst, *block_base, *lane_offset, *d_vreg],
+            VmInstr::Q6KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } => vec![*dst, *block_base, *lane_offset, *d_vreg],
             VmInstr::BitwiseGemm { dst, sign_bits, input_sign_bits, scale, .. } => vec![*dst, *sign_bits, *input_sign_bits, *scale],
             VmInstr::SparseGemm { acc, a_sparse, b_dense, sparse_mask_ptr, .. } => vec![*acc, *a_sparse, *b_dense, *sparse_mask_ptr],
             _ => Self::referenced_vregs_quantc(instr),
@@ -1828,6 +1829,9 @@ fn validate_spill_is_pure_write_quantb(instr: &VmInstr, vreg: VRegId) -> bool {
     // Quant cluster b (3 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
     match instr {
         VmInstr::Q3KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } => {
+                        *dst == vreg && *block_base != vreg && *lane_offset != vreg && *d_vreg != vreg
+                    },
+        VmInstr::Q6KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } => {
                         *dst == vreg && *block_base != vreg && *lane_offset != vreg && *d_vreg != vreg
                     },
         VmInstr::QuantScalarCvtLoad { dst, base, .. } => *dst == vreg && *base != vreg,

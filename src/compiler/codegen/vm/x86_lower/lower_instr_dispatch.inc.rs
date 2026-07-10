@@ -139,6 +139,7 @@ impl X86Lower {
             VmInstr::QuantInterleave { dst, lo, hi, .. } => self.lower_quant_interleave_x86(instr, alloc),
             VmInstr::QuantConcatSeq { dst, lo, hi, .. } => self.lower_quant_concat_seq_x86(instr, alloc),
             VmInstr::Q3KDecodeStep { dst, block_base, lane_offset, d_vreg: _, qs_offset, hmask_offset, lanes, width } => self.lower_q3_k_decode_step_x86(instr, alloc),
+            VmInstr::Q6KDecodeStep { dst, block_base, lane_offset, d_vreg: _, qs_offset, qh_offset, lanes, width } => self.lower_q6_k_decode_step_x86(instr, alloc),
             VmInstr::BitwiseGemm { dst, sign_bits, input_sign_bits, scale, width } => self.lower_bitwise_gemm_x86(instr, alloc),
             VmInstr::SparseGemm { .. } => self.lower_sparse_gemm_x86(instr, alloc),
             VmInstr::SparseFp8Gemm { .. } => self.lower_sparse_fp8_gemm_x86(instr, alloc),
@@ -4017,6 +4018,85 @@ impl X86Lower {
             }
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_q3_k_decode_step_x86: expected VmInstr::Q3KDecodeStep, got {:?}", instr))),
+        }
+    }
+
+    /// Q6_K 单步解码 x86 lowering (BCE-20260710-Q6K-HIGHBITS).
+    /// 委托 q6k_decode_step_native (scalar 循环, 处理 quarter 位置相关高 2 bit).
+    /// ABI 同 q3k: RDI=block, RSI=lane_offset, XMM0=d_f32, RDX=qs_offset, RCX=qh_offset, R8=lanes, R9=out_ptr.
+    fn lower_q6_k_decode_step_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
+        match instr {
+            VmInstr::Q6KDecodeStep { dst, block_base, lane_offset, d_vreg: _, qs_offset, qh_offset, lanes, width } => {
+                let bb_gpr = self.resolve_gpr_read(*block_base, alloc, 0)?;
+                let lo_gpr = self.resolve_gpr_read(*lane_offset, alloc, 1)?;
+
+                let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
+
+                #[rustfmt::skip]
+                let all_ymms: [AsmRegisterYmm; 16] = [ymm0, ymm1, ymm2, ymm3, ymm4, ymm5, ymm6, ymm7, ymm8, ymm9, ymm10, ymm11, ymm12, ymm13, ymm14, ymm15];
+                let save_ymms: Vec<AsmRegisterYmm> = all_ymms.iter().filter(|&&r| r != dst_ymm).copied().collect();
+
+                let save_gprs = [rax, rbx, rcx, rdx, rsi, rdi, r8, r9, r10, r11, r12, r13, r14, r15];
+
+                {
+                    let mut frame = SymbolicSaveFrame::new(&mut self.asm);
+                    frame.push_gprs(&save_gprs)?;
+                    frame.pushfq()?;
+                    frame.save_ymm_block(&save_ymms)?;
+                    frame.verify_alignment()?;
+                }
+
+                self.asm.mov(rdi, bb_gpr).map_err(Self::err)?;
+                self.asm.mov(rsi, lo_gpr).map_err(Self::err)?;
+                self.asm.vxorps(xmm0, xmm0, xmm0).map_err(Self::err)?;
+                self.asm.mov(rdx, *qs_offset as u64).map_err(Self::err)?;
+                self.asm.mov(rcx, *qh_offset as u64).map_err(Self::err)?;
+                self.asm.mov(r8, *lanes as u64).map_err(Self::err)?;
+
+                let aligned_out_bytes = ((*lanes as i32 + 3) & !3) * 4;
+                self.asm.mov(r10, rsp).map_err(Self::err)?;
+                self.asm.and(rsp, -16i32).map_err(Self::err)?;
+                self.asm.sub(rsp, aligned_out_bytes).map_err(Self::err)?;
+                self.asm.lea(r9, qword_ptr(rsp)).map_err(Self::err)?;
+
+                let fn_ptr = crate::asm::x86_64::quant_gemv::q6k_decode_step_native as *const () as u64;
+                self.asm.mov(rax, fn_ptr).map_err(Self::err)?;
+                self.asm.call(rax).map_err(Self::err)?;
+
+                match width {
+                    SimdWidth::W128 => {
+                        self.asm.vmovups(dst_ymm, xmmword_ptr(rsp)).map_err(Self::err)?;
+                    }
+                    SimdWidth::W256 => {
+                        self.asm.vmovups(dst_ymm, ymmword_ptr(rsp)).map_err(Self::err)?;
+                    }
+                    SimdWidth::W512 => {
+                        self.asm.vmovups(dst_ymm, ymmword_ptr(rsp)).map_err(Self::err)?;
+                    }
+                    SimdWidth::Scalar => {
+                        let dst_xmm = Self::ymm_to_xmm(dst_ymm);
+                        self.asm.vmovss(dst_xmm, dword_ptr(rsp)).map_err(Self::err)?;
+                    }
+                    SimdWidth::Warp(_) | SimdWidth::Scalable => {
+                        return Err(CompilerError::CodegenViolation(
+                            "Q6KDecodeStep: Warp/Scalable SIMD width not supported on x86".into()
+                        ));
+                    }
+                }
+
+                self.asm.mov(rsp, r10).map_err(Self::err)?;
+
+                {
+                    let mut frame = SymbolicSaveFrame::new(&mut self.asm);
+                    frame.restore_all(&save_gprs, &save_ymms)?;
+                }
+
+                if dst_spilled { self.spill_store_ymm(*dst, alloc, 0)?; }
+
+                Ok(())
+            }
+            _ => Err(CompilerError::CodegenViolation(
+                format!("lower_q6_k_decode_step_x86: expected VmInstr::Q6KDecodeStep, got {:?}", instr))),
         }
     }
 

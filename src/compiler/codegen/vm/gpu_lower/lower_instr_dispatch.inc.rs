@@ -127,6 +127,7 @@ impl GpuLower {
             VmInstr::QuantInterleave { dst, lo, hi, .. } => self.lower_quant_interleave_gpu(instr, alloc),
             VmInstr::QuantConcatSeq { dst, lo, hi, .. } => self.lower_quant_concat_seq_gpu(instr, alloc),
             VmInstr::Q3KDecodeStep { .. } => self.lower_q3_k_decode_step_gpu(instr, alloc),
+            VmInstr::Q6KDecodeStep { .. } => self.lower_q6_k_decode_step_gpu(instr, alloc),
             VmInstr::GgufSubScaleLoad { .. } | VmInstr::GgufKQuantScaleLoad { .. } => self.lower_gguf_sub_scale_load_gpu(instr, alloc),
             VmInstr::QuantBlockLoad { dst, base, offset, unpack, width } => self.lower_quant_block_load_gpu(instr, alloc),
             VmInstr::QuantBiPlaneLoad { dst, qs_base, extra_base, bias, mode, width } => self.lower_quant_bi_plane_load_gpu(instr, alloc),
@@ -4197,6 +4198,21 @@ Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_q3_k_decode_step_gpu: expected VmInstr::Q3KDecodeStep, got {:?}", instr))),
+        }
+    }
+
+    fn lower_q6_k_decode_step_gpu(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
+        let _ = alloc;
+        match instr {
+            VmInstr::Q6KDecodeStep { .. } => {
+                // BCE-20260710-Q6K-HIGHBITS: GPU PTX lowering not yet implemented.
+                // Q6_K quarter 结构需逐元素位置相关高 2 bit 提取, 待 GPU 路径实测时补 PTX.
+                Err(CompilerError::CodegenViolation(
+                    "Q6KDecodeStep GPU: not yet implemented".into()
+                ))
+            }
+            _ => Err(CompilerError::CodegenViolation(
+                format!("lower_q6_k_decode_step_gpu: expected VmInstr::Q6KDecodeStep, got {:?}", instr))),
         }
     }
 

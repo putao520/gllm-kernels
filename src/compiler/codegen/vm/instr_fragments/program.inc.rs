@@ -495,6 +495,7 @@ impl VmProgram {
             VmInstr::QuantInterleave { dst, lo, hi, width } => VmInstr::QuantInterleave { dst: r(dst, map, next_vreg), lo: r(lo, map, next_vreg), hi: r(hi, map, next_vreg), width },
             VmInstr::QuantConcatSeq { dst, lo, hi, width } => VmInstr::QuantConcatSeq { dst: r(dst, map, next_vreg), lo: r(lo, map, next_vreg), hi: r(hi, map, next_vreg), width },
             VmInstr::Q3KDecodeStep { dst, block_base, lane_offset, d_vreg, qs_offset, hmask_offset, lanes, width } => VmInstr::Q3KDecodeStep { dst: r(dst, map, next_vreg), block_base: r(block_base, map, next_vreg), lane_offset: r(lane_offset, map, next_vreg), d_vreg: r(d_vreg, map, next_vreg), qs_offset, hmask_offset, lanes, width },
+            VmInstr::Q6KDecodeStep { dst, block_base, lane_offset, d_vreg, qs_offset, qh_offset, lanes, width } => VmInstr::Q6KDecodeStep { dst: r(dst, map, next_vreg), block_base: r(block_base, map, next_vreg), lane_offset: r(lane_offset, map, next_vreg), d_vreg: r(d_vreg, map, next_vreg), qs_offset, qh_offset, lanes, width },
             VmInstr::BitwiseGemm { dst, sign_bits, input_sign_bits, scale, width } => VmInstr::BitwiseGemm { dst: r(dst, map, next_vreg), sign_bits: r(sign_bits, map, next_vreg), input_sign_bits: r(input_sign_bits, map, next_vreg), scale: r(scale, map, next_vreg), width },
             _ => Self::remap_vreg_with_map_quantc(instr, map, next_vreg, &r, &remap_offset, &remap_scalar, &remap_ptr),
         }
@@ -897,6 +898,7 @@ impl VmProgram {
             VmInstr::QuantInterleave { dst, lo, hi, width } => VmInstr::QuantInterleave { dst: r(dst), lo: r(lo), hi: r(hi), width },
             VmInstr::QuantConcatSeq { dst, lo, hi, width } => VmInstr::QuantConcatSeq { dst: r(dst), lo: r(lo), hi: r(hi), width },
             VmInstr::Q3KDecodeStep { dst, block_base, lane_offset, d_vreg, qs_offset, hmask_offset, lanes, width } => VmInstr::Q3KDecodeStep { dst: r(dst), block_base: r(block_base), lane_offset: r(lane_offset), d_vreg: r(d_vreg), qs_offset, hmask_offset, lanes, width },
+            VmInstr::Q6KDecodeStep { dst, block_base, lane_offset, d_vreg, qs_offset, qh_offset, lanes, width } => VmInstr::Q6KDecodeStep { dst: r(dst), block_base: r(block_base), lane_offset: r(lane_offset), d_vreg: r(d_vreg), qs_offset, qh_offset, lanes, width },
             VmInstr::BitwiseGemm { dst, sign_bits, input_sign_bits, scale, width } => VmInstr::BitwiseGemm { dst: r(dst), sign_bits: r(sign_bits), input_sign_bits: r(input_sign_bits), scale: r(scale), width },
             _ => Self::remap_vreg_instr_quantc(instr, &r, &remap_offset, &remap_scalar, &remap_ptr),
         }
@@ -2428,7 +2430,9 @@ impl VmProgram {
         // Quant cluster c (7 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
         match instr {
             // Quant* decode instrs: produce VecData
-            VmInstr::Q3KDecodeStep { dst, .. } => { 
+            VmInstr::Q3KDecodeStep { dst, .. } => {
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            VmInstr::Q6KDecodeStep { dst, .. } => {
                                     domains.insert(*dst, Domain::VecData); Ok(()) },
             // Quant* decode instrs: produce VecData
             VmInstr::BitwiseGemm { dst, .. } => { 

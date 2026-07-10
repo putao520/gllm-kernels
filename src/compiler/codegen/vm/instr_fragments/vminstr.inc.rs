@@ -1355,6 +1355,27 @@ pub enum VmInstr {
         width: SimdWidth,
     },
 
+    /// Q6_K 单步解码 (BCE-20260710-Q6K-HIGHBITS).
+    /// 修复 emit_unpack NibbleWithHighBits qh<<6 & 0x30 丢高 2 bit bug.
+    /// 委托 q6k_decode_step_native (scalar 循环, 处理 quarter 结构位置相关高 2 bit 提取).
+    /// dst = f32 vector of decoded values.
+    /// block_base: pointer to Q6_K block (qs[128] + qh[64] + scales[16] + d(f16) = 210B)
+    /// lane_offset: GPR holding iteration counter (0.., 步进 lanes)
+    /// d_vreg: Vec VReg holding f32 super-block scale d (未用, native 内部从 block+208 读)
+    /// qs_offset: byte offset to qs[] (0 for Q6_K)
+    /// qh_offset: byte offset to qh[] (128 for Q6_K)
+    /// lanes: output elements per iteration (8 for AVX2)
+    Q6KDecodeStep {
+        dst: VRegId,
+        block_base: VRegId,
+        lane_offset: VRegId,
+        d_vreg: VRegId,
+        qs_offset: usize,
+        qh_offset: usize,
+        lanes: usize,
+        width: SimdWidth,
+    },
+
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // SPEC 23-QUANT-CODEGEN-ALGO §4.3: 原生 Dot-Product VmInstr
     // 硬件无关语义，ISA lowering 决定具体指令

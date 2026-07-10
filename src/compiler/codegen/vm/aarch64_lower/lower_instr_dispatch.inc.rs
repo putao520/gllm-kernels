@@ -135,6 +135,7 @@ impl AArch64Lower {
             VmInstr::QuantInterleave { dst, lo, hi, .. } => self.lower_quant_interleave_aarch64(instr, alloc),
             VmInstr::QuantConcatSeq { dst, lo, hi, .. } => self.lower_quant_concat_seq_aarch64(instr, alloc),
             VmInstr::Q3KDecodeStep { .. } => self.lower_q3_k_decode_step_aarch64(instr, alloc),
+            VmInstr::Q6KDecodeStep { .. } => self.lower_q6_k_decode_step_aarch64(instr, alloc),
             VmInstr::BitwiseGemm { .. } => self.lower_bitwise_gemm_aarch64(instr, alloc),
             VmInstr::SparseGemm { .. } => self.lower_sparse_gemm_aarch64(instr, alloc),
             VmInstr::SparseFp8Gemm { .. } => self.lower_sparse_fp8_gemm_aarch64(instr, alloc),
@@ -3432,6 +3433,19 @@ Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_q3_k_decode_step_aarch64: expected VmInstr::Q3KDecodeStep, got {:?}", instr))),
+        }
+    }
+
+    fn lower_q6_k_decode_step_aarch64(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
+        match instr {
+            VmInstr::Q6KDecodeStep { .. } => {
+
+                Err(CompilerError::CodegenViolation(
+                    "Q6KDecodeStep AArch64: not yet implemented".into()
+                ))
+            }
+            _ => Err(CompilerError::CodegenViolation(
+                format!("lower_q6_k_decode_step_aarch64: expected VmInstr::Q6KDecodeStep, got {:?}", instr))),
         }
     }
 

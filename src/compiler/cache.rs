@@ -547,6 +547,7 @@ impl SerializedTraceOp {
             TraceOp::Tma2DCopy { .. } => Self { tag: 128, operands: [0, 0, 0, 0], float_val: 0.0 },
             TraceOp::DynamicPrecisionSelect { .. } => Self { tag: 129, operands: [0, 0, 0, 0], float_val: 0.0 },
             TraceOp::QuantQ3KDecode { block_base, lane_offset, d_slot, .. } => Self { tag: 130, operands: [block_base.0, lane_offset.0, d_slot.0, 0], float_val: 0.0 },
+            TraceOp::QuantQ6KDecode { block_base, lane_offset, d_slot, .. } => Self { tag: 131, operands: [block_base.0, lane_offset.0, d_slot.0, 0], float_val: 0.0 },
         }
     }
 
@@ -629,6 +630,13 @@ impl SerializedTraceOp {
                 d_slot: ValueId(o[2]),
                 qs_offset: 32,
                 hmask_offset: 0,
+            }),
+            131 => Some(TraceOp::QuantQ6KDecode {
+                block_base: ValueId(o[0]),
+                lane_offset: ValueId(o[1]),
+                d_slot: ValueId(o[2]),
+                qs_offset: 0,
+                qh_offset: 128,
             }),
             _ => None,
         }

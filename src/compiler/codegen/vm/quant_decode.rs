@@ -213,6 +213,12 @@ impl<'a> DecodeTraceBuilder<'a> {
             return self.build_q3k_decode(trace, block_base_slot, lane_offset_slot);
         }
 
+        // Q6_K (NibbleWithHighBits high_bits=2): monolithic decode TraceOp
+        // (BCE-20260710-Q6K-HIGHBITS: 旧 emit_unpack qh<<6 & 0x30 丢高 2 bit)
+        if self.is_q6k_format() {
+            return self.build_q6k_decode(trace, block_base_slot, lane_offset_slot);
+        }
+
         let scale_result = self.emit_scale_load(trace, block_base_slot, lane_offset_slot);
         let zero_result = self.emit_zero_load(trace, block_base_slot, lane_offset_slot);
         let quant_data_slot = self.emit_data_load(trace, data_ptr_slot);
@@ -229,6 +235,13 @@ impl<'a> DecodeTraceBuilder<'a> {
     /// Whether this format uses Q3_K monolithic decode (TwoBitConditionalBias layout).
     fn is_q3k_format(&self) -> bool {
         matches!(&self.desc.data_layout, DataLayout::TwoBitConditionalBias { .. })
+    }
+
+    /// Whether this format uses Q6_K monolithic decode (BCE-20260710-Q6K-HIGHBITS).
+    /// Q6_K quarter 结构需位置相关高 2 bit 提取, 旧 NibbleWithHighBits qh<<6 & 0x30 丢高 bit.
+    fn is_q6k_format(&self) -> bool {
+        // Q6_K: quant_type 匹配 + NibbleWithHighBits(high_bits=2) layout
+        matches!(&self.desc.data_layout, DataLayout::NibbleWithHighBits { high_bits_per_elem: 2, .. })
     }
 
     /// Q3_K combined decode: loads d (f16), delegates to QuantQ3KDecode TraceOp
@@ -262,6 +275,40 @@ impl<'a> DecodeTraceBuilder<'a> {
             d_slot,
             qs_offset,
             hmask_offset,
+        })
+    }
+
+    /// Q6_K combined decode (BCE-20260710-Q6K-HIGHBITS): loads d (f16), delegates to
+    /// QuantQ6KDecode TraceOp → q6k_decode_step_native (quarter 结构位置相关高 2 bit 提取).
+    fn build_q6k_decode(
+        &self,
+        trace: &mut Vec<TraceOp>,
+        block_base_slot: ValueId,
+        lane_offset_slot: ValueId,
+    ) -> ValueId {
+        let (qs_offset, qh_offset) = match &self.desc.data_layout {
+            DataLayout::NibbleWithHighBits { low_offset, high_offset, .. } => (*low_offset, *high_offset),
+            _ => unreachable!("is_q6k_format guarantees NibbleWithHighBits high_bits=2"),
+        };
+
+        // Load block super-scale d as f16→f32 (Q6KScales: block_d_offset)
+        let d_offset = match &self.desc.scale_layout {
+            ScaleLayout::Q6KScales { block_d_offset, .. } => *block_d_offset,
+            _ => 0,
+        };
+        let d_ptr = push_op(trace, TraceOp::QuantPtrAddOffset {
+            base: block_base_slot,
+            offset_bytes: d_offset as i64,
+        });
+        let d_slot = push_op(trace, TraceOp::QuantLoadF16toF32 { ptr: d_ptr, offset_bytes: 0 });
+
+        // Emit the monolithic Q6_K decode TraceOp
+        push_op(trace, TraceOp::QuantQ6KDecode {
+            block_base: block_base_slot,
+            lane_offset: lane_offset_slot,
+            d_slot,
+            qs_offset,
+            qh_offset,
         })
     }
 
@@ -1037,9 +1084,13 @@ mod tests {
             .build(&mut trace);
         assert_trace_valid(&trace);
         assert!(final_slot.0 < trace.len() as u32);
-        // Q6_K: StaticBias(32) → Sub op
-        let has_sub = trace.iter().any(|op| matches!(op, TraceOp::Sub(_, _)));
-        assert!(has_sub, "Q6_K should have Sub for static bias of 32");
+        // BCE-20260710-Q6K-HIGHBITS: Q6_K 用整体式 QuantQ6KDecode (非旧 NibbleWithHighBits qh<<6&0x30).
+        // trace 应含 QuantQ6KDecode (处理 quarter 位置相关高 2 bit 提取).
+        let has_q6k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
+        assert!(has_q6k_decode, "Q6_K should emit QuantQ6KDecode monolithic TraceOp (replaces buggy NibbleWithHighBits unpack)");
+        // d (f16→f32) 加载仍应在 trace
+        let has_d_load = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
+        assert!(has_d_load, "Q6_K should load block d (f16→f32)");
     }
 
     #[test]
@@ -2120,32 +2171,24 @@ mod tests {
         // Arrange
         let r = registry();
 
-        // Act & Assert: Q6K with 16 lanes
-        // Q6_K: 2 bits/elem, 16 lanes → (16*2+7)/8 = 4 bytes
+        // BCE-20260710-Q6K-HIGHBITS: Q6_K 现走整体式 QuantQ6KDecode (非 NibbleWithHighBits).
+        // high_bits_stride/needs_high_bits_ptr 仍可调用 (返回值), 但 build() 走整体式.
         let q6k = r.get(&QuantType::Q6K).expect("Q6K");
         let builder_16 = DecodeTraceBuilder::new(q6k, 16);
-        assert_eq!(builder_16.high_bits_stride(), 4,
-            "Q6_K with 16 lanes should have 4-byte high bits stride");
+        // Q6_K 仍走整体式: trace 应含 QuantQ6KDecode
+        let mut trace = Vec::new();
+        let slot = builder_16.build(&mut trace);
+        assert_trace_valid(&trace);
+        assert!(slot.0 < trace.len() as u32);
+        let has_q6k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
+        assert!(has_q6k_decode, "Q6_K 16 lanes should emit QuantQ6KDecode");
 
-        // Act & Assert: Q5_0 with 16 lanes
+        // Act & Assert: Q5_0 with 16 lanes (Q5_0 仍用 NibbleWithHighBits, high bit plane)
         // Q5_0: 1 bit/elem, 16 lanes → (16*1+7)/8 = 2 bytes
         let q5_0 = r.get(&QuantType::Q5_0).expect("Q5_0");
         let q5_0_builder_16 = DecodeTraceBuilder::new(q5_0, 16);
         assert_eq!(q5_0_builder_16.high_bits_stride(), 2,
             "Q5_0 with 16 lanes should have 2-byte high bits stride");
-
-        // Verify the 16-lane trace builds correctly for Q6K
-        let mut trace = Vec::new();
-        let slot = builder_16.build(&mut trace);
-        assert_trace_valid(&trace);
-        assert!(slot.0 < trace.len() as u32);
-
-        // Q6K with 16 lanes: QuantLoadBytesVec for high bits should load 4 bytes
-        let has_4byte_high = trace.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantLoadBytesVec { count: 4, .. }
-        ));
-        assert!(has_4byte_high, "Q6_K with 16 lanes should load 4 bytes for high bits");
     }
 
     // ── Wave 12kka: +10 additional tests ──
@@ -2275,8 +2318,9 @@ mod tests {
     }
 
     // @trace TEST-QD-28 [req:REQ-QCG] [level:unit]
-    // Q6_K static bias value: verifies Const(32.0) bias constant in the trace.
-    // Q6_K maps integer range [0,63] → symmetric [-32,31] via StaticBias(32).
+    // Q6_K static bias: BCE-20260710-Q6K-HIGHBITS 后 Q6_K 走整体式 QuantQ6KDecode,
+    // bias 由 q6k_decode_step_native 内部处理 (six_bit = (lo4|(hi2<<4)) - 32).
+    // trace 不再含 Const(32)/Sub (旧 NibbleWithHighBits 路径).
     #[test]
     fn test_q6k_static_bias_value() {
         // Arrange
@@ -2287,13 +2331,9 @@ mod tests {
         let mut trace = Vec::new();
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
-        // Assert: Q6_K has StaticBias(32) → Const(32.0) in trace
-        let has_bias_32 = trace.iter().any(|op| matches!(op, TraceOp::Const(v) if (*v - 32.0_f64).abs() < f64::EPSILON));
-        assert!(has_bias_32, "Q6_K should have Const(32.0) for StaticBias(32)");
-
-        // Assert: Sub must be present to subtract the bias
-        let has_sub = trace.iter().any(|op| matches!(op, TraceOp::Sub(_, _)));
-        assert!(has_sub, "Q6_K should have Sub to subtract StaticBias(32)");
+        // Assert: Q6_K 走整体式 QuantQ6KDecode (bias 在 native 内部处理, 非 trace Const/Sub)
+        let has_q6k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
+        assert!(has_q6k_decode, "Q6_K should emit QuantQ6KDecode (bias handled in native, not trace Const/Sub)");
     }
 
     // @trace TEST-QD-29 [req:REQ-QCG] [level:unit]
@@ -2745,14 +2785,13 @@ mod tests {
             .count();
         assert!(q4k_div >= 1, "Q4K should have at least 1 QuantIntDivConst for sub_block_idx");
 
-        // Q6K: Q6KScales layout → QuantIntDivConst for sub_block_idx
+        // Q6K: BCE-20260710-Q6K-HIGHBITS 后走整体式 QuantQ6KDecode (scale 在 native 内处理)
+        // 不再含 QuantIntDivConst (旧 Q6KScales trace 路径已废)
         let q6k = r.get(&QuantType::Q6K).expect("Q6K");
         let mut trace_q6k = Vec::new();
         let _ = DecodeTraceBuilder::new(q6k, 8).build(&mut trace_q6k);
-        let q6k_div = trace_q6k.iter()
-            .filter(|op| matches!(op, TraceOp::QuantIntDivConst { .. }))
-            .count();
-        assert!(q6k_div >= 1, "Q6K should have at least 1 QuantIntDivConst for sub_block_idx");
+        let has_q6k_decode = trace_q6k.iter().any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
+        assert!(has_q6k_decode, "Q6K should emit QuantQ6KDecode (replaces scale trace ops)");
 
         // Q4_0: BlockScalar scale → no QuantIntDivConst
         let q4_0 = r.get(&QuantType::Q4_0).expect("Q4_0");
@@ -2772,13 +2811,12 @@ mod tests {
         // Arrange
         let r = registry();
 
-        // Q6K: Q6KScales uses QuantPtrAddDynamic for sub_scales_ptr + sub_idx
+        // Q6K: BCE-20260710-Q6K-HIGHBITS 后走整体式 QuantQ6KDecode (不再 QuantPtrAddDynamic)
         let q6k = r.get(&QuantType::Q6K).expect("Q6K");
         let mut trace = Vec::new();
         let _ = DecodeTraceBuilder::new(q6k, 8).build(&mut trace);
-        let has_dynamic_ptr = trace.iter()
-            .any(|op| matches!(op, TraceOp::QuantPtrAddDynamic { .. }));
-        assert!(has_dynamic_ptr, "Q6K should have QuantPtrAddDynamic for indexed scale access");
+        let has_q6k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
+        assert!(has_q6k_decode, "Q6K should emit QuantQ6KDecode (replaces QuantPtrAddDynamic scale path)");
 
         // NVFP4: SubBlockScalars uses QuantPtrAddDynamic for sub-block scale lookup
         let nvfp4 = r.get(&QuantType::Nvfp4).expect("NVFP4");
@@ -2802,10 +2840,9 @@ mod tests {
         let mut trace = Vec::new();
         let _ = DecodeTraceBuilder::new(q6k, 8).build(&mut trace);
 
-        // Assert: Q6K has QuantLoadI8toF32 for i8 sub-scale loading
-        let has_i8_load = trace.iter()
-            .any(|op| matches!(op, TraceOp::QuantLoadI8toF32 { .. }));
-        assert!(has_i8_load, "Q6K should have QuantLoadI8toF32 for i8 sub-scale loading");
+        // BCE-20260710-Q6K-HIGHBITS: Q6_K 走整体式 QuantQ6KDecode (i8 scale 在 native 内加载)
+        let has_q6k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
+        assert!(has_q6k_decode, "Q6K should emit QuantQ6KDecode (i8 scale load moved to native)");
 
         // Q4_0 uses f16 scale → no QuantLoadI8toF32
         let q4_0 = r.get(&QuantType::Q4_0).expect("Q4_0");
@@ -2988,12 +3025,12 @@ mod tests {
         let has_mul = trace_q4k.iter().any(|op| matches!(op, TraceOp::Mul(_, _)));
         assert!(has_mul, "Q4K should have Mul for block_d * sub_scale");
 
-        // Q6K: Q6KScales → block_d * sub_scale → Mul present
+        // Q6K: BCE-20260710-Q6K-HIGHBITS 后走整体式 QuantQ6KDecode (d*sc 在 native 内乘)
         let q6k = r.get(&QuantType::Q6K).expect("Q6K");
         let mut trace_q6k = Vec::new();
         let _ = DecodeTraceBuilder::new(q6k, 8).build(&mut trace_q6k);
-        let has_mul_q6k = trace_q6k.iter().any(|op| matches!(op, TraceOp::Mul(_, _)));
-        assert!(has_mul_q6k, "Q6K should have Mul for block_d * sub_scale");
+        let has_q6k_decode = trace_q6k.iter().any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
+        assert!(has_q6k_decode, "Q6K should emit QuantQ6KDecode (d*sub_scale moved to native)");
 
         // Q4_0: flat scale → no Mul for scale computation
         let q4_0 = r.get(&QuantType::Q4_0).expect("Q4_0");
@@ -3073,15 +3110,16 @@ mod tests {
     }
 
     // @trace TEST-QD-56 [req:REQ-QCG] [level:unit]
-    // Q6K NibbleWithHighBits high_bits_per_elem: verifies Q6_K uses 2 high bits
-    // per element, resulting in QuantShiftLeft with amount = 4 + (4 - 2) = 6.
+    // Q6K NibbleWithHighBits high_bits_per_elem=2: BCE-20260710-Q6K-HIGHBITS 后
+    // Q6_K 走整体式 QuantQ6KDecode (quarter 位置相关高 2 bit 提取在 native).
+    // 旧 NibbleWithHighBits qh<<6 & 0x30 (QuantShiftLeft amount=6 + QuantAndMask 0x30) 已废.
     #[test]
     fn test_q6k_high_bits_per_elem_shift_amount() {
         // Arrange
         let r = registry();
         let desc = r.get(&QuantType::Q6K).expect("Q6_K must be registered");
 
-        // Verify Q6_K uses NibbleWithHighBits with high_bits_per_elem=2
+        // Verify Q6_K uses NibbleWithHighBits with high_bits_per_elem=2 (descriptor 不变)
         match &desc.data_layout {
             DataLayout::NibbleWithHighBits { high_bits_per_elem, .. } => {
                 assert_eq!(*high_bits_per_elem, 2,
@@ -3094,21 +3132,10 @@ mod tests {
         let mut trace = Vec::new();
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
-        // Assert: Q6_K has QuantShiftLeft with amount=6 (4 + (4 - 2))
-        let has_shift_6 = trace.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantShiftLeft { amount: 6, .. }
-        ));
-        assert!(has_shift_6,
-            "Q6_K should have QuantShiftLeft with amount=6 for 2-bit high bits");
-
-        // Assert: Q6_K high mask is 0x30 ((0b11 << 4) = 0x30)
-        let has_high_mask = trace.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantAndMask { mask, .. } if *mask == 0x30
-        ));
-        assert!(has_high_mask,
-            "Q6_K should have QuantAndMask with mask=0x30 for 2-bit high bits shifted to bits 4-5");
+        // Assert: Q6_K 走整体式 QuantQ6KDecode (非旧 QuantShiftLeft/QuantAndMask)
+        let has_q6k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
+        assert!(has_q6k_decode,
+            "Q6_K should emit QuantQ6KDecode (replaces buggy qh<<6 & 0x30 QuantShiftLeft/QuantAndMask)");
     }
 
     // @trace TEST-QD-57 [req:REQ-QCG] [level:unit]

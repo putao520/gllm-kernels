@@ -1455,7 +1455,8 @@ mod quant_gemv_tests {
         }
 
         let mut act = vec![0.0f32; m * k];
-        act[0] = 1.0; act[1] = 1.0; act[2] = 1.0; act[3] = 1.0;
+        // q1=1 at pos 0, q2=2 at pos 32, q3=3 at pos 64, q4=4 at pos 96
+        act[0] = 1.0; act[32] = 1.0; act[64] = 1.0; act[96] = 1.0;
 
         let mut output = vec![0.0f32; m * n];
 
@@ -1483,8 +1484,9 @@ mod quant_gemv_tests {
         let _ret = unsafe { f(act.as_ptr() as *const u8, weight.as_ptr() as *const u8, 0,0,0,0,0, output.as_mut_ptr() as *mut u8) };
 
         let out_f32: &[f32] = &output;
+        // dot(row0) = act[0]*1 + act[32]*2 + act[64]*3 + act[96]*4 = 1+2+3+4 = 10
         eprintln!("[Q6_K-ORACLE] out = {:?} (want [10.0, 0.0])", out_f32);
-        eprintln!("[Q6_K-ORACLE] want: out[0]=1+2+3+4=10, out[1]=0");
+        eprintln!("[Q6_K-ORACLE] want: out[0]=1*1+1*2+1*3+1*4=10, out[1]=0");
 
         unsafe { libc::munmap(exec_ptr as *mut _, exec_len); }
 

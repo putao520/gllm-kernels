@@ -1967,3 +1967,74 @@ pub unsafe extern "C" fn q3k_decode_step_native(
         *out.add(i) = (qs_val as i8 - bias) as f32 * dl;
     }
 }
+
+/// Q6_K 单步解码 (BCE-20260710-Q6K-HIGHBITS).
+///
+/// 修复 emit_unpack NibbleWithHighBits 的 qh<<6 & 0x30 丢高 2 bit bug.
+/// Q6_K quarter 结构: 每 256 元素 block = qs[128](低4bit) + qh[64](高2bit) + scales[16 i8] + d(f16).
+/// 输出位置 global_elem 的解码 (llama.cpp k_quant.rs:442-468 / dequantize_row_q6_K):
+///   n_group = global_elem / 128 (0 or 1)
+///   l = global_elem % 32
+///   quarter q ∈ {q1,q2,q3,q4} = (global_elem / 32) % 4  (输出位 l + 32*quarter)
+///   6bit_val = (lo4 | (hi2 << 4)) - 32
+///     q1: lo4=qs[n_group*64+l]&0xF,       hi2=(qh[n_group*32+l]>>0)&3
+///     q2: lo4=qs[n_group*64+l+32]&0xF,    hi2=(qh[n_group*32+l]>>2)&3
+///     q3: lo4=qs[n_group*64+l]>>4,         hi2=(qh[n_group*32+l]>>4)&3
+///     q4: lo4=qs[n_group*64+l+32]>>4,      hi2=(qh[n_group*32+l]>>6)&3
+///   value = d * sc[n_group*8 + (l/16) + 2*quarter] * 6bit_val
+///
+/// 参数对齐 q3k_decode_step_native ABI (block, lane_offset, _d, _qs_off, _qh_off, lanes, out).
+pub unsafe extern "C" fn q6k_decode_step_native(
+    block: *const u8,
+    lane_offset: u64,
+    _d_f32: f32,
+    _qs_offset: u64,   // Q6_K: qs at offset 0 (fixed by descriptor)
+    _qh_offset: u64,   // Q6_K: qh at offset 128 (fixed by descriptor)
+    lanes: u64,
+    out: *mut f32,
+) {
+    if block.is_null() {
+        return;
+    }
+
+    // d (f16) at block+208
+    let d_bits = (*block.add(208) as u16) | ((*block.add(209) as u16) << 8);
+    let d = half::f16::from_bits(d_bits).to_f32();
+
+    // qs[128] at block+0, qh[64] at block+128, scales[16] at block+192
+    let qs = block;            // qs[0..128]
+    let qh = block.add(128);   // qh[0..64]
+    let sc = block.add(192);   // scales[0..16] (i8)
+
+    for i in 0..lanes as usize {
+        let global_elem = (lane_offset as usize) + i;
+        let n_group = global_elem / 128;          // 0 or 1
+        let within = global_elem % 128;
+        let quarter = within / 32;                 // 0=q1, 1=q2, 2=q3, 3=q4
+        let l = within % 32;
+        let is = l / 16;                            // 0 or 1 (sub-block within quarter)
+
+        let ql_off = n_group * 64;
+        let qh_off = n_group * 32;
+        let sc_off = n_group * 8;
+
+        // lo4 from qs (depends on quarter: q1/q3 read qs[ql_off+l], q2/q4 read qs[ql_off+l+32])
+        let qs_idx = ql_off + l + if (quarter % 2) == 1 { 32 } else { 0 };
+        let lo4 = if quarter >= 2 {
+            (*qs.add(qs_idx) >> 4) & 0xF
+        } else {
+            *qs.add(qs_idx) & 0xF
+        };
+
+        // hi2 from qh[qh_off+l], bit-pair at (2*quarter)
+        let hi2 = (*qh.add(qh_off + l) >> (2 * quarter)) & 3;
+
+        let six_bit = ((lo4 as i32) | ((hi2 as i32) << 4)) - 32;
+
+        // scale index: sc_off + is + 2*quarter  (matches k_quant.rs sc[sc_off+is+{0,2,4,6}])
+        let scale_idx = sc_off + is + 2 * quarter;
+        let sc_val = *sc.add(scale_idx) as i8 as f32;
+
+        *out.add(i) = d * sc_val * (six_bit as f32);
+    }
+}

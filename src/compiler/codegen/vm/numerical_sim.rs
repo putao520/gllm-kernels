@@ -557,7 +557,8 @@ impl NumericalSimulator {
             | TraceOp::MlaAttnScore { .. }
             | TraceOp::MlaRopeMerge { .. }
             | TraceOp::DynamicPrecisionSelect { .. }
-            | TraceOp::QuantQ3KDecode { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            | TraceOp::QuantQ3KDecode { .. }
+            | TraceOp::QuantQ6KDecode { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
         }
     }
     /// ComputePattern::elementwise 仿真 handler (REQ-LC-011 查表化).
@@ -1621,7 +1622,8 @@ impl NumericalSimulator {
             | TraceOp::MlaAttnScore { .. }
             | TraceOp::MlaRopeMerge { .. }
             | TraceOp::DynamicPrecisionSelect { .. }
-            | TraceOp::QuantQ3KDecode { .. } => {
+            | TraceOp::QuantQ3KDecode { .. }
+            | TraceOp::QuantQ6KDecode { .. } => {
                 let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(0.0));
                 Ok(Some(id))
