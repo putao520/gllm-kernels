@@ -135,6 +135,10 @@ impl<'a> DecodeTraceBuilder<'a> {
         ) || matches!(
             &self.desc.zero_layout,
             ZeroLayout::Hierarchical { .. }
+        ) || matches!(
+            &self.desc.data_layout,
+            // BCE-20260710: 单片 decode (Q6K/Q5_0/Q5_1) 需 lane_offset (元素在 block 内位置)
+            DataLayout::NibbleWithHighBits { .. }
         )
     }
 
@@ -194,15 +198,6 @@ impl<'a> DecodeTraceBuilder<'a> {
             block_base_slot
         };
 
-        // Input(3): high_bits_ptr for NibbleWithHighBits (Q6_K, Q5_0, Q5_1).
-        // Independently advanced pointer into the high bit-plane.
-        // When unused, alias block_base_slot.
-        let high_bits_ptr_slot = if self.needs_high_bits_ptr() {
-            push_op(trace, TraceOp::Input(3))
-        } else {
-            block_base_slot
-        };
-
         // E2M1 formats (MXFP4, NVFP4): use combined LUT decode TraceOp
         if self.is_e2m1_format() {
             return self.build_e2m1_decode(trace, block_base_slot, data_ptr_slot, lane_offset_slot);
@@ -218,6 +213,21 @@ impl<'a> DecodeTraceBuilder<'a> {
         if self.is_q6k_format() {
             return self.build_q6k_decode(trace, block_base_slot, lane_offset_slot);
         }
+
+        // Q5_0/Q5_1 (PackedInt5 + NibbleWithHighBits high_bits=1): monolithic decode
+        // (BCE-20260710-Q5_0-HIGHBITS 同类: 旧路径丢高1bit + phase 无关)
+        if self.is_q5_format() {
+            return self.build_q5_decode(trace, block_base_slot, lane_offset_slot);
+        }
+
+        // Input(3): high_bits_ptr for NibbleWithHighBits (only for non-monolithic paths).
+        // Q6_K/Q5_0/Q5_1 走单片 build_q*_decode (early return above), 不需 Input(3).
+        // When unused, alias block_base_slot.
+        let high_bits_ptr_slot = if self.needs_high_bits_ptr() {
+            push_op(trace, TraceOp::Input(3))
+        } else {
+            block_base_slot
+        };
 
         let scale_result = self.emit_scale_load(trace, block_base_slot, lane_offset_slot);
         let zero_result = self.emit_zero_load(trace, block_base_slot, lane_offset_slot);
@@ -242,6 +252,14 @@ impl<'a> DecodeTraceBuilder<'a> {
     fn is_q6k_format(&self) -> bool {
         // Q6_K: quant_type 匹配 + NibbleWithHighBits(high_bits=2) layout
         matches!(&self.desc.data_layout, DataLayout::NibbleWithHighBits { high_bits_per_elem: 2, .. })
+    }
+
+    /// Whether this format uses Q5_0/Q5_1 monolithic decode (BCE-20260710-Q5_0-HIGHBITS 同类).
+    /// Q5_0/Q5_1 高1bit 是 bit-index plane (位置相关), 旧 NibbleWithHighBits qh<<7 & 0x10 丢高 bit + phase 无关.
+    /// 仅 Classic Q5_0/Q5_1 (BlockScalar/BlockScalarWithMin); Q5_K (Hierarchical) 不在此, 走旧路径.
+    fn is_q5_format(&self) -> bool {
+        matches!(self.desc.quant_type, crate::quant::QuantType::Q5_0 | crate::quant::QuantType::Q5_1)
+            && matches!(&self.desc.data_layout, DataLayout::NibbleWithHighBits { high_bits_per_elem: 1, .. })
     }
 
     /// Q3_K combined decode: loads d (f16), delegates to QuantQ3KDecode TraceOp
@@ -309,6 +327,39 @@ impl<'a> DecodeTraceBuilder<'a> {
             d_slot,
             qs_offset,
             qh_offset,
+        })
+    }
+
+    /// Q5_0/Q5_1 combined decode (BCE-20260710-Q5_0-HIGHBITS 同类横扫).
+    /// Q5_0/Q5_1 高1bit 是 bit-index plane (位置相关 hi=(qh[i/8]>>(i%8))&1), 旧路径丢高 bit.
+    /// 委托 q5_0/q5_1_decode_step_native. has_min: Q5_1=true (d*q+m), Q5_0=false (d*(q-16)).
+    fn build_q5_decode(
+        &self,
+        trace: &mut Vec<TraceOp>,
+        block_base_slot: ValueId,
+        lane_offset_slot: ValueId,
+    ) -> ValueId {
+        let (qs_offset, qh_offset) = match &self.desc.data_layout {
+            DataLayout::NibbleWithHighBits { low_offset, high_offset, .. } => (*low_offset, *high_offset),
+            _ => unreachable!("is_q5_format guarantees NibbleWithHighBits high_bits=1"),
+        };
+        // d (f16) at block+0 (Q5_0/Q5_1 都在 offset 0)
+        let d_ptr = push_op(trace, TraceOp::QuantPtrAddOffset {
+            base: block_base_slot,
+            offset_bytes: 0,
+        });
+        let d_slot = push_op(trace, TraceOp::QuantLoadF16toF32 { ptr: d_ptr, offset_bytes: 0 });
+
+        // has_min: Q5_1 (BlockScalarWithMin) vs Q5_0 (BlockScalar + StaticBias)
+        let has_min = matches!(&self.desc.scale_layout, ScaleLayout::BlockScalarWithMin { .. });
+
+        push_op(trace, TraceOp::QuantQ5Decode {
+            block_base: block_base_slot,
+            lane_offset: lane_offset_slot,
+            d_slot,
+            qs_offset,
+            qh_offset,
+            has_min,
         })
     }
 
@@ -1088,6 +1139,12 @@ mod tests {
         // trace 应含 QuantQ6KDecode (处理 quarter 位置相关高 2 bit 提取).
         let has_q6k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
         assert!(has_q6k_decode, "Q6_K should emit QuantQ6KDecode monolithic TraceOp (replaces buggy NibbleWithHighBits unpack)");
+        // 结构断言 (防抽象回退): Q6_K 禁止走旧 NibbleWithHighBits 通用 shift+mask 路径.
+        // 旧 buggy 路径 emit QuantShiftLeft(amount=6) + QuantAndMask(0x30) — 见 BCE-20260710-Q6K-HIGHBITS.
+        let has_old_shift6 = trace.iter().any(|op| matches!(op, TraceOp::QuantShiftLeft { amount: 6, .. }));
+        assert!(!has_old_shift6, "Q6_K must NOT use old NibbleWithHighBits QuantShiftLeft(amount=6) — use QuantQ6KDecode");
+        let has_old_mask30 = trace.iter().any(|op| matches!(op, TraceOp::QuantAndMask { mask: 0x30, .. }));
+        assert!(!has_old_mask30, "Q6_K must NOT use old NibbleWithHighBits QuantAndMask(0x30) — use QuantQ6KDecode");
         // d (f16→f32) 加载仍应在 trace
         let has_d_load = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
         assert!(has_d_load, "Q6_K should load block d (f16→f32)");
@@ -1332,13 +1389,10 @@ mod tests {
         assert_trace_valid(&trace);
         assert!(final_slot.0 < trace.len() as u32);
 
-        // Q5_0: StaticBias(16) → Const(16.0) + Sub
-        let has_bias_sub = trace.iter().any(|op| matches!(op, TraceOp::Sub(_, _)));
-        assert!(has_bias_sub, "Q5_0 should have Sub for static bias of 16");
-
-        // Q5_0: NibbleWithHighBits → QuantBitOr (merge low + high bits)
-        let has_bitor = trace.iter().any(|op| matches!(op, TraceOp::QuantBitOr { .. }));
-        assert!(has_bitor, "Q5_0 should have QuantBitOr for merging low nibble + high bit");
+        // BCE-20260710-Q5_0-HIGHBITS: Q5_0 走整体式 QuantQ5Decode (has_min=false).
+        // 旧 NibbleWithHighBits Sub/QuantBitOr 已废.
+        let has_q5_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ5Decode { has_min: false, .. }));
+        assert!(has_q5_decode, "Q5_0 should emit QuantQ5Decode (has_min=false, replaces Sub/QuantBitOr)");
     }
 
     // @trace TEST-QD-02 [req:REQ-QCG] [level:unit]
@@ -1358,20 +1412,9 @@ mod tests {
         assert_trace_valid(&trace);
         assert!(final_slot.0 < trace.len() as u32);
 
-        // Q5_1: BlockScalarWithMin → loads d via QuantLoadF16toF32
-        let has_f16_load = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
-        assert!(has_f16_load, "Q5_1 should load f16 scale via QuantLoadF16toF32");
-
-        // Q5_1: NibbleWithHighBits → QuantLoadBytesVec for high bits
-        let has_bytes_load = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadBytesVec { .. }));
-        assert!(has_bytes_load, "Q5_1 should load bytes for nibble data");
-
-        // Q5_1: BlockMin zero layout → Add for min addition (value = d*quantized + m)
-        let has_add = trace.iter().any(|op| matches!(op, TraceOp::Add(_, _)));
-        assert!(has_add, "Q5_1 should have Add for BlockMin post-scale addition");
-        // Q5_1: no pre-scale subtraction (no AWQ/GPTQ style zero-point)
-        let has_sub = trace.iter().any(|op| matches!(op, TraceOp::Sub(_, _)));
-        assert!(!has_sub, "Q5_1 should NOT have Sub (no PreScaleSubtract zero-point)");
+        // BCE-20260710-Q5_0-HIGHBITS: Q5_1 走整体式 QuantQ5Decode (has_min=true).
+        let has_q5_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ5Decode { has_min: true, .. }));
+        assert!(has_q5_decode, "Q5_1 should emit QuantQ5Decode (has_min=true)");
     }
 
     // @trace TEST-QD-03 [req:REQ-QCG] [level:unit]
@@ -2538,8 +2581,8 @@ mod tests {
     }
 
     // @trace TEST-QD-36 [req:REQ-QCG] [level:unit]
-    // Q5_0 high bits shift amount: verifies QuantShiftLeft uses the correct shift
-    // for 1-bit high bits (shift_amount = 4 + (4 - 1) = 7).
+    // Q5_0 high bits: BCE-20260710-Q5_0-HIGHBITS 后走整体式 QuantQ5Decode.
+    // 旧 QuantShiftLeft(7) + QuantBitOr 已废 (高1bit plane 位置相关, 单片处理).
     #[test]
     fn test_q5_0_high_bits_shift_amount() {
         // Arrange
@@ -2550,16 +2593,9 @@ mod tests {
         let mut trace = Vec::new();
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
-        // Assert: Q5_0 has QuantShiftLeft with amount=7 (4 + (4 - 1))
-        let has_shift_7 = trace.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantShiftLeft { amount: 7, .. }
-        ));
-        assert!(has_shift_7, "Q5_0 should have QuantShiftLeft with amount=7 for 1-bit high bits");
-
-        // Assert: Q5_0 has QuantBitOr to merge low nibble + shifted high bit
-        let has_bitor = trace.iter().any(|op| matches!(op, TraceOp::QuantBitOr { .. }));
-        assert!(has_bitor, "Q5_0 should have QuantBitOr for low+high merge");
+        // Assert: Q5_0 走整体式 QuantQ5Decode (非旧 QuantShiftLeft/QuantBitOr)
+        let has_q5_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ5Decode { .. }));
+        assert!(has_q5_decode, "Q5_0 should emit QuantQ5Decode (replaces QuantShiftLeft(7)/QuantBitOr)");
     }
 
     // @trace TEST-QD-37 [req:REQ-QCG] [level:unit]
@@ -2982,23 +3018,25 @@ mod tests {
         // Arrange
         let r = registry();
 
-        // Q6K: NibbleWithHighBits → needs_high_bits_ptr → Input(3) present
+        // Q6K: BCE-20260710-Q6K-HIGHBITS 后走整体式 QuantQ6KDecode (非旧 Input(3) high_bits_ptr)
         let q6k = r.get(&QuantType::Q6K).expect("Q6K");
         let builder = DecodeTraceBuilder::new(q6k, 8);
-        assert!(builder.needs_high_bits_ptr(), "Q6K should need high bits ptr");
+        assert!(builder.needs_high_bits_ptr(), "Q6K descriptor should need high bits ptr");
         let mut trace = Vec::new();
         let _ = builder.build(&mut trace);
-        let has_input_3 = trace.iter().any(|op| matches!(op, TraceOp::Input(3)));
-        assert!(has_input_3, "Q6K should have Input(3) for high_bits_ptr");
+        // 整体式: 不 emit Input(3) (high bit 在 native 内从 block+qh_offset 读)
+        let has_q6k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
+        assert!(has_q6k_decode, "Q6K should emit QuantQ6KDecode (no Input(3), monolithic)");
 
-        // Q5_0: NibbleWithHighBits (1 high bit) → Input(3) present
+        // Q5_0: BCE-20260710-Q5_0-HIGHBITS 后走整体式 QuantQ5Decode (非旧 Input(3) high_bits_ptr)
         let q5_0 = r.get(&QuantType::Q5_0).expect("Q5_0");
         let builder_q5_0 = DecodeTraceBuilder::new(q5_0, 8);
-        assert!(builder_q5_0.needs_high_bits_ptr(), "Q5_0 should need high bits ptr");
+        assert!(builder_q5_0.needs_high_bits_ptr(), "Q5_0 should need high bits ptr (descriptor)");
         let mut trace_q5_0 = Vec::new();
         let _ = builder_q5_0.build(&mut trace_q5_0);
-        let has_input_3_q5_0 = trace_q5_0.iter().any(|op| matches!(op, TraceOp::Input(3)));
-        assert!(has_input_3_q5_0, "Q5_0 should have Input(3) for high_bits_ptr");
+        // 整体式: 不 emit Input(3) (high bit 在 native 内从 block+qh_offset 读)
+        let has_q5_decode = trace_q5_0.iter().any(|op| matches!(op, TraceOp::QuantQ5Decode { .. }));
+        assert!(has_q5_decode, "Q5_0 should emit QuantQ5Decode (no Input(3), monolithic)");
 
         // Q4_0: PackedNibbles → no high bits ptr → Input(3) should NOT appear
         let q4_0 = r.get(&QuantType::Q4_0).expect("Q4_0");

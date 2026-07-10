@@ -795,6 +795,7 @@ impl QuantGemmPlan {
                 let scale_offset = match &desc.scale_layout { ScaleLayout::BlockScalar { offset_bytes, .. } => *offset_bytes, _ => 0 };
                 GemmKernel::Assisted { scale_offset, data_offset }
             } else if matches!(desc.data_kind, DK::PackedInt5 | DK::PackedInt6)
+                && !matches!(desc.quant_type, crate::quant::QuantType::Q5_0 | crate::quant::QuantType::Q5_1)
                 && matches!(
                     &desc.scale_layout,
                     ScaleLayout::BlockScalar { .. } | ScaleLayout::BlockScalarWithMin { .. }

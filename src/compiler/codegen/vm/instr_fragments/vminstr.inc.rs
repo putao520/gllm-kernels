@@ -1376,6 +1376,25 @@ pub enum VmInstr {
         width: SimdWidth,
     },
 
+    /// Q5_0/Q5_1 单步解码 (BCE-20260710-Q5_0-HIGHBITS 同类横扫).
+    /// 修复 NibbleWithHighBits 高1bit plane (bit-index) 位置相关提取 + phase 无关 bug.
+    /// 委托 q5_0/q5_1_decode_step_native (has_min=false→q5_0, true→q5_1).
+    /// block_base: pointer to Q5 block (d + qh[4] + qs[16]; Q5_1 前置 m)
+    /// qs_offset: byte offset to qs[] (Q5_0=6, Q5_1=8)
+    /// qh_offset: byte offset to qh[] (Q5_0=2, Q5_1=4)
+    /// has_min: true=Q5_1 (d*q+m), false=Q5_0 (d*(q-16))
+    Q5DecodeStep {
+        dst: VRegId,
+        block_base: VRegId,
+        lane_offset: VRegId,
+        d_vreg: VRegId,
+        qs_offset: usize,
+        qh_offset: usize,
+        has_min: bool,
+        lanes: usize,
+        width: SimdWidth,
+    },
+
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // SPEC 23-QUANT-CODEGEN-ALGO §4.3: 原生 Dot-Product VmInstr
     // 硬件无关语义，ISA lowering 决定具体指令

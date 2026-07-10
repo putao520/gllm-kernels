@@ -2038,3 +2038,68 @@ pub unsafe extern "C" fn q6k_decode_step_native(
         *out.add(i) = d * sc_val * (six_bit as f32);
     }
 }
+
+/// Q5_0 单步解码 (BCE-20260710-Q5_0-HIGHBITS, 同类横扫).
+///
+/// Q5_0: d(f16) + qh[4](32 high bits, bit-index plane) + qs[16](byte-packed low 4bit) = 22B.
+/// value = d * ((hi<<4 | lo) - 16)
+///   lo = (qs[i/2] >> ((i%2)*4)) & 0xF   (byte-packed, 非 SPLIT)
+///   hi = (qh[i/8] >> (i%8)) & 1          (bit-index plane, 位置相关)
+/// 旧 NibbleWithHighBits qh<<7 & 0x10 丢高1bit + phase 无关 → 错.
+/// ABI 对齐 q6k: (block, lane_offset, _d, _qs_off, _qh_off, lanes, out).
+pub unsafe extern "C" fn q5_0_decode_step_native(
+    block: *const u8,
+    lane_offset: u64,
+    _d_f32: f32,
+    _qs_offset: u64,   // Q5_0: qs at offset 6 (fixed by descriptor)
+    _qh_offset: u64,   // Q5_0: qh at offset 2 (fixed by descriptor)
+    lanes: u64,
+    out: *mut f32,
+) {
+    if block.is_null() { return; }
+    // d (f16) at block+0
+    let d_bits = (*block.add(0) as u16) | ((*block.add(1) as u16) << 8);
+    let d = half::f16::from_bits(d_bits).to_f32();
+    // qh[4] at block+2, qs[16] at block+6
+    let qh = block.add(2);
+    let qs = block.add(6);
+    for i in 0..lanes as usize {
+        let gi = (lane_offset as usize) + i;
+        let lo = (*qs.add(gi / 2) >> ((gi % 2) * 4)) & 0xF;
+        let hi = (*qh.add(gi / 8) >> (gi % 8)) & 1;
+        let q = ((hi as i32) << 4) | (lo as i32);
+        *out.add(i) = d * (q as f32 - 16.0);
+    }
+}
+
+/// Q5_1 单步解码 (BCE-20260710-Q5_0-HIGHBITS 同类).
+///
+/// Q5_1: d(f16) + m(f16) + qh[4](32 high bits) + qs[16] = 24B.
+/// value = d * (hi<<4 | lo) + m   (BlockScalarWithMin: PostScaleAdd)
+///   lo = (qs[i/2] >> ((i%2)*4)) & 0xF, hi = (qh[i/8] >> (i%8)) & 1
+pub unsafe extern "C" fn q5_1_decode_step_native(
+    block: *const u8,
+    lane_offset: u64,
+    _d_f32: f32,
+    _qs_offset: u64,   // Q5_1: qs at offset 8
+    _qh_offset: u64,   // Q5_1: qh at offset 4
+    lanes: u64,
+    out: *mut f32,
+) {
+    if block.is_null() { return; }
+    // d (f16) at block+0, m (f16) at block+2
+    let d_bits = (*block.add(0) as u16) | ((*block.add(1) as u16) << 8);
+    let d = half::f16::from_bits(d_bits).to_f32();
+    let m_bits = (*block.add(2) as u16) | ((*block.add(3) as u16) << 8);
+    let m = half::f16::from_bits(m_bits).to_f32();
+    // qh[4] at block+4, qs[16] at block+8
+    let qh = block.add(4);
+    let qs = block.add(8);
+    for i in 0..lanes as usize {
+        let gi = (lane_offset as usize) + i;
+        let lo = (*qs.add(gi / 2) >> ((gi % 2) * 4)) & 0xF;
+        let hi = (*qh.add(gi / 8) >> (gi % 8)) & 1;
+        let q = ((hi as i32) << 4) | (lo as i32);
+        *out.add(i) = d * (q as f32) + m;
+    }
+}

@@ -47,7 +47,7 @@ pub enum InstrCategory {
     /// KiviQuantChannel / KiviQuantToken / KiviDequantLoad / GgufSubScaleLoad /
     /// GgufKQuantScaleLoad / QuantBroadcastInt / QuantScalarCvtLoad / QuantBlockLoad /
     /// QuantBiPlaneLoad / QuantLoadBytesVec / QuantCodebookLookup / QuantExtractBits /
-    /// QuantDequantFma / QuantInterleave / QuantConcatSeq / Q3KDecodeStep / Q6KDecodeStep /
+    /// QuantDequantFma / QuantInterleave / QuantConcatSeq / Q3KDecodeStep / Q6KDecodeStep / Q5DecodeStep /
     /// HwQuantDequant / BitwiseGemm / SparseGemm / SparseFp8Gemm / NativeFp4Gemm /
     /// NativeFp6Gemm / NativeFp8Gemm / TwoCtaFp4Gemm / SparseMaskIntersect
     Quant,
@@ -175,6 +175,7 @@ impl VmInstr {
             | VmInstr::QuantConcatSeq { .. }
             | VmInstr::Q3KDecodeStep { .. }
             | VmInstr::Q6KDecodeStep { .. }
+            | VmInstr::Q5DecodeStep { .. }
             | VmInstr::HwQuantDequant { .. }
             | VmInstr::BitwiseGemm { .. }
             | VmInstr::SparseGemm { .. }

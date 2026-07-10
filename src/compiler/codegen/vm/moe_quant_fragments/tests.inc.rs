@@ -9,6 +9,8 @@ mod tests {
 
     #[test]
     fn test_q5_0_selects_highbit_merge() {
+        // BCE-20260710-Q5_0-HIGHBITS: Q5_0 现走 DequantFma (build_q5_decode 单片),
+        // 非旧 HighBitMerge (QuantBiPlaneLoad 高1bit plane 位置相关提取错).
         let desc = QuantAlgoKind::Q5_0.descriptor();
         let plan = QuantGemmPlan::derive(
             BoundExpr::Const(1), 1, 256, &desc, SimdWidth::W256,
@@ -16,20 +18,16 @@ mod tests {
         ).expect("Q5_0 plan derive should succeed");
 
         match &plan.kernel {
-            GemmKernel::HighBitMerge { scale_offset, low_offset, high_offset, bias, high_bits, post_scale_add } => {
-                assert_eq!(*scale_offset, 0);
-                assert_eq!(*low_offset, 6);
-                assert_eq!(*high_offset, 2);
-                assert_eq!(*bias, 16.0);
-                assert_eq!(*high_bits, 1);
-                assert!(!post_scale_add, "Q5_0 uses StaticBias, not BlockMin");
+            GemmKernel::DequantFma => {
+                // Q5_0 走 DequantFma → build_q5_decode (QuantQ5Decode 单片, has_min=false)
             }
-            other => panic!("Q5_0 should select HighBitMerge, got {:?}", other),
+            other => panic!("Q5_0 should select DequantFma (monolithic Q5 decode), got {:?}", other),
         }
     }
 
     #[test]
     fn test_q5_1_selects_highbit_merge_with_min() {
+        // BCE-20260710-Q5_0-HIGHBITS: Q5_1 同 Q5_0 走 DequantFma (has_min=true).
         let desc = QuantAlgoKind::Q5_1.descriptor();
         let plan = QuantGemmPlan::derive(
             BoundExpr::Const(1), 1, 256, &desc, SimdWidth::W256,
@@ -37,12 +35,10 @@ mod tests {
         ).expect("Q5_1 plan derive should succeed");
 
         match &plan.kernel {
-            GemmKernel::HighBitMerge { bias, high_bits, post_scale_add, .. } => {
-                assert_eq!(*bias, 0.0);
-                assert_eq!(*high_bits, 1);
-                assert!(post_scale_add, "Q5_1 uses BlockScalarWithMin → post_scale_add");
+            GemmKernel::DequantFma => {
+                // Q5_1 走 DequantFma → build_q5_decode (QuantQ5Decode 单片, has_min=true)
             }
-            other => panic!("Q5_1 should select HighBitMerge, got {:?}", other),
+            other => panic!("Q5_1 should select DequantFma (monolithic Q5 decode), got {:?}", other),
         }
     }
 
@@ -156,11 +152,9 @@ mod tests {
 
         assert!(result.is_ok(), "Q5_0 emit failed: {:?}", result.err());
         assert!(prog.instrs.len() > 10, "Q5_0 GEMM should produce > 10 instrs, got {}", prog.instrs.len());
-        // Q5_0 uses HighBitMerge path: QuantBlockLoad with QhBitExpand
-        let has_qh_expand = prog.instrs.iter().any(|i| matches!(
-            i, VmInstr::QuantBlockLoad { unpack: BlockUnpackMode::QhBitExpand { .. }, .. }
-        ));
-        assert!(has_qh_expand, "Q5_0 GEMM should emit QuantBlockLoad with QhBitExpand");
+        // BCE-20260710-Q5_0-HIGHBITS: Q5_0 走 DequantFma → Q5DecodeStep 单片 (非旧 QuantBlockLoad QhBitExpand)
+        let has_q5_decode = prog.instrs.iter().any(|i| matches!(i, VmInstr::Q5DecodeStep { .. }));
+        assert!(has_q5_decode, "Q5_0 GEMM should emit Q5DecodeStep (monolithic, has_min=false)");
     }
 
     // ── Additional format coverage tests ─────────────────────────────────

@@ -1499,4 +1499,100 @@ mod quant_gemv_tests {
         }
         assert!(pass0 && pass1, "Q6_K oracle: got [{}, {}] want [10, 0]", out_f32[0], out_f32[1]);
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Q5_0 真实执行 oracle (BCE-20260710-Q5_0-HIGHBITS, 同类嫌疑横扫)
+    // Q5_0: d(f16) + qh[4](32 high bits, bit-index plane) + qs[16](byte-packed low 4bit) = 22B
+    // value = d * ((hi<<4 | lo) - 16), lo=(qs[i/2]>>((i%2)*4))&0xF, hi=(qh[i/8]>>(i%8))&1
+    // ─────────────────────────────────────────────────────────────────────
+    #[test]
+    fn test_q5_0_quant_gemm_x86_oracle() {
+        use crate::compiler::codegen::vm::moe_quant_emit::emit_quant_gemm_inline;
+
+        let m: usize = 1;
+        let n: usize = 2;
+        let k: usize = 32; // 1 Q5_0 block/row (block_size=32)
+        let block_bytes: usize = 22;
+
+        // 构造 row0: elem[0]=15 (lo=15,hi=0 → q=15, val=15-16=-1), elem[1]=16 (lo=0,hi=1 → q=16, val=0)
+        //   elem[0]: lo=15 (qs[0]&0xF=15), hi=0 (qh[0] bit0=0)
+        //   elem[1]: lo=0  (qs[0]>>4=0),   hi=1 (qh[0] bit1=1)
+        //   elem[2]=15, elem[3]=16 ... 交替, 测两个 phase (低/高 nibble + 高 bit plane)
+        // d=f16(1.0). act[0]=1,act[1]=1,act[2]=1,act[3]=1 → dot(row0)=(-1+0-1+0)=-2
+        // row1 全 0 (q=16, val=0): lo=0,hi=1 → qs[0]=0, qh[0]=0xFF (全 hi=1 → q=16, val=0)
+        let d_f16 = f16::from_f32(1.0);
+        let d_bits = d_f16.to_bits();
+        let d_lo = (d_bits & 0xFF) as u8;
+        let d_hi = ((d_bits >> 8) & 0xFF) as u8;
+
+        let mut weight = vec![0u8; n * block_bytes];
+        // row0: 交替 elem[i] = (i%2==0)? 15 : 16
+        // elem[i]: lo = (i%2==0)?15:0, hi=(i%2==0)?0:1
+        // qs[i/2]: byte holds elem[2i](lo) | elem[2i+1](hi<<4)
+        //   qs[0]: elem0 lo=15 | elem1 lo<<4=0 → 0x0F
+        //   qs[1]: elem2 lo=15 | elem3 lo<<4=0 → 0x0F  (每偶数 elem lo=15, 奇数 lo=0)
+        // qh[i/8]: 32 bits, elem[i] hi bit at qh[i/8] bit(i%8)
+        //   elem1 hi=1 (bit1), elem3 hi=1 (bit3), ... 奇数 elem hi=1
+        //   qh[0] = 0b10101010 = 0xAA (bit1,3,5,7 = 奇数 elem)
+        {
+            let r0 = &mut weight[0..block_bytes];
+            r0[0] = d_lo; r0[1] = d_hi;          // d
+            r0[2] = 0xAA; r0[3] = 0xAA; r0[4] = 0xAA; r0[5] = 0xAA; // qh: 奇数 elem hi=1
+            // qs: 偶数 elem lo=15, 奇数 elem lo=0 → 每 byte = 0x0F
+            for j in 0..16 { r0[6 + j] = 0x0F; }
+        }
+        // row1: 全 0 (q=16, val=0): lo=0, hi=1 → qs=0, qh=0xFF
+        {
+            let r1 = &mut weight[block_bytes..2*block_bytes];
+            r1[0] = d_lo; r1[1] = d_hi;
+            r1[2] = 0xFF; r1[3] = 0xFF; r1[4] = 0xFF; r1[5] = 0xFF;
+            for j in 0..16 { r1[6 + j] = 0x00; }
+        }
+
+        // act: 前4=1
+        let mut act = vec![0.0f32; m * k];
+        act[0] = 1.0; act[1] = 1.0; act[2] = 1.0; act[3] = 1.0;
+
+        let mut output = vec![0.0f32; m * n];
+
+        let mut prog = VmProgram::new();
+        let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadPtr { dst: input_ptr, src: PtrExpr::AbiArg(0) });
+        prog.emit(VmInstr::LoadPtr { dst: weight_ptr, src: PtrExpr::AbiArg(1) });
+        prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: PtrExpr::StackArg(24) });
+
+        emit_quant_gemm_inline(
+            &mut prog, BoundExpr::Const(m), n, k,
+            QuantType::Q5_0, SimdWidth::W256,
+            input_ptr, weight_ptr, output_ptr,
+            QuantPrecision::F32, DotProductCap::SimdAssisted,
+        ).expect("emit should succeed");
+
+        let code = compile_vm_prog(&prog);
+        eprintln!("[Q5_0-ORACLE] JIT {} bytes, {} instrs", code.len(), prog.instrs.len());
+
+        let (exec_ptr, exec_len) = make_exec_buffer(&code);
+        type GemmFn = unsafe extern "C" fn(*const u8, *const u8, usize, usize, usize, usize, usize, *mut u8) -> usize;
+        let f: GemmFn = unsafe { std::mem::transmute(exec_ptr) };
+        let _ret = unsafe { f(act.as_ptr() as *const u8, weight.as_ptr() as *const u8, 0,0,0,0,0, output.as_mut_ptr() as *mut u8) };
+
+        let out_f32: &[f32] = &output;
+        // row0: elem0=val(15-16)=-1, elem1=val(16-16)=0, elem2=-1, elem3=0
+        // dot = 1*(-1) + 1*0 + 1*(-1) + 1*0 = -2
+        eprintln!("[Q5_0-ORACLE] out = {:?} (want [-2.0, 0.0])", out_f32);
+        eprintln!("[Q5_0-ORACLE] want: out[0]=-2 (act·row0), out[1]=0");
+
+        unsafe { libc::munmap(exec_ptr as *mut _, exec_len); }
+
+        let pass0 = (out_f32[0] - (-2.0)).abs() < 1e-2;
+        let pass1 = out_f32[1].abs() < 1e-2;
+        if pass0 && pass1 {
+            eprintln!("[Q5_0-ORACLE] PASS — Q5_0 高1bit plane + low nibble 解码正确");
+        } else {
+            eprintln!("[Q5_0-ORACLE] FAIL — Q5_0 解码错, got [{}, {}] want [-2, 0]", out_f32[0], out_f32[1]);
+        }
+        assert!(pass0 && pass1, "Q5_0 oracle: got [{}, {}] want [-2, 0]", out_f32[0], out_f32[1]);
+    }
 }
