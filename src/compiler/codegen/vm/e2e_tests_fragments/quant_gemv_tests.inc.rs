@@ -1514,32 +1514,35 @@ mod quant_gemv_tests {
         let k: usize = 32; // 1 Q5_0 block/row (block_size=32)
         let block_bytes: usize = 22;
 
-        // 构造 row0: elem[0]=15 (lo=15,hi=0 → q=15, val=15-16=-1), elem[1]=16 (lo=0,hi=1 → q=16, val=0)
-        //   elem[0]: lo=15 (qs[0]&0xF=15), hi=0 (qh[0] bit0=0)
-        //   elem[1]: lo=0  (qs[0]>>4=0),   hi=1 (qh[0] bit1=1)
-        //   elem[2]=15, elem[3]=16 ... 交替, 测两个 phase (低/高 nibble + 高 bit plane)
-        // d=f16(1.0). act[0]=1,act[1]=1,act[2]=1,act[3]=1 → dot(row0)=(-1+0-1+0)=-2
-        // row1 全 0 (q=16, val=0): lo=0,hi=1 → qs[0]=0, qh[0]=0xFF (全 hi=1 → q=16, val=0)
+        // SPLIT-distinguishing oracle (BCE-20260710-Q5_0-HIGHBITS):
+        // Q5_0 SPLIT: qs[j] low nibble → elem[j], high nibble → elem[j+16].
+        // qh LE u32: bit i → elem[i] 的第5bit.
+        // row0: elem[0]=q15 (val=-1), elem[16]=q17 (val=+1), 其余 elem=0 (q=16, val=0).
+        //   elem[0]: lo=15 (qs[0]&0xF), hi=0 (qh bit0=0) → q=15
+        //   elem[16]: lo=1 (qs[0]>>4), hi=1 (qh bit16=1) → q=1|16=17
+        //   其余: lo=0, hi=1 (q=16, val=0)
+        // d=f16(1.0). act[0]=1,act[16]=1 → dot(row0)=1*(-1)+1*(+1)=0? no: act·row0 = act[0]*elem0_val + act[16]*elem16_val
+        //   = 1*(-1) + 1*(+1) = 0. 改 act[0]=2,act[16]=1 → dot=2*(-1)+1*(+1)=-1.
+        // 负向断言: 若误 INTERLEAVED (qs[0]=elem0 lo | elem1 hi<<4), elem16 会错 → dot≠-1.
         let d_f16 = f16::from_f32(1.0);
         let d_bits = d_f16.to_bits();
         let d_lo = (d_bits & 0xFF) as u8;
         let d_hi = ((d_bits >> 8) & 0xFF) as u8;
 
         let mut weight = vec![0u8; n * block_bytes];
-        // row0: 交替 elem[i] = (i%2==0)? 15 : 16
-        // elem[i]: lo = (i%2==0)?15:0, hi=(i%2==0)?0:1
-        // qs[i/2]: byte holds elem[2i](lo) | elem[2i+1](hi<<4)
-        //   qs[0]: elem0 lo=15 | elem1 lo<<4=0 → 0x0F
-        //   qs[1]: elem2 lo=15 | elem3 lo<<4=0 → 0x0F  (每偶数 elem lo=15, 奇数 lo=0)
-        // qh[i/8]: 32 bits, elem[i] hi bit at qh[i/8] bit(i%8)
-        //   elem1 hi=1 (bit1), elem3 hi=1 (bit3), ... 奇数 elem hi=1
-        //   qh[0] = 0b10101010 = 0xAA (bit1,3,5,7 = 奇数 elem)
         {
             let r0 = &mut weight[0..block_bytes];
             r0[0] = d_lo; r0[1] = d_hi;          // d
-            r0[2] = 0xAA; r0[3] = 0xAA; r0[4] = 0xAA; r0[5] = 0xAA; // qh: 奇数 elem hi=1
-            // qs: 偶数 elem lo=15, 奇数 elem lo=0 → 每 byte = 0x0F
-            for j in 0..16 { r0[6 + j] = 0x0F; }
+            // qh: bit16=1 (elem16 hi), 其余 bit=1 (elem val=0 需 hi=1 → q=16)
+            //   qh[0] (bit0-7): elem0-7. elem0 hi=0 (q=15), elem1-7 hi=1. → 0b11111110 = 0xFE
+            //   qh[1] (bit8-15): elem8-15. 全 hi=1 → 0xFF
+            //   qh[2] (bit16-23): elem16-23. elem16 hi=1 (q=17), elem17-23 hi=1 → 0xFF
+            //   qh[3] (bit24-31): elem24-31. 全 hi=1 → 0xFF
+            r0[2] = 0xFE; r0[3] = 0xFF; r0[4] = 0xFF; r0[5] = 0xFF;
+            // qs[0]: elem0 lo=15 (low nibble), elem16 lo=1 (high nibble) → 0x1F
+            r0[6] = 0x1F;
+            // qs[1..15]: elem1-15 lo=0 (low), elem17-31 lo=0 (high) → 0x00
+            for j in 1..16 { r0[6 + j] = 0x00; }
         }
         // row1: 全 0 (q=16, val=0): lo=0, hi=1 → qs=0, qh=0xFF
         {
@@ -1549,9 +1552,9 @@ mod quant_gemv_tests {
             for j in 0..16 { r1[6 + j] = 0x00; }
         }
 
-        // act: 前4=1
+        // act: act[0]=2, act[16]=1, 其余 0
         let mut act = vec![0.0f32; m * k];
-        act[0] = 1.0; act[1] = 1.0; act[2] = 1.0; act[3] = 1.0;
+        act[0] = 2.0; act[16] = 1.0;
 
         let mut output = vec![0.0f32; m * n];
 
@@ -1579,20 +1582,123 @@ mod quant_gemv_tests {
         let _ret = unsafe { f(act.as_ptr() as *const u8, weight.as_ptr() as *const u8, 0,0,0,0,0, output.as_mut_ptr() as *mut u8) };
 
         let out_f32: &[f32] = &output;
-        // row0: elem0=val(15-16)=-1, elem1=val(16-16)=0, elem2=-1, elem3=0
-        // dot = 1*(-1) + 1*0 + 1*(-1) + 1*0 = -2
-        eprintln!("[Q5_0-ORACLE] out = {:?} (want [-2.0, 0.0])", out_f32);
-        eprintln!("[Q5_0-ORACLE] want: out[0]=-2 (act·row0), out[1]=0");
+        // SPLIT decode: elem0=q15 val=-1, elem16=q17 val=+1.
+        // dot(row0) = act[0]*(-1) + act[16]*(+1) = 2*(-1) + 1*(+1) = -1
+        // INTERLEAVED 误判: elem16 会取 qs[8] 高 nibble (=0) → elem16 q=16 val=0, dot=2*(-1)+1*0=-2 ≠ -1
+        eprintln!("[Q5_0-ORACLE] out = {:?} (want [-1.0, 0.0])", out_f32);
+        eprintln!("[Q5_0-ORACLE] want: out[0]=-1 (SPLIT: elem0=-1, elem16=+1, act=2,1); INTERLEAVED 会得 -2");
 
         unsafe { libc::munmap(exec_ptr as *mut _, exec_len); }
 
-        let pass0 = (out_f32[0] - (-2.0)).abs() < 1e-2;
+        // SPLIT 正解: dot(row0) = 2*(-1) + 1*(+1) = -1
+        // INTERLEAVED 误判: dot = 2*(-1) + 1*0 = -2 (elem16 错取 qs[8] 高 nibble=0 → q=16 val=0)
+        let pass_split = (out_f32[0] - (-1.0)).abs() < 1e-2;
         let pass1 = out_f32[1].abs() < 1e-2;
-        if pass0 && pass1 {
-            eprintln!("[Q5_0-ORACLE] PASS — Q5_0 高1bit plane + low nibble 解码正确");
+        let interleaved_trap = (out_f32[0] - (-2.0)).abs() < 1e-2; // 误 INTERLEAVED 会落这里
+        if pass_split && pass1 {
+            eprintln!("[Q5_0-ORACLE] PASS — Q5_0 SPLIT 布局解码正确 (out[0]=-1, 区分 SPLIT/INTERLEAVED)");
+        } else if interleaved_trap {
+            eprintln!("[Q5_0-ORACLE] FAIL — 检测到 INTERLEAVED 误判! got out[0]={} want -1 (SPLIT), INTERLEAVED 会得 -2", out_f32[0]);
         } else {
-            eprintln!("[Q5_0-ORACLE] FAIL — Q5_0 解码错, got [{}, {}] want [-2, 0]", out_f32[0], out_f32[1]);
+            eprintln!("[Q5_0-ORACLE] FAIL — Q5_0 解码错, got [{}, {}] want [-1, 0] (SPLIT)", out_f32[0], out_f32[1]);
         }
-        assert!(pass0 && pass1, "Q5_0 oracle: got [{}, {}] want [-2, 0]", out_f32[0], out_f32[1]);
+        assert!(pass_split && pass1, "Q5_0 SPLIT oracle: got [{}, {}] want [-1, 0]; 若得 [-2,0] 说明仍是 INTERLEAVED 误判", out_f32[0], out_f32[1]);
+    }
+
+    // BCE-20260710-Q5_0-HIGHBITS: Q5_1 SPLIT + min oracle.
+    // Q5_1: d(f16) + m(f16) + qh[4] + qs[16] = 24B. value = d*(hi<<4|lo) + m.
+    // SPLIT: qs[j] low nibble → elem[j], high nibble → elem[j+16]. qh bit i → elem[i] 第5bit.
+    #[test]
+    fn test_q5_1_quant_gemm_x86_oracle() {
+        let m = 2; let n = 2; let k = 32;
+        let block_bytes: usize = 24;
+
+        // SPLIT-distinguishing Q5_1 min oracle:
+        // d=f16(2.0), m=f16(5.0).
+        // row0: elem[0]=q15 (val=2*15+5=35), elem[16]=q17 (val=2*17+5=39), 其余 elem=q16 (val=2*16+5=37).
+        //   elem[0]: lo=15 (qs[0]&0xF), hi=0 (qh bit0=0) → q=15, val=2*15+5=35
+        //   elem[16]: lo=1 (qs[0]>>4), hi=1 (qh bit16=1) → q=1|16=17, val=2*17+5=39
+        // act[0]=1, act[16]=1 → dot(row0) = 1*35 + 1*39 = 74
+        // INTERLEAVED 误判: elem16 取 qs[8] 高 nibble=0 → q=16, val=37; dot=35+37=72 ≠ 74
+        let d_f16 = f16::from_f32(2.0);
+        let m_f16 = f16::from_f32(5.0);
+        let d_bits = d_f16.to_bits();
+        let m_bits = m_f16.to_bits();
+        let d_lo = (d_bits & 0xFF) as u8; let d_hi = ((d_bits >> 8) & 0xFF) as u8;
+        let m_lo = (m_bits & 0xFF) as u8; let m_hi = ((m_bits >> 8) & 0xFF) as u8;
+
+        let mut weight = vec![0u8; n * block_bytes];
+        {
+            let r0 = &mut weight[0..block_bytes];
+            r0[0] = d_lo; r0[1] = d_hi;          // d
+            r0[2] = m_lo; r0[3] = m_hi;          // m
+            // qh: elem0 hi=0 (q=15), elem1-7 hi=1 (q=16); elem16 hi=1 (q=17), 其余 hi=1
+            //   qh[0] (bit0-7): elem0 hi=0, elem1-7 hi=1 → 0b11111110 = 0xFE
+            //   qh[1] (bit8-15): 全 hi=1 → 0xFF
+            //   qh[2] (bit16-23): elem16 hi=1, 其余 hi=1 → 0xFF
+            //   qh[3]: 0xFF
+            r0[4] = 0xFE; r0[5] = 0xFF; r0[6] = 0xFF; r0[7] = 0xFF;
+            // qs[0]: elem0 lo=15 (low), elem16 lo=1 (high) → 0x1F
+            r0[8] = 0x1F;
+            for j in 1..16 { r0[8 + j] = 0x00; }
+        }
+        // row1: 全 q=16 (val=37): lo=0, hi=1
+        {
+            let r1 = &mut weight[block_bytes..2*block_bytes];
+            r1[0] = d_lo; r1[1] = d_hi; r1[2] = m_lo; r1[3] = m_hi;
+            r1[4] = 0xFF; r1[5] = 0xFF; r1[6] = 0xFF; r1[7] = 0xFF;
+            for j in 0..16 { r1[8 + j] = 0x00; }
+        }
+
+        let mut act = vec![0.0f32; m * k];
+        act[0] = 1.0; act[16] = 1.0;
+
+        let mut output = vec![0.0f32; m * n];
+
+        let mut prog = VmProgram::new();
+        let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadPtr { dst: input_ptr, src: PtrExpr::AbiArg(0) });
+        prog.emit(VmInstr::LoadPtr { dst: weight_ptr, src: PtrExpr::AbiArg(1) });
+        prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: PtrExpr::StackArg(24) });
+
+        emit_quant_gemm_inline(
+            &mut prog, BoundExpr::Const(m), n, k,
+            QuantType::Q5_1, SimdWidth::W256,
+            input_ptr, weight_ptr, output_ptr,
+            QuantPrecision::F32, DotProductCap::SimdAssisted,
+        ).expect("emit should succeed");
+
+        let code = compile_vm_prog(&prog);
+        eprintln!("[Q5_1-ORACLE] JIT {} bytes, {} instrs", code.len(), prog.instrs.len());
+
+        let (exec_ptr, exec_len) = make_exec_buffer(&code);
+        type GemmFn = unsafe extern "C" fn(*const u8, *const u8, usize, usize, usize, usize, usize, *mut u8) -> usize;
+        let f: GemmFn = unsafe { std::mem::transmute(exec_ptr) };
+        let _ret = unsafe { f(act.as_ptr() as *const u8, weight.as_ptr() as *const u8, 0,0,0,0,0, output.as_mut_ptr() as *mut u8) };
+
+        let out_f32: &[f32] = &output;
+        // SPLIT: dot = 1*35 + 1*39 = 74; INTERLEAVED 误判: dot = 1*35 + 1*37 = 72
+        eprintln!("[Q5_1-ORACLE] out = {:?} (want [74.0, 74.0])", out_f32);
+        eprintln!("[Q5_1-ORACLE] row0: elem0=35, elem16=39, dot=74; row1: elem全37, dot=74 (act只[0],[16])");
+        eprintln!("[Q5_1-ORACLE] wait — row1 act[0]=1,act[16]=1, elem0=elem16=37 → dot=37+37=74 too");
+
+        unsafe { libc::munmap(exec_ptr as *mut _, exec_len); }
+
+        // 修正 row1 预期: row1 全 q=16 (val=37), act[0]=1,act[16]=1 → dot=37+37=74
+        // 但 row0: elem0=35, elem16=39 → dot=35+39=74 (SPLIT)
+        // INTERLEAVED 误判 row0: elem16=37 → dot=35+37=72
+        let pass_split0 = (out_f32[0] - 74.0).abs() < 1e-1;
+        let pass1 = (out_f32[1] - 74.0).abs() < 1e-1;
+        let interleaved_trap = (out_f32[0] - 72.0).abs() < 1e-1;
+        if pass_split0 && pass1 {
+            eprintln!("[Q5_1-ORACLE] PASS — Q5_1 SPLIT + min 解码正确 (out=[74,74])");
+        } else if interleaved_trap {
+            eprintln!("[Q5_1-ORACLE] FAIL — 检测到 INTERLEAVED 误判! got out[0]={} want 74 (SPLIT), INTERLEAVED 得 72", out_f32[0]);
+        } else {
+            eprintln!("[Q5_1-ORACLE] FAIL — Q5_1 解码错, got [{}, {}] want [74, 74] (SPLIT+min)", out_f32[0], out_f32[1]);
+        }
+        assert!(pass_split0 && pass1, "Q5_1 SPLIT+min oracle: got [{}, {}] want [74, 74]; 若 [72,74] 说明 INTERLEAVED 误判", out_f32[0], out_f32[1]);
     }
 }

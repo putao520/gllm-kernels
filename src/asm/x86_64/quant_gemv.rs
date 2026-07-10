@@ -2039,13 +2039,13 @@ pub unsafe extern "C" fn q6k_decode_step_native(
     }
 }
 
-/// Q5_0 单步解码 (BCE-20260710-Q5_0-HIGHBITS, 同类横扫).
+/// Q5_0 单步解码 (BCE-20260710-Q5_0-HIGHBITS 同类横扫).
 ///
-/// Q5_0: d(f16) + qh[4](32 high bits, bit-index plane) + qs[16](byte-packed low 4bit) = 22B.
+/// Q5_0: d(f16) + qh[4](32 high bits, bit-index plane) + qs[16](SPLIT low 4bit) = 22B.
 /// value = d * ((hi<<4 | lo) - 16)
-///   lo = (qs[i/2] >> ((i%2)*4)) & 0xF   (byte-packed, 非 SPLIT)
-///   hi = (qh[i/8] >> (i%8)) & 1          (bit-index plane, 位置相关)
-/// 旧 NibbleWithHighBits qh<<7 & 0x10 丢高1bit + phase 无关 → 错.
+///   lo: SPLIT — i<16: qs[i] & 0xF; i>=16: qs[i-16] >> 4 (前半低 nibble, 后半高 nibble)
+///   hi = (qh[i/8] >> (i%8)) & 1   (bit-index plane: bit i → element i)
+/// 旧 NibbleWithHighBits qh<<7 & 0x10 丢高1bit + phase 无关 + 误用 INTERLEAVED → 错.
 /// ABI 对齐 q6k: (block, lane_offset, _d, _qs_off, _qh_off, lanes, out).
 pub unsafe extern "C" fn q5_0_decode_step_native(
     block: *const u8,
@@ -2065,7 +2065,13 @@ pub unsafe extern "C" fn q5_0_decode_step_native(
     let qs = block.add(6);
     for i in 0..lanes as usize {
         let gi = (lane_offset as usize) + i;
-        let lo = (*qs.add(gi / 2) >> ((gi % 2) * 4)) & 0xF;
+        // SPLIT low nibble (BCE-20260710: 非 INTERLEAVED qs[gi/2])
+        let lo = if gi < 16 {
+            *qs.add(gi) & 0xF
+        } else {
+            *qs.add(gi - 16) >> 4
+        };
+        // bit-index plane: bit gi → element gi (qh LE u32)
         let hi = (*qh.add(gi / 8) >> (gi % 8)) & 1;
         let q = ((hi as i32) << 4) | (lo as i32);
         *out.add(i) = d * (q as f32 - 16.0);
@@ -2074,9 +2080,10 @@ pub unsafe extern "C" fn q5_0_decode_step_native(
 
 /// Q5_1 单步解码 (BCE-20260710-Q5_0-HIGHBITS 同类).
 ///
-/// Q5_1: d(f16) + m(f16) + qh[4](32 high bits) + qs[16] = 24B.
+/// Q5_1: d(f16) + m(f16) + qh[4](32 high bits) + qs[16](SPLIT low 4bit) = 24B.
 /// value = d * (hi<<4 | lo) + m   (BlockScalarWithMin: PostScaleAdd)
-///   lo = (qs[i/2] >> ((i%2)*4)) & 0xF, hi = (qh[i/8] >> (i%8)) & 1
+///   lo: SPLIT — i<16: qs[i] & 0xF; i>=16: qs[i-16] >> 4
+///   hi = (qh[i/8] >> (i%8)) & 1   (bit-index plane: bit i → element i)
 pub unsafe extern "C" fn q5_1_decode_step_native(
     block: *const u8,
     lane_offset: u64,
@@ -2097,7 +2104,12 @@ pub unsafe extern "C" fn q5_1_decode_step_native(
     let qs = block.add(8);
     for i in 0..lanes as usize {
         let gi = (lane_offset as usize) + i;
-        let lo = (*qs.add(gi / 2) >> ((gi % 2) * 4)) & 0xF;
+        // SPLIT low nibble (BCE-20260710: 非 INTERLEAVED qs[gi/2])
+        let lo = if gi < 16 {
+            *qs.add(gi) & 0xF
+        } else {
+            *qs.add(gi - 16) >> 4
+        };
         let hi = (*qh.add(gi / 8) >> (gi % 8)) & 1;
         let q = ((hi as i32) << 4) | (lo as i32);
         *out.add(i) = d * (q as f32) + m;
