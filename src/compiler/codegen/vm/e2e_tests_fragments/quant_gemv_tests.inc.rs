@@ -2264,4 +2264,65 @@ mod quant_gemv_tests {
         }
         assert!(pass_sum && pass_elem, "Q5_K real-scale JIT vs scalar: sum_diff={:.6} elem_diff={:.6}", (scalar_sum-jit_sum).abs(), max_elem_diff);
     }
+
+    // BCE-20260710-Q5_K-HIGHBITS: Q5_K + Q6_K 同 program 交替执行 (同层混合模拟, #[ignore] — SIGSEGV 嫌疑).
+    // Q5_K_M 同层含 Q5K(q_proj) + Q6K(v_proj). 若同 program 内连续 emit 两者 SIGSEGV → VReg/stack 冲突.
+    #[test]
+    #[ignore]
+    fn test_q5k_q6k_mixed_program() {
+        use crate::compiler::codegen::vm::moe_quant_emit::emit_quant_gemm_inline;
+        use half::f16;
+        let m = 1; let n = 1; let k = 256;
+
+        let mut q5_w = vec![0u8; 176];
+        let d = f16::from_f32(1.0); let dm = f16::from_f32(1.0);
+        q5_w[0] = (d.to_bits() & 0xFF) as u8; q5_w[1] = ((d.to_bits() >> 8) & 0xFF) as u8;
+        q5_w[2] = (dm.to_bits() & 0xFF) as u8; q5_w[3] = ((dm.to_bits() >> 8) & 0xFF) as u8;
+        q5_w[4] = 1; q5_w[8] = 1; q5_w[16] = 0x01; q5_w[48] = 0x01;
+        let q5_act = { let mut a = vec![0.0f32; k]; a[0] = 1.0; a };
+
+        let mut q6_w = vec![0u8; 210];
+        q6_w[0] = 0x31; q6_w[32] = 0x42;
+        for j in 0..64 { q6_w[128 + j] = 0xAA; }
+        for j in 0..16 { q6_w[192 + j] = 1; }
+        q6_w[208] = (d.to_bits() & 0xFF) as u8; q6_w[209] = ((d.to_bits() >> 8) & 0xFF) as u8;
+        let q6_act = { let mut a = vec![0.0f32; k]; a[0]=1.0; a[32]=1.0; a[64]=1.0; a[96]=1.0; a };
+
+        let mut prog = VmProgram::new();
+        let q5_in = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let q5_wv = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let q5_out = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let q6_in = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let q6_wv = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let q6_out = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadPtr { dst: q5_in, src: PtrExpr::AbiArg(0) });
+        prog.emit(VmInstr::LoadPtr { dst: q5_wv, src: PtrExpr::AbiArg(1) });
+        prog.emit(VmInstr::LoadPtr { dst: q5_out, src: PtrExpr::StackArg(24) });
+        prog.emit(VmInstr::LoadPtr { dst: q6_in, src: PtrExpr::StackArg(32) });
+        prog.emit(VmInstr::LoadPtr { dst: q6_wv, src: PtrExpr::StackArg(40) });
+        prog.emit(VmInstr::LoadPtr { dst: q6_out, src: PtrExpr::StackArg(48) });
+
+        emit_quant_gemm_inline(&mut prog, BoundExpr::Const(m), n, k, QuantType::Q5K, SimdWidth::W256,
+            q5_in, q5_wv, q5_out, QuantPrecision::F32, DotProductCap::SimdAssisted).expect("q5");
+        emit_quant_gemm_inline(&mut prog, BoundExpr::Const(m), n, k, QuantType::Q6K, SimdWidth::W256,
+            q6_in, q6_wv, q6_out, QuantPrecision::F32, DotProductCap::SimdAssisted).expect("q6");
+
+        let code = compile_vm_prog(&prog);
+        eprintln!("[MIX] JIT {} bytes", code.len());
+        let (exec_ptr, exec_len) = make_exec_buffer(&code);
+        type Fn = unsafe extern "C" fn(*const u8, *const u8, usize, usize, usize, usize, usize, *mut u8, *const u8, *const u8, *const u8, *const u8, *const u8, *mut u8) -> usize;
+        let f: Fn = unsafe { std::mem::transmute(exec_ptr) };
+        let mut q5_o = vec![0.0f32; 1];
+        let mut q6_o = vec![0.0f32; 1];
+        let _ret = unsafe { f(q5_act.as_ptr() as *const u8, q5_w.as_ptr() as *const u8, 0,0,0,0,0,
+            q5_o.as_mut_ptr() as *mut u8,
+            q6_act.as_ptr() as *const u8, q6_w.as_ptr() as *const u8,
+            std::ptr::null(), std::ptr::null(), std::ptr::null(),
+            q6_o.as_mut_ptr() as *mut u8) };
+        eprintln!("[MIX] q5_out={} (want 16), q6_out={} (want 10)", q5_o[0], q6_o[0]);
+        unsafe { libc::munmap(exec_ptr as *mut _, exec_len); }
+        assert!((q5_o[0] - 16.0).abs() < 1e-2, "q5={} want 16", q5_o[0]);
+        assert!((q6_o[0] - 10.0).abs() < 1e-2, "q6={} want 10", q6_o[0]);
+        eprintln!("[MIX] PASS — 同 program Q5K+Q6K 交替执行正确 (q5=16, q6=10)");
+    }
 }
