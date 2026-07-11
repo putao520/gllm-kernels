@@ -3936,9 +3936,6 @@ impl X86Lower {
                 //      qs_offset: u64, hmask_offset: u64, lanes: u64, out: *mut f32)
                 // ABI: RDI=block, RSI=lane_offset, XMM0=d_f32, RDX=qs_offset, RCX=hmask_offset, R8=lanes, R9=out_ptr
 
-                let bb_gpr = self.resolve_gpr_read(*block_base, alloc, 0)?;
-                let lo_gpr = self.resolve_gpr_read(*lane_offset, alloc, 1)?;
-
                 // Resolve dst for write — we need to know which physical YMM it maps to
                 let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
 
@@ -3959,6 +3956,10 @@ impl X86Lower {
                     // Total: 14*8=112 + 8 + 15*32=480 = 600 → 600%16=8 ✓
                     frame.verify_alignment()?;
                 }
+
+                // BCE-20260711-NATIVE-CALL-SAVE-ORDER: resolve_gpr_read 在 push_gprs 之后 (见 Q6K 注释).
+                let bb_gpr = self.resolve_gpr_read(*block_base, alloc, 0)?;
+                let lo_gpr = self.resolve_gpr_read(*lane_offset, alloc, 1)?;
 
                 // Set up arguments
                 self.asm.mov(rdi, bb_gpr).map_err(Self::err)?;
@@ -4029,9 +4030,6 @@ impl X86Lower {
     fn lower_q6_k_decode_step_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
             VmInstr::Q6KDecodeStep { dst, block_base, lane_offset, d_vreg: _, qs_offset, qh_offset, lanes, width } => {
-                let bb_gpr = self.resolve_gpr_read(*block_base, alloc, 0)?;
-                let lo_gpr = self.resolve_gpr_read(*lane_offset, alloc, 1)?;
-
                 let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
 
                 #[rustfmt::skip]
@@ -4047,6 +4045,16 @@ impl X86Lower {
                     frame.save_ymm_block(&save_ymms)?;
                     frame.verify_alignment()?;
                 }
+
+                // BCE-20260711-NATIVE-CALL-SAVE-ORDER: resolve_gpr_read 必须在 push_gprs 之后.
+                // 旧序: resolve_gpr_read(block_base, slot=0=rax) 在 push_gprs 之前 → 若 block_base
+                // spilled, mov rax,[rbp+off] 覆盖 rax, 而 rax 可能持有层循环 counter/byte_offset
+                // VReg → push_gprs 保存被覆盖值 → restore_all 恢复错值 → counter/byte_offset 永久破坏
+                // → layer-loop 第2次迭代用错值 → Q5_K_M N=2 崩 (N=1 不触发因 counter=0).
+                // 正序: 先 push_gprs 保存所有 GPR 原值, 再 resolve_gpr_read 用 scratch 加载 spill 值
+                // (覆盖不影响, 原值已保存), restore_all 恢复原值.
+                let bb_gpr = self.resolve_gpr_read(*block_base, alloc, 0)?;
+                let lo_gpr = self.resolve_gpr_read(*lane_offset, alloc, 1)?;
 
                 self.asm.mov(rdi, bb_gpr).map_err(Self::err)?;
                 self.asm.mov(rsi, lo_gpr).map_err(Self::err)?;
@@ -4107,9 +4115,6 @@ impl X86Lower {
     fn lower_q5_decode_step_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
             VmInstr::Q5DecodeStep { dst, block_base, lane_offset, d_vreg: _, qs_offset, qh_offset, has_min, lanes, width } => {
-                let bb_gpr = self.resolve_gpr_read(*block_base, alloc, 0)?;
-                let lo_gpr = self.resolve_gpr_read(*lane_offset, alloc, 1)?;
-
                 let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
 
                 #[rustfmt::skip]
@@ -4125,6 +4130,10 @@ impl X86Lower {
                     frame.save_ymm_block(&save_ymms)?;
                     frame.verify_alignment()?;
                 }
+
+                // BCE-20260711-NATIVE-CALL-SAVE-ORDER: resolve_gpr_read 在 push_gprs 之后 (见 Q6K 注释).
+                let bb_gpr = self.resolve_gpr_read(*block_base, alloc, 0)?;
+                let lo_gpr = self.resolve_gpr_read(*lane_offset, alloc, 1)?;
 
                 self.asm.mov(rdi, bb_gpr).map_err(Self::err)?;
                 self.asm.mov(rsi, lo_gpr).map_err(Self::err)?;
@@ -4189,9 +4198,6 @@ impl X86Lower {
     fn lower_q5k_decode_step_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
             VmInstr::Q5KDecodeStep { dst, block_base, lane_offset, d_vreg: _, qs_offset, qh_offset, lanes, width } => {
-                let bb_gpr = self.resolve_gpr_read(*block_base, alloc, 0)?;
-                let lo_gpr = self.resolve_gpr_read(*lane_offset, alloc, 1)?;
-
                 let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
 
                 #[rustfmt::skip]
@@ -4207,6 +4213,10 @@ impl X86Lower {
                     frame.save_ymm_block(&save_ymms)?;
                     frame.verify_alignment()?;
                 }
+
+                // BCE-20260711-NATIVE-CALL-SAVE-ORDER: resolve_gpr_read 在 push_gprs 之后 (见 Q6K 注释).
+                let bb_gpr = self.resolve_gpr_read(*block_base, alloc, 0)?;
+                let lo_gpr = self.resolve_gpr_read(*lane_offset, alloc, 1)?;
 
                 self.asm.mov(rdi, bb_gpr).map_err(Self::err)?;
                 self.asm.mov(rsi, lo_gpr).map_err(Self::err)?;
