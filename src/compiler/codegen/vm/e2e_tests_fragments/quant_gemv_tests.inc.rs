@@ -1500,6 +1500,106 @@ mod quant_gemv_tests {
         assert!(pass0 && pass1, "Q6_K oracle: got [{}, {}] want [10, 0]", out_f32[0], out_f32[1]);
     }
 
+    // BCE-20260710-Q6K-HIGHBITS: Q6_K 多 block (k=512, 2 blocks) oracle.
+    // Q5_K_M 的 attn_v/ffn_down 是 Q6_K 且在 layer-loop 内 (多 row, 每 row 多 block).
+    // 1层 cos 0.9998 (对), 2层 cos 0.78 (跌) — 怀疑 Q6_K 多 block 在 layer-loop 第2次迭代错.
+    // 本 oracle 测 Q6_K k=512 (2 blocks/row), 每 block 独立 d.
+    #[test]
+    fn test_q6_k_multi_block_oracle() {
+        use crate::compiler::codegen::vm::moe_quant_emit::emit_quant_gemm_inline;
+
+        let m: usize = 1;
+        let n: usize = 2;
+        let k: usize = 512; // 2 Q6_K blocks/row
+        let block_bytes: usize = 210;
+        let block_size: usize = 256;
+
+        // block 0: d=1.0. block 1: d=2.0. scales=1, hi2=2 (全 quarter 高 bit).
+        // block0 l=0: q1=1,q2=2,q3=3,q4=4 (位 [0,32,64,96]) → values [1,2,3,4]
+        // block1 l=0: q1=1,q2=2,q3=3,q4=4 (位 [256,288,320,352]) → values [2,4,6,8] (d=2)
+        // act[0]=1,act[32]=1,act[64]=1,act[96]=1 (block0), act[256]=1,act[288]=1,act[320]=1,act[352]=1 (block1)
+        // dot(row0) = (1+2+3+4) + (2+4+6+8) = 10 + 20 = 30
+        let d0_f16 = f16::from_f32(1.0);
+        let d1_f16 = f16::from_f32(2.0);
+        let d0_bits = d0_f16.to_bits();
+        let d1_bits = d1_f16.to_bits();
+
+        let row_bytes = (k / block_size) * block_bytes;  // 2 * 210 = 420
+        let mut weight = vec![0u8; n * row_bytes];
+        {
+            let r0 = &mut weight[0..row_bytes];
+            // block 0 (d=1.0): q1=1,q2=2,q3=3,q4=4 at l=0
+            let b0 = &mut r0[0..block_bytes];
+            b0[0] = 0x31;   // qs[0] = lo4(q1)=1 | lo4(q3)<<4=3<<4 = 0x31
+            b0[32] = 0x42;  // qs[32] = lo4(q2)=2 | lo4(q4)<<4=4<<4 = 0x42
+            for j in 0..64 { b0[128 + j] = 0xAA; }  // qh hi2=2
+            for j in 0..16 { b0[192 + j] = 1; }      // scales=1
+            b0[208] = (d0_bits & 0xFF) as u8; b0[209] = ((d0_bits >> 8) & 0xFF) as u8;
+
+            // block 1 (d=2.0): same q layout, d=2
+            let b1 = &mut r0[block_bytes..2*block_bytes];
+            b1[0] = 0x31;
+            b1[32] = 0x42;
+            for j in 0..64 { b1[128 + j] = 0xAA; }
+            for j in 0..16 { b1[192 + j] = 1; }
+            b1[208] = (d1_bits & 0xFF) as u8; b1[209] = ((d1_bits >> 8) & 0xFF) as u8;
+        }
+        // row1: 全零 (value=0: lo4=0, hi2=2 → 6bit=32-32=0)
+        {
+            let r1 = &mut weight[row_bytes..2*row_bytes];
+            for j in 0..64 { r1[128 + j] = 0xAA; }
+            for j in 0..16 { r1[192 + j] = 1; }
+            r1[208] = (d0_bits & 0xFF) as u8; r1[209] = ((d0_bits >> 8) & 0xFF) as u8;
+            // block 1 of row1
+            for j in 0..64 { r1[block_bytes + 128 + j] = 0xAA; }
+            for j in 0..16 { r1[block_bytes + 192 + j] = 1; }
+            r1[block_bytes + 208] = (d0_bits & 0xFF) as u8; r1[block_bytes + 209] = ((d0_bits >> 8) & 0xFF) as u8;
+        }
+
+        let mut act = vec![0.0f32; m * k];
+        act[0] = 1.0; act[32] = 1.0; act[64] = 1.0; act[96] = 1.0;       // block 0
+        act[256] = 1.0; act[288] = 1.0; act[320] = 1.0; act[352] = 1.0;  // block 1
+
+        let mut output = vec![0.0f32; m * n];
+        let mut prog = VmProgram::new();
+        let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadPtr { dst: input_ptr, src: PtrExpr::AbiArg(0) });
+        prog.emit(VmInstr::LoadPtr { dst: weight_ptr, src: PtrExpr::AbiArg(1) });
+        prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: PtrExpr::StackArg(24) });
+
+        emit_quant_gemm_inline(
+            &mut prog, BoundExpr::Const(m), n, k,
+            QuantType::Q6K, SimdWidth::W256,
+            input_ptr, weight_ptr, output_ptr,
+            QuantPrecision::F32, DotProductCap::SimdAssisted,
+        ).expect("emit should succeed");
+
+        let code = compile_vm_prog(&prog);
+        eprintln!("[Q6_K-MULTIBLK] JIT {} bytes, k={} ({} blocks/row)", code.len(), k, k/block_size);
+        let (exec_ptr, exec_len) = make_exec_buffer(&code);
+        type GemmFn = unsafe extern "C" fn(*const u8, *const u8, usize, usize, usize, usize, usize, *mut u8) -> usize;
+        let f: GemmFn = unsafe { std::mem::transmute(exec_ptr) };
+        let _ret = unsafe { f(act.as_ptr() as *const u8, weight.as_ptr() as *const u8, 0,0,0,0,0, output.as_mut_ptr() as *mut u8) };
+
+        let out_f32: &[f32] = &output;
+        // block0: d=1, values [1,2,3,4] → dot=10. block1: d=2, values [1,2,3,4]→[2,4,6,8] → dot=20. total=30
+        eprintln!("[Q6_K-MULTIBLK] out = {:?} (want [30.0, 0.0])", out_f32);
+        eprintln!("[Q6_K-MULTIBLK] block0 dot=10 (d=1), block1 dot=20 (d=2), total=30 (跨 block d 独立)");
+
+        unsafe { libc::munmap(exec_ptr as *mut _, exec_len); }
+
+        let pass0 = (out_f32[0] - 30.0).abs() < 1e-1;
+        let pass1 = out_f32[1].abs() < 1e-1;
+        if pass0 && pass1 {
+            eprintln!("[Q6_K-MULTIBLK] PASS — Q6_K 多 block (k=512) 跨 block 解码正确 (out=30)");
+        } else {
+            eprintln!("[Q6_K-MULTIBLK] FAIL — Q6_K 多 block 解码错, got [{}, {}] want [30, 0]", out_f32[0], out_f32[1]);
+        }
+        assert!(pass0 && pass1, "Q6_K multi-block oracle: got [{}, {}] want [30, 0] (跨 block d/scales 独立)", out_f32[0], out_f32[1]);
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // Q5_0 真实执行 oracle (BCE-20260710-Q5_0-HIGHBITS, 同类嫌疑横扫)
     // Q5_0: d(f16) + qh[4](32 high bits, bit-index plane) + qs[16](byte-packed low 4bit) = 22B
@@ -1943,5 +2043,100 @@ mod quant_gemv_tests {
             eprintln!("[Q5_K-J4-ORACLE] FAIL — Q5_K j>=4 解码错, got [{}, {}] want [26, 26]", out_f32[0], out_f32[1]);
         }
         assert!(pass0 && pass1, "Q5_K j>=4 oracle: got [{}, {}] want [26, 26] (get_scale_min_k4 交错拼分支)", out_f32[0], out_f32[1]);
+    }
+
+    // BCE-20260710-Q5_K-HIGHBITS: Q5_K 多 block (k=512, 2 blocks) oracle.
+    // 验证跨 block 解码 — blk_ptr 前进 block_bytes=176, lane_offset 重置 0, 每 block 独立 d/dmin/scales.
+    // 1层 E2E cos 0.9998 (对), 2层 cos 0.78 (跌). 怀疑 multi-block 边界. 本 oracle 测 k=512.
+    #[test]
+    fn test_q5_k_multi_block_oracle() {
+        let m = 1; let n = 2; let k = 512;  // 2 blocks per row
+        let block_bytes: usize = 176;
+        let block_size: usize = 256;
+
+        // d=f16(1.0), dmin=f16(1.0). 每 block 独立设置不同 d 以区分 block.
+        // block 0: d=1.0, dmin=1.0. block 1: d=2.0, dmin=0.5.
+        // row0 block0: elem0 (mini0,l0): lo4=1, hi1=1 → q5=17. val=1*sc*17 - 1*m.
+        //   设 scales[0]&63=1 (sc=1), scales[4]&63=1 (m=1) → val=17-1=16.
+        // row0 block1: elem256 (mini0,l0 of block1): lo4=1, hi1=1 → q5=17. val=2*1*17 - 0.5*1 = 34-0.5=33.5.
+        // act[0]=1, act[256]=1 → dot(row0) = 1*16 + 1*33.5 = 49.5
+        let d0_f16 = f16::from_f32(1.0);
+        let dmin0_f16 = f16::from_f32(1.0);
+        let d1_f16 = f16::from_f32(2.0);
+        let dmin1_f16 = f16::from_f32(0.5);
+        let d0_bits = d0_f16.to_bits(); let dmin0_bits = dmin0_f16.to_bits();
+        let d1_bits = d1_f16.to_bits(); let dmin1_bits = dmin1_f16.to_bits();
+
+        let row_bytes = (k / block_size) * block_bytes;  // 2 * 176 = 352
+        let mut weight = vec![0u8; n * row_bytes];
+        {
+            // row0: block0 + block1
+            let r0 = &mut weight[0..row_bytes];
+            // block 0 (d=1.0, dmin=1.0)
+            let b0 = &mut r0[0..block_bytes];
+            b0[0] = (d0_bits & 0xFF) as u8; b0[1] = ((d0_bits >> 8) & 0xFF) as u8;
+            b0[2] = (dmin0_bits & 0xFF) as u8; b0[3] = ((dmin0_bits >> 8) & 0xFF) as u8;
+            b0[4] = 1;  // scales[0]&63=1 (sc=1 for mini0)
+            b0[8] = 1;  // scales[4]&63=1 (m=1 for mini0)
+            // qh[0] bit0=1 (elem0 hi1=1) → qh[0]=0x01
+            b0[16] = 0x01;
+            // qs[0] low nibble=1 (elem0 lo4=1) → qs[0]=0x01
+            b0[48] = 0x01;
+
+            // block 1 (d=2.0, dmin=0.5)
+            let b1 = &mut r0[block_bytes..2*block_bytes];
+            b1[0] = (d1_bits & 0xFF) as u8; b1[1] = ((d1_bits >> 8) & 0xFF) as u8;
+            b1[2] = (dmin1_bits & 0xFF) as u8; b1[3] = ((dmin1_bits >> 8) & 0xFF) as u8;
+            b1[4] = 1;  // sc=1 for mini0
+            b1[8] = 1;  // m=1 for mini0
+            b1[16] = 0x01;  // qh[0] bit0=1
+            b1[48] = 0x01;  // qs[0] low=1
+        }
+        // row1: 全零 (act=0 不影响, 但需正确 size)
+        // row1 留全零
+
+        // act: elem0=1 (block0), elem256=1 (block1)
+        let mut act = vec![0.0f32; m * k];
+        act[0] = 1.0; act[256] = 1.0;
+
+        let mut output = vec![0.0f32; m * n];
+        let mut prog = VmProgram::new();
+        let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadPtr { dst: input_ptr, src: PtrExpr::AbiArg(0) });
+        prog.emit(VmInstr::LoadPtr { dst: weight_ptr, src: PtrExpr::AbiArg(1) });
+        prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: PtrExpr::StackArg(24) });
+
+        emit_quant_gemm_inline(
+            &mut prog, BoundExpr::Const(m), n, k,
+            QuantType::Q5K, SimdWidth::W256,
+            input_ptr, weight_ptr, output_ptr,
+            QuantPrecision::F32, DotProductCap::SimdAssisted,
+        ).expect("emit should succeed");
+
+        let code = compile_vm_prog(&prog);
+        eprintln!("[Q5_K-MULTIBLK] JIT {} bytes, k={} ({} blocks/row)", code.len(), k, k/block_size);
+        let (exec_ptr, exec_len) = make_exec_buffer(&code);
+        type GemmFn = unsafe extern "C" fn(*const u8, *const u8, usize, usize, usize, usize, usize, *mut u8) -> usize;
+        let f: GemmFn = unsafe { std::mem::transmute(exec_ptr) };
+        let _ret = unsafe { f(act.as_ptr() as *const u8, weight.as_ptr() as *const u8, 0,0,0,0,0, output.as_mut_ptr() as *mut u8) };
+
+        let out_f32: &[f32] = &output;
+        // block0 elem0: d=1,sc=1,q5=17,m=1,dmin=1 → 17-1=16
+        // block1 elem256: d=2,sc=1,q5=17,m=1,dmin=0.5 → 34-0.5=33.5
+        // dot = 1*16 + 1*33.5 = 49.5
+        eprintln!("[Q5_K-MULTIBLK] out = {:?} (want [49.5, 0.0])", out_f32);
+        eprintln!("[Q5_K-MULTIBLK] block0 elem0=16, block1 elem256=33.5, dot=49.5 (跨 block d/dmin 独立)");
+
+        unsafe { libc::munmap(exec_ptr as *mut _, exec_len); }
+
+        let pass0 = (out_f32[0] - 49.5).abs() < 1e-1;
+        if pass0 {
+            eprintln!("[Q5_K-MULTIBLK] PASS — Q5_K 多 block (k=512) 跨 block 解码正确 (out=49.5)");
+        } else {
+            eprintln!("[Q5_K-MULTIBLK] FAIL — Q5_K 多 block 解码错, got {} want 49.5", out_f32[0]);
+        }
+        assert!(pass0, "Q5_K multi-block oracle: got {} want 49.5 (跨 block d/dmin/scales 独立解码)", out_f32[0]);
     }
 }
