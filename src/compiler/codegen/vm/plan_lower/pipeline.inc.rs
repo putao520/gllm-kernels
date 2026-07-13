@@ -503,12 +503,6 @@ fn close_layer_loop(
         }
     }
     prog.emit(VmInstr::LoopEnd);
-    // §0.2.8 Parity fix: after the layer loop, N swaps have occurred.
-    // The last iteration wrote to pong, then swapped — so pong_ptr now
-    // points to the WRONG buffer. One more swap restores correctness.
-    if let Some((ping, pong)) = locals.activation_swap_vregs {
-        prog.emit(VmInstr::ActivationSwap { ptr_a: ping, ptr_b: pong });
-    }
     // After the layer loop, reset weight_ptr to original (offset 0).
     // Global weights are at the beginning of the blob with absolute offsets.
     state.abi.weight_ptr = original_weight_vreg;
@@ -812,11 +806,6 @@ fn handle_hetero_layer_loop(
         }
         // Close outer segment loop
         prog.emit(VmInstr::LoopEnd);
-        // §0.2.8 Parity fix: after the hetero loop, N swaps have occurred.
-        // One more swap restores pong_ptr to the last-written buffer.
-        if let Some((ping, pong)) = activation_swap_vregs {
-            prog.emit(VmInstr::ActivationSwap { ptr_a: ping, ptr_b: pong });
-        }
         state.abi.weight_ptr = original_weight_vreg;
         state.abi.layer_loop_counter = None;
         state.in_layer_loop = false;
@@ -947,14 +936,6 @@ fn handle_standard_layer_loop(
             }
         }
         prog.emit(VmInstr::LoopEnd);
-        // §0.2.8 Parity fix: after the layer loop, N swaps have occurred.
-        // The last iteration wrote to pong, then swapped — so pong_ptr now
-        // points to the WRONG buffer (the one NOT written by the last layer).
-        // One more swap restores pong_ptr to the last-written buffer, ensuring
-        // post-loop ops (MeanPool, final_norm) read from the correct data.
-        if let Some((ping, pong)) = locals.activation_swap_vregs {
-            prog.emit(VmInstr::ActivationSwap { ptr_a: ping, ptr_b: pong });
-        }
         // After the layer loop, reload weight base from ABI args.
         // original_weight_vreg's spill slot may have been overwritten by the
         // register allocator during the multi-iteration layer loop. Reloading
