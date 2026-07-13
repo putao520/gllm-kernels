@@ -394,6 +394,24 @@ pub(super) fn emit_fusion_groups(
             use std::io::Write;
             std::io::stderr().flush().ok();
         }
+        // BCE-20260713-ACTIVATION-SWAP-PARITY (Plan C): 每组重置 ping/pong 到初始 buffer.
+        // 3 融合组共享 v25/v26 (locals.activation_swap_vregs 单一 pair). 每组 layer loop 后
+        // 有 parity-fix ActivationSwap (恢复 pong 指向最后层输出, 对单组 post-loop 正确性必需).
+        // 但 3 组串行, 前一组 parity fix 翻转 v25/v26, 后一组继承翻转状态 → 组间代码读翻转
+        // 后的 v25 → 错 buffer → N=偶数 layer0=0 (乱码).
+        // 每组开始前重新 AddPtr 重置 v25/v26 = scratch + ping_off/pong_off, 覆盖翻转.
+        if let Some((ping_ptr, pong_ptr)) = locals.activation_swap_vregs {
+            let ping_off = fctx.alloc.slots.iter()
+                .find(|s| s.tensor_id.0 == 0xFFFF_FF00)
+                .map(|s| s.offset);
+            let pong_off = fctx.alloc.slots.iter()
+                .find(|s| s.tensor_id.0 == 0xFFFF_FF01)
+                .map(|s| s.offset);
+            if let (Some(po), Some(ngo)) = (ping_off, pong_off) {
+                prog.emit(VmInstr::AddPtr { dst: ping_ptr, base: locals.scratch_base, offset: po });
+                prog.emit(VmInstr::AddPtr { dst: pong_ptr, base: locals.scratch_base, offset: ngo });
+            }
+        }
         emit_one_fusion_group(
             fctx, prog, current_abi, resolver, &mut state, group, &locals,
         )?;
@@ -503,6 +521,15 @@ fn close_layer_loop(
         }
     }
     prog.emit(VmInstr::LoopEnd);
+    // §0.2.8 Parity fix: after the layer loop, N swaps have occurred.
+    // The last iteration wrote to pong, then swapped — so pong_ptr now
+    // points to the WRONG buffer. One more swap restores correctness.
+    // BCE-20260713-ACTIVATION-SWAP-PARITY: restored (was removed in 210b0d6e
+    // which broke N=odd post-loop). Plan C adds per-group reset to cover the
+    // cross-group flip that this parity fix causes.
+    if let Some((ping, pong)) = locals.activation_swap_vregs {
+        prog.emit(VmInstr::ActivationSwap { ptr_a: ping, ptr_b: pong });
+    }
     // After the layer loop, reset weight_ptr to original (offset 0).
     // Global weights are at the beginning of the blob with absolute offsets.
     state.abi.weight_ptr = original_weight_vreg;
@@ -806,6 +833,12 @@ fn handle_hetero_layer_loop(
         }
         // Close outer segment loop
         prog.emit(VmInstr::LoopEnd);
+        // §0.2.8 Parity fix: after the hetero loop, N swaps have occurred.
+        // One more swap restores pong_ptr to the last-written buffer.
+        // BCE-20260713-ACTIVATION-SWAP-PARITY: restored (210b0d6e removed it).
+        if let Some((ping, pong)) = activation_swap_vregs {
+            prog.emit(VmInstr::ActivationSwap { ptr_a: ping, ptr_b: pong });
+        }
         state.abi.weight_ptr = original_weight_vreg;
         state.abi.layer_loop_counter = None;
         state.in_layer_loop = false;
@@ -936,6 +969,15 @@ fn handle_standard_layer_loop(
             }
         }
         prog.emit(VmInstr::LoopEnd);
+        // §0.2.8 Parity fix: after the layer loop, N swaps have occurred.
+        // The last iteration wrote to pong, then swapped — so pong_ptr now
+        // points to the WRONG buffer (the one NOT written by the last layer).
+        // One more swap restores pong_ptr to the last-written buffer, ensuring
+        // post-loop ops (MeanPool, final_norm) read from the correct data.
+        // BCE-20260713-ACTIVATION-SWAP-PARITY: restored (210b0d6e removed it).
+        if let Some((ping, pong)) = locals.activation_swap_vregs {
+            prog.emit(VmInstr::ActivationSwap { ptr_a: ping, ptr_b: pong });
+        }
         // After the layer loop, reload weight base from ABI args.
         // original_weight_vreg's spill slot may have been overwritten by the
         // register allocator during the multi-iteration layer loop. Reloading
