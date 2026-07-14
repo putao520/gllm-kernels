@@ -942,6 +942,53 @@ mod tests {
         assert_eq!(v1.0, 1, "second vreg must be id 1");
     }
 
+    /// emit_bitset_membership emits GprLoadImm + GprBinOp(BitTest) computing
+    /// `is_member = (bitset >> layer_idx) & 1`. Verifies the bitset membership
+    /// primitive reused by LayerInGroup / LayerNotInGroup guards.
+    #[test]
+    fn test_emit_bitset_membership_emits_loadimm_and_bittest() {
+        use crate::compiler::codegen::vm::instr::{VmInstr, GprOp, GprOperand};
+        let mut prog = VmProgram::new();
+        let layer_idx = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+        // bitset 0b0101 = layers {0, 2} belong to this group
+        let bitset = 0b0101u64;
+        let is_member = emit_bitset_membership(&mut prog, bitset, layer_idx);
+
+        // Expect: DeclareVReg(layer_idx), DeclareVReg(bitset_reg), GprLoadImm,
+        //         DeclareVReg(is_member), GprBinOp(BitTest)
+        let loadimm = prog.instrs.iter().find(|i| matches!(i, VmInstr::GprLoadImm { value, .. } if *value == bitset as usize));
+        assert!(loadimm.is_some(), "must emit GprLoadImm with the bitset constant");
+        let bittest = prog.instrs.iter().find_map(|i| match i {
+            VmInstr::GprBinOp { dst, a, b: GprOperand::VReg(b_vreg), op: GprOp::BitTest } => {
+                Some((*dst, *a, *b_vreg))
+            }
+            _ => None,
+        });
+        let (dst, a, b) = bittest.expect("must emit GprBinOp(BitTest)");
+        assert_eq!(dst, is_member, "BitTest dst must be the returned is_member vreg");
+        // b operand must be the layer_idx vreg (the shift amount)
+        assert_eq!(b, layer_idx, "BitTest b operand must be layer_idx");
+        // a must be the bitset_reg (a GPR holding the bitset constant)
+        let _ = a; // a is the freshly-allocated bitset_reg; just confirm it's a valid distinct vreg
+        assert_ne!(a, layer_idx, "bitset_reg must be distinct from layer_idx");
+        assert_ne!(a, is_member, "bitset_reg must be distinct from is_member");
+    }
+
+    /// LayerCondition::LayerInGroup / LayerNotInGroup variants carry a bitset
+    /// and are distinct from LayerIdxLt / LayerIdxGe.
+    #[test]
+    fn test_layer_condition_in_group_variants() {
+        use crate::compiler::graph::LayerCondition;
+        let g = LayerCondition::LayerInGroup(0b1010);
+        let ng = LayerCondition::LayerNotInGroup(0b1010);
+        assert_ne!(g, LayerCondition::Always);
+        assert_ne!(g, LayerCondition::LayerIdxLt(4));
+        assert_ne!(ng, g);
+        // Copy semantics (the enum is #[derive(Copy)])
+        let g2 = g;
+        assert_eq!(g, g2);
+    }
+
     /// graph_dtype: compute precision is always F32 regardless of storage dtype mix.
     /// BCE-20260630-DT2 (B1): graph_dtype 返回计算精度 F32，不取首个 tensor 的存储 dtype。
     /// 混合存储（BF16 + F32）下计算仍统一 F32，存储精度由各 OpImpl weight_dtype 独立传播。
