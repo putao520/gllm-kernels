@@ -104,6 +104,21 @@ pub enum LayerCondition {
     LayerIdxLt(usize),
     /// Execute only when `layer_idx >= threshold` (consumer layers).
     LayerIdxGe(usize),
+    /// Execute only when `layer_idx` is a member of the bitset
+    /// (mixed-quant irregular interleaving: Q5_K_M has 14 Q6K + 14 Q5K layers
+    /// interleaved non-contiguously in attn_v/ffn_down). The bitset is
+    /// data-driven — filled by build_graph from `weight_quant_types`, bit i
+    /// set iff layer i belongs to this op's dtype group.
+    ///
+    /// Constitutional: the guard selects a pre-baked template segment by
+    /// `layer_idx` (control flow), NOT a runtime dtype match (data→logic,
+    /// forbidden by ARCH-JIT-DATA-YIELDS rule 4). Analogous to Gemma-4
+    /// `SharedKvRef` `GprCondAction` (production-proven control-flow dispatch
+    /// on a layer index).
+    LayerInGroup(u64),
+    /// Execute only when `layer_idx` is NOT a member of the bitset
+    /// (complement of `LayerInGroup`).
+    LayerNotInGroup(u64),
 }
 
 // ── Compiler operation (graph node) ────────────────────────────────

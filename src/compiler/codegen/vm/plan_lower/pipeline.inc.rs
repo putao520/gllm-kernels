@@ -998,6 +998,34 @@ fn handle_standard_layer_loop(
     Ok(())
 }
 
+/// Emit a bitset membership test: returns a VReg holding
+/// `is_member = (bitset >> layer_idx) & 1` (1 iff `layer_idx` is in `bitset`).
+///
+/// Used by `LayerCondition::LayerInGroup` / `LayerNotInGroup` guards for
+/// mixed-quant irregular interleaving (Q5_K_M: 14 Q6K + 14 Q5K layers).
+/// Reuses the production-proven `GprBinOp(BitTest)` primitive (`dst = (a >> b) & 1`),
+/// which lowers to x86 `shr` + `and` / AArch64 `lsr` + `and` — no new VmInstr needed.
+///
+/// Emitted instructions:
+///   GprLoadImm(bitset_reg, bitset)
+///   GprBinOp(is_member, bitset_reg, layer_idx, BitTest)  // (bitset >> layer_idx) & 1
+fn emit_bitset_membership(
+    prog: &mut VmProgram,
+    bitset: u64,
+    layer_idx: VRegId,
+) -> VRegId {
+    let bitset_reg = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::GprLoadImm { dst: bitset_reg, value: bitset as usize });
+    let is_member = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::GprBinOp {
+        dst: is_member,
+        a: bitset_reg,
+        b: GprOperand::VReg(layer_idx),
+        op: GprOp::BitTest,
+    });
+    is_member
+}
+
 /// 处理 group 的 guard (mixed / standard) + tensor materialize + emit_fusion_group_by_mode。
 #[allow(clippy::too_many_arguments)]
 fn emit_group_guard_and_body(
@@ -1062,6 +1090,18 @@ fn emit_group_guard_and_body(
                         }
                         LayerCondition::LayerIdxGe(t) => {
                             GprCondition::CmpLtU(counter, t as u64)
+                        }
+                        LayerCondition::LayerInGroup(bitset) => {
+                            // skip when layer_idx NOT in bitset → is_member == 0.
+                            // GprOp::BitTest computes dst = (a >> b) & 1, so
+                            // is_member = (bitset >> layer_idx) & 1.
+                            let is_member = emit_bitset_membership(prog, bitset, counter);
+                            GprCondition::CmpEq(is_member, 0)
+                        }
+                        LayerCondition::LayerNotInGroup(bitset) => {
+                            // skip when layer_idx IS in bitset → is_member != 0.
+                            let is_member = emit_bitset_membership(prog, bitset, counter);
+                            GprCondition::IsNonNull(is_member)
                         }
                         LayerCondition::Always => unreachable!(),
                     };
@@ -1129,6 +1169,16 @@ fn emit_group_guard_and_body(
                     LayerCondition::LayerIdxGe(t) => {
                         // Guard = "consumer executes" → skip when donor (idx < t)
                         GprCondition::CmpLtU(counter, t as u64)
+                    }
+                    LayerCondition::LayerInGroup(bitset) => {
+                        // skip when layer_idx NOT in bitset → is_member == 0
+                        let is_member = emit_bitset_membership(prog, bitset, counter);
+                        GprCondition::CmpEq(is_member, 0)
+                    }
+                    LayerCondition::LayerNotInGroup(bitset) => {
+                        // skip when layer_idx IS in bitset → is_member != 0
+                        let is_member = emit_bitset_membership(prog, bitset, counter);
+                        GprCondition::IsNonNull(is_member)
                     }
                     LayerCondition::Always => unreachable!(),
                 };

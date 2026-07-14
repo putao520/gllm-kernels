@@ -608,6 +608,8 @@ fn guard_label(guard: &crate::compiler::graph::LayerCondition) -> Option<String>
         LayerCondition::Always => None,
         LayerCondition::LayerIdxLt(threshold) => Some(format!("layer_idx<{}", threshold)),
         LayerCondition::LayerIdxGe(threshold) => Some(format!("layer_idx>={}", threshold)),
+        LayerCondition::LayerInGroup(bitset) => Some(format!("layer_in_group=0x{:016x}", bitset)),
+        LayerCondition::LayerNotInGroup(bitset) => Some(format!("layer_not_in_group=0x{:016x}", bitset)),
     }
 }
 
