@@ -185,6 +185,11 @@ pub fn analyze_lifetimes(
             alias_outputs.insert(out_tid);
         }
     }
+    if let Some(cfg) = &graph.mixed_quant_layer_loop_config {
+        if let Some((_, out_tid)) = cfg.activation_alias {
+            alias_outputs.insert(out_tid);
+        }
+    }
     // Generic output-alias detection: any op whose output_aliases_input() returns
     // Some(n) means output[0] shares the same physical slot as input[n]. No separate
     // scratchpad allocation needed — the output reuses the input's slot via
@@ -215,6 +220,11 @@ pub fn analyze_lifetimes(
     if let Some(cfg) = &graph.hetero_layer_loop_config {
         if let Some(&(in_tid, _)) = cfg.activation_aliases.first() {
             activation_input = Some(in_tid);
+        }
+    }
+    if let Some(cfg) = &graph.mixed_quant_layer_loop_config {
+        if let Some((in_tid, _)) = cfg.activation_alias {
+            activation_input = resolve_alias_to_physical(in_tid, &alias_outputs, graph);
         }
     }
 

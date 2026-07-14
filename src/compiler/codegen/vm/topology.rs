@@ -247,10 +247,13 @@ impl GraphTopologyAnalysis {
             }
         });
 
-        // 层循环拓扑属性
-        let layer_num_layers = graph.layer_loop_config.as_ref().map(|cfg| cfg.num_layers);
+        // 层循环拓扑属性 (standard / hetero / mixed-quant 三路径统一推导)
+        let layer_num_layers = graph.layer_loop_config.as_ref().map(|cfg| cfg.num_layers)
+            .or_else(|| graph.mixed_quant_layer_loop_config.as_ref().map(|cfg| cfg.num_layers));
         let layer_activation_alias = graph.layer_loop_config.as_ref()
-            .and_then(|cfg| cfg.activation_alias);
+            .and_then(|cfg| cfg.activation_alias)
+            .or_else(|| graph.mixed_quant_layer_loop_config.as_ref()
+                .and_then(|cfg| cfg.activation_alias));
 
         Self {
             loop_topology,

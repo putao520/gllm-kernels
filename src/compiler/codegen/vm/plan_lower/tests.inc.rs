@@ -1002,6 +1002,106 @@ mod tests {
         assert_eq!(dtype, QuantPrecision::F32, "graph_dtype must return compute precision F32 regardless of storage mix");
     }
 
+    /// handle_mixed_quant_layer_loop emits LoopBegin(step_bytes=0) + LoadLayerWeightOffset.
+    ///
+    /// Mixed-quant graph (2 groups, 4 layers) with layer.* ops + LayerLoopBegin/End
+    /// markers. lower_fusion_plan must route through handle_mixed_quant_layer_loop
+    /// (not standard), emitting a single LoopBegin with step_bytes=0 (non-linear
+    /// weight offset, no stride) and a LoadLayerWeightOffset table lookup.
+    #[test]
+    fn handle_mixed_quant_layer_loop_emits_load_layer_weight_offset() {
+        use crate::compiler::codegen::vm::instr::{GprOperand, GprOp};
+        use crate::compiler::graph::{MixedQuantGroup, MixedQuantLayerLoopConfig};
+        use crate::compiler::buffer_alloc::{analyze_lifetimes, allocate_buffers_aligned};
+        use crate::compiler::codegen::vm::isa_profile::IsaProfile;
+        use crate::compiler::codegen::vm::isa_hook;
+
+        let mut g = CompilerGraph::new();
+        let inp = g.add_tensor_concrete("input", &[4, 4], DType::F32);
+        let w0 = g.add_tensor_concrete("w0", &[4, 4], DType::F32);
+        let mid = g.add_tensor_concrete("mid", &[4, 4], DType::F32);
+        let w1 = g.add_tensor_concrete("w1", &[4, 4], DType::F32);
+        let out = g.add_tensor_concrete("output", &[4, 4], DType::F32);
+        g.inputs = vec![inp, w0, w1];
+        g.outputs = vec![out];
+        let op0 = g.add_op(
+            Op::Gemm(GemmSpec { m: SymDim::Concrete(4), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
+            vec![inp, w0], vec![mid], "layer.q_proj",
+        );
+        let op1 = g.add_op(
+            Op::Gemm(GemmSpec { m: SymDim::Concrete(4), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
+            vec![mid, w1], vec![out], "layer.down_proj",
+        );
+        g.mixed_quant_layer_loop_config = Some(MixedQuantLayerLoopConfig {
+            num_layers: 4,
+            num_groups: 2,
+            layer_blob_base_offset: 0,
+            groups: vec![
+                MixedQuantGroup {
+                    prefix: "layer_q6k_g0.".to_string(), weight_stride: 128,
+                    layer_indices: vec![0, 1], layer_bitset: 0b0011, weight_input_indices: vec![1],
+                },
+                MixedQuantGroup {
+                    prefix: "layer_q5k_g1.".to_string(), weight_stride: 112,
+                    layer_indices: vec![2, 3], layer_bitset: 0b1100, weight_input_indices: vec![2],
+                },
+            ],
+            offset_table: vec![0, 128, 240, 352],
+            group_of: vec![0, 0, 1, 1],
+            activation_alias: Some((inp, out)),
+        });
+
+        // Build fusion plan with LayerLoopBegin/End markers (mirrors assign_mixed_quant_markers).
+        let mut op_to_group = HashMap::new();
+        op_to_group.insert(op0, 0);
+        op_to_group.insert(op1, 1);
+        let plan = FusionPlan {
+            groups: vec![
+                FusionGroup {
+                    id: 0, anchor: op0, epilogue: vec![], mode: FusionMode::Standalone,
+                    ops: vec![op0], multi_output: MultiOutputConfig::single(),
+                    dominant_dtype: None, marker: GroupMarker::LayerLoopBegin { num_iterations: 4 },
+                    is_layer_group: true, hetero_layer_type: None,
+                },
+                FusionGroup {
+                    id: 1, anchor: op1, epilogue: vec![], mode: FusionMode::Standalone,
+                    ops: vec![op1], multi_output: MultiOutputConfig::single(),
+                    dominant_dtype: None, marker: GroupMarker::LayerLoopEnd,
+                    is_layer_group: true, hetero_layer_type: None,
+                },
+            ],
+            op_to_group,
+        };
+
+        let lifetimes = analyze_lifetimes(&g, &plan, None, None);
+        let alloc = allocate_buffers_aligned(&lifetimes, 64, None, None, &g, None);
+        let profile = IsaProfile::from_device_profile(&DeviceProfile::detect());
+        let hook = isa_hook::select_hook(&profile);
+        let registry = ScalarOpRegistry::with_defaults();
+
+        let prog = lower_fusion_plan(&plan, &g, &alloc, Some(&registry), &profile, Some(hook.as_ref()))
+            .expect("mixed-quant plan must lower");
+
+        // Assert: exactly one LoopBegin with step_bytes=0 (non-linear weight offset).
+        let loop_begin_zero_step = prog.instrs.iter().any(|i| matches!(
+            i, VmInstr::LoopBegin { step_bytes: 0, .. }
+        ));
+        assert!(loop_begin_zero_step, "mixed-quant must emit LoopBegin with step_bytes=0 (non-linear offset_table), got instrs: {:?}",
+                prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).collect::<Vec<_>>());
+
+        // Assert: LoadLayerWeightOffset emitted (offset_table runtime lookup).
+        let has_load_offset = prog.instrs.iter().any(|i| matches!(i, VmInstr::LoadLayerWeightOffset { .. }));
+        assert!(has_load_offset, "mixed-quant must emit LoadLayerWeightOffset for offset_table lookup");
+
+        // Assert: LoadLayerWeightOffset's offset_table matches config.
+        if let Some(VmInstr::LoadLayerWeightOffset { offset_table, .. }) = prog.instrs.iter()
+            .find(|i| matches!(i, VmInstr::LoadLayerWeightOffset { .. }))
+        {
+            assert_eq!(offset_table, &vec![0usize, 128, 240, 352],
+                       "offset_table must match config (file-layer-order running sum)");
+        }
+    }
+
     /// lower_fusion_plan with IsaProfile::cuda(80) must produce a VmProgram
     /// that passes provenance and structure validation.
     #[test]

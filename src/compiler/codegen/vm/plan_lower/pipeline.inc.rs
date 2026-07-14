@@ -257,6 +257,7 @@ pub(super) fn emit_fusion_groups(
     let _dwc_req = fctx.ctx.dwc_req;
     let layer_loop_cfg = fctx.graph.layer_loop_config.as_ref();
     let hetero_loop_cfg = fctx.graph.hetero_layer_loop_config.as_ref();
+    let mixed_quant_loop_cfg = fctx.graph.mixed_quant_layer_loop_config.as_ref();
 
     // ── 异构模型预编译: 并行编译 4 种层类型模板 ──
     if hetero_loop_cfg.is_some() {
@@ -290,7 +291,7 @@ pub(super) fn emit_fusion_groups(
     // buffer_alloc 在 scratch 中分配了 ping (offset 0) 和 pong (offset ping_size) 两个 slot。
     // ping_ptr = scratch_base + 0, pong_ptr = scratch_base + ping_size。
     // 每层迭代末尾 ActivationSwap 交换 ptr 值，下一层的 input/output 自动切换。
-    let activation_swap_vregs: Option<(VRegId, VRegId)> = if layer_loop_cfg.is_some() || hetero_loop_cfg.is_some() {
+    let activation_swap_vregs: Option<(VRegId, VRegId)> = if layer_loop_cfg.is_some() || hetero_loop_cfg.is_some() || mixed_quant_loop_cfg.is_some() {
         // 从 alloc 中查找 ping/pong sentinel slot 的 offset
         let ping_offset = fctx.alloc.slots.iter()
             .find(|s| s.tensor_id.0 == 0xFFFF_FF00)
@@ -569,9 +570,11 @@ fn emit_one_fusion_group(
         return Ok(());
     }
 
-    // ── Heterogeneous or standard layer loop handling ──
+    // ── Heterogeneous / mixed-quant / standard layer loop handling ──
     if fctx.graph.hetero_layer_loop_config.is_some() {
         handle_hetero_layer_loop(fctx, prog, state, group, locals)?;
+    } else if fctx.graph.mixed_quant_layer_loop_config.is_some() {
+        handle_mixed_quant_layer_loop(fctx, prog, state, group, locals)?;
     } else {
         handle_standard_layer_loop(fctx, prog, state, group, locals)?;
     }
@@ -994,6 +997,141 @@ fn handle_standard_layer_loop(
         state.abi.weight_ptr = Some(fresh_weight_base);
         state.abi.layer_loop_counter = None;
         state.in_layer_loop = false;
+    }
+    Ok(())
+}
+
+/// 处理 mixed-quant (per-layer varying quant dtype) 层循环 (task #6 方案 B)。
+///
+/// Mixed-quant 模型 (Q5_K_M: 14 Q6K + 14 Q5K 层在 attn_v/ffn_down 不规则交错)
+/// 按文件层序单循环迭代, 但每层 weight dtype 不同 → offset_table 非线性
+/// (文件层序 running sum, 非组聚集)。
+///
+/// JIT 结构 (单层 LoopBegin, step=0, 非双层非逐层展开):
+///   LoopBegin(counter=layer_idx, bound=num_layers, step_bytes=0)
+///     fresh_weight = reload from ABI weights slot (防 regalloc 覆盖)
+///     offset = LoadLayerWeightOffset(offset_table, layer_idx)  // 查表
+///     weight_ptr = fresh_weight + offset
+///     // per-group 模板分化 (v_proj/down_proj per-dtype + LayerInGroup guard)
+///     // 由 emit_group_guard_and_body 走 LayerInGroup guard 路径处理
+///     ActivationSwap
+///   LoopEnd
+///   + parity-fix ActivationSwap (恢复 pong_ptr 到最后写入 buffer)
+///   + reload weight_ptr from ABI (global ops 用绝对偏移)
+///
+/// 合宪性 (ARCH-JIT-DATA-YIELDS 铁律4): offset_table 是层序控制流数据
+/// (layer_idx → byte offset), 非权重 dtype 数据。LoadLayerWeightOffset 按
+/// layer_idx 选 pre-bake 偏移是控制流, 非运行时 dtype match。
+fn handle_mixed_quant_layer_loop(
+    fctx: &FusionEmitCtx,
+    prog: &mut VmProgram,
+    state: &mut EmitState,
+    group: &crate::compiler::fusion::FusionGroup,
+    locals: &LoopLocals,
+) -> Result<(), CompilerError> {
+    let mcfg = match fctx.graph.mixed_quant_layer_loop_config.as_ref() {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+    let topology = fctx.topology;
+    let ctx = fctx.ctx;
+    let width = ctx.session.width;
+    let activation_swap_vregs = locals.activation_swap_vregs;
+    let original_weight_vreg = fctx.original_weight_vreg;
+
+    // ── Layer loop entry: emit LoopBegin (step=0) + LoadLayerWeightOffset ──
+    if group.is_layer_group && !state.in_layer_loop {
+        let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+        let byte_offset = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+        // SPEC/39: num_layers 从 topology 推导, 替代 cfg.num_layers 读取
+        let topology_num_layers = topology.layer_num_layers.unwrap_or(mcfg.num_layers);
+        let layer_bound = if let Ok(n) = std::env::var("GLLM_DEBUG_LAYERS") {
+            if let Ok(count) = n.parse::<usize>() {
+                BoundExpr::Const(count)
+            } else {
+                BoundExpr::Const(topology_num_layers)
+            }
+        } else if std::env::var("GLLM_SINGLE_LAYER").is_ok() {
+            BoundExpr::Const(1)
+        } else {
+            BoundExpr::Const(topology_num_layers)
+        };
+
+        // step_bytes=0: no linear weight stride (per-layer dtype varies → non-linear).
+        // weight offset is computed via LoadLayerWeightOffset(offset_table, layer_idx).
+        prog.emit(VmInstr::LoopBegin {
+            counter, byte_offset,
+            bound: layer_bound,
+            step_bytes: 0,
+        });
+
+        // Reload weight_ptr from ABI stack slot on every iteration (regalloc safety,
+        // mirrors standard path line 908-912).
+        let fresh_weight = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadPtr {
+            dst: fresh_weight,
+            src: ctx.session.sym_map.resolve("weights").cloned().expect("ABI: weights"),
+        });
+
+        // LoadLayerWeightOffset: offset = offset_table[layer_idx] (runtime table lookup).
+        let layer_offset = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadLayerWeightOffset {
+            dst: layer_offset,
+            offset_table: mcfg.offset_table.clone(),
+            layer_idx_reg: counter,
+        });
+
+        // weight_ptr = fresh_weight + layer_offset
+        // (layer_blob_base_offset is already baked into offset_table entries by build_graph)
+        let layer_weight_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::GprBinOp {
+            dst: layer_weight_base, a: fresh_weight,
+            b: GprOperand::VReg(layer_offset), op: GprOp::Add,
+        });
+        state.abi.weight_ptr = Some(layer_weight_base);
+        state.abi.layer_loop_counter = Some(counter);
+        state.in_layer_loop = true;
+    }
+
+    // ── Layer loop exit: emit ActivationSwap + LoopEnd + reload weight base ──
+    if !group.is_layer_group && state.in_layer_loop {
+        // §diagnostic-layer-capture: counter-scaled side-channel copy BEFORE swap.
+        #[cfg(feature = "diagnostic-layer-capture")]
+        {
+            if let Some(ref cap) = locals.layer_capture {
+                if let Some(counter) = state.abi.layer_loop_counter {
+                    if let Some((_, pong)) = activation_swap_vregs {
+                        let _ = super::structural_builder::StructuralOpBuilder::emit_layer_capture_copy(
+                            prog, pong, cap.capture_base, counter,
+                            cap.per_layer_stride, cap.hidden_dim, width, ctx.accum_dtype,
+                        );
+                    }
+                }
+            }
+        }
+        // ActivationSwap: each iteration swaps ping-pong buffer pointers.
+        if let Some((ping, pong)) = activation_swap_vregs {
+            prog.emit(VmInstr::ActivationSwap { ptr_a: ping, ptr_b: pong });
+        }
+        prog.emit(VmInstr::LoopEnd);
+        // §0.2.8 Parity fix: N swaps occurred; one more restores pong_ptr to the
+        // last-written buffer (BCE-20260713-ACTIVATION-SWAP-PARITY, same as standard path).
+        if let Some((ping, pong)) = activation_swap_vregs {
+            prog.emit(VmInstr::ActivationSwap { ptr_a: ping, ptr_b: pong });
+        }
+        // After the loop, reload weight base from ABI (global ops use absolute offsets).
+        let fresh_weight_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadPtr {
+            dst: fresh_weight_base,
+            src: ctx.session.sym_map.resolve("weights").cloned().expect("ABI: weights"),
+        });
+        state.abi.weight_ptr = Some(fresh_weight_base);
+        state.abi.layer_loop_counter = None;
+        state.in_layer_loop = false;
+        // Restore the original weight vreg for post-loop global ops (mirrors hetero path).
+        if let Some(orig) = original_weight_vreg {
+            state.abi.weight_ptr = Some(orig);
+        }
     }
     Ok(())
 }
