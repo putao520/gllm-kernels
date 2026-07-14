@@ -684,8 +684,9 @@ fn validate_fusion_group_dtype(
 fn assign_group_markers(groups: &mut [FusionGroup], graph: &CompilerGraph) {
     let has_layer_loop = graph.layer_loop_config.is_some();
     let has_hetero_loop = graph.hetero_layer_loop_config.is_some();
+    let has_mixed_quant_loop = graph.mixed_quant_layer_loop_config.is_some();
 
-    if !has_layer_loop && !has_hetero_loop {
+    if !has_layer_loop && !has_hetero_loop && !has_mixed_quant_loop {
         return;
     }
 
@@ -704,8 +705,73 @@ fn assign_group_markers(groups: &mut [FusionGroup], graph: &CompilerGraph) {
 
     if has_hetero_loop {
         assign_hetero_markers(groups, &signatures, graph);
+    } else if has_mixed_quant_loop {
+        assign_mixed_quant_markers(groups, &signatures, graph);
     } else {
         assign_homogeneous_markers(groups, &signatures, graph);
+    }
+}
+
+/// Detect mixed-quant layer groups (task #6).
+///
+/// Mixed-quant models (e.g. Q5_K_M: 14 Q6K + 14 Q5K layers interleaved non-
+/// contiguously) have a single layer template repeated N times in file layer
+/// order, but per-layer weight dtype varies. build_graph (#4) emits a single
+/// `layer.`-prefixed template; per-group template differentiation (v_proj/
+/// down_proj per-dtype + LayerInGroup guard) happens in the lowering phase
+/// (handle_mixed_quant_layer_loop).
+///
+/// Marker assignment mirrors the homogeneous path: mark all consecutive groups
+/// whose anchor op label starts with "layer." as layer groups, set
+/// LayerLoopBegin { num_iterations = num_layers } on the first and LayerLoopEnd
+/// on the last. The handler (pipeline.inc.rs) reads mixed_quant_layer_loop_config
+/// for offset_table + group dispatch.
+fn assign_mixed_quant_markers(
+    groups: &mut [FusionGroup],
+    _signatures: &[Vec<std::mem::Discriminant<Op>>],
+    graph: &CompilerGraph,
+) {
+    let num_iterations = graph.mixed_quant_layer_loop_config.as_ref()
+        .map(|cfg| cfg.num_layers)
+        .unwrap_or(0);
+
+    if num_iterations == 0 || groups.is_empty() {
+        return;
+    }
+
+    // Fallback (same as homogeneous): mark all consecutive groups whose anchor
+    // op label starts with "layer." as layer groups. Per-group template
+    // differentiation is deferred to the lowering phase.
+    let mut layer_group_indices = Vec::new();
+    let mut in_layer_run = false;
+    for (i, group) in groups.iter().enumerate() {
+        let anchor_label = graph.op(group.ops[0])
+            .map(|op| op.label.as_str())
+            .unwrap_or("");
+        if anchor_label.starts_with("layer.") {
+            layer_group_indices.push(i);
+            in_layer_run = true;
+        } else if in_layer_run {
+            break;
+        }
+    }
+
+    if layer_group_indices.is_empty() {
+        return;
+    }
+
+    // Mark all layer groups
+    for &idx in &layer_group_indices {
+        groups[idx].is_layer_group = true;
+    }
+
+    if let Some(&first) = layer_group_indices.first() {
+        groups[first].marker = GroupMarker::LayerLoopBegin { num_iterations };
+    }
+    if layer_group_indices.len() > 1 {
+        if let Some(&last) = layer_group_indices.last() {
+            groups[last].marker = GroupMarker::LayerLoopEnd;
+        }
     }
 }
 
@@ -3301,5 +3367,84 @@ mod tests {
 
         // All ops are covered
         assert_eq!(fusion_plan.op_to_group.len(), 5);
+    }
+
+    // ── Test: assign_group_markers handles mixed_quant_layer_loop_config ──
+
+    #[test]
+    fn assign_group_markers_mixed_quant_sets_layer_loop_markers() {
+        // Arrange: graph with mixed_quant_layer_loop_config (2 groups, 4 layers)
+        // and two layer.* ops (single template, per-group diff deferred to lowering).
+        use crate::compiler::graph::{MixedQuantGroup, MixedQuantLayerLoopConfig};
+        use crate::types::DType;
+
+        let mut g = CompilerGraph::new();
+        let inp = g.add_tensor_concrete("input", &[4], DType::F32);
+        let w0 = g.add_tensor_concrete("w0", &[4, 4], DType::F32);
+        let mid = g.add_tensor_concrete("mid", &[4], DType::F32);
+        let w1 = g.add_tensor_concrete("w1", &[4, 4], DType::F32);
+        let out = g.add_tensor_concrete("output", &[4], DType::F32);
+        g.inputs = vec![inp, w0, w1];
+        g.outputs = vec![out];
+        let op0 = g.add_op(
+            Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
+            vec![inp, w0], vec![mid], "layer.q_proj",
+        );
+        let op1 = g.add_op(
+            Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
+            vec![mid, w1], vec![out], "layer.down_proj",
+        );
+        g.mixed_quant_layer_loop_config = Some(MixedQuantLayerLoopConfig {
+            num_layers: 4,
+            num_groups: 2,
+            layer_blob_base_offset: 0,
+            groups: vec![
+                MixedQuantGroup {
+                    prefix: "layer_q6k_g0.".to_string(),
+                    weight_stride: 200,
+                    layer_indices: vec![0, 1],
+                    layer_bitset: 0b0011,
+                    weight_input_indices: vec![1],
+                },
+                MixedQuantGroup {
+                    prefix: "layer_q5k_g1.".to_string(),
+                    weight_stride: 180,
+                    layer_indices: vec![2, 3],
+                    layer_bitset: 0b1100,
+                    weight_input_indices: vec![2],
+                },
+            ],
+            offset_table: vec![0, 200, 380, 580],
+            group_of: vec![0, 0, 1, 1],
+            activation_alias: None,
+        });
+
+        let mut groups = vec![
+            FusionGroup {
+                id: 0, anchor: op0, epilogue: vec![], mode: FusionMode::Standalone,
+                ops: vec![op0], multi_output: MultiOutputConfig::single(),
+                dominant_dtype: None, marker: GroupMarker::None,
+                is_layer_group: false, hetero_layer_type: None,
+            },
+            FusionGroup {
+                id: 1, anchor: op1, epilogue: vec![], mode: FusionMode::Standalone,
+                ops: vec![op1], multi_output: MultiOutputConfig::single(),
+                dominant_dtype: None, marker: GroupMarker::None,
+                is_layer_group: false, hetero_layer_type: None,
+            },
+        ];
+
+        // Act
+        assign_group_markers(&mut groups, &g);
+
+        // Assert: both layer.* groups marked is_layer_group
+        assert!(groups[0].is_layer_group, "group 0 (layer.q_proj) must be layer group");
+        assert!(groups[1].is_layer_group, "group 1 (layer.down_proj) must be layer group");
+        // First group gets LayerLoopBegin { num_iterations = 4 }
+        assert!(matches!(groups[0].marker, GroupMarker::LayerLoopBegin { num_iterations: 4 }),
+                "first layer group must be LayerLoopBegin{{4}}, got {:?}", groups[0].marker);
+        // Last group gets LayerLoopEnd
+        assert!(matches!(groups[1].marker, GroupMarker::LayerLoopEnd),
+                "last layer group must be LayerLoopEnd, got {:?}", groups[1].marker);
     }
 }
