@@ -371,4 +371,55 @@ mod tests {
         assert_ne!(sources[0], sources[1]);
     }
 
+    #[test]
+    fn mixed_quant_layer_loop_config_defaults_none() {
+        // New graph must default the mixed-quant layer loop config to None
+        // (uniform-quant models use the standard LayerLoopConfig path).
+        let g = CompilerGraph::new();
+        assert!(g.mixed_quant_layer_loop_config.is_none());
+    }
+
+    #[test]
+    fn mixed_quant_layer_loop_config_roundtrip() {
+        // A MixedQuantLayerLoopConfig with two groups (Q6K + Q5K, mirroring Q5_K_M)
+        // round-trips through the graph field and preserves per-layer offset table
+        // and group dispatch lookup.
+        use crate::compiler::graph::{MixedQuantGroup, MixedQuantLayerLoopConfig};
+        let cfg = MixedQuantLayerLoopConfig {
+            num_layers: 4,
+            num_groups: 2,
+            layer_blob_base_offset: 1024,
+            groups: vec![
+                MixedQuantGroup {
+                    prefix: "layer_q6k.".to_string(),
+                    weight_stride: 200,
+                    layer_indices: vec![0, 1],
+                    layer_bitset: 0b0011,
+                    weight_input_indices: vec![1],
+                },
+                MixedQuantGroup {
+                    prefix: "layer_q5k.".to_string(),
+                    weight_stride: 180,
+                    layer_indices: vec![2, 3],
+                    layer_bitset: 0b1100,
+                    weight_input_indices: vec![2],
+                },
+            ],
+            offset_table: vec![1024, 1224, 1024, 1204],
+            group_of: vec![0, 0, 1, 1],
+            activation_alias: None,
+        };
+        let mut g = CompilerGraph::new();
+        g.mixed_quant_layer_loop_config = Some(cfg.clone());
+        let stored = g.mixed_quant_layer_loop_config.as_ref().unwrap();
+        assert_eq!(stored.num_layers, 4);
+        assert_eq!(stored.num_groups, 2);
+        assert_eq!(stored.groups.len(), 2);
+        assert_eq!(stored.groups[0].prefix, "layer_q6k.");
+        assert_eq!(stored.groups[1].prefix, "layer_q5k.");
+        assert_eq!(stored.offset_table, vec![1024, 1224, 1024, 1204]);
+        assert_eq!(stored.group_of, vec![0, 0, 1, 1]);
+        assert!(stored.activation_alias.is_none());
+    }
+
 }

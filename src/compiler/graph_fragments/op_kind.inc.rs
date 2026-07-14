@@ -226,6 +226,14 @@ pub struct CompilerGraph {
     /// Heterogeneous layer loop config for models with alternating layer types
     /// (e.g., Gemma-4 E2B). When present, takes precedence over layer_loop_config.
     pub hetero_layer_loop_config: Option<HeteroLayerLoopConfig>,
+    /// Mixed-quantization layer loop config (per-layer varying quant dtype).
+    /// `Some` when layers have non-uniform per-layer quant dtype (K-Quant _M
+    /// variants such as Q5_K_M: 14 Q6K + 14 Q5K layers interleaved in attn_v/
+    /// ffn_down). `None` for uniform-quant models (standard `LayerLoopConfig`
+    /// is used). When `Some`, the compiler emits a single layer loop with a
+    /// compile-time offset table + IndirectJump dispatch to per-dtype templates
+    /// (control-flow selection, not runtime dtype match — constitutional).
+    pub mixed_quant_layer_loop_config: Option<MixedQuantLayerLoopConfig>,
     /// SPEC/39 NOTE: 编译器不再读取此字段。embedding_scale 已迁移到 OpKind::Gather::scale
     /// 和 OpKind::QuantGather::scale（per-op 拓扑驱动）。此字段仅保留供 gllm 侧
     /// build_graph 构建 OpKind 时读取，编译器路径不使用。

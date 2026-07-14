@@ -9,6 +9,7 @@ impl CompilerGraph {
             telemetry: EpilogueTelemetryConfig::default(),
             layer_loop_config: None,
             hetero_layer_loop_config: None,
+            mixed_quant_layer_loop_config: None,
             embedding_scale: None,
             custom_weight_layout: None,
             quant_weight_bytes: HashMap::new(),

@@ -252,6 +252,71 @@ pub struct HeteroLayerLoopConfig {
     pub activation_aliases: Vec<(TensorId, TensorId)>,
 }
 
+/// Mixed-quantization per-group template config (one entry per dtype group).
+///
+/// A "group" is the set of layers sharing the same per-layer weight quant dtype.
+/// For Q5_K_M: group 0 = Q6K layers {0,1,2,5,8,...}, group 1 = Q5K layers
+/// {3,4,6,7,...}. All layers within a group share an identical JIT template
+/// (v_proj/down baked as that group's QuantDecode), so the intra-group weight
+/// stride is uniform.
+#[derive(Debug, Clone)]
+pub struct MixedQuantGroup {
+    /// Template prefix for this group (e.g. "layer_q6k.", "layer_q5k.").
+    pub prefix: String,
+    /// Byte stride between consecutive layers WITHIN this group (all layers in a
+    /// group share the same quant dtype, so stride is uniform within group).
+    pub weight_stride: usize,
+    /// Layer indices belonging to this group (non-contiguous, e.g. [0,1,2,5,8...]).
+    pub layer_indices: Vec<usize>,
+    /// Bitset: bit i set iff layer i belongs to this group (for LayerInGroup guard).
+    pub layer_bitset: u64,
+    /// Indices into graph.inputs that are per-layer weights for this group's template.
+    pub weight_input_indices: Vec<usize>,
+}
+
+/// Mixed-quantization layer loop configuration for models with per-layer
+/// varying quant dtype (e.g. K-Quant _M variants: Q5_K_M has 14 Q6K + 14 Q5K
+/// layers interleaved non-contiguously in attn_v/ffn_down).
+///
+/// Unlike `HeteroLayerLoopConfig` (regular [4 sliding + 1 full] segments),
+/// mixed-quant layers interleave IRREGULARLY (0,1,2,5,8...=Q6K vs 3,4,6,7...=Q5K),
+/// so a single linear stride cannot describe per-layer weight offsets.
+///
+/// JIT structure (single LoopBegin, not double, not per-layer expand):
+///   LoopBegin(counter=layer_idx, bound=num_layers, step=0)  // step=0, no linear stride
+///     weight_off = offset_table[layer_idx]  // compile-time baked per-layer absolute offset
+///     IndirectJump(group_of[layer_idx], targets=[label_g0, label_g1, ...])
+///     MarkLabel label_g0: [group0 template: v_proj/down baked as Q6KDecode]
+///     MarkLabel label_g1: [group1 template: v_proj/down baked as Q5KDecode]
+///     MarkLabel label_merge: [shared ops: q/k/o/gate/up (uniform dtype, single emit)]
+///   LoopEnd
+///
+/// Constitutional: selecting a pre-baked template by `layer_idx` (control flow)
+/// is NOT runtime dtype match (data→logic, forbidden by ARCH-JIT-DATA-YIELDS
+/// rule 4). This is analogous to Gemma-4 `SharedKvRef` `GprCondAction`
+/// (production-proven control-flow dispatch on a layer index).
+#[derive(Debug, Clone)]
+pub struct MixedQuantLayerLoopConfig {
+    /// Total number of layers (loop iteration count, e.g. 28).
+    pub num_layers: usize,
+    /// Number of dtype groups (e.g. 2 for Q5_K_M: Q6K group + Q5K group).
+    pub num_groups: usize,
+    /// Absolute byte offset of layer_0's weights in the weight blob.
+    pub layer_blob_base_offset: usize,
+    /// Per-group config (template prefix, stride, layer indices, bitset, weight inputs).
+    pub groups: Vec<MixedQuantGroup>,
+    /// Per-layer absolute byte offset in weight blob (compile-time baked, non-linear).
+    /// `layer_weight = layer_blob_base_offset + offset_table[layer_idx]`.
+    /// Non-linear because layers interleave with different dtype sizes.
+    pub offset_table: Vec<usize>,
+    /// Per-layer group index lookup (layer_idx → group_idx), for IndirectJump dispatch.
+    pub group_of: Vec<usize>,
+    /// Activation alias: single (not per-group) because the single loop iterates
+    /// in file layer order and the residual flow is in-place (same as the
+    /// standard `LayerLoopConfig`).
+    pub activation_alias: Option<(TensorId, TensorId)>,
+}
+
 /// Platform-independent pointer source for a fusion group.
 #[derive(Debug, Clone)]
 pub enum PtrSource {
