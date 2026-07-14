@@ -2329,4 +2329,71 @@ mod tests {
             }
         }
     }
+
+    // ── Test 105: LoadLayerWeightOffset provenance + field round-trip ──
+    //
+    // Mixed-quant per-layer weight offset table lookup (task #6 方案 B):
+    // dst = offset_table[layer_idx_reg]. The offset_table is a compile-time
+    // baked Vec<usize> (file-layer-order running sum, non-linear). Runtime
+    // loads the per-layer absolute weight blob offset by indexing the table
+    // with the layer loop counter. Constitutional: offset_table is layer-order
+    // control-flow data (layer_idx → offset), NOT weight dtype data — selecting
+    // a pre-baked offset by layer_idx is control flow, not runtime dtype match
+    // (ARCH-JIT-DATA-YIELDS rule 4).
+
+    #[test]
+    fn load_layer_weight_offset_provenance_validates() {
+        // Arrange: dst (Ptr) + layer_idx_reg (Counter) must be declared GPR vregs.
+        let mut prog = VmProgram::new();
+        let dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let layer_idx = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+        // Q5_K_M-like 4-layer non-linear offset table (file layer order).
+        let offset_table = vec![0usize, 200, 380, 580];
+
+        // Act
+        prog.emit(VmInstr::LoadLayerWeightOffset {
+            dst,
+            offset_table: offset_table.clone(),
+            layer_idx_reg: layer_idx,
+        });
+
+        // Assert: provenance passes with declared dst + layer_idx_reg
+        let result = prog.validate_provenance();
+        assert!(result.is_ok(),
+                "LoadLayerWeightOffset with declared vregs should pass provenance, got: {:?}", result);
+
+        // Assert: fields round-trip
+        let instr = prog.instrs.iter().find(|i| matches!(i, VmInstr::LoadLayerWeightOffset { .. }));
+        assert!(instr.is_some(), "LoadLayerWeightOffset must be emitted");
+        if let Some(VmInstr::LoadLayerWeightOffset { dst: d, offset_table: t, layer_idx_reg: li }) = instr {
+            assert_eq!(*d, dst, "dst must round-trip");
+            assert_eq!(*li, layer_idx, "layer_idx_reg must round-trip");
+            assert_eq!(t, &offset_table, "offset_table must round-trip");
+            assert_eq!(t.len(), 4, "offset_table must preserve 4 entries");
+        }
+    }
+
+    // ── Test 106: LoadLayerWeightOffset referenced vregs (read layer_idx + write dst) ──
+
+    #[test]
+    fn load_layer_weight_offset_src_vregs_include_layer_idx() {
+        // The instruction reads layer_idx_reg (to index the table) and writes dst.
+        // RegAllocator::referenced_vregs returns the union of read+write vregs,
+        // so it must include both layer_idx_reg (read) and dst (write).
+        use crate::compiler::codegen::vm::reg_alloc::RegAllocator;
+        let mut prog = VmProgram::new();
+        let dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let layer_idx = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadLayerWeightOffset {
+            dst,
+            offset_table: vec![0, 200, 380, 580],
+            layer_idx_reg: layer_idx,
+        });
+        let instr = prog.instrs.iter().find(|i| matches!(i, VmInstr::LoadLayerWeightOffset { .. })).unwrap();
+        let vregs = RegAllocator::referenced_vregs(instr);
+        assert!(vregs.contains(&layer_idx),
+                "LoadLayerWeightOffset must read layer_idx_reg, vregs={:?}", vregs);
+        assert!(vregs.contains(&dst),
+                "LoadLayerWeightOffset must write dst, vregs={:?}", vregs);
+    }
 }

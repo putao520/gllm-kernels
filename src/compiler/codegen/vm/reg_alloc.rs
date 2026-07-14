@@ -835,6 +835,7 @@ impl<'a> RegAllocator<'a> {
                                 v
                             },
             VmInstr::IndirectJump { index, .. } => vec![*index],
+            VmInstr::LoadLayerWeightOffset { dst, layer_idx_reg, .. } => vec![*layer_idx_reg, *dst],
             VmInstr::ConditionalExit { condition, output } => vec![*condition, *output],
             VmInstr::BranchIfPtrNonNull { ptr, .. } => vec![*ptr],
             VmInstr::BranchIfGprZero { value, .. } => vec![*value],

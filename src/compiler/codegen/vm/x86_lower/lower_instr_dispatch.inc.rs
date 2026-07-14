@@ -88,6 +88,7 @@ impl X86Lower {
             VmInstr::ConditionalSkip { mask, skip_count } => self.lower_conditional_skip_x86(instr, alloc),
             VmInstr::GprCondAction { cond, action } => self.lower_gpr_cond_action_x86(instr, alloc),
             VmInstr::IndirectJump { index, targets } => self.lower_indirect_jump_x86(instr, alloc),
+            VmInstr::LoadLayerWeightOffset { dst, offset_table, layer_idx_reg } => self.lower_load_layer_weight_offset_x86(instr, alloc),
             VmInstr::ConditionalExit { condition, output } => self.lower_conditional_exit_x86(instr, alloc),
             VmInstr::BranchIfPtrNonNull { ptr, target_label } => self.lower_branch_if_ptr_non_null_x86(instr, alloc),
             VmInstr::BranchIfGprZero { value, target_label } => self.lower_branch_if_gpr_zero_x86(instr, alloc),
@@ -2987,6 +2988,50 @@ impl X86Lower {
             }
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_indirect_jump_x86: expected VmInstr::IndirectJump, got {:?}", instr))),
+        }
+    }
+
+    // ── §6.5 Mixed-quant per-layer weight offset table lookup ──
+    //
+    // dst = offset_table[layer_idx_reg]
+    //
+    // Loads the per-layer absolute weight blob offset from a compile-time baked
+    // table by indexing with the layer loop counter. The table (file-layer-order
+    // running sum, NON-LINEAR for mixed-quant) is baked into the code section as
+    // 8-byte usize entries right after the load instruction.
+    //
+    // Pattern (borrows IndirectJump's lea+table emit, but loads a value via mov
+    // instead of jumping, and fills real baked bytes instead of HotPatch 0s):
+    //   lea rax, [rip + table_label]        ; table base
+    //   mov dst, [rax + idx*8]              ; load offset_table[idx]
+    //   ; ... fall through ...
+    //   table_label:
+    //     db <offset[0].to_le_bytes()>      ; 8 bytes, real baked value
+    //     db <offset[1].to_le_bytes()>
+    //     ...
+    //
+    // Constitutional: offset_table is layer-order control-flow data, NOT weight
+    // dtype data (ARCH-JIT-DATA-YIELDS rule 4).
+    fn lower_load_layer_weight_offset_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
+        match instr {
+            VmInstr::LoadLayerWeightOffset { dst, offset_table, layer_idx_reg } => {
+                let idx_reg = self.resolve_gpr_read(*layer_idx_reg, alloc, 1)?;
+                let dst_reg = self.resolve_gpr_write(*dst, alloc, 2)?;
+                // Table base: lea rax, [rip + table_label]
+                let mut table_label = self.asm.create_label();
+                self.asm.lea(rax, qword_ptr(table_label)).map_err(Self::err)?;
+                // Load 8-byte usize entry: mov dst, [rax + idx*8]
+                self.asm.mov(dst_reg, qword_ptr(rax + idx_reg * 8)).map_err(Self::err)?;
+                // Bake the offset_table as 8-byte entries right after the load.
+                // Forward reference: set_label binds the label to the next emit.
+                self.asm.set_label(&mut table_label).map_err(Self::err)?;
+                for &off in offset_table {
+                    self.asm.db(&(off as u64).to_le_bytes()).map_err(Self::err)?;
+                }
+                Ok(())
+            }
+            _ => Err(CompilerError::CodegenViolation(
+                format!("lower_load_layer_weight_offset_x86: expected VmInstr::LoadLayerWeightOffset, got {:?}", instr))),
         }
     }
 

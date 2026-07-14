@@ -1312,6 +1312,7 @@ fn collect_src_vregs_controla(instr: &VmInstr) -> Vec<VRegId> {
                     },
         VmInstr::ConditionalSkip { mask, skip_count: _ } => vec![*mask],
         VmInstr::IndirectJump { index, targets: _ } => vec![*index],
+        VmInstr::LoadLayerWeightOffset { layer_idx_reg, .. } => vec![*layer_idx_reg],
         VmInstr::ConditionalExit {
             condition,
             output: _,
@@ -1652,6 +1653,7 @@ fn collect_dst_vreg(instr: &VmInstr) -> Option<VRegId> {
         | VmInstr::AddPtr { dst, .. }
         | VmInstr::GprBinOp { dst, .. }
         | VmInstr::GprLoadImm { dst, .. }
+        | VmInstr::LoadLayerWeightOffset { dst, .. }
         | VmInstr::LoadCallbackEntry { fn_ptr_out: dst, .. }
         | VmInstr::NativeCall { ret_val: dst, .. } => Some(*dst),
         VmInstr::SharedMemLoad { dst, .. } | VmInstr::WarpReduce { dst, .. }

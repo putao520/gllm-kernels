@@ -138,6 +138,7 @@ impl VmInstr {
             | VmInstr::ConditionalSkip { .. }
             | VmInstr::GprCondAction { .. }
             | VmInstr::IndirectJump { .. }
+            | VmInstr::LoadLayerWeightOffset { .. }
             | VmInstr::ConditionalExit { .. }
             | VmInstr::BranchIfPtrNonNull { .. }
             | VmInstr::BranchIfGprZero { .. }

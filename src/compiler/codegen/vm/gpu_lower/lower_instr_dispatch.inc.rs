@@ -84,6 +84,7 @@ impl GpuLower {
             VmInstr::BranchIfGprLtU { a, b, target_label } => self.lower_branch_if_gpr_lt_u_gpu(instr, alloc),
             VmInstr::UnconditionalBranch { target_label } => self.lower_unconditional_branch_gpu(instr, alloc),
             VmInstr::IndirectJump { index, targets } => self.lower_indirect_jump_gpu(instr, alloc),
+            VmInstr::LoadLayerWeightOffset { dst, offset_table, layer_idx_reg } => self.lower_load_layer_weight_offset_gpu(instr, alloc),
             VmInstr::BreakLoop { return_value } => self.lower_break_loop_gpu(instr, alloc),
             VmInstr::MarkLabel { label_id } => self.lower_mark_label_gpu(instr, alloc),
             VmInstr::ScopeBegin { .. } | VmInstr::ScopeEnd { .. } => self.lower_scope_begin_gpu(instr, alloc),
@@ -2806,6 +2807,39 @@ Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_indirect_jump_gpu: expected VmInstr::IndirectJump, got {:?}", instr))),
+        }
+    }
+
+    // ── §6.5 Mixed-quant per-layer weight offset table lookup (GPU) ──
+    //
+    // dst = offset_table[layer_idx_reg]
+    //
+    // GPU text-IR cmp-chain mov imm: for each layer idx k, if idx == k then
+    // dst = offset_table[k]. Single template (loops N times), no per-layer
+    // expand (NO-LAYER-EXPAND). offset_table is baked as immediate constants
+    // in the emitted mov instructions (compile-time data, not runtime dtype).
+    //
+    // Constitutional: offset_table is layer-order control-flow data, NOT weight
+    // dtype data (ARCH-JIT-DATA-YIELDS rule 4).
+    fn lower_load_layer_weight_offset_gpu(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
+        match instr {
+            VmInstr::LoadLayerWeightOffset { dst, offset_table, layer_idx_reg } => {
+                let dst_name = self.reg_name_with_kind(*dst, alloc);
+                let idx_name = self.reg_name_with_kind(*layer_idx_reg, alloc);
+                let ps0 = self.scratch_pred_names[0];
+                for (k, &off) in offset_table.iter().enumerate() {
+                    match self.dialect {
+                        GpuDialect::Ptx { .. } => {
+                            self.emit_line(&format!("setp.eq.u32 {ps0}, {idx_name}, {k};"));
+                            self.emit_line(&format!("@{ps0} mov.u64 {dst_name}, {off};"));
+                        }
+                        _ => self.emit_line(&format!("if ({idx_name} == {k}) {{ {dst_name} = {off}; }}")),
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(CompilerError::CodegenViolation(
+                format!("lower_load_layer_weight_offset_gpu: expected VmInstr::LoadLayerWeightOffset, got {:?}", instr))),
         }
     }
 

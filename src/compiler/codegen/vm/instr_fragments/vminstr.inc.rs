@@ -569,6 +569,37 @@ pub enum VmInstr {
         index: VRegId,
         targets: Vec<JumpTarget>,
     },
+    /// §6.5 Mixed-quant per-layer weight offset table lookup (task #6 方案 B).
+    ///
+    /// `dst = offset_table[layer_idx_reg]` — runtime loads the per-layer absolute
+    /// weight blob offset by indexing a compile-time baked table with the layer
+    /// loop counter. The offset_table holds file-layer-order running sums
+    /// (NON-LINEAR because per-layer dtype varies, e.g. Q5_K_M: 14 Q6K + 14 Q5K
+    /// interleaved). Used inside `handle_mixed_quant_layer_loop` to set
+    /// `weight_ptr = weight_blob_base + offset_table[layer_idx]` each iteration
+    /// (step_bytes=0 LoopBegin, no linear stride — handles non-contiguous
+    /// interleave without per-layer expand).
+    ///
+    /// Constitutional (ARCH-JIT-DATA-YIELDS rule 4): offset_table is layer-order
+    /// control-flow data (layer_idx → byte offset), NOT weight dtype data.
+    /// Selecting a pre-baked offset by layer_idx is control flow, not runtime
+    /// dtype match. Analogous to selecting a pre-baked template segment by
+    /// layer_idx (Gemma-4 SharedKvRef GprCondAction pattern).
+    ///
+    /// Lowering: offset_table is baked into the code section as a const table
+    /// (x86: `lea rax,[rip+table]` + `mov dst,[rax+idx*8]` + `db` per-entry
+    /// usize bytes via const_pool; AArch64: ADR + LDR table; GPU: cmp-chain
+    /// mov imm). Borrows the IndirectJump table-emit pattern but loads a value
+    /// (not a jump target) and fills real baked bytes (not HotPatch placeholders).
+    LoadLayerWeightOffset {
+        /// Destination GPR (VRegKind::Ptr) holding the per-layer weight offset.
+        dst: VRegId,
+        /// Compile-time baked per-layer absolute byte offsets (file layer order).
+        /// len == num_layers; entry i = sum of layer_bytes[0..i].
+        offset_table: Vec<usize>,
+        /// Layer loop counter GPR (VRegKind::Counter) — indexes the table.
+        layer_idx_reg: VRegId,
+    },
     /// §16 Early-Exit: 条件退出
     ConditionalExit {
         condition: VRegId,

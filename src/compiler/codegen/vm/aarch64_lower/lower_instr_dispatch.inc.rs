@@ -86,6 +86,7 @@ impl AArch64Lower {
             VmInstr::ConditionalSkip { mask, skip_count } => self.lower_conditional_skip_aarch64(instr, alloc),
             VmInstr::GprCondAction { cond, action } => self.lower_gpr_cond_action_aarch64(instr, alloc),
             VmInstr::IndirectJump { index, targets } => self.lower_indirect_jump_aarch64(instr, alloc),
+            VmInstr::LoadLayerWeightOffset { dst, offset_table, layer_idx_reg } => self.lower_load_layer_weight_offset_aarch64(instr, alloc),
             VmInstr::ConditionalExit { condition, output } => self.lower_conditional_exit_aarch64(instr, alloc),
             VmInstr::BranchIfPtrNonNull { ptr, target_label } => self.lower_branch_if_ptr_non_null_aarch64(instr, alloc),
             VmInstr::BranchIfGprZero { .. } => self.lower_branch_if_gpr_zero_aarch64(instr, alloc),
@@ -2706,6 +2707,48 @@ Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_indirect_jump_aarch64: expected VmInstr::IndirectJump, got {:?}", instr))),
+        }
+    }
+
+    // ── §6.5 Mixed-quant per-layer weight offset table lookup (AArch64) ──
+    //
+    // dst = offset_table[layer_idx_reg]
+    //
+    // ADR + LDR table pattern (borrows IndirectJump's AArch64 table emit, but
+    // loads a value into dst instead of branching, and fills real baked bytes):
+    //   ADR dst, table          ; table base (2 instrs ahead)
+    //   LDR dst, [dst, idx, LSL #3]  ; load offset_table[idx] (8-byte usize)
+    //   ; ... fall through ...
+    //   table:
+    //     <offset[0] as u64 LE>  ; 8 bytes, real baked value
+    //     <offset[1] as u64 LE>
+    //     ...
+    //
+    // Constitutional: offset_table is layer-order control-flow data, NOT weight
+    // dtype data (ARCH-JIT-DATA-YIELDS rule 4).
+    fn lower_load_layer_weight_offset_aarch64(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
+        match instr {
+            VmInstr::LoadLayerWeightOffset { dst, offset_table, layer_idx_reg } => {
+                let xd = self.resolve_gpr(*dst, alloc)?;
+                let xn = self.resolve_gpr(*layer_idx_reg, alloc)?;
+                // ADR xd, table (table is 2 instrs ahead: skip ADR + LDR).
+                let table_dist = 2u32;
+                self.emit32(0x10000000 | ((table_dist * 4) << 5) | (xd as u32));
+                // LDR xd, [xd, xn, LSL #3] — load 8-byte usize entry.
+                // Encoding: size=11, VR=1, opc=01, Rm=xn, option=011, S=1, Rn=xd, Rt=xd.
+                // 0xF8607A10 has S=1 option=011 LSL; substitute Rm=xn, Rn=Rt=xd.
+                self.emit32(0xF8606800 | ((xn as u32) << 16) | ((xd as u32) << 5) | (xd as u32));
+                // Bake offset_table as 8-byte u64 LE entries (real values).
+                // emit32 emits a u32 (4 bytes), so each 8-byte entry = 2x emit32.
+                for &off in offset_table {
+                    let v = off as u64;
+                    self.emit32((v & 0xFFFF_FFFF) as u32);          // low 32 bits
+                    self.emit32(((v >> 32) & 0xFFFF_FFFF) as u32);  // high 32 bits
+                }
+                Ok(())
+            }
+            _ => Err(CompilerError::CodegenViolation(
+                format!("lower_load_layer_weight_offset_aarch64: expected VmInstr::LoadLayerWeightOffset, got {:?}", instr))),
         }
     }
 
