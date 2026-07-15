@@ -30,6 +30,17 @@ impl X86Lower {
                 self.asm.db(&val.to_le_bytes()).map_err(Self::err)?;
             }
         }
+        // Data tables (LoadLayerWeightOffset per-layer offset table, etc.) are
+        // flushed here too — past `ret`, out of fall-through execution path
+        // (ARCH-TABLE-OUT-OF-FALLTHROUGH). Forward-reference labels emitted by
+        // add_data_table() are bound here. A NOP guards each set_label for the
+        // same iced `ret`+`set_label` reason above (ret is 1 byte; without NOP
+        // the label could bind to the ret address).
+        for (bytes, label) in &mut self.data_tables {
+            self.asm.nop().map_err(Self::err)?;
+            self.asm.set_label(label).map_err(Self::err)?;
+            self.asm.db(bytes).map_err(Self::err)?;
+        }
         let code = self.asm.assemble(0x0).map_err(|e| CompilerError::Internal(format!("assemble: {e}")))?;
         Ok(code)
     }

@@ -1,5 +1,5 @@
 impl AArch64Lower {
-    pub fn finalize(self) -> Result<Vec<u8>, CompilerError> {
+    pub fn finalize(mut self) -> Result<Vec<u8>, CompilerError> {
         // SPEC 15 REQ-JCTX-022: 编译后资源泄漏检测
         let report = self.jit_ctx.usage_report();
         if !report.warnings.is_empty() {
@@ -13,6 +13,32 @@ impl AArch64Lower {
                     }
                 }
             }
+        }
+        // ARCH-TABLE-OUT-OF-FALLTHROUGH: flush data tables (LoadLayerWeightOffset
+        // per-layer offset table) past the epilogue's RET, and backpatch each
+        // ADR's 21-bit signed immediate (immlo:immhi) to reach its table.
+        // The tables are unreachable by control flow (RET ends execution), so
+        // the load-fall-through SIGSEGV (BCE-20260715) cannot occur.
+        let data_tables = std::mem::take(&mut self.data_tables);
+        for (adr_offset, bytes) in data_tables {
+            let table_offset = self.code.len();
+            let delta = table_offset as i64 - adr_offset as i64;
+            // ADR imm is a signed 21-bit byte offset split as immlo[1:0] | immhi[20:2].
+            if delta < -(1 << 20) || delta >= (1 << 20) {
+                return Err(CompilerError::CodegenViolation(format!(
+                    "ADR backpatch: data table delta {} out of signed 21-bit range (ADR offset={}, table offset={})",
+                    delta, adr_offset, table_offset
+                )));
+            }
+            let delta = delta as u32;
+            let immlo = delta & 0b11;
+            let immhi = (delta >> 2) & 0x7FFFF;
+            let adr = 0x10000000u32 | (immlo << 29) | (immhi << 5);
+            // Preserve Rd (destination reg) from the placeholder ADR we emitted.
+            let old = u32::from_le_bytes(self.code[adr_offset..adr_offset + 4].try_into().unwrap());
+            let rd = old & 0x1F;
+            self.patch32(adr_offset, adr | rd);
+            self.code.extend_from_slice(&bytes);
         }
         Ok(self.code)
     }

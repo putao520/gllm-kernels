@@ -2998,17 +2998,21 @@ impl X86Lower {
     // Loads the per-layer absolute weight blob offset from a compile-time baked
     // table by indexing with the layer loop counter. The table (file-layer-order
     // running sum, NON-LINEAR for mixed-quant) is baked into the code section as
-    // 8-byte usize entries right after the load instruction.
+    // 8-byte usize entries.
     //
-    // Pattern (borrows IndirectJump's lea+table emit, but loads a value via mov
+    // Pattern (borrows IndirectJump's lea+table lookup, but loads a value via mov
     // instead of jumping, and fills real baked bytes instead of HotPatch 0s):
     //   lea rax, [rip + table_label]        ; table base
     //   mov dst, [rax + idx*8]              ; load offset_table[idx]
-    //   ; ... fall through ...
-    //   table_label:
-    //     db <offset[0].to_le_bytes()>      ; 8 bytes, real baked value
-    //     db <offset[1].to_le_bytes()>
-    //     ...
+    //   ; ... fall through to next instr ...
+    //
+    // The table bytes are flushed AFTER `ret` in finalize(), NOT inline. This is
+    // the critical difference from IndirectJump: IndirectJump emits `jmp [rax+idx*8]`
+    // (unconditional — never falls through), so its inline table is unreachable.
+    // Here we emit `mov dst,[rax+idx*8]` (a load — falls through), so an inline
+    // table would be executed as instructions → SIGSEGV (BCE-20260715).
+    // add_data_table() reserves a forward-reference label; finalize() binds it and
+    // appends the bytes past `ret` (out of fall-through path).
     //
     // Constitutional: offset_table is layer-order control-flow data, NOT weight
     // dtype data (ARCH-JIT-DATA-YIELDS rule 4).
@@ -3017,17 +3021,18 @@ impl X86Lower {
             VmInstr::LoadLayerWeightOffset { dst, offset_table, layer_idx_reg } => {
                 let idx_reg = self.resolve_gpr_read(*layer_idx_reg, alloc, 1)?;
                 let dst_reg = self.resolve_gpr_write(*dst, alloc, 2)?;
-                // Table base: lea rax, [rip + table_label]
-                let mut table_label = self.asm.create_label();
+                // Bake the offset_table as 8-byte little-endian usize entries into a
+                // data table flushed past `ret` (out of fall-through execution).
+                let mut table_bytes = Vec::with_capacity(offset_table.len() * 8);
+                for &off in offset_table {
+                    table_bytes.extend_from_slice(&(off as u64).to_le_bytes());
+                }
+                let table_label = self.add_data_table(table_bytes);
+                // Table base: lea rax, [rip + table_label]  (forward ref bound in finalize)
                 self.asm.lea(rax, qword_ptr(table_label)).map_err(Self::err)?;
                 // Load 8-byte usize entry: mov dst, [rax + idx*8]
                 self.asm.mov(dst_reg, qword_ptr(rax + idx_reg * 8)).map_err(Self::err)?;
-                // Bake the offset_table as 8-byte entries right after the load.
-                // Forward reference: set_label binds the label to the next emit.
-                self.asm.set_label(&mut table_label).map_err(Self::err)?;
-                for &off in offset_table {
-                    self.asm.db(&(off as u64).to_le_bytes()).map_err(Self::err)?;
-                }
+                self.commit_gpr_write(*dst, alloc, 2)?;
                 Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(

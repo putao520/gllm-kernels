@@ -1324,4 +1324,88 @@ mod tests {
         assert!(err_msg.contains("VDPBF16PS") || err_msg.contains("AVX512-BF16") || err_msg.contains("has_bf16"),
             "Err message must mention VDPBF16PS/AVX512-BF16/has_bf16; got: {}", err_msg);
     }
+
+    /// BCE-20260715-SIGSEGV-TABLE-IN-FALLTHROUGH regression (x86).
+    ///
+    /// LoadLayerWeightOffset emits `lea rax,[table]` + `mov dst,[rax+idx*8]` — a
+    /// load that falls through. The offset_table bytes must NOT be baked inline
+    /// right after the `mov` (the CPU would execute them as instructions →
+    /// SIGSEGV). They must live past `ret`, unreachable by control flow.
+    ///
+    /// Root cause: the IndirectJump precedent (`jmp [rax+idx*8]`) inlines its
+    /// table safely because `jmp` never falls through; `LoadLayerWeightOffset`
+    /// uses `mov` (does fall through), so inlining was a same-class BUG.
+    ///
+    /// Fix: add_data_table() registers the table; finalize() flushes it past
+    /// `ret` (ARCH-TABLE-OUT-OF-FALLTHROUGH).
+    #[test]
+    fn bce_load_layer_weight_offset_table_out_of_fallthrough_x86() {
+        let mut prog = VmProgram::new();
+        let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+        let byte_offset = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+        let dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        // Realistic 4-entry non-linear table (mirrors mixed-quant shape).
+        let offset_table = vec![0usize, 11370496, 22740992, 34111488];
+
+        prog.emit(VmInstr::LoopBegin {
+            counter, byte_offset,
+            bound: BoundExpr::Const(4),
+            step_bytes: 0,
+        });
+        prog.emit(VmInstr::LoadLayerWeightOffset {
+            dst, offset_table: offset_table.clone(), layer_idx_reg: counter,
+        });
+        prog.emit(VmInstr::LoopEnd);
+
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
+        let frame = super::super::stack_frame::StackFrame::compute(&alloc, &profile, 0);
+
+        let mut lower = X86Lower::new();
+        lower.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            lower.lower_instr(instr, &alloc).unwrap();
+        }
+        lower.emit_epilogue(&frame, &alloc).unwrap();
+        let code = lower.finalize().unwrap();
+        let disasm = disasm_lower(&code);
+
+        // 1. The `mov dst,[rax+idx*8]` load must be immediately followed by the
+        //    LoopEnd's `inc`/`jmp`, NOT by table bytes. Before the fix the table
+        //    was inlined → disasm showed `mov ...,[rax+...]` then data-as-instructions.
+        //    Find the table-indexed load (the only `mov` reading [rax+...]).
+        let load_line = disasm.lines()
+            .find(|l| l.contains("mov ") && l.contains("[rax+") && l.contains("*8]"))
+            .expect("table-indexed load `mov dst,[rax+idx*8]` must exist");
+        let load_line_idx = disasm.lines().position(|l| l == load_line)
+            .or_else(|| disasm.lines().position(|l| l.trim() == load_line.trim()))
+            .expect("load line index");
+        let next_line = disasm.lines().nth(load_line_idx + 1).unwrap_or("").trim();
+        assert!(next_line.starts_with("inc"),
+            "BCE-20260715 x86: load must fall through to next real instr (inc), \
+             not into table bytes. After load {:?}: {:?}\nFull disasm:\n{}",
+            load_line, next_line, disasm);
+
+        // 2. `ret` must exist and table bytes must live AFTER it (past function
+        //    end, unreachable). Verify each offset_table entry's 8-byte LE
+        //    pattern appears in the code after `ret`.
+        let ret_pos = code.iter().position(|&b| b == 0xC3)
+            .expect("ret (0xC3) must exist");
+        let after_ret = &code[ret_pos + 1..];
+        for &off in &offset_table {
+            let le = (off as u64).to_le_bytes();
+            assert!(after_ret.windows(le.len()).any(|w| w == le),
+                "BCE-20260715 x86: offset_table entry {} (LE {:?}) must be baked \
+                 past `ret`, not inline. After-ret bytes: {}",
+                off, le, after_ret.iter().map(|b| format!("{:02x}", b)).collect::<String>());
+        }
+        // 3. And must NOT appear inline in the fall-through path (before ret).
+        let before_ret = &code[..ret_pos];
+        // offset_table[1] is the most distinctive (0x00AD8000); if it leaked into
+        // the pre-ret instruction stream that's the bug.
+        let le1 = (offset_table[1] as u64).to_le_bytes();
+        assert!(!before_ret.windows(le1.len()).any(|w| w == le1),
+            "BCE-20260715 x86: offset_table[1] LE bytes leaked into fall-through path (pre-ret).");
+    }
 }

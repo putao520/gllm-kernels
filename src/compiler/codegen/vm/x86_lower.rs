@@ -88,6 +88,18 @@ pub struct X86Lower {
     /// 由 Platform::X86_64 { has_vnni, .. } 注入 (compile.inc.rs)。
     has_vnni: bool,
     const_pool: Vec<([f32; 8], CodeLabel)>,
+    /// Arbitrary byte data tables (e.g. LoadLayerWeightOffset per-layer offset
+    /// table) flushed AFTER `ret` in `finalize`, out of fall-through execution.
+    ///
+    /// ARCH-TABLE-OUT-OF-FALLTHROUGH: data tables baked into the code section
+    /// must NOT be placed inline where execution would fall through into them.
+    /// Unlike IndirectJump (whose `jmp [rax+idx*8]` never falls through), a
+    /// `mov dst,[rax+idx*8]` load DOES fall through — baking the table right
+    /// after the `mov` made the CPU execute the table bytes as instructions
+    /// (BCE-20260715-SIGSEGV-TABLE-IN-FALLTHROUGH). Tables are emitted here and
+    /// flushed after `ret` so they live at function end, unreachable by control
+    /// flow. The label (forward reference) is bound in `finalize`.
+    data_tables: Vec<(Vec<u8>, CodeLabel)>,
     loop_stack: Vec<(CodeLabel, CodeLabel, AsmRegister64, Option<i32>, AsmRegister64, usize, Option<i32>)>,
     scope_saves: Vec<Vec<AsmRegister64>>,
     skip_stack: Vec<(usize, CodeLabel)>,

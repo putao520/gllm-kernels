@@ -49,6 +49,7 @@ mod tests {
         let mut lower = AArch64Lower {
             code: Vec::new(),
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: true, has_sve2: true, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 32 },
@@ -131,6 +132,7 @@ mod tests {
         let mut lower = AArch64Lower {
             code: Vec::new(),
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: true, has_sve2: true, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 32 },
@@ -187,6 +189,7 @@ mod tests {
         let mut lower = AArch64Lower {
             code: Vec::new(),
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: true, has_sve2: true, has_sme2: true, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 32 },
@@ -230,6 +233,7 @@ mod tests {
         let mut lower = AArch64Lower {
             code: Vec::new(),
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
@@ -269,6 +273,7 @@ mod tests {
         let mut lower = AArch64Lower {
             code: Vec::new(),
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: true, has_sve2: true, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 32 },
@@ -306,6 +311,7 @@ mod tests {
         let mut lower = AArch64Lower {
             code: Vec::new(),
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
@@ -343,6 +349,7 @@ mod tests {
         let mut lower = AArch64Lower {
             code: Vec::new(),
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
@@ -383,6 +390,7 @@ mod tests {
         let mut lower = AArch64Lower {
             code: Vec::new(),
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
@@ -416,6 +424,7 @@ mod tests {
         let mut lower = AArch64Lower {
             code: Vec::new(),
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
@@ -449,6 +458,7 @@ mod tests {
         let mut lower = AArch64Lower {
             code: Vec::new(),
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
@@ -481,6 +491,7 @@ mod tests {
         let mut lower = AArch64Lower {
             code: Vec::new(),
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
@@ -514,6 +525,7 @@ mod tests {
         let mut lower = AArch64Lower {
             code: Vec::new(),
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
@@ -546,6 +558,7 @@ mod tests {
         let mut lower = AArch64Lower {
             code: Vec::new(),
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
@@ -696,6 +709,7 @@ mod tests {
         let mut lower = AArch64Lower {
             code: Vec::new(),
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
@@ -737,6 +751,7 @@ mod tests {
         let mut lower = AArch64Lower {
             code: Vec::new(),
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
@@ -774,6 +789,7 @@ mod tests {
         let mut lower = AArch64Lower {
             code: Vec::new(),
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
@@ -809,6 +825,7 @@ mod tests {
         let mut lower = AArch64Lower {
             code: Vec::new(),
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
@@ -893,6 +910,7 @@ mod tests {
         let mut lower = AArch64Lower {
             code: Vec::new(),
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: true, has_sve2: true, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 32 },
@@ -934,6 +952,7 @@ mod tests {
         AArch64Lower {
             code: Vec::new(),
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
             platform: features,
@@ -1052,6 +1071,7 @@ mod tests {
         let mut lower = AArch64Lower {
             code: Vec::new(),
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: true, has_sve2: true, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 32 },
@@ -1079,6 +1099,7 @@ mod tests {
         let mut lower = AArch64Lower {
             code: Vec::new(),
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: true, has_sve2: true, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 32 },
@@ -1122,6 +1143,7 @@ mod tests {
         let mut lower = AArch64Lower {
             code: Vec::new(),
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: true, has_sve2: true, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 32 },
@@ -1174,7 +1196,8 @@ mod tests {
     #[test]
     fn test_vec_narrow_f32_to_bf16_requires_has_bf16() {
         let mut lower = AArch64Lower {
-            code: Vec::new(), const_pool: Vec::new(), loop_stack: Vec::new(),
+            code: Vec::new(), const_pool: Vec::new(),
+            data_tables: Vec::new(), loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
@@ -1226,6 +1249,70 @@ mod tests {
             "Err must mention FP8/FEAT_FP8 limitation, got: {}", err_msg);
         // 确保未发射任何指令 (静默 NOP 的反面: Err 时不写入 code)
         assert!(lower.finalize().unwrap().is_empty(), "Err path must not emit code bytes (no silent NOP)");
+    }
+
+    /// BCE-20260715-SIGSEGV-TABLE-IN-FALLTHROUGH regression (AArch64).
+    ///
+    /// LoadLayerWeightOffset emits ADR + LDR (LDR falls through). The table
+    /// bytes must NOT be baked inline after LDR (CPU would execute them as
+    /// instructions → SIGSEGV). Must be flushed past RET and the ADR immediate
+    /// backpatched to reach it (ARCH-TABLE-OUT-OF-FALLTHROUGH, same-class x86 fix).
+    #[test]
+    fn bce_load_layer_weight_offset_table_out_of_fallthrough_aarch64() {
+        use crate::compiler::codegen::vm::isa_profile::{PhysGpr, PhysReg};
+        let mut prog = VmProgram::new();
+        let dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let layer_idx = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+        let offset_table = vec![0usize, 11370496, 22740992, 34111488];
+        prog.emit(VmInstr::LoadLayerWeightOffset {
+            dst, offset_table: offset_table.clone(), layer_idx_reg: layer_idx,
+        });
+
+        // Map dst → x1, layer_idx → x2 (arbitrary GPRs).
+        let mut mapping = std::collections::HashMap::new();
+        mapping.insert(dst, PhysReg::Gpr(PhysGpr(1)));
+        mapping.insert(layer_idx, PhysReg::Gpr(PhysGpr(2)));
+        let alloc = RegAllocation {
+            mapping, spills: vec![], callee_saved_used: vec![],
+        };
+
+        let mut lower = AArch64Lower::new();
+        // Emit only the LoadLayerWeightOffset (skip DeclareVReg no-ops), then RET.
+        let llwo = prog.instrs.iter()
+            .find(|i| matches!(i, VmInstr::LoadLayerWeightOffset { .. }))
+            .expect("LoadLayerWeightOffset must be emitted");
+        lower.lower_instr(llwo, &alloc).unwrap();
+        lower.emit32(lower.enc_ret()); // 0xD65F03C0
+        let code = lower.finalize().unwrap();
+
+        // 1. ADR is at offset 0; LDR at offset 4; RET at offset 8; table past RET.
+        let adr = u32::from_le_bytes([code[0], code[1], code[2], code[3]]);
+        // ADR opcode top bits + Rd=1.
+        assert_eq!(adr & 0x9F00001F, 0x10000001, "ADR x1, ... ; got {:08x}", adr);
+        // RET must be at offset 8 (after ADR+LDR).
+        let ret = u32::from_le_bytes([code[8], code[9], code[10], code[11]]);
+        assert_eq!(ret, 0xD65F03C0, "RET must follow ADR+LDR at offset 8");
+
+        // 2. Table bytes must live AFTER RET (offset >= 12), not inline (offset 8).
+        let after_ret = &code[12..];
+        for &off in &offset_table {
+            let le = (off as u64).to_le_bytes();
+            assert!(after_ret.windows(le.len()).any(|w| w == le),
+                "BCE-20260715 aarch64: offset_table entry {} (LE {:?}) must be baked past RET",
+                off, le);
+        }
+        // 3. Table must NOT leak into the inline path between LDR (offset 4-8).
+        let inline = &code[8..12];
+        let le1 = (offset_table[1] as u64).to_le_bytes();
+        assert!(!inline.windows(le1.len()).any(|w| w == le1),
+            "BCE-20260715 aarch64: table bytes leaked into inline fall-through path");
+
+        // 4. ADR immediate correctly backpatched to reach the table (offset 12).
+        //    imm21 (signed byte offset) = 12 - 0 = 12. immlo=12&3=0, immhi=(12>>2)=3.
+        let immlo = (adr >> 29) & 0b11;
+        let immhi = (adr >> 5) & 0x7FFFF;
+        let delta = (immhi << 2) | immlo;
+        assert_eq!(delta, 12, "ADR immediate must reach table at offset 12 (delta=12)");
     }
 
 }

@@ -24,6 +24,7 @@ impl X86Lower {
             has_bf16,
             has_vnni,
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             scope_saves: Vec::new(),
             skip_stack: Vec::new(),
@@ -801,6 +802,17 @@ impl X86Lower {
         }
         let label = self.asm.create_label();
         self.const_pool.push(([val; 8], label));
+        label
+    }
+
+    /// Register an arbitrary byte data table (e.g. per-layer weight offset
+    /// table) to be flushed AFTER `ret` in `finalize`. Returns a forward-
+    /// reference label usable by `lea reg, [rip + label]`. The table bytes are
+    /// NOT emitted inline — only the label is reserved; `finalize` binds it and
+    /// appends the data past `ret` (ARCH-TABLE-OUT-OF-FALLTHROUGH).
+    fn add_data_table(&mut self, bytes: Vec<u8>) -> CodeLabel {
+        let label = self.asm.create_label();
+        self.data_tables.push((bytes, label));
         label
     }
 

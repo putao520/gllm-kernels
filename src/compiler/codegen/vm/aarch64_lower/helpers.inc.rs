@@ -3,6 +3,7 @@ impl AArch64Lower {
         Self {
             code: Vec::new(),
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             platform: AArch64Features::default(),
             labels: std::collections::HashMap::new(),
@@ -31,6 +32,7 @@ impl AArch64Lower {
         Self {
             code: Vec::new(),
             const_pool: Vec::new(),
+            data_tables: Vec::new(),
             loop_stack: Vec::new(),
             platform,
             labels: std::collections::HashMap::new(),

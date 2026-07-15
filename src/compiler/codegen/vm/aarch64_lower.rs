@@ -33,6 +33,18 @@ use crate::types::DType;
 pub struct AArch64Lower {
     code: Vec<u8>,
     const_pool: Vec<(f32, usize)>, // (value, offset_in_code)
+    /// Pending data tables to flush after `ret` in finalize(). Each entry is
+    /// (adr_emit_offset, bytes): adr_emit_offset is the byte offset in `code`
+    /// where the ADR instruction was emitted (placeholder imm=0); finalize
+    /// appends `bytes` after the epilogue's RET and backpatches the ADR's
+    /// 21-bit signed immediate to reach it.
+    ///
+    /// ARCH-TABLE-OUT-OF-FALLTHROUGH (same-class fix as x86 BCE-20260715):
+    /// LoadLayerWeightOffset emits ADR + LDR (LDR falls through), so baking
+    /// the table inline (as the AArch64 IndirectJump precedent does with BR —
+    /// which never falls through) would execute table bytes as instructions.
+    /// Tables are flushed past RET, unreachable by control flow.
+    data_tables: Vec<(usize, Vec<u8>)>,
     /// 循环控制: (loop_top_offset, branch_placeholder_offset, counter_reg, offset_reg, step, is_sve)
     loop_stack: Vec<LoopCtx>,
     /// 目标平台特性

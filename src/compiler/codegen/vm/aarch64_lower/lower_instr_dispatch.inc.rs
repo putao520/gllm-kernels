@@ -2714,12 +2714,18 @@ Ok(())
     //
     // dst = offset_table[layer_idx_reg]
     //
-    // ADR + LDR table pattern (borrows IndirectJump's AArch64 table emit, but
-    // loads a value into dst instead of branching, and fills real baked bytes):
-    //   ADR dst, table          ; table base (2 instrs ahead)
-    //   LDR dst, [dst, idx, LSL #3]  ; load offset_table[idx] (8-byte usize)
-    //   ; ... fall through ...
-    //   table:
+    // ADR + LDR table pattern. Borrows IndirectJump's AArch64 ADR+table emit,
+    // BUT unlike IndirectJump (which ends in BR — unconditional, never falls
+    // through), this ends in LDR (a load — falls through). So the table bytes
+    // CANNOT be baked inline (the CPU would execute them as instructions →
+    // same-class SIGSEGV as x86, BCE-20260715). The table is registered into
+    // `data_tables` and flushed past the epilogue's RET in finalize(); the ADR's
+    // 21-bit signed immediate is backpatched to reach it.
+    //
+    //   ADR xd, <table>          ; table base (placeholder imm=0, backpatched)
+    //   LDR xd, [xd, xn, LSL #3] ; load offset_table[idx] (8-byte usize)
+    //   ; ... fall through to next instr ...
+    //   <after RET, in finalize>:
     //     <offset[0] as u64 LE>  ; 8 bytes, real baked value
     //     <offset[1] as u64 LE>
     //     ...
@@ -2731,20 +2737,19 @@ Ok(())
             VmInstr::LoadLayerWeightOffset { dst, offset_table, layer_idx_reg } => {
                 let xd = self.resolve_gpr(*dst, alloc)?;
                 let xn = self.resolve_gpr(*layer_idx_reg, alloc)?;
-                // ADR xd, table (table is 2 instrs ahead: skip ADR + LDR).
-                let table_dist = 2u32;
-                self.emit32(0x10000000 | ((table_dist * 4) << 5) | (xd as u32));
+                // ADR xd, #0  (placeholder; imm backpatched in finalize).
+                let adr_offset = self.current_offset();
+                self.emit32(0x10000000 | (xd as u32)); // imm21 = 0
                 // LDR xd, [xd, xn, LSL #3] — load 8-byte usize entry.
-                // Encoding: size=11, VR=1, opc=01, Rm=xn, option=011, S=1, Rn=xd, Rt=xd.
-                // 0xF8607A10 has S=1 option=011 LSL; substitute Rm=xn, Rn=Rt=xd.
                 self.emit32(0xF8606800 | ((xn as u32) << 16) | ((xd as u32) << 5) | (xd as u32));
-                // Bake offset_table as 8-byte u64 LE entries (real values).
-                // emit32 emits a u32 (4 bytes), so each 8-byte entry = 2x emit32.
+                // Build the table bytes (8-byte u64 LE per entry) and register
+                // them to be flushed past RET in finalize.
+                let mut table_bytes = Vec::with_capacity(offset_table.len() * 8);
                 for &off in offset_table {
                     let v = off as u64;
-                    self.emit32((v & 0xFFFF_FFFF) as u32);          // low 32 bits
-                    self.emit32(((v >> 32) & 0xFFFF_FFFF) as u32);  // high 32 bits
+                    table_bytes.extend_from_slice(&v.to_le_bytes());
                 }
+                self.data_tables.push((adr_offset, table_bytes));
                 Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
