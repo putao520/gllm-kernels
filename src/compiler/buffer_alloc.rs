@@ -750,6 +750,15 @@ fn build_tensor_sources(
                     }
                 }
             }
+            // Mixed-quant: single activation_alias, same in-place residual flow as standard.
+            if let Some(cfg) = &graph.mixed_quant_layer_loop_config {
+                if let Some((in_tid, out_tid)) = cfg.activation_alias {
+                    map.insert(in_tid, TensorPtrSource::ActivationPing);
+                    if !gather_outs.contains(&out_tid) {
+                        map.entry(out_tid).or_insert(TensorPtrSource::ActivationPong);
+                    }
+                }
+            }
             if let Some(cfg) = &graph.hetero_layer_loop_config {
                 for &(in_tid, out_tid) in &cfg.activation_aliases {
                     map.insert(in_tid, TensorPtrSource::ActivationPing);
@@ -776,6 +785,14 @@ fn build_tensor_sources(
     } else {
         // Forward-only path (compile_graph): alias output inherits activation input's source.
         if let Some(cfg) = &graph.layer_loop_config {
+            if let Some((in_tid, out_tid)) = cfg.activation_alias {
+                if let Some(src) = map.get(&in_tid).copied() {
+                    map.insert(out_tid, src);
+                }
+            }
+        }
+        // Mixed-quant: single activation_alias, same forward-only inheritance.
+        if let Some(cfg) = &graph.mixed_quant_layer_loop_config {
             if let Some((in_tid, out_tid)) = cfg.activation_alias {
                 if let Some(src) = map.get(&in_tid).copied() {
                     map.insert(out_tid, src);
@@ -811,6 +828,13 @@ fn build_tensor_sources(
     // Per-layer 编译路径 activation_buffer_size=0，保持原始 Activation 映射。
     if activation_buffer_size > 0 {
         if let Some(ref cfg) = graph.layer_loop_config {
+            if let Some((ref input_tid, ref output_tid)) = cfg.activation_alias {
+                map.insert(*input_tid, TensorPtrSource::ActivationPing);
+                map.insert(*output_tid, TensorPtrSource::ActivationPong);
+            }
+        }
+        // Mixed-quant: single activation_alias, same ping-pong mapping.
+        if let Some(ref cfg) = graph.mixed_quant_layer_loop_config {
             if let Some((ref input_tid, ref output_tid)) = cfg.activation_alias {
                 map.insert(*input_tid, TensorPtrSource::ActivationPing);
                 map.insert(*output_tid, TensorPtrSource::ActivationPong);
@@ -977,6 +1001,14 @@ impl TensorLifetimeExt {
 fn determine_cross_layer_lifetime(tid: TensorId, graph: &CompilerGraph) -> CrossLayerLifetime {
     // Activation input tensor — spans all layers (ping-pong)
     if let Some(cfg) = &graph.layer_loop_config {
+        if let Some((in_tid, _)) = cfg.activation_alias {
+            if tid == in_tid {
+                return CrossLayerLifetime::SpanningAllLayers;
+            }
+        }
+    }
+    // Mixed-quant: activation input spans all layers (single in-place residual flow).
+    if let Some(cfg) = &graph.mixed_quant_layer_loop_config {
         if let Some((in_tid, _)) = cfg.activation_alias {
             if tid == in_tid {
                 return CrossLayerLifetime::SpanningAllLayers;

@@ -67,9 +67,19 @@ impl VirtualActivationMap {
         graph: &CompilerGraph,
         plan: &FusionPlan,
     ) -> Self {
-        eprintln!("[VAM] analyze: layer_loop_config={:?} activation_alias={:?}",
+        // Standard/hetero path reads graph.layer_loop_config / hetero_layer_loop_config;
+        // mixed-quant path reads graph.mixed_quant_layer_loop_config (single activation_alias,
+        // same in-place residual flow as the standard path — see types.inc.rs §314-317).
+        // BCE-20260713-MIXEDQUANT-VAM: VAM previously only read layer_loop_config → mixed-quant
+        // graphs (layer_loop_config=None) returned empty → activation_buffer_size=0 → no
+        // ping-pong sentinel slots → Norm op input failed to materialize (TensorPtrSource mapped
+        // to a too-short-lifetime Intermediate). Add mixed_quant fallback, mirroring topology.rs:253-256.
+        let mq_alias = graph.mixed_quant_layer_loop_config.as_ref().and_then(|c| c.activation_alias);
+        let alias = graph.layer_loop_config.as_ref().and_then(|c| c.activation_alias).or(mq_alias);
+        eprintln!("[VAM] analyze: layer_loop_config={:?} mixed_quant={:?} activation_alias={:?}",
             graph.layer_loop_config.as_ref().map(|c| (c.num_layers, c.weight_stride)),
-            graph.layer_loop_config.as_ref().and_then(|c| c.activation_alias));
+            graph.mixed_quant_layer_loop_config.as_ref().map(|c| (c.num_layers, c.num_groups)),
+            alias);
         let mut activation_assignments = HashMap::new();
         let mut swap_sequence = Vec::new();
 
@@ -172,6 +182,16 @@ fn find_layer_activations(
     if let Some(ref cfg) = graph.layer_loop_config {
         if let Some((input_tid, output_tid)) = cfg.activation_alias {
             // 排除 Gather 输出，返回不含 Gather 输出的 activation tensors
+            let result: Vec<(TensorId, usize)> = [(input_tid, 0), (output_tid, 0)]
+                .into_iter()
+                .filter(|(tid, _)| !gather_output_tids.contains(tid))
+                .collect();
+            return result;
+        }
+    }
+    // Mixed-quant fallback: single activation_alias (same in-place residual flow as standard).
+    if let Some(ref cfg) = graph.mixed_quant_layer_loop_config {
+        if let Some((input_tid, output_tid)) = cfg.activation_alias {
             let result: Vec<(TensorId, usize)> = [(input_tid, 0), (output_tid, 0)]
                 .into_iter()
                 .filter(|(tid, _)| !gather_output_tids.contains(tid))
@@ -385,6 +405,59 @@ mod tests {
         assert_eq!(vam.bytes_saved, 0);
         assert!(vam.activation_assignments.is_empty());
         assert!(vam.swap_sequence.is_empty());
+    }
+
+    // ── Test 11.5: VAM analyze falls back to mixed_quant_layer_loop_config ──
+    // BCE-20260713-MIXEDQUANT-VAM: mixed-quant graphs set only
+    // mixed_quant_layer_loop_config (not layer_loop_config). VAM must fall back to its
+    // activation_alias, otherwise activation_buffer_size=0 → Norm op input fails to
+    // materialize. Mirrors topology.rs:253-256 fallback pattern.
+
+    #[test]
+    fn vam_analyze_falls_back_to_mixed_quant_layer_loop_config() {
+        use crate::compiler::graph::{MixedQuantGroup, MixedQuantLayerLoopConfig};
+        // Arrange — graph with only mixed_quant_layer_loop_config (layer_loop_config=None)
+        let mut graph = CompilerGraph::new();
+        let in_tid = graph.add_tensor_concrete("layer.input", &[4, 8], DType::F32);
+        let out_tid = graph.add_tensor_concrete("layer.output", &[4, 8], DType::F32);
+        graph.mixed_quant_layer_loop_config = Some(MixedQuantLayerLoopConfig {
+            num_layers: 4,
+            num_groups: 2,
+            layer_blob_base_offset: 0,
+            groups: vec![
+                MixedQuantGroup {
+                    prefix: "layer_q6k.".to_string(),
+                    weight_stride: 128,
+                    layer_indices: vec![0, 1],
+                    layer_bitset: 0b0011,
+                    weight_input_indices: vec![],
+                },
+                MixedQuantGroup {
+                    prefix: "layer_q5k.".to_string(),
+                    weight_stride: 112,
+                    layer_indices: vec![2, 3],
+                    layer_bitset: 0b1100,
+                    weight_input_indices: vec![],
+                },
+            ],
+            offset_table: vec![0, 128, 240, 352],
+            group_of: vec![0, 0, 1, 1],
+            activation_alias: Some((in_tid, out_tid)),
+        });
+        let plan = FusionPlan {
+            groups: Vec::new(),
+            op_to_group: HashMap::new(),
+        };
+
+        // Act
+        let vam = VirtualActivationMap::analyze(&graph, &plan);
+
+        // Assert — VAM recognizes the mixed-quant activation_alias and assigns ping-pong slots
+        assert_eq!(vam.num_buffers, 2, "mixed_quant activation_alias must drive ping-pong");
+        assert!(!vam.activation_assignments.is_empty());
+        assert!(vam.activation_assignments.contains_key(&in_tid));
+        assert!(vam.activation_assignments.contains_key(&out_tid));
+        assert!(vam.buffer_size_bytes > 0);
     }
 
     // ── Test 12: ActivationSwap with layer_idx zero ──
