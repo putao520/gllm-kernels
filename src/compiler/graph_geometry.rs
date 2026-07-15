@@ -124,7 +124,12 @@ impl GraphDerivedGeometry {
         let intermediate = derive_intermediate(graph, hidden)?;
 
         // Derive num_layers from layer loop config.
+        // BCE-20260713-MIXEDQUANT-VAM residual: mixed_quant_layer_loop_config
+        // must be a fallback (mirrors topology.rs:251-252). Without it,
+        // mixed-quant graphs (Q5_K_M etc.) set only mixed_quant_layer_loop_config,
+        // so num_layers falls to unwrap_or(1) → KV buffer 1/N size → SIGSEGV.
         let num_layers = graph.layer_loop_config.as_ref().map(|c| c.num_layers)
+            .or_else(|| graph.mixed_quant_layer_loop_config.as_ref().map(|c| c.num_layers))
             .or_else(|| graph.hetero_layer_loop_config.as_ref().map(|c| {
                 c.num_segments * (c.sliding_per_segment + 1)
             }))
