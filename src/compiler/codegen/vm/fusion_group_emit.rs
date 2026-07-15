@@ -775,6 +775,7 @@ mod tests {
             scratch_ptr: Some(VRegId(3)),
             gen_loop_counter: None,
             layer_loop_counter: None,
+            layer_loop_counter_fresh: None,
             mega_decode_seq_len: None,
             hook_ctx_ptr: None,
             sg_detect_scratch_offset: None,

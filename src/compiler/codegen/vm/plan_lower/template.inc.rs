@@ -43,6 +43,7 @@ pub fn compile_layer_type_body(
         scratch_ptr: Some(tpl_scratch),
         gen_loop_counter: None,
         layer_loop_counter: None,
+        layer_loop_counter_fresh: None,
         mega_decode_seq_len: None,
         hook_ctx_ptr: None,
         sg_detect_scratch_offset: None,

@@ -161,6 +161,7 @@ pub(crate) fn lower_fusion_plan_inner_with_sym_map(
         scratch_ptr: if needs_scratch { Some(scratch_base) } else { None },
         gen_loop_counter: None,
         layer_loop_counter: None,
+        layer_loop_counter_fresh: None,
         mega_decode_seq_len: None,
         hook_ctx_ptr: None,
         sg_detect_scratch_offset: None,
@@ -585,6 +586,7 @@ fn emit_one_fusion_group(
     current_abi.weight_ptr = state.abi.weight_ptr;
     current_abi.scratch_ptr = state.abi.scratch_ptr;
     current_abi.layer_loop_counter = state.abi.layer_loop_counter;
+    current_abi.layer_loop_counter_fresh = state.abi.layer_loop_counter_fresh;
     current_abi.gen_loop_counter = state.abi.gen_loop_counter;
     current_abi.kv_cache_ptr = state.abi.kv_cache_ptr;
 
@@ -672,6 +674,7 @@ fn handle_hetero_layer_loop(
         prog.emit(VmInstr::GprBinOp { dst: global_layer_idx, a: seg_layer_base, b: GprOperand::VReg(counter), op: GprOp::Add });
         state.abi.weight_ptr = Some(layer_weight_base);
         state.abi.layer_loop_counter = Some(global_layer_idx);
+        state.abi.layer_loop_counter_fresh = Some(global_layer_idx);
         state.hetero_global_layer_idx = Some(global_layer_idx);
         state.in_layer_loop = true;
         state.hetero_phase = HeteroPhase::InSlidingLoop;
@@ -709,6 +712,7 @@ fn handle_hetero_layer_loop(
         prog.emit(VmInstr::GprBinOp { dst: full_layer_idx, a: seg_layer_base, b: GprOperand::VReg(sps_gpr), op: GprOp::Add });
         state.abi.weight_ptr = Some(full_base_ptr);
         state.abi.layer_loop_counter = Some(full_layer_idx);
+        state.abi.layer_loop_counter_fresh = Some(full_layer_idx);
         state.hetero_global_layer_idx = Some(full_layer_idx);
         state.in_layer_loop = true;
         state.hetero_phase = HeteroPhase::InFullBody;
@@ -769,6 +773,7 @@ fn handle_hetero_layer_loop(
         prog.emit(VmInstr::GprBinOp { dst: global_layer_idx, a: seg_layer_base, b: GprOperand::VReg(counter), op: GprOp::Add });
         state.abi.weight_ptr = Some(layer_weight_base);
         state.abi.layer_loop_counter = Some(global_layer_idx);
+        state.abi.layer_loop_counter_fresh = Some(global_layer_idx);
         state.hetero_global_layer_idx = Some(global_layer_idx);
         state.in_layer_loop = true;
         state.hetero_phase = HeteroPhase::InLargeSlidingLoop;
@@ -807,6 +812,7 @@ fn handle_hetero_layer_loop(
         prog.emit(VmInstr::GprBinOp { dst: full_layer_idx, a: seg_layer_base, b: GprOperand::VReg(sps_gpr), op: GprOp::Add });
         state.abi.weight_ptr = Some(full_base_ptr);
         state.abi.layer_loop_counter = Some(full_layer_idx);
+        state.abi.layer_loop_counter_fresh = Some(full_layer_idx);
         state.hetero_global_layer_idx = Some(full_layer_idx);
         state.in_layer_loop = true;
         state.hetero_phase = HeteroPhase::InLargeFullBody;
@@ -844,6 +850,7 @@ fn handle_hetero_layer_loop(
         }
         state.abi.weight_ptr = original_weight_vreg;
         state.abi.layer_loop_counter = None;
+        state.abi.layer_loop_counter_fresh = None;
         state.in_layer_loop = false;
         state.hetero_phase = HeteroPhase::Done;
     }
@@ -926,6 +933,20 @@ fn handle_standard_layer_loop(
             prog.emit(VmInstr::GprBinOp { dst: layer_weight_base, a: fresh_weight, b: GprOperand::VReg(byte_offset), op: GprOp::Add });
             state.abi.weight_ptr = Some(layer_weight_base);
             state.abi.layer_loop_counter = Some(counter);
+            // §BCE-20260715-KV-COUNTER-SPILL: fresh per-iteration copy of the layer
+            // counter for KV-cache offset computation. The raw `counter` is
+            // loop-carried + regalloc-spillable; its spill slot may be polluted by
+            // other counters (gen-counter) inside the loop body, blowing up the
+            // KV-cache offset → SIGSEGV. Mirrors the mixed-quant path + fresh_weight
+            // reload pattern (BCE-20260706-008). Also fixes the standard-path latent
+            // bug where KV copy previously hardcoded GprLoadImm{value:0} (KV always
+            // wrote layer 0, multi-layer KV cache was silently wrong but did not crash).
+            let fresh_layer_ctr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp {
+                dst: fresh_layer_ctr, a: counter,
+                b: GprOperand::Imm(0), op: GprOp::Add,
+            });
+            state.abi.layer_loop_counter_fresh = Some(fresh_layer_ctr);
             state.in_layer_loop = true;
         }
     }
@@ -934,10 +955,13 @@ fn handle_standard_layer_loop(
     if !group.is_layer_group && state.in_layer_loop {
         // §diagnostic-layer-capture: emit counter-scaled side-channel copy BEFORE
         // ActivationSwap. The pong buffer holds the current layer's output.
+        // Uses the fresh counter copy (regalloc-safe) — BCE-20260715-KV-COUNTER-SPILL.
         #[cfg(feature = "diagnostic-layer-capture")]
         {
             if let Some(ref cap) = locals.layer_capture {
-                if let Some(counter) = state.abi.layer_loop_counter {
+                let ctr = state.abi.layer_loop_counter_fresh
+                    .or(state.abi.layer_loop_counter);
+                if let Some(counter) = ctr {
                     if let Some((_, pong)) = locals.activation_swap_vregs {
                         let _ = super::structural_builder::StructuralOpBuilder::emit_layer_capture_copy(
                             prog, pong, cap.capture_base, counter,
@@ -996,6 +1020,7 @@ fn handle_standard_layer_loop(
         });
         state.abi.weight_ptr = Some(fresh_weight_base);
         state.abi.layer_loop_counter = None;
+        state.abi.layer_loop_counter_fresh = None;
         state.in_layer_loop = false;
     }
     Ok(())
@@ -1090,16 +1115,34 @@ fn handle_mixed_quant_layer_loop(
         });
         state.abi.weight_ptr = Some(layer_weight_base);
         state.abi.layer_loop_counter = Some(counter);
+        // §BCE-20260715-KV-COUNTER-SPILL: fresh per-iteration copy of the layer
+        // counter for KV-cache offset computation. The raw `counter` is loop-carried
+        // and regalloc-spillable; its spill slot may be polluted by other counters
+        // (gen-counter) inside the loop body, blowing up the KV-cache offset → SIGSEGV.
+        // The fresh copy has a short live-range (used only by KV copy + capture),
+        // so it is far less likely to be spilled, and even if spilled it is rewritten
+        // from the authoritative `counter` every iteration (mirrors fresh_weight
+        // reload-from-ABI pattern, BCE-20260706-008).
+        let fresh_layer_ctr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+        prog.emit(VmInstr::GprBinOp {
+            dst: fresh_layer_ctr, a: counter,
+            b: GprOperand::Imm(0), op: GprOp::Add,
+        });
+        state.abi.layer_loop_counter_fresh = Some(fresh_layer_ctr);
         state.in_layer_loop = true;
     }
 
     // ── Layer loop exit: emit ActivationSwap + LoopEnd + reload weight base ──
     if !group.is_layer_group && state.in_layer_loop {
         // §diagnostic-layer-capture: counter-scaled side-channel copy BEFORE swap.
+        // Uses the fresh counter copy (regalloc-safe) so the capture offset is not
+        // corrupted by spill-slot pollution (BCE-20260715-KV-COUNTER-SPILL).
         #[cfg(feature = "diagnostic-layer-capture")]
         {
             if let Some(ref cap) = locals.layer_capture {
-                if let Some(counter) = state.abi.layer_loop_counter {
+                let ctr = state.abi.layer_loop_counter_fresh
+                    .or(state.abi.layer_loop_counter);
+                if let Some(counter) = ctr {
                     if let Some((_, pong)) = activation_swap_vregs {
                         let _ = super::structural_builder::StructuralOpBuilder::emit_layer_capture_copy(
                             prog, pong, cap.capture_base, counter,
@@ -1127,6 +1170,7 @@ fn handle_mixed_quant_layer_loop(
         });
         state.abi.weight_ptr = Some(fresh_weight_base);
         state.abi.layer_loop_counter = None;
+        state.abi.layer_loop_counter_fresh = None;
         state.in_layer_loop = false;
         // Restore the original weight vreg for post-loop global ops (mirrors hetero path).
         if let Some(orig) = original_weight_vreg {

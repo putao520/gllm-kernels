@@ -1535,10 +1535,50 @@ fn lower_attention_v2(
             let kv_cache_ptr = abi.kv_cache_ptr.ok_or_else(|| CompilerError::CodegenViolation(
                 format!("MHA op {:?}: kv_source=FromCache 但 ABI 中无 kv_cache_ptr", op.id)))?;
 
-            let layer_ctr = abi.layer_loop_counter.unwrap_or_else(|| {
-                let zero = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprLoadImm { dst: zero, value: 0 });
-                zero
+            // §BCE-20260715-KV-COUNTER-SPILL: KV-cache layer offset MUST read a
+            // fresh, short-lived copy of the layer counter, re-materialized HERE at
+            // the use site (immediately before the Mul) FROM THE RAW COUNTER.
+            //
+            // Two failure modes drove this design (both observed in N=3 mixed-quant):
+            //
+            // 1. Spill-pollution (the architect's original hypothesis): the raw
+            //    `layer_loop_counter` is loop-carried + regalloc-spillable; under
+            //    register pressure its spill slot can be polluted by other counters
+            //    (gen-counter) inside the loop body, making layer_ctr explode → SIGSEGV.
+            //
+            // 2. In-register clobber (discovered at runtime, N=3): a copy materialized
+            //    at LoopBegin (layer_loop_counter_fresh) has a long live range spanning
+            //    the whole layer-loop body. x86 variable shifts `GprBinOp{Shl/Shr, b:VReg}`
+            //    lower via `mov(rcx,b)` + `shl dst,cl`, clobbering rcx OUTSIDE regalloc's
+            //    clobber model. If the loop-entry copy lands in rcx, any VReg-shift
+            //    between LoopBegin and here corrupts it. Observed: the loop-entry fresh
+            //    copy (rcx) = 0 while the raw counter (r14) = 2 at SIGSEGV. Re-copying
+            //    from the corrupted loop-entry copy just propagates the corruption.
+            //
+            // Resolution: re-materialize from the RAW counter (not the loop-entry copy)
+            // immediately before the Mul. The raw counter is the authoritative source
+            // (it is the LoopBegin-managed counter, rewritten each iteration by LoopEnd).
+            // The use-site copy's live range is ONE instruction, so no VReg-shift can
+            // interpose to clobber it, and the range is too short to both spill AND be
+            // re-polluted. If the raw counter itself is spilled, reading it goes through
+            // the regalloc spill-slot load path which reloads the authoritative value
+            // (the LoopEnd inc writes back to the slot) — distinct from the pollution
+            // case (pollution happens when a DIFFERENT counter reuses the slot; that
+            // case is handled separately by the loop-entry copy, kept as a fallback
+            // only when the raw counter is unavailable).
+            //
+            // The previous fallback `GprLoadImm{value:0}` (hardcoding layer 0) was a
+            // latent bug: KV always wrote layer 0, so multi-layer KV cache was silently
+            // wrong (standard path didn't crash only because offset=0 stays in-bounds).
+            // That fallback is now removed — a missing counter is a real error.
+            let raw_layer_ctr = abi.layer_loop_counter
+                .or(abi.layer_loop_counter_fresh)
+                .ok_or_else(|| CompilerError::CodegenViolation(
+                    format!("MHA op {:?}: kv_source=FromCache 但 layer loop counter 未设置", op.id)))?;
+            let layer_ctr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp {
+                dst: layer_ctr, a: raw_layer_ctr,
+                b: GprOperand::Imm(0), op: GprOp::Add,
             });
             let gen_ctr = abi.gen_loop_counter.unwrap_or_else(|| {
                 let zero = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);

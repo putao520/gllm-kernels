@@ -329,6 +329,14 @@ pub struct AbiPtrs {
     pub gen_loop_counter: Option<super::instr::VRegId>,
     /// Layer loop counter VReg (mega-kernel only).
     pub layer_loop_counter: Option<super::instr::VRegId>,
+    /// §BCE-20260715-KV-COUNTER-SPILL: fresh per-iteration copy of the layer
+    /// loop counter. The raw `layer_loop_counter` is loop-carried + regalloc-spillable;
+    /// its spill slot can be polluted by other counters (e.g. gen-counter) inside the
+    /// loop body, causing KV-cache offset to explode → SIGSEGV. KV-cache copy reads
+    /// this fresh copy instead, mirroring the `fresh_weight` (reload every iteration)
+    /// regalloc-safety pattern (BCE-20260706-008). Live-range is a single emit block,
+    /// so it is far less likely to be spilled.
+    pub layer_loop_counter_fresh: Option<super::instr::VRegId>,
     /// Mega-kernel decode seq_len VReg: prompt_len + gen_counter.
     pub mega_decode_seq_len: Option<super::instr::VRegId>,
     /// Mega-kernel hook_ctx_ptr: SG shared memory base address.

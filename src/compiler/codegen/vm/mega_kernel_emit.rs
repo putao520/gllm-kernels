@@ -1297,6 +1297,7 @@ pub fn compile_mega_kernel_vm(
         scratch_ptr: if needs_scratch { Some(scratchpad_reloaded) } else { None },  // Reloaded each iteration
         gen_loop_counter: Some(gen_counter),
         layer_loop_counter: None,
+        layer_loop_counter_fresh: None,
         mega_decode_seq_len: if topology.loop_topology == LoopTopology::GenerateLoop { Some(decode_seq_len) } else { None },
         hook_ctx_ptr: {
             let hook_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -1965,6 +1966,7 @@ fn emit_batch_mode_path(
             scratch_ptr: if mk.needs_scratch { Some(scratchpad_batch) } else { None },
             gen_loop_counter: None, // no generate loop in prefill
             layer_loop_counter: None,
+            layer_loop_counter_fresh: None,
             mega_decode_seq_len: Some(batch_m), // M = total_prefill_tokens
             hook_ctx_ptr: batch_hook_ctx,
             sg_detect_scratch_offset: mk.sg_detect_scratch_offset,
@@ -2699,6 +2701,7 @@ fn emit_batch_decode_step_loop(
             scratch_ptr: if mk.needs_scratch { Some(scratchpad_batch) } else { None },
             gen_loop_counter: None,
             layer_loop_counter: None,
+            layer_loop_counter_fresh: None,
             mega_decode_seq_len: Some(num_active), // M = num_active
             hook_ctx_ptr: batch_hook_ctx,
             sg_detect_scratch_offset: mk.sg_detect_scratch_offset,
