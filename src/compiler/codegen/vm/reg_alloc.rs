@@ -695,6 +695,48 @@ impl<'a> RegAllocator<'a> {
         }
     }
 
+    /// 返回一条 VmInstr 隐式 clobber 的物理 GPR 集合 (x86 专属)。
+    ///
+    /// BCE-20260715-REGALLOC-SHL-SHR-RCX-CLOBBER: x86 变量移位 `shl/shr reg, cl`
+    /// (GprBinOp{Shl/Shr, b: VReg}) 与 BitTest 变体 隐式用 cl (rcx 低 8 位) 作移位
+    /// 计数 → clobber rcx。regalloc 的 InterferenceGraph 仅按 liveness 建 VReg↔VReg
+    /// 干涉，不建模「指令 clobber 物理寄存器」，导致任何活跃跨该指令并被分配到
+    /// rcx 的 VReg 被破坏 (mixed-quant KV-cache copy 的 fresh counter 副本 SIGSEGV)。
+    ///
+    /// 本函数把「指令 clobber 物理寄存器」建模成显式约束，供 allocate_impl 在
+    /// GPR 分配时从候选池剔除任何在该 VReg 活跃区间内被 clobber 的物理寄存器
+    /// (根治方案 1: regalloc clobber 模型，而非下游 workaround)。
+    ///
+    /// 范围:
+    /// - 仅 `GprBinOp { op: Shl|Shr|BitTest, b: GprOperand::VReg(_) }` (变量移位,
+    ///   操作数是 VReg 非 Imm) 才 clobber rcx。Imm 操作数走 `shl reg, imm8`
+    ///   (立即数移位，不碰 cl)，不 clobber。
+    /// - 仅 x86_64。AArch64 的 LSL/LSR Xd,Xn,Xm 用通用寄存器作移位，无隐式 clobber
+    ///   (aarch64_lower/lower_instr_dispatch.inc.rs:1903-1909 确认)。GPU 不走 CPU
+    ///   线性扫描 (allocate_impl 早已 return)。
+    /// - rcx = PhysGpr(1) (见 isa_profile.rs gpr 映射 0=>rax,1=>rcx,...)。
+    #[allow(clippy::match_like_matches_macro)]
+    pub fn instr_phys_clobbers(instr: &VmInstr, platform: &super::isa_profile::Platform) -> Vec<PhysGpr> {
+        // 仅 x86_64 有隐式 rcx clobber; AArch64/GPU 无此问题。
+        if !matches!(platform, super::isa_profile::Platform::X86_64 { .. }) {
+            return Vec::new();
+        }
+        match instr {
+            VmInstr::GprBinOp { op, b, .. } => {
+                // 变量移位 (VReg 操作数): shl/shr dst, cl → clobber rcx。
+                // Imm 操作数走 shl/shr dst, imm8 (立即数)，不 clobber。
+                if matches!(op, GprOp::Shl | GprOp::Shr | GprOp::BitTest)
+                    && matches!(b, GprOperand::VReg(_))
+                {
+                    vec![PhysGpr(1)] // rcx
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
     fn referenced_vregs_memorya(instr: &VmInstr) -> Vec<VRegId> {
         // Memory cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
         match instr {
@@ -1184,6 +1226,20 @@ impl<'a> RegAllocator<'a> {
         // 预扫描 VmProgram 构建 scope 位置表，用于在 spill 分配时确定归属 scope。
         let scope_positions = Self::build_scope_positions(program);
 
+        // BCE-20260715-REGALLOC-SHL-SHR-RCX-CLOBBER: 预扫描 VmProgram 构建物理寄存器
+        // clobber 位置表 (position → clobbered PhysGpr 集合)。x86 变量移位 clobber rcx
+        // 在此显式建模，供下方 GPR 分配从候选池剔除活跃区间内被 clobber 的物理寄存器。
+        // 仅 x86_64 有 clobber (见 instr_phys_clobbers)；AArch64/GPU 为空表，零开销。
+        let phys_clobbers: Vec<(usize, Vec<PhysGpr>)> = program.instrs.iter().enumerate()
+            .filter_map(|(i, instr)| {
+                let c = Self::instr_phys_clobbers(instr, &self.profile.platform);
+                if c.is_empty() { None } else { Some((i, c)) }
+            })
+            .collect();
+        // 按 position 排序，便于区间查询 (二分查找首个 clobber 落在区间内的位置)。
+        // phys_clobbers_pos: 仅位置序列 (与 phys_clobbers 同序)，供二分。
+        let phys_clobbers_pos: Vec<usize> = phys_clobbers.iter().map(|(p, _)| *p).collect();
+
         let mut mapping: HashMap<VRegId, PhysReg> = HashMap::new();
         let mut gpr_used: HashSet<PhysGpr> = HashSet::new();
         let mut vec_used: HashSet<PhysVec> = HashSet::new();
@@ -1209,10 +1265,23 @@ impl<'a> RegAllocator<'a> {
 
         for iv in &sorted {
             // 收集干涉邻居已占用的物理寄存器
-            let occupied_gpr: HashSet<PhysGpr> = interference.neighbors(iv.vreg)
+            let mut occupied_gpr: HashSet<PhysGpr> = interference.neighbors(iv.vreg)
                 .filter_map(|n| mapping.get(n))
                 .filter_map(|p| match p { PhysReg::Gpr(g) => Some(*g), _ => None })
                 .collect();
+            // BCE-20260715-REGALLOC-SHL-SHR-RCX-CLOBBER: 剔除活跃区间内被指令隐式
+            // clobber 的物理寄存器 (x86 变量移位 clobber rcx)。若某 clobber 位置落在
+            // VReg 活跃区间 [def_point, last_use] 内，则被 clobber 的物理寄存器不可
+            // 分配给该 VReg — 否则 clobber 会破坏其值 (SIGSEGV 根因)。
+            // 二分找首个 clobber 位置 >= def_point，扫描到 > last_use 停止。
+            if !phys_clobbers_pos.is_empty() {
+                let start = phys_clobbers_pos.partition_point(|&p| p < iv.def_point);
+                for &(pos, ref clobbers) in phys_clobbers.iter().skip(start) {
+                    if pos > iv.last_use { break; }
+                    // pos ∈ [def_point, last_use]: clobber 命中活跃区间
+                    for g in clobbers { occupied_gpr.insert(*g); }
+                }
+            }
             let occupied_vec: HashSet<PhysVec> = interference.neighbors(iv.vreg)
                 .filter_map(|n| mapping.get(n))
                 .filter_map(|p| match p { PhysReg::Vec(v) => Some(*v), _ => None })
@@ -2621,6 +2690,149 @@ mod tests {
         };
         let vregs = RegAllocator::referenced_vregs(&instr);
         assert_eq!(vregs.len(), 3);
+    }
+
+    // ── BCE-20260715-REGALLOC-SHL-SHR-RCX-CLOBBER tests ────────────────
+    // x86 变量移位 `shl/shr reg, cl` 隐式 clobber rcx (PhysGpr(1))。regalloc 必须把
+    // 「指令 clobber 物理寄存器」建模成约束，避免把活跃跨该指令的 VReg 分配到 rcx。
+
+    #[test]
+    fn test_instr_phys_clobbers_shl_vreg_x86_clobbers_rcx() {
+        // GprBinOp{Shl, VReg} → shl dst, cl → clobber rcx (PhysGpr(1))
+        let instr = VmInstr::GprBinOp {
+            dst: VRegId(0), a: VRegId(1), b: GprOperand::VReg(VRegId(2)), op: GprOp::Shl,
+        };
+        let plat = super::super::isa_profile::Platform::X86_64 {
+            has_avx512: false, has_bf16: false, has_vnni: false, has_avx512fp16: false,
+            has_f16c: false, has_amx: false, has_amx_fp16: false, has_amx_complex: false,
+            has_amx_transpose: false, has_amx_fp8: false, has_avx10_2: false, has_apx: false,
+            has_sparse_mask_intersect: false,
+        };
+        let c = RegAllocator::instr_phys_clobbers(&instr, &plat);
+        assert_eq!(c, vec![PhysGpr(1)], "x86 Shl VReg must clobber rcx (PhysGpr(1))");
+    }
+
+    #[test]
+    fn test_instr_phys_clobbers_shr_vreg_x86_clobbers_rcx() {
+        let instr = VmInstr::GprBinOp {
+            dst: VRegId(0), a: VRegId(1), b: GprOperand::VReg(VRegId(2)), op: GprOp::Shr,
+        };
+        let plat = super::super::isa_profile::Platform::X86_64 {
+            has_avx512: false, has_bf16: false, has_vnni: false, has_avx512fp16: false,
+            has_f16c: false, has_amx: false, has_amx_fp16: false, has_amx_complex: false,
+            has_amx_transpose: false, has_amx_fp8: false, has_avx10_2: false, has_apx: false,
+            has_sparse_mask_intersect: false,
+        };
+        let c = RegAllocator::instr_phys_clobbers(&instr, &plat);
+        assert_eq!(c, vec![PhysGpr(1)], "x86 Shr VReg must clobber rcx");
+    }
+
+    #[test]
+    fn test_instr_phys_clobbers_bittest_vreg_x86_clobbers_rcx() {
+        // BitTest VReg 也会 mov rcx,b; shr dst,cl → clobber rcx
+        let instr = VmInstr::GprBinOp {
+            dst: VRegId(0), a: VRegId(1), b: GprOperand::VReg(VRegId(2)), op: GprOp::BitTest,
+        };
+        let plat = super::super::isa_profile::Platform::X86_64 {
+            has_avx512: false, has_bf16: false, has_vnni: false, has_avx512fp16: false,
+            has_f16c: false, has_amx: false, has_amx_fp16: false, has_amx_complex: false,
+            has_amx_transpose: false, has_amx_fp8: false, has_avx10_2: false, has_apx: false,
+            has_sparse_mask_intersect: false,
+        };
+        let c = RegAllocator::instr_phys_clobbers(&instr, &plat);
+        assert_eq!(c, vec![PhysGpr(1)], "x86 BitTest VReg must clobber rcx");
+    }
+
+    #[test]
+    fn test_instr_phys_clobbers_shl_imm_x86_no_clobber() {
+        // Shl + Imm (立即数移位 shl reg, imm8) 不用 cl → 不 clobber rcx
+        let instr = VmInstr::GprBinOp {
+            dst: VRegId(0), a: VRegId(1), b: GprOperand::Imm(3), op: GprOp::Shl,
+        };
+        let plat = super::super::isa_profile::Platform::X86_64 {
+            has_avx512: false, has_bf16: false, has_vnni: false, has_avx512fp16: false,
+            has_f16c: false, has_amx: false, has_amx_fp16: false, has_amx_complex: false,
+            has_amx_transpose: false, has_amx_fp8: false, has_avx10_2: false, has_apx: false,
+            has_sparse_mask_intersect: false,
+        };
+        let c = RegAllocator::instr_phys_clobbers(&instr, &plat);
+        assert!(c.is_empty(), "x86 Shl Imm must NOT clobber rcx (uses imm8, not cl)");
+    }
+
+    #[test]
+    fn test_instr_phys_clobbers_add_vreg_x86_no_clobber() {
+        // 非 shift 算术 (Add VReg) 不 clobber rcx (用 lea/add, 无 cl)
+        let instr = VmInstr::GprBinOp {
+            dst: VRegId(0), a: VRegId(1), b: GprOperand::VReg(VRegId(2)), op: GprOp::Add,
+        };
+        let plat = super::super::isa_profile::Platform::X86_64 {
+            has_avx512: false, has_bf16: false, has_vnni: false, has_avx512fp16: false,
+            has_f16c: false, has_amx: false, has_amx_fp16: false, has_amx_complex: false,
+            has_amx_transpose: false, has_amx_fp8: false, has_avx10_2: false, has_apx: false,
+            has_sparse_mask_intersect: false,
+        };
+        let c = RegAllocator::instr_phys_clobbers(&instr, &plat);
+        assert!(c.is_empty(), "x86 Add VReg must NOT clobber rcx");
+    }
+
+    #[test]
+    fn test_instr_phys_clobbers_shl_vreg_aarch64_no_clobber() {
+        // AArch64 LSL Xd,Xn,Xm 用通用寄存器作移位，无隐式 clobber
+        let instr = VmInstr::GprBinOp {
+            dst: VRegId(0), a: VRegId(1), b: GprOperand::VReg(VRegId(2)), op: GprOp::Shl,
+        };
+        let profile = super::super::isa_profile::IsaProfile::aarch64(false, false, 16, false, false, false);
+        let c = RegAllocator::instr_phys_clobbers(&instr, &profile.platform);
+        assert!(c.is_empty(), "AArch64 Shl VReg must NOT clobber (uses LSL Xd,Xn,Xm)");
+    }
+
+    #[test]
+    fn test_instr_phys_clobbers_shr_vreg_gpu_no_clobber() {
+        // GPU 不走 CPU 线性扫描，clobber 表应为空
+        let instr = VmInstr::GprBinOp {
+            dst: VRegId(0), a: VRegId(1), b: GprOperand::VReg(VRegId(2)), op: GprOp::Shr,
+        };
+        let profile = super::super::isa_profile::IsaProfile::cuda(80);
+        let c = RegAllocator::instr_phys_clobbers(&instr, &profile.platform);
+        assert!(c.is_empty(), "GPU must NOT model rcx clobber");
+    }
+
+    #[test]
+    fn test_regalloc_shl_vreg_excludes_rcx_from_live_vreg() {
+        // 集成测试: 构造一个活跃跨变量移位 (Shl VReg) 的 VReg，验证它不会被分配到
+        // rcx (PhysGpr(1))。这是 BCE-20260715-REGALLOC-SHL-SHR-RCX-CLOBBER 的回归断言。
+        // 仅在 x86_64 host 上有确定性 (test_profile 用探测到的设备)。
+        let profile = test_profile();
+        if !matches!(profile.platform, super::super::isa_profile::Platform::X86_64 { .. }) {
+            // 非 x86_64 host: 跳过 (rcx 是 x86 专属概念，AArch64 host 无法验证)
+            return;
+        }
+        let mut prog = VmProgram::new();
+        // live_vreg: 定义在 shift 前，shift 后使用 → 活跃跨 shift
+        let live_vreg = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+        let shift_amt = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+        let shift_dst = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+        prog.emit(VmInstr::GprLoadImm { dst: live_vreg, value: 42 });
+        prog.emit(VmInstr::GprLoadImm { dst: shift_amt, value: 3 });
+        // 变量移位 (clobber rcx): shift_dst = shift_amt << shift_amt
+        prog.emit(VmInstr::GprBinOp {
+            dst: shift_dst, a: shift_amt, b: GprOperand::VReg(shift_amt), op: GprOp::Shl,
+        });
+        // live_vreg 仍活跃 (使用它) → 其活跃区间跨过上面的 Shl
+        let sink = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+        prog.emit(VmInstr::GprBinOp {
+            dst: sink, a: live_vreg, b: GprOperand::Imm(1), op: GprOp::Add,
+        });
+
+        let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
+        // live_vreg 活跃跨 Shl VReg → 不可分配到 rcx (PhysGpr(1))
+        let live_phys = alloc.get_gpr(live_vreg);
+        // 若被 spill (register pressure 极高)，则不存在冲突；仅当分到 GPR 时检查
+        if let Some(g) = live_phys {
+            assert_ne!(g, PhysGpr(1),
+                "live VReg spanning Shl VReg must NOT be in rcx (PhysGpr(1)); got {:?}. \
+                 BCE-20260715-REGALLOC-SHL-SHR-RCX-CLOBBER regression.", g);
+        }
     }
 
     // ── validate_spill_layout tests ────────────────────────────────────
