@@ -1174,16 +1174,99 @@ impl X86Lower {
                 // 将两个 ptr VReg 加载到 scratch GPR (slot 1, 2)
                 let reg_a = self.resolve_gpr_read(*ptr_a, alloc, 1)?;
                 let reg_b = self.resolve_gpr_read(*ptr_b, alloc, 2)?;
+
+                // ── BCE-20260716-BUG-A: ActivationSwap runtime ptr instrumentation ──
+                // BUG-A: Q5_K_M mixed-quant N=2 pong buffer (offset 167772160) 全零，Q6_K N=2
+                // pong 保留 layer0 输出。静态 VmProgram+RegAlloc 完全对称；唯一差异 = step_bytes
+                // (Q5_K_M=0 LoadLayerWeightOffset vs Q6_K=12911616 线性) 改变寄存器压力。
+                // 用户方法论 "no GDB"：用 JIT 插桩 dump 每次 ActivationSwap 前后 ping/pong
+                // 指针的运行时物理值，定位 pong 何时被清零。
+                //
+                // 插桩方案：env var GLLM_TRACE_SWAP=1 (compile-time 门控，production 零开销) 时，
+                // 在每次 ActivationSwap xchg 前后各 dump [reg_a, reg_b] 到 telemetry_ptr 指向的
+                // buffer。telemetry_ptr = MegaKernelFn arg 15 (StackArg(88))，harness 传入非 NULL
+                // buffer 预填 0xDEADBEEF sentinel，跑完后读出 ping/pong 运行时值序列。
+                //
+                // 布局：SWAP_LOG_BASE=1024 之后，每次 ActivationSwap 占 32 字节
+                //   [base + idx*32 + 0]  = ping-before (reg_a pre-xchg)
+                //   [base + idx*32 + 8]  = pong-before (reg_b pre-xchg)
+                //   [base + idx*32 + 16] = ping-after  (reg_a post-xchg)
+                //   [base + idx*32 + 24] = pong-after  (reg_b post-xchg)
+                let trace_swap = std::env::var("GLLM_TRACE_SWAP").map(|v| !v.is_empty() && v != "0").unwrap_or(false);
+                let swap_slot = if trace_swap {
+                    static TRACE_SWAP_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                    const SWAP_LOG_BASE: i32 = 1024;
+                    let idx = TRACE_SWAP_IDX.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32;
+                    let off = SWAP_LOG_BASE + idx * 32;
+                    Some(off)
+                } else {
+                    None
+                };
+
+                // dump-before：把 xchg 前的 reg_a/reg_b 写入 telemetry buffer
+                if let Some(off) = swap_slot {
+                    self.emit_swap_trace_store(reg_a, reg_b, off, 0, alloc)?;
+                }
+
                 // xchg reg_a, reg_b — 交换两个指针值
                 self.asm.xchg(reg_a, reg_b).map_err(Self::err)?;
                 // 写回（spilled 时 store 到栈槽，非 spill 时 no-op）
                 self.commit_gpr_write(*ptr_a, alloc, 1)?;
                 self.commit_gpr_write(*ptr_b, alloc, 2)?;
+
+                // dump-after：重新读取 ptr_a/ptr_b（含 commit 后的值）写入 telemetry buffer
+                if let Some(off) = swap_slot {
+                    let reg_a2 = self.resolve_gpr_read(*ptr_a, alloc, 1)?;
+                    let reg_b2 = self.resolve_gpr_read(*ptr_b, alloc, 2)?;
+                    self.emit_swap_trace_store(reg_a2, reg_b2, off, 16, alloc)?;
+                }
                 Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_activation_swap_x86: expected VmInstr::ActivationSwap, got {:?}", instr))),
         }
+    }
+
+    /// BCE-20260716-BUG-A: dump ActivationSwap ping/pong 运行时指针值到 telemetry buffer。
+    ///
+    /// 把 `reg_a`/`reg_b` 当前值 store 到 `[telemetry_ptr + off + sub_off]` /
+    /// `[telemetry_ptr + off + sub_off + 8]`。telemetry_ptr 从 sym_slot_map 解析
+    /// (MegaKernelFn arg 15, x86 StackArg(88))。harness 须传非 NULL buffer + 预填
+    /// sentinel (ARCH-TELEMETRY-NONNULL：NULL ptr 解引用会 SIGSEGV，故门控在 env var)。
+    ///
+    /// 寄存器冲突规避：telemetry_ptr carrier 选 scratch_gprs 中既非 reg_a 也非 reg_b
+    /// 的寄存器（3 scratch - 2 occupied ≥ 1 free，ARCH-REGALLOC-GPR-SPILL 保证 ≥3）。
+    /// 对简单 StackArg/AbiArg PtrExpr，emit_load_ptr_from_resolved 内部不再用 scratch
+    /// slot 1/2（仅 VRegPlus* 分支才用），故 carrier 不与 reg_a/reg_b 的 slot 冲突。
+    fn emit_swap_trace_store(
+        &mut self,
+        reg_a: AsmRegister64,
+        reg_b: AsmRegister64,
+        off: i32,
+        sub_off: i32,
+        alloc: &RegAllocation,
+    ) -> Result<(), CompilerError> {
+        // 解析 telemetry_ptr PtrExpr
+        let telem_expr = self.sym_slot_map.resolve("telemetry_ptr")
+            .ok_or_else(|| CompilerError::CodegenViolation(
+                "emit_swap_trace_store: 'telemetry_ptr' not in SymDimSlotMap".into()))?
+            .clone();
+        // 选不与 reg_a/reg_b 冲突的 scratch carrier
+        let carrier = self.scratch_gprs.iter()
+            .find(|&&s| s != reg_a && s != reg_b)
+            .copied()
+            .ok_or_else(|| CompilerError::CodegenViolation(format!(
+                "emit_swap_trace_store: no free scratch (reg_a={:?} reg_b={:?} scratches={:?})",
+                reg_a, reg_b, self.scratch_gprs,
+            )))?;
+        // carrier = telemetry_ptr (mov carrier, [rbp+88] for StackArg)
+        self.emit_load_ptr_from_resolved(carrier, &telem_expr, alloc)?;
+        // store reg_a / reg_b 到 [carrier + off + sub_off(+8)]
+        let base0 = off + sub_off;
+        let base1 = base0 + 8;
+        self.asm.mov(qword_ptr(carrier + base0), reg_a).map_err(Self::err)?;
+        self.asm.mov(qword_ptr(carrier + base1), reg_b).map_err(Self::err)?;
+        Ok(())
     }
 
     // GatherLoad: 向量索引加载 — 生成标量循环（每次加载一个元素）。

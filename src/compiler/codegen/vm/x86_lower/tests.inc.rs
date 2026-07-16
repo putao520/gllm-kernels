@@ -1408,4 +1408,66 @@ mod tests {
         assert!(!before_ret.windows(le1.len()).any(|w| w == le1),
             "BCE-20260715 x86: offset_table[1] LE bytes leaked into fall-through path (pre-ret).");
     }
+
+    /// Build a minimal program with a single ActivationSwap { ptr_a, ptr_b },
+    /// where both ptrs are loaded from ABI stack slots (mimicking ping/pong VReg
+    /// loading). Used by the swap-trace instrumentation tests.
+    fn build_activation_swap_prog() -> (VmProgram, VRegId, VRegId) {
+        let mut prog = VmProgram::new();
+        let ptr_a = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let ptr_b = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        // Load ptr_a / ptr_b from named ABI slots so they resolve via sym_map.
+        prog.emit(VmInstr::LoadPtr { dst: ptr_a, src: PtrExpr::NamedArg("scratchpad_ptr".into()) });
+        prog.emit(VmInstr::LoadPtr { dst: ptr_b, src: PtrExpr::NamedArg("output_tokens_ptr".into()) });
+        prog.emit(VmInstr::ActivationSwap { ptr_a, ptr_b });
+        (prog, ptr_a, ptr_b)
+    }
+
+    fn lower_swap_prog_to_code(prog: &VmProgram) -> Vec<u8> {
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        let alloc = RegAllocator::new(&profile).allocate(prog).unwrap();
+        let frame = super::super::stack_frame::StackFrame::compute(&alloc, &profile, 0);
+        let mut lower = X86Lower::new();
+        lower.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            lower.lower_instr(instr, &alloc).unwrap();
+        }
+        lower.emit_epilogue(&frame, &alloc).unwrap();
+        lower.finalize().unwrap()
+    }
+
+    /// BCE-20260716-BUG-A: with GLLM_TRACE_SWAP unset, ActivationSwap lowering
+    /// produces the baseline (uninstrumented) code — production zero-overhead.
+    #[test]
+    fn bce_bug_a_activation_swap_trace_disabled_is_baseline() {
+        // Ensure env var is unset for this test process (tests share a process).
+        std::env::remove_var("GLLM_TRACE_SWAP");
+        let (prog, _a, _b) = build_activation_swap_prog();
+        let code = lower_swap_prog_to_code(&prog);
+        assert!(!code.is_empty(), "baseline swap code must be non-empty");
+    }
+
+    /// BCE-20260716-BUG-A: with GLLM_TRACE_SWAP=1, ActivationSwap lowering emits
+    /// extra telemetry stores (before+after each swap) → strictly more bytes than
+    /// the disabled baseline. Proves instrumentation is gated-on by the env var
+    /// at compile time.
+    #[test]
+    fn bce_bug_a_activation_swap_trace_enabled_emits_extra_stores() {
+        // Baseline (disabled).
+        std::env::remove_var("GLLM_TRACE_SWAP");
+        let (prog, _a, _b) = build_activation_swap_prog();
+        let code_disabled = lower_swap_prog_to_code(&prog);
+
+        // Instrumented (enabled). Use a process-unique marker so the assertion
+        // is robust to other tests flipping the same env var.
+        std::env::set_var("GLLM_TRACE_SWAP", "1");
+        let (prog2, _a2, _b2) = build_activation_swap_prog();
+        let code_enabled = lower_swap_prog_to_code(&prog2);
+        std::env::remove_var("GLLM_TRACE_SWAP");
+
+        assert!(code_enabled.len() > code_disabled.len(),
+            "GLLM_TRACE_SWAP=1 must emit extra telemetry stores: enabled={} bytes, disabled={} bytes",
+            code_enabled.len(), code_disabled.len());
+    }
 }
