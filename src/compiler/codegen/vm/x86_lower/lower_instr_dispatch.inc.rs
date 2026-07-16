@@ -244,6 +244,7 @@ impl X86Lower {
             VmInstr::DebugMarker { message } => self.lower_debug_marker_x86(instr, alloc),
             VmInstr::DebugProbe { vreg, probe_name, width } => self.lower_debug_probe_x86(instr, alloc),
             VmInstr::DebugBreakIf { label, cond_gpr } => self.lower_debug_break_if_x86(instr, alloc),
+            VmInstr::TracePtrs { a, b, base_offset, idx } => self.lower_trace_ptrs_x86(instr, alloc),
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_misc_x86: variant {:?} not in Misc category", instr))),
         }
@@ -5787,6 +5788,29 @@ impl X86Lower {
             }
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_debug_break_if_x86: expected VmInstr::DebugBreakIf, got {:?}", instr))),
+        }
+    }
+
+    /// BCE-20260716-BUG-A: TracePtrs lowering — dump two ptr VReg runtime values
+    /// to telemetry_ptr buffer at base_offset + idx*16 ([+0]=a, [+8]=b). Mirrors
+    /// emit_swap_trace_store carrier scheme. Used by layer body-entry diagnostics.
+    fn lower_trace_ptrs_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
+        match instr {
+            VmInstr::TracePtrs { a, b, base_offset, idx } => {
+                // resolve_gpr_read forces the VReg into a scratch GPR (loading from
+                // spill slot if spilled). slot 1 / 2 — same as ActivationSwap.
+                let reg_a = self.resolve_gpr_read(*a, alloc, 1)?;
+                let reg_b = self.resolve_gpr_read(*b, alloc, 2)?;
+                let off = *base_offset + (*idx as i32) * 16;
+                // store [telemetry_ptr + off + 0] = reg_a, [+8] = reg_b
+                // carrier = a free scratch (not reg_a/reg_b); emit_swap_trace_store
+                // picks carrier internally — but it takes reg_a/reg_b already as
+                // the values to store, so reuse it with sub_off=0.
+                self.emit_swap_trace_store(reg_a, reg_b, off, 0, alloc)?;
+                Ok(())
+            }
+            _ => Err(CompilerError::CodegenViolation(
+                format!("lower_trace_ptrs_x86: expected VmInstr::TracePtrs, got {:?}", instr))),
         }
     }
 

@@ -1897,6 +1897,16 @@ pub enum VmInstr {
         cond_gpr: VRegId,
     },
 
+    /// BCE-20260716-BUG-A: 把两个 ptr VReg 的运行时物理值 store 到 telemetry_ptr
+    /// buffer (base_offset + idx*16: [+0]=a, [+8]=b)。env=GLLM_TRACE_SWAP 编译时门控
+    /// (pipeline.inc.rs 决定是否 emit)。用于 layer body 入口 dump ping/pong 真实值。
+    TracePtrs {
+        a: VRegId,
+        b: VRegId,
+        base_offset: i32,
+        idx: usize,
+    },
+
     // ── REQ-VR-005~010: 缺失指令补全 ──
 
     /// 向量 lane 重排 (REQ-VR-005)。

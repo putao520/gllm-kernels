@@ -252,6 +252,7 @@ impl VmInstr {
             | VmInstr::DebugMarker { .. }
             | VmInstr::DebugProbe { .. }
             | VmInstr::DebugBreakIf { .. }
+            | VmInstr::TracePtrs { .. }
             | VmInstr::DeclareVReg { .. }
             | VmInstr::ReleaseVReg { .. }
             | VmInstr::HotpatchSlot { .. }

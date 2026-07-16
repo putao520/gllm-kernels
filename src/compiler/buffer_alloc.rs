@@ -746,7 +746,13 @@ fn build_tensor_sources(
                     // in_tid 强制 ActivationPing (覆盖 Intermediate/gather-out 跳过)
                     map.insert(in_tid, TensorPtrSource::ActivationPing);
                     if !gather_outs.contains(&out_tid) {
-                        map.entry(out_tid).or_insert(TensorPtrSource::ActivationPong);
+                        // BCE-20260716-BUG-A: out_tid (layer output = ffn_resid) must
+                        // FORCE ActivationPong (swapped pointer), not or_insert. If
+                        // out_tid already has an Intermediate entry (from its slot
+                        // allocation), or_insert leaves it as a FIXED offset → layer
+                        // output writes to fixed 167M slot instead of swapped pong
+                        // ptr → N≥2 overwrites prior layer's output → NaN.
+                        map.insert(out_tid, TensorPtrSource::ActivationPong);
                     }
                 }
             }
@@ -755,7 +761,8 @@ fn build_tensor_sources(
                 if let Some((in_tid, out_tid)) = cfg.activation_alias {
                     map.insert(in_tid, TensorPtrSource::ActivationPing);
                     if !gather_outs.contains(&out_tid) {
-                        map.entry(out_tid).or_insert(TensorPtrSource::ActivationPong);
+                        // BCE-20260716-BUG-A: same force-override as standard path.
+                        map.insert(out_tid, TensorPtrSource::ActivationPong);
                     }
                 }
             }
@@ -763,7 +770,8 @@ fn build_tensor_sources(
                 for &(in_tid, out_tid) in &cfg.activation_aliases {
                     map.insert(in_tid, TensorPtrSource::ActivationPing);
                     if !gather_outs.contains(&out_tid) {
-                        map.entry(out_tid).or_insert(TensorPtrSource::ActivationPong);
+                        // BCE-20260716-BUG-A: same force-override.
+                        map.insert(out_tid, TensorPtrSource::ActivationPong);
                     }
                 }
             }

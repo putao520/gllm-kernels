@@ -1624,6 +1624,7 @@ fn collect_src_vregs_miscb(instr: &VmInstr) -> Vec<VRegId> {
         VmInstr::DebugMarker { .. } => vec![],
         VmInstr::DebugProbe { vreg, .. } => vec![*vreg],
         VmInstr::DebugBreakIf { cond_gpr, .. } => vec![*cond_gpr],
+        VmInstr::TracePtrs { a, b, .. } => vec![*a, *b],
         _ => unreachable!("Misc category mismatch in collect_src_vregs"),
     }
 }

@@ -236,7 +236,8 @@ impl AArch64Lower {
             VmInstr::Lz4Decode { src_ptr, dst_ptr, compressed_size, decompressed_size } => self.lower_lz4_decode_aarch64(instr, alloc),
             VmInstr::BitPackRleDecode { src_ptr, dst_ptr, compressed_size, nibble_bits, element_count } => self.lower_bit_pack_rle_decode_aarch64(instr, alloc),
             VmInstr::DebugBreakpoint { .. } | VmInstr::DebugMarker { .. }
-            | VmInstr::DebugProbe { .. } | VmInstr::DebugBreakIf { .. } => self.lower_debug_breakpoint_aarch64(instr, alloc),
+            | VmInstr::DebugProbe { .. } | VmInstr::DebugBreakIf { .. }
+            | VmInstr::TracePtrs { .. } => self.lower_debug_breakpoint_aarch64(instr, alloc),
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_misc_aarch64: variant {:?} not in Misc category", instr))),
         }
@@ -4874,7 +4875,8 @@ Ok(())
     fn lower_debug_breakpoint_aarch64(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
             VmInstr::DebugBreakpoint { .. } | VmInstr::DebugMarker { .. }
-            | VmInstr::DebugProbe { .. } | VmInstr::DebugBreakIf { .. } => {
+            | VmInstr::DebugProbe { .. } | VmInstr::DebugBreakIf { .. }
+            | VmInstr::TracePtrs { .. } => {
 
                 // BRK #1 (AArch64 software breakpoint = 0xD4200020)
                 // For now, NOP — debug instrumentation only meaningful on x86_64 host

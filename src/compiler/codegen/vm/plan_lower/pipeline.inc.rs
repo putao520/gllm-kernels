@@ -1098,6 +1098,22 @@ fn handle_mixed_quant_layer_loop(
             src: ctx.session.sym_map.resolve("weights").cloned().expect("ABI: weights"),
         });
 
+        // BCE-20260716-BUG-A: dump ping/pong ptr values at layer body entry.
+        // env=GLLM_TRACE_SWAP compile-time gate. idx = compile-time counter (per
+        // emit call) — runtime iterations overwrite the same idx slot → last
+        // iteration (layer1 for N=2) value survives. base_offset=4096 (swap-log
+        // uses 1024; 16B/entry: [+0]=ping, [+8]=pong).
+        if std::env::var("GLLM_TRACE_SWAP").map(|v| !v.is_empty() && v != "0").unwrap_or(false) {
+            if let Some((ping_ptr, pong_ptr)) = activation_swap_vregs {
+                static TRACE_BODY_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let bidx = TRACE_BODY_IDX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                prog.emit(VmInstr::TracePtrs {
+                    a: ping_ptr, b: pong_ptr,
+                    base_offset: 4096, idx: bidx,
+                });
+            }
+        }
+
         // LoadLayerWeightOffset: offset = offset_table[layer_idx] (runtime table lookup).
         let layer_offset = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         prog.emit(VmInstr::LoadLayerWeightOffset {

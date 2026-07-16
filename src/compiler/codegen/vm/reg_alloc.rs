@@ -1169,6 +1169,7 @@ impl<'a> RegAllocator<'a> {
             VmInstr::DebugMarker { .. } => vec![],
             VmInstr::DebugProbe { vreg, .. } => vec![*vreg],
             VmInstr::DebugBreakIf { cond_gpr, .. } => vec![*cond_gpr],
+            VmInstr::TracePtrs { a, b, .. } => vec![*a, *b],
             _ => unreachable!("Misc category mismatch in referenced_vregs"),
         }
     }
