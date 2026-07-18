@@ -796,33 +796,31 @@ fn assign_homogeneous_markers(
     // execute inside the layer loop.
     let layer_group_indices = {
         let iso = find_isomorphic_run(signatures, num_iterations);
-        eprintln!("[MARKER-DBG] num_iterations={} groups.len={} iso.len={}", num_iterations, groups.len(), iso.len());
-        if !iso.is_empty() && iso.len() > 2 {
-            eprintln!("[MARKER-DBG] using iso (len>2) path");
-            iso
-        } else {
-            eprintln!("[MARKER-DBG] using fallback (label starts_with layer.) path");
-            // Fallback: mark all consecutive groups whose anchor op label starts
-            // with "layer." as layer groups. This handles single-template graphs
-            // where the isomorphic pattern detection fails.
-            let mut layer_indices = Vec::new();
-            let mut in_layer_run = false;
-            for (i, group) in groups.iter().enumerate() {
-                let anchor_label = graph.op(group.ops[0])
-                    .map(|op| op.label.as_str())
-                    .unwrap_or("");
-                eprintln!("[MARKER-DBG] group[{i}] ops[0].label='{}' starts_layer={}", anchor_label, anchor_label.starts_with("layer."));
-                if anchor_label.starts_with("layer.") {
-                    layer_indices.push(i);
-                    in_layer_run = true;
-                } else if in_layer_run {
-                    // Once we exit the layer run, stop — don't include global ops
-                    // (final_norm, lm_head) that appear after the layer template.
-                    break;
-                }
+        let _ = &iso;
+        // BUG-C 根治 (Design 2): 强制用 fallback (label starts_with "layer.") path
+        // 而非 iso path。BUG-B 的 per-group QuantGemm (v_proj/down_proj 各 2 个 op)
+        // 破坏 iso 同构检测，iso path 漏标记 MHA group → layer loop counter 未设 →
+        // MHA kv_source=FromCache 报错。fallback 用 label 前缀标记所有 layer.* group，
+        // 稳健覆盖所有 layer ops（含 MHA）。@trace REQ-ARCH-DTYPE-MIXED-PRECISION
+        // Fallback: mark all consecutive groups whose anchor op label starts
+        // with "layer." as layer groups. This handles single-template graphs
+        // where the isomorphic pattern detection fails.
+        let mut layer_indices = Vec::new();
+        let mut in_layer_run = false;
+        for (i, group) in groups.iter().enumerate() {
+            let anchor_label = graph.op(group.ops[0])
+                .map(|op| op.label.as_str())
+                .unwrap_or("");
+            if anchor_label.starts_with("layer.") {
+                layer_indices.push(i);
+                in_layer_run = true;
+            } else if in_layer_run {
+                // Once we exit the layer run, stop — don't include global ops
+                // (final_norm, lm_head) that appear after the layer template.
+                break;
             }
-            layer_indices
         }
+        layer_indices
     };
 
     if layer_group_indices.is_empty() {

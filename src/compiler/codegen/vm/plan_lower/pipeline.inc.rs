@@ -871,7 +871,6 @@ fn handle_standard_layer_loop(
     let width = ctx.session.width;
 
     // ── Layer loop entry: emit LoopBegin + compute layer_weight_base ──
-    eprintln!("[LOOP-DBG] handle_standard: group.is_layer_group={} state.in_layer_loop={} marker={:?}", group.is_layer_group, state.in_layer_loop, group.marker);
     if group.is_layer_group && !state.in_layer_loop {
         if let Some(cfg) = layer_loop_cfg {
             let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
