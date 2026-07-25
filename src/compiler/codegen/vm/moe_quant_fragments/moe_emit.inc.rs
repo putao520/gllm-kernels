@@ -777,7 +777,20 @@ impl QuantGemmPlan {
             }
 
             let is_int4 = matches!(desc.data_kind, DK::PackedInt4 | DK::SignedPackedInt4);
-            let is_assisted = is_int4 && matches!(dot_cap,
+            // BCE-20260723-Q4K-ASSISTED-MISROUTE: Assisted kernel only handles FLAT
+            // scale layouts (BlockScalar / BlockScalarWithMin). K-Quant Q4_K uses
+            // Hierarchical 6-bit packed scales (get_scale_min_k4) which Assisted
+            // cannot decode (it would load d/F16 at offset 0 as the per-block scale,
+            // silently producing garbage — N=1 single-token cos went NEGATIVE).
+            // Exclude Hierarchical-scale INT4 from Assisted → fall through to
+            // DequantFma whose DecodeTraceBuilder decodes Q4_K scales correctly
+            // (QuantKQuantPackedScaleLookup + QuantIntDivConst, mirror of Q5_K).
+            // Same gate as the HighBitMerge branch above (flat-only) — DRY intent.
+            let is_flat_scale = matches!(
+                &desc.scale_layout,
+                ScaleLayout::BlockScalar { .. } | ScaleLayout::BlockScalarWithMin { .. }
+            );
+            let is_assisted = is_int4 && is_flat_scale && matches!(dot_cap,
                 DotProductCap::SimdAssisted | DotProductCap::SimdBasic);
 
             let kernel = if matches!(desc.data_kind, DK::Int8) && matches!(dot_cap,
@@ -791,8 +804,13 @@ impl QuantGemmPlan {
                 };
                 GemmKernel::Int8Native { scale_offset, data_offset, m_offset }
             } else if is_assisted {
+                // is_flat_scale guaranteed true here; scale_layout is BlockScalar(_WithMin).
                 let data_offset = match &desc.data_layout { DataLayout::Bytes { offset, .. } | DataLayout::PackedNibbles { offset, .. } => *offset, _ => 0 };
-                let scale_offset = match &desc.scale_layout { ScaleLayout::BlockScalar { offset_bytes, .. } => *offset_bytes, _ => 0 };
+                let scale_offset = match &desc.scale_layout {
+                    ScaleLayout::BlockScalar { offset_bytes, .. } => *offset_bytes,
+                    ScaleLayout::BlockScalarWithMin { d_offset, .. } => *d_offset,
+                    _ => 0,  // unreachable: is_flat_scale gate excludes Hierarchical/Q6KScales
+                };
                 GemmKernel::Assisted { scale_offset, data_offset }
             } else if matches!(desc.data_kind, DK::PackedInt5 | DK::PackedInt6)
                 && !matches!(desc.quant_type, crate::quant::QuantType::Q5_0 | crate::quant::QuantType::Q5_1)

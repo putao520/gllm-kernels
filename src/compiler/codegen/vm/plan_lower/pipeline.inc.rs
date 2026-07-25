@@ -397,11 +397,12 @@ pub(super) fn emit_fusion_groups(
             std::io::stderr().flush().ok();
         }
         // BCE-20260713-ACTIVATION-SWAP-PARITY (Plan C): 每组重置 ping/pong 到初始 buffer.
-        // 3 融合组共享 v25/v26 (locals.activation_swap_vregs 单一 pair). 每组 layer loop 后
-        // 有 parity-fix ActivationSwap (恢复 pong 指向最后层输出, 对单组 post-loop 正确性必需).
-        // 但 3 组串行, 前一组 parity fix 翻转 v25/v26, 后一组继承翻转状态 → 组间代码读翻转
-        // 后的 v25 → 错 buffer → N=偶数 layer0=0 (乱码).
-        // 每组开始前重新 AddPtr 重置 v25/v26 = scratch + ping_off/pong_off, 覆盖翻转.
+        // ⚠️ BCE-20260724-PLAN-C-RESIDUAL-BREAK: Plan C 破坏 BF16 残差(每组前 ping=emb →
+        // attn_resid=emb+attn_output 而非 prev_layer_out+attn_output), N=28 logits 趋同
+        // (argmax 恒定). 但删除后 Q5_K_M N=28 core dump (GDB 定位: Q5KDecodeStep block_base
+        // spill 槽被覆盖 → reload 得 0 → NULL 解引用, 详见 BUG-KNOWLEDGE 方向66i).
+        // 真根因是 regalloc spill slot 管理 bug (Q5 大代码下复用覆盖活跃 VReg), Plan C 的
+        // AddPtr 改变 regalloc 决策"碰巧"避开冲突 spill 槽. 待 regalloc 修复后再删 Plan C.
         if let Some((ping_ptr, pong_ptr)) = locals.activation_swap_vregs {
             let ping_off = fctx.alloc.slots.iter()
                 .find(|s| s.tensor_id.0 == 0xFFFF_FF00)

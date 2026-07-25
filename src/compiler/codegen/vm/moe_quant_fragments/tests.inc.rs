@@ -174,7 +174,13 @@ mod tests {
     }
 
     #[test]
-    fn test_q4k_selects_assisted() {
+    fn test_q4k_selects_dequant_fma() {
+        // BCE-20260723-Q4K-ASSISTED-MISROUTE: Q4_K has Hierarchical 6-bit packed
+        // scales (get_scale_min_k4) which the Assisted kernel cannot decode — it
+        // would load d/F16 at offset 0 as the per-block scale, silently producing
+        // garbage (N=1 single-token cos went NEGATIVE). Q4_K now routes to
+        // DequantFma (same as Q5_K), whose DecodeTraceBuilder decodes Hierarchical
+        // scales via QuantKQuantPackedScaleLookup + QuantIntDivConst.
         let desc = QuantAlgoKind::Q4K.descriptor();
         let plan = QuantGemmPlan::derive(
             BoundExpr::Const(1), 1, 256, &desc, SimdWidth::W256,
@@ -182,8 +188,8 @@ mod tests {
         ).expect("Q4K plan derive should succeed");
 
         match &plan.kernel {
-            GemmKernel::Assisted { .. } => {}
-            other => panic!("Q4K should select Assisted, got {:?}", other),
+            GemmKernel::DequantFma => {}
+            other => panic!("Q4_K should select DequantFma (Hierarchical scale), got {:?}", other),
         }
     }
 
