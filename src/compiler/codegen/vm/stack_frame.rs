@@ -28,18 +28,16 @@ pub struct StackFrame {
 
 impl StackFrame {
     /// 从 RegAllocation + IsaProfile 计算栈帧布局。
-    pub fn compute(
-        alloc: &RegAllocation,
-        profile: &IsaProfile,
-        scratchpad_bytes: usize,
-    ) -> Self {
+    pub fn compute(alloc: &RegAllocation, profile: &IsaProfile, scratchpad_bytes: usize) -> Self {
         let callee_save_area = alloc.callee_saved_used.len() * 8; // 每个 GPR push 8 bytes
-        // ARCH-SPILL-SAFE: spill_area must cover the maximum (offset + size) across all
-        // spill slots, not the sum of sizes. After fixing ScopedSpillAllocator to never
-        // reuse offsets, each slot gets a unique offset, and the total area is determined
-        // by the highest-addressed slot. Using size-sum would undercount when slots are
-        // freed and re-allocated with fresh (larger) offsets.
-        let spill_area: usize = alloc.spills.iter()
+                                                                  // ARCH-SPILL-SAFE: spill_area must cover the maximum (offset + size) across all
+                                                                  // spill slots, not the sum of sizes. After fixing ScopedSpillAllocator to never
+                                                                  // reuse offsets, each slot gets a unique offset, and the total area is determined
+                                                                  // by the highest-addressed slot. Using size-sum would undercount when slots are
+                                                                  // freed and re-allocated with fresh (larger) offsets.
+        let spill_area: usize = alloc
+            .spills
+            .iter()
             .map(|s| s.offset + s.size)
             .max()
             .unwrap_or(0);
@@ -61,8 +59,7 @@ impl StackFrame {
         };
 
         // Red zone: 如果总大小 ≤ red_zone_bytes 且无嵌套调用，可以不 sub rsp
-        let uses_red_zone = total_size <= profile.abi.red_zone_bytes
-            && scratchpad_area == 0; // scratchpad 需要外部可见地址，不能用 red zone
+        let uses_red_zone = total_size <= profile.abi.red_zone_bytes && scratchpad_area == 0; // scratchpad 需要外部可见地址，不能用 red zone
 
         Self {
             total_size,
@@ -128,6 +125,9 @@ pub struct ScopedSpillAllocator {
     scope_slots: std::collections::HashMap<ScopeId, Vec<usize>>,
     next_scope_id: ScopeId,
     next_offset: usize,
+    /// BCE-20260724-PLAN-C-RESIDUAL-BREAK Dimension A: accumulated alloc-time
+    /// offset-overlap violations (drained via `drain_violations`). Empty = clean.
+    violations: Vec<String>,
 }
 
 impl ScopedSpillAllocator {
@@ -139,6 +139,7 @@ impl ScopedSpillAllocator {
             scope_slots: std::collections::HashMap::new(),
             next_scope_id: 0,
             next_offset: 0,
+            violations: Vec::new(),
         }
     }
 
@@ -164,7 +165,20 @@ impl ScopedSpillAllocator {
         //
         // The free_list is now used ONLY to reuse slot indices (to keep the
         // spills vector compact), but each reuse gets a brand-new offset.
-        let (idx, offset) = if let Some(pos) = self.free_list.iter().position(|&idx| self.slots[idx].size == size) {
+        //
+        // BCE-20260724-PLAN-C-RESIDUAL-BREAK (Dimension A): When GLLM_VERIFY_SPILL=1
+        // is set, each alloc verifies the freshly-assigned offset does not overlap
+        // any currently-Occupied slot's [offset, offset+size) range. A violation
+        // here would directly prove the "spill slot corruption via offset reuse"
+        // root-cause hypothesis for the Q5_K_M N=28 SIGSEGV. The check is
+        // diagnostic-only (eprintln + push to violations) — it does NOT abort,
+        // so the full violation profile can be collected across all 4119+ spills.
+        // @trace REQ-LC-004 [req:ScopedSpillAllocator] scope-based spill slot alloc with offset-uniqueness verification
+        let (idx, offset) = if let Some(pos) = self
+            .free_list
+            .iter()
+            .position(|&idx| self.slots[idx].size == size)
+        {
             let idx = self.free_list.remove(pos);
             // Reuse the slot INDEX but allocate a FRESH offset
             let offset = self.next_offset;
@@ -195,7 +209,124 @@ impl ScopedSpillAllocator {
             }
             (idx, offset)
         };
+
+        // ── BCE-20260724-PLAN-C-RESIDUAL-BREAK Dimension A: offset-overlap self-check ──
+        // After assigning the fresh offset, verify it does not overlap any OTHER
+        // currently-Occupied slot. With the ARCH-SPILL-SAFE fix (fresh offset per
+        // alloc) this should NEVER trigger. If it does, the fix has been violated
+        // or bypassed, and the Q5_K_M N=28 SIGSEGV root cause is confirmed as
+        // "spill slot corruption via offset reuse".
+        //
+        // Gated by GLLM_VERIFY_SPILL=1 (compile-time diagnostic, zero overhead in
+        // production). Diagnostic-only: logs violation + records to violations Vec,
+        // does NOT abort — so the full violation profile is collectable.
+        if std::env::var("GLLM_VERIFY_SPILL")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+        {
+            self.verify_alloc_no_overlap(idx, offset, size, vreg);
+        }
+
         (idx, offset)
+    }
+
+    /// BCE-20260724-PLAN-C-RESIDUAL-BREAK Dimension A: Verify no two currently-
+    /// Occupied slots have overlapping [offset, offset+size) ranges. Scans ALL
+    /// Occupied slot pairs (not just the new slot) to catch pre-existing
+    /// corruption. Diagnostic-only — logs violations, never aborts.
+    ///
+    /// Returns the list of violations found (empty = clean). Also pushes each
+    /// violation to `self.violations` for post-hoc collection.
+    fn verify_alloc_no_overlap(
+        &mut self,
+        _new_idx: usize,
+        _new_offset: usize,
+        _new_size: usize,
+        _new_vreg: super::instr::VRegId,
+    ) -> Vec<String> {
+        let mut found = Vec::new();
+        // Full scan: check all pairs of Occupied slots for offset overlap.
+        // This catches both (a) the new slot overlapping an existing one, and
+        // (b) any pre-existing corruption between two older slots.
+        for i in 0..self.slots.len() {
+            if self.slots[i].state != SlotState::Occupied {
+                continue;
+            }
+            for j in (i + 1)..self.slots.len() {
+                if self.slots[j].state != SlotState::Occupied {
+                    continue;
+                }
+                let a = &self.slots[i];
+                let b = &self.slots[j];
+                let a_end = a.offset + a.size;
+                let b_end = b.offset + b.size;
+                // Overlap: [a.offset, a_end) ∩ [b.offset, b_end) != ∅
+                if a.offset < b_end && b.offset < a_end {
+                    let a_vreg = a.vreg.map(|v| v.0).unwrap_or(u32::MAX);
+                    let b_vreg = b.vreg.map(|v| v.0).unwrap_or(u32::MAX);
+                    let msg = format!(
+                        "SPILL-OVERLAP(alloc): v{} slot[{}] @ off=[{}, {}) OVERLAPS v{} slot[{}] @ off=[{}, {}) (both Occupied)",
+                        a_vreg, i, a.offset, a_end,
+                        b_vreg, j, b.offset, b_end,
+                    );
+                    eprintln!("[GLLM_VERIFY_SPILL] {msg}");
+                    found.push(msg);
+                }
+            }
+        }
+        self.violations.extend(found.iter().cloned());
+        found
+    }
+
+    /// BCE-20260724-PLAN-C-RESIDUAL-BREAK Dimension A: Collect all recorded
+    /// alloc-time overlap violations (accumulated across all alloc calls).
+    /// Empty = no offset overlap detected (root-cause hypothesis disproved
+    //  at the alloc layer). Non-empty = hypothesis confirmed.
+    pub fn drain_violations(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.violations)
+    }
+
+    /// BCE-20260724-PLAN-C-RESIDUAL-BREAK Dimension A: Run a full scan of all
+    /// Occupied slot pairs for offset overlap. Not env-gated — always available
+    /// for explicit diagnostic calls (used by tests + compile.inc.rs when
+    /// GLLM_VERIFY_SPILL=1). Returns violations but does NOT push to
+    /// `self.violations` (caller decides whether to accumulate).
+    pub fn scan_overlap_violations(&self) -> Vec<String> {
+        let mut found = Vec::new();
+        for i in 0..self.slots.len() {
+            if self.slots[i].state != SlotState::Occupied {
+                continue;
+            }
+            for j in (i + 1)..self.slots.len() {
+                if self.slots[j].state != SlotState::Occupied {
+                    continue;
+                }
+                let a = &self.slots[i];
+                let b = &self.slots[j];
+                let a_end = a.offset + a.size;
+                let b_end = b.offset + b.size;
+                if a.offset < b_end && b.offset < a_end {
+                    let a_vreg = a.vreg.map(|v| v.0).unwrap_or(u32::MAX);
+                    let b_vreg = b.vreg.map(|v| v.0).unwrap_or(u32::MAX);
+                    let msg = format!(
+                        "SPILL-OVERLAP(scan): v{} slot[{}] @ off=[{}, {}) OVERLAPS v{} slot[{}] @ off=[{}, {}) (both Occupied)",
+                        a_vreg, i, a.offset, a_end,
+                        b_vreg, j, b.offset, b_end,
+                    );
+                    found.push(msg);
+                }
+            }
+        }
+        found
+    }
+
+    /// Test-only helper: corrupt a slot's offset to simulate a bug.
+    /// Used by reg_alloc tests to verify Dimension A violation detection.
+    #[cfg(test)]
+    pub fn corrupt_slot_offset_for_test(&mut self, slot_idx: usize, new_offset: usize) {
+        if slot_idx < self.slots.len() {
+            self.slots[slot_idx].offset = new_offset;
+        }
     }
 
     /// ScopeBegin: 推入新 scope，返回 ScopeId。
@@ -232,16 +363,20 @@ impl ScopedSpillAllocator {
 
     /// 当前活跃 (Occupied) 的 slot 数量
     pub fn active_count(&self) -> usize {
-        self.slots.iter().filter(|s| s.state == SlotState::Occupied).count()
+        self.slots
+            .iter()
+            .filter(|s| s.state == SlotState::Occupied)
+            .count()
     }
 
     /// 转换为 RegAllocation 兼容的 spill 列表。
     /// 返回所有 slot（包括 Freed 状态的），保持与 slot_index 的一一对应关系。
     /// Freed slot 用 (VRegId(u32::MAX), 0, 0) 占位。
     pub fn into_spills(self) -> Vec<super::reg_alloc::SpillSlot> {
-        use super::reg_alloc::SpillSlot;
         use super::instr::VRegId;
-        self.slots.into_iter()
+        use super::reg_alloc::SpillSlot;
+        self.slots
+            .into_iter()
             .map(|s| {
                 if s.state == SlotState::Occupied {
                     SpillSlot {
@@ -346,7 +481,13 @@ pub enum AccessPattern {
 
 /// 缓存层级。
 #[derive(Debug, Clone, Copy)]
-pub enum CacheLevel { Register, L1, L2, L3, Hbm }
+pub enum CacheLevel {
+    Register,
+    L1,
+    L2,
+    L3,
+    Hbm,
+}
 
 /// 内存压力 (§11.5)。
 #[derive(Debug, Clone)]
@@ -391,8 +532,8 @@ pub enum FwhtInsertPoint {
 /// §11 KV 量化模式。
 #[derive(Debug, Clone, Copy)]
 pub enum KvQuantMode {
-    PerChannel,  // Key: 离线校准
-    PerToken,    // Value: 运行时 reduce_max
+    PerChannel, // Key: 离线校准
+    PerToken,   // Value: 运行时 reduce_max
 }
 
 /// 量化压力 (§11 TurboQuant)。
@@ -488,7 +629,11 @@ impl PressureModel {
         let l3 = cache.l3_bytes.max(1048576);
 
         // BLIS 微内核形状从 IsaProfile 派生（avx2 16 vec regs → mr=3,nr=4; avx-512 32 regs → mr=6,nr=4）
-        let (mr, nr) = if profile.vec_regs.len() >= 32 { (6, 4) } else { (3, 4) };
+        let (mr, nr) = if profile.vec_regs.len() >= 32 {
+            (6, 4)
+        } else {
+            (3, 4)
+        };
 
         // BLIS 分块（标准公式）:
         //   kc = L1 / (2 * mr * elem)       — A+B 两个矩阵驻留 L1，mr 为行高
@@ -528,9 +673,21 @@ impl PressureModel {
                 gpu_target_occupancy: 0.75,
                 gpu_shared_per_wave: 0,
                 shape_buckets: vec![
-                    ShapeBucket { seq_range: (0, 1), batch_size: 1, strategy: BucketStrategy::Gemv },
-                    ShapeBucket { seq_range: (2, 64), batch_size: 1, strategy: BucketStrategy::Standard },
-                    ShapeBucket { seq_range: (65, 8192), batch_size: 1, strategy: BucketStrategy::ChunkedPrefill { chunk_size: 128 } },
+                    ShapeBucket {
+                        seq_range: (0, 1),
+                        batch_size: 1,
+                        strategy: BucketStrategy::Gemv,
+                    },
+                    ShapeBucket {
+                        seq_range: (2, 64),
+                        batch_size: 1,
+                        strategy: BucketStrategy::Standard,
+                    },
+                    ShapeBucket {
+                        seq_range: (65, 8192),
+                        batch_size: 1,
+                        strategy: BucketStrategy::ChunkedPrefill { chunk_size: 128 },
+                    },
                 ],
             },
             quant: QuantPressure {
@@ -559,18 +716,28 @@ impl PressureModel {
     /// GPU Occupancy 计算。
     /// 返回给定 regs_per_thread 下的最大 waves/warps per SM。
     /// GPU Occupancy 计算——从 IsaProfile 的实际硬件参数推导。
-    pub fn gpu_occupancy(&self, regs_per_thread: usize, profile: &super::isa_profile::IsaProfile) -> f32 {
+    pub fn gpu_occupancy(
+        &self,
+        regs_per_thread: usize,
+        profile: &super::isa_profile::IsaProfile,
+    ) -> f32 {
         use super::isa_profile::Platform;
         let (reg_file, threads_per_wave, max_waves) = match &profile.platform {
-            Platform::Cuda { reg_file_per_sm, warp_size, .. } => {
-                (*reg_file_per_sm, *warp_size as usize, 64usize)
-            }
-            Platform::Hip { vgpr_per_cu, wave_size, .. } => {
-                (*vgpr_per_cu, *wave_size as usize, 40usize)
-            }
+            Platform::Cuda {
+                reg_file_per_sm,
+                warp_size,
+                ..
+            } => (*reg_file_per_sm, *warp_size as usize, 64usize),
+            Platform::Hip {
+                vgpr_per_cu,
+                wave_size,
+                ..
+            } => (*vgpr_per_cu, *wave_size as usize, 40usize),
             _ => (65536, 32, 64), // CPU 兜底
         };
-        if regs_per_thread == 0 || threads_per_wave == 0 { return 0.0; }
+        if regs_per_thread == 0 || threads_per_wave == 0 {
+            return 0.0;
+        }
         let waves = reg_file / (regs_per_thread * threads_per_wave);
         (waves.min(max_waves) as f32) / (max_waves as f32)
     }
@@ -589,12 +756,14 @@ impl PressureModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dispatch::DeviceProfile;
-    use crate::compiler::codegen::vm::instr::{VmProgram, VRegKind, VmInstr, OffsetExpr, SimdWidth, VRegId};
-    use crate::compiler::codegen::vm::reg_alloc::*;
     use crate::compiler::codegen::vm::auto_select;
-    use crate::compiler::trace::{TraceOp, ValueId};
+    use crate::compiler::codegen::vm::instr::{
+        OffsetExpr, SimdWidth, VRegId, VRegKind, VmInstr, VmProgram,
+    };
+    use crate::compiler::codegen::vm::reg_alloc::*;
     use crate::compiler::trace::QuantPrecision;
+    use crate::compiler::trace::{TraceOp, ValueId};
+    use crate::dispatch::DeviceProfile;
 
     #[test]
     fn test_stack_frame_alignment() {
@@ -605,10 +774,31 @@ mod tests {
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let vec_reg = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        prog.emit(VmInstr::VecLoad { dst: vec_reg, base: input_ptr, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None, });
-        let slots = auto_select::auto_lower_trace_raw(&mut prog, &body, &[vec_reg], SimdWidth::W256, QuantPrecision::F32).unwrap();
+        prog.emit(VmInstr::VecLoad {
+            dst: vec_reg,
+            base: input_ptr,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
+        });
+        let slots = auto_select::auto_lower_trace_raw(
+            &mut prog,
+            &body,
+            &[vec_reg],
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
         let last = *slots.last().unwrap();
-        prog.emit(VmInstr::VecStore { base: output_ptr, src: last, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None, });
+        prog.emit(VmInstr::VecStore {
+            base: output_ptr,
+            src: last,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
+        });
         let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
         let frame = StackFrame::compute(&alloc, &profile, 0);
 
@@ -629,7 +819,10 @@ mod tests {
         // ARCH-SCRATCH-NOT-ON-STACK: scratchpad is an external buffer (ABI arg),
         // not allocated on the CPU stack. total_size only includes callee_saves + spills.
         assert!(frame.total_size >= 16, "frame must include callee saves"); // 2 callee saves * 8 bytes = 16
-        assert!(frame.scratchpad_area == 1024, "scratchpad_area field preserved for GPU use");
+        assert!(
+            frame.scratchpad_area == 1024,
+            "scratchpad_area field preserved for GPU use"
+        );
         assert!(!frame.uses_red_zone); // scratchpad 禁用 red zone
     }
 
@@ -734,7 +927,10 @@ mod tests {
 
     #[test]
     fn execution_mode_chunked_prefill_adaptive() {
-        let mode = ExecutionMode::ChunkedPrefill { chunk_size: 32, total_seq: 512 };
+        let mode = ExecutionMode::ChunkedPrefill {
+            chunk_size: 32,
+            total_seq: 512,
+        };
         assert!(matches!(mode.gemm_strategy(), GemmModeHint::Adaptive));
         assert!(matches!(mode.prefetch_mode(), PrefetchMode::Adaptive));
     }
@@ -811,7 +1007,13 @@ mod tests {
 
     #[test]
     fn gemm_blocking_construction_and_access() {
-        let blocking = GemmBlocking { mr: 6, nr: 4, mc: 24, nc: 32, kc: 128 };
+        let blocking = GemmBlocking {
+            mr: 6,
+            nr: 4,
+            mc: 24,
+            nc: 32,
+            kc: 128,
+        };
         assert_eq!(blocking.mr, 6);
         assert_eq!(blocking.nr, 4);
         assert_eq!(blocking.mc, 24);
@@ -984,9 +1186,21 @@ mod tests {
         let alloc = RegAllocation {
             mapping: std::collections::HashMap::new(),
             spills: vec![
-                SpillSlot { vreg: VRegId(0), offset: 0, size: 8 },
-                SpillSlot { vreg: VRegId(1), offset: 8, size: 16 },
-                SpillSlot { vreg: VRegId(2), offset: 24, size: 4 },
+                SpillSlot {
+                    vreg: VRegId(0),
+                    offset: 0,
+                    size: 8,
+                },
+                SpillSlot {
+                    vreg: VRegId(1),
+                    offset: 8,
+                    size: 16,
+                },
+                SpillSlot {
+                    vreg: VRegId(2),
+                    offset: 24,
+                    size: 4,
+                },
             ],
             callee_saved_used: vec![PhysGpr(3)], // 1 callee save = 8 bytes
         };
@@ -1022,7 +1236,11 @@ mod tests {
         assert_eq!(frame.callee_save_area, 24);
         assert_eq!(frame.spill_area, 0);
         assert!(frame.total_size >= 24);
-        assert_eq!(frame.total_size % frame.alignment, 0, "frame must be aligned");
+        assert_eq!(
+            frame.total_size % frame.alignment,
+            0,
+            "frame must be aligned"
+        );
     }
 
     // ── 33. StackFrame alignment rounds up ───────────────────────────
@@ -1037,7 +1255,11 @@ mod tests {
         // Use 1 callee save (8 bytes) + 1 spill of 3 bytes = 11 bytes raw
         let alloc = RegAllocation {
             mapping: std::collections::HashMap::new(),
-            spills: vec![SpillSlot { vreg: VRegId(0), offset: 0, size: 3 }],
+            spills: vec![SpillSlot {
+                vreg: VRegId(0),
+                offset: 0,
+                size: 3,
+            }],
             callee_saved_used: vec![PhysGpr(3)],
         };
         let frame = StackFrame::compute(&alloc, &profile, 0);
@@ -1050,7 +1272,8 @@ mod tests {
                 frame.total_size
             );
             assert_eq!(
-                frame.total_size % alignment, 0,
+                frame.total_size % alignment,
+                0,
                 "total_size must be aligned to {alignment}"
             );
         }
@@ -1074,24 +1297,43 @@ mod tests {
 
         // Same indices reused
         assert!((idx2 == 0 || idx2 == 1), "should reuse freed index");
-        assert!((idx3 == 0 || idx3 == 1) && idx3 != idx2, "should reuse other freed index");
+        assert!(
+            (idx3 == 0 || idx3 == 1) && idx3 != idx2,
+            "should reuse other freed index"
+        );
 
         // But offsets are unique and NOT reused from freed slots
-        assert_ne!(off2, off0, "reallocated slot must get a new unique offset, not old off0={}", off0);
-        assert_ne!(off2, off1, "reallocated slot must get a new unique offset, not old off1={}", off1);
+        assert_ne!(
+            off2, off0,
+            "reallocated slot must get a new unique offset, not old off0={}",
+            off0
+        );
+        assert_ne!(
+            off2, off1,
+            "reallocated slot must get a new unique offset, not old off1={}",
+            off1
+        );
         assert_ne!(off3, off0, "reallocated slot must get a new unique offset");
         assert_ne!(off3, off1, "reallocated slot must get a new unique offset");
-        assert_ne!(off2, off3, "two simultaneously active slots must have different offsets");
+        assert_ne!(
+            off2, off3,
+            "two simultaneously active slots must have different offsets"
+        );
 
         // Verify into_spills doesn't produce duplicate offsets for occupied slots
         let spills = allocator.into_spills();
-        let occupied_offsets: Vec<_> = spills.iter()
+        let occupied_offsets: Vec<_> = spills
+            .iter()
             .filter(|s| s.vreg != VRegId(u32::MAX))
             .map(|s| s.offset)
             .collect();
         let unique_offsets: std::collections::HashSet<_> = occupied_offsets.iter().collect();
-        assert_eq!(occupied_offsets.len(), unique_offsets.len(),
-            "occupied spill slots must have unique offsets, got duplicates: {:?}", occupied_offsets);
+        assert_eq!(
+            occupied_offsets.len(),
+            unique_offsets.len(),
+            "occupied spill slots must have unique offsets, got duplicates: {:?}",
+            occupied_offsets
+        );
     }
 
     #[test]

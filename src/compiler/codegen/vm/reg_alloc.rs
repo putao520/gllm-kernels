@@ -3,9 +3,9 @@
 //! 线性扫描分配: VRegId → PhysReg。
 //! InterferenceGraph 保证数学无冲突。
 
-use std::collections::{HashMap, HashSet, BTreeSet};
 use super::instr::*;
 use super::isa_profile::*;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Tracks the first body-local occurrence of a VReg inside a loop, used by
 /// `compute_intervals` Pass 3 to decide whether to extend `last_use` to
@@ -165,10 +165,9 @@ fn infer_lifecycle(
 
     // ── 特殊规则: Counter / ByteOffset 强制 LoopCarried ──
     // 循环计数器和字节偏移量的语义决定了它们必须跨迭代存活。
-    if matches!(kind, VRegKind::Counter | VRegKind::ByteOffset)
-        && tag == LifecycleTag::BodyLocal {
-            tag = LifecycleTag::LoopCarried;
-        }
+    if matches!(kind, VRegKind::Counter | VRegKind::ByteOffset) && tag == LifecycleTag::BodyLocal {
+        tag = LifecycleTag::LoopCarried;
+    }
 
     tag
 }
@@ -218,7 +217,9 @@ impl InterferenceGraph {
 
         for (i, iv) in intervals.iter().enumerate() {
             match iv.kind {
-                VRegKind::Ptr | VRegKind::Scalar | VRegKind::Counter | VRegKind::ByteOffset => gpr.push(i),
+                VRegKind::Ptr | VRegKind::Scalar | VRegKind::Counter | VRegKind::ByteOffset => {
+                    gpr.push(i)
+                }
                 VRegKind::Vec => vec.push(i),
                 VRegKind::Tile => tile.push(i),
                 VRegKind::Mask => mask.push(i),
@@ -363,7 +364,12 @@ impl<'a> RegAllocator<'a> {
         // 这确保循环变量不会被分配到和 body 内 VReg 相同的物理寄存器
         let mut loop_stack: Vec<(VRegId, VRegId)> = Vec::new(); // (counter, byte_offset)
         for (i, instr) in program.instrs.iter().enumerate() {
-            if let VmInstr::LoopBegin { counter, byte_offset, .. } = instr {
+            if let VmInstr::LoopBegin {
+                counter,
+                byte_offset,
+                ..
+            } = instr
+            {
                 loop_stack.push((*counter, *byte_offset));
             }
             if matches!(instr, VmInstr::LoopEnd) {
@@ -428,18 +434,16 @@ impl<'a> RegAllocator<'a> {
                 VmInstr::GprUnaryOp { dst, src, .. } => *dst == vreg && *src != vreg,
                 VmInstr::GprLoadImm { dst, .. } => *dst == vreg,
                 VmInstr::VecUnaryOp { dst, a, .. } => *dst == vreg && *a != vreg,
-                VmInstr::VecBinOp { dst, a, b, .. } => {
-                    *dst == vreg && *a != vreg && *b != vreg
-                }
-                VmInstr::VecCmp { dst, a, b, .. } => {
-                    *dst == vreg && *a != vreg && *b != vreg
-                }
-                VmInstr::VecCast { dst, src, .. } => {
-                    *dst == vreg && *src != vreg
-                }
-                VmInstr::ConditionalSelect { dst, mask, true_val, false_val, .. } => {
-                    *dst == vreg && *mask != vreg && *true_val != vreg && *false_val != vreg
-                }
+                VmInstr::VecBinOp { dst, a, b, .. } => *dst == vreg && *a != vreg && *b != vreg,
+                VmInstr::VecCmp { dst, a, b, .. } => *dst == vreg && *a != vreg && *b != vreg,
+                VmInstr::VecCast { dst, src, .. } => *dst == vreg && *src != vreg,
+                VmInstr::ConditionalSelect {
+                    dst,
+                    mask,
+                    true_val,
+                    false_val,
+                    ..
+                } => *dst == vreg && *mask != vreg && *true_val != vreg && *false_val != vreg,
                 VmInstr::HReduce { dst, src, .. } => *dst == vreg && *src != vreg,
                 VmInstr::Transcendental { dst, src, .. } => *dst == vreg && *src != vreg,
                 // Fma: dst==vreg && acc==dst → 读写; dst==vreg && acc!=dst → 纯写
@@ -567,9 +571,15 @@ impl<'a> RegAllocator<'a> {
             }
         }
 
-        let mut intervals: Vec<LiveInterval> = map.into_iter()
-            .map(|(vreg, (kind, width, def_point, last_use))| {
-                LiveInterval { vreg, kind, width, def_point, last_use, lifecycle: LifecycleTag::BodyLocal }
+        let mut intervals: Vec<LiveInterval> = map
+            .into_iter()
+            .map(|(vreg, (kind, width, def_point, last_use))| LiveInterval {
+                vreg,
+                kind,
+                width,
+                def_point,
+                last_use,
+                lifecycle: LifecycleTag::BodyLocal,
             })
             .collect();
 
@@ -682,14 +692,22 @@ impl<'a> RegAllocator<'a> {
 
     /// 提取一条 VmInstr 引用的所有 VRegId (含嵌套表达式中的 VReg)。
     pub fn referenced_vregs(instr: &VmInstr) -> Vec<VRegId> {
-                match instr.category() {
-            super::vm_instr_category::InstrCategory::Memory => Self::referenced_vregs_memorya(instr),
+        match instr.category() {
+            super::vm_instr_category::InstrCategory::Memory => {
+                Self::referenced_vregs_memorya(instr)
+            }
             super::vm_instr_category::InstrCategory::Arith => Self::referenced_vregs_aritha(instr),
-            super::vm_instr_category::InstrCategory::Control => Self::referenced_vregs_controla(instr),
+            super::vm_instr_category::InstrCategory::Control => {
+                Self::referenced_vregs_controla(instr)
+            }
             super::vm_instr_category::InstrCategory::Tile => Self::referenced_vregs_tilea(instr),
             super::vm_instr_category::InstrCategory::Quant => Self::referenced_vregs_quanta(instr),
-            super::vm_instr_category::InstrCategory::GpuComm => Self::referenced_vregs_gpucomma(instr),
-            super::vm_instr_category::InstrCategory::Sampling => Self::referenced_vregs_samplinga(instr),
+            super::vm_instr_category::InstrCategory::GpuComm => {
+                Self::referenced_vregs_gpucomma(instr)
+            }
+            super::vm_instr_category::InstrCategory::Sampling => {
+                Self::referenced_vregs_samplinga(instr)
+            }
             super::vm_instr_category::InstrCategory::Misc => Self::referenced_vregs_misca(instr),
             _ => unreachable!("uncovered category in referenced_vregs"),
         }
@@ -716,7 +734,10 @@ impl<'a> RegAllocator<'a> {
     ///   线性扫描 (allocate_impl 早已 return)。
     /// - rcx = PhysGpr(1) (见 isa_profile.rs gpr 映射 0=>rax,1=>rcx,...)。
     #[allow(clippy::match_like_matches_macro)]
-    pub fn instr_phys_clobbers(instr: &VmInstr, platform: &super::isa_profile::Platform) -> Vec<PhysGpr> {
+    pub fn instr_phys_clobbers(
+        instr: &VmInstr,
+        platform: &super::isa_profile::Platform,
+    ) -> Vec<PhysGpr> {
         // 仅 x86_64 有隐式 rcx clobber; AArch64/GPU 无此问题。
         if !matches!(platform, super::isa_profile::Platform::X86_64 { .. }) {
             return Vec::new();
@@ -740,34 +761,38 @@ impl<'a> RegAllocator<'a> {
     fn referenced_vregs_memorya(instr: &VmInstr) -> Vec<VRegId> {
         // Memory cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
         match instr {
-            VmInstr::VecLoad { dst, base, offset, .. } => {
-                                let mut v = vec![*dst, *base];
-                                v.extend(Self::offset_vregs(offset));
-                                v
-                            },
-            VmInstr::VecStore { base, offset, src, .. } => {
-                                let mut v = vec![*base, *src];
-                                v.extend(Self::offset_vregs(offset));
-                                v
-                            },
+            VmInstr::VecLoad {
+                dst, base, offset, ..
+            } => {
+                let mut v = vec![*dst, *base];
+                v.extend(Self::offset_vregs(offset));
+                v
+            }
+            VmInstr::VecStore {
+                base, offset, src, ..
+            } => {
+                let mut v = vec![*base, *src];
+                v.extend(Self::offset_vregs(offset));
+                v
+            }
             VmInstr::VecNarrow { dst, src, .. } => vec![*dst, *src],
             VmInstr::VecWiden { dst, src, .. } => vec![*dst, *src],
             VmInstr::Mov { dst, src, .. } => vec![*dst, *src],
             VmInstr::Broadcast { dst, src, .. } => {
-                                let mut v = vec![*dst];
-                                v.extend(Self::scalar_expr_vregs(src));
-                                v
-                            },
+                let mut v = vec![*dst];
+                v.extend(Self::scalar_expr_vregs(src));
+                v
+            }
             VmInstr::LoadPtr { dst, src } => {
-                                let mut v = vec![*dst];
-                                v.extend(Self::ptr_vregs(src));
-                                v
-                            },
+                let mut v = vec![*dst];
+                v.extend(Self::ptr_vregs(src));
+                v
+            }
             VmInstr::ScalarLoad { dst, base, offset } => {
-                                let mut v = vec![*dst, *base];
-                                v.extend(Self::offset_vregs(offset));
-                                v
-                            },
+                let mut v = vec![*dst, *base];
+                v.extend(Self::offset_vregs(offset));
+                v
+            }
             _ => Self::referenced_vregs_memoryb(instr),
         }
     }
@@ -778,10 +803,10 @@ impl<'a> RegAllocator<'a> {
             VmInstr::ScalarToIndex { dst, src, .. } => vec![*dst, *src],
             VmInstr::IndexToScalar { dst, src } => vec![*dst, *src],
             VmInstr::ScalarByteLoad { dst, base, offset } => {
-                                let mut v = vec![*dst, *base];
-                                v.extend(Self::offset_vregs(offset));
-                                v
-                            },
+                let mut v = vec![*dst, *base];
+                v.extend(Self::offset_vregs(offset));
+                v
+            }
             VmInstr::AtomicAdd { base, .. } => vec![*base],
             VmInstr::MemFence { .. } => vec![],
             VmInstr::AddPtr { dst, base, .. } => vec![*dst, *base],
@@ -799,9 +824,18 @@ impl<'a> RegAllocator<'a> {
             VmInstr::IntMulStride { dst, src, .. } => vec![*dst, *src],
             VmInstr::Prefetch { base, .. } => vec![*base],
             VmInstr::ActivationSwap { ptr_a, ptr_b } => vec![*ptr_a, *ptr_b],
-            VmInstr::GatherLoad { dst, base, indices, .. } => vec![*dst, *base, *indices],
-            VmInstr::ScatterStore { base, indices, src, .. } => vec![*base, *indices, *src],
-            VmInstr::TableLookup { dst, base, row_index, .. } => vec![*dst, *base, *row_index],
+            VmInstr::GatherLoad {
+                dst, base, indices, ..
+            } => vec![*dst, *base, *indices],
+            VmInstr::ScatterStore {
+                base, indices, src, ..
+            } => vec![*base, *indices, *src],
+            VmInstr::TableLookup {
+                dst,
+                base,
+                row_index,
+                ..
+            } => vec![*dst, *base, *row_index],
             _ => Self::referenced_vregs_memoryd(instr),
         }
     }
@@ -809,7 +843,13 @@ impl<'a> RegAllocator<'a> {
     fn referenced_vregs_memoryd(instr: &VmInstr) -> Vec<VRegId> {
         // Memory cluster d (1 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
         match instr {
-            VmInstr::AtomicCAS { dst, ptr, expected, desired, .. } => vec![*dst, *ptr, *expected, *desired],
+            VmInstr::AtomicCAS {
+                dst,
+                ptr,
+                expected,
+                desired,
+                ..
+            } => vec![*dst, *ptr, *expected, *desired],
             _ => unreachable!("Memory category mismatch in referenced_vregs"),
         }
     }
@@ -822,7 +862,13 @@ impl<'a> RegAllocator<'a> {
             VmInstr::VecUnaryOp { dst, a, .. } => vec![*dst, *a],
             VmInstr::VecCmp { dst, a, b, .. } => vec![*dst, *a, *b],
             VmInstr::VecCast { dst, src, .. } => vec![*dst, *src],
-            VmInstr::ConditionalSelect { dst, mask, true_val, false_val, .. } => vec![*dst, *mask, *true_val, *false_val],
+            VmInstr::ConditionalSelect {
+                dst,
+                mask,
+                true_val,
+                false_val,
+                ..
+            } => vec![*dst, *mask, *true_val, *false_val],
             VmInstr::Fma { dst, acc, a, b, .. } => vec![*dst, *acc, *a, *b],
             VmInstr::HReduce { dst, src, .. } => vec![*dst, *src],
             _ => Self::referenced_vregs_arithb(instr),
@@ -835,19 +881,29 @@ impl<'a> RegAllocator<'a> {
             VmInstr::Accumulate { acc, src } => vec![*acc, *src],
             VmInstr::Transcendental { dst, src, .. } => vec![*dst, *src],
             VmInstr::GprBinOp { dst, a, b, .. } => {
-                                let mut v = vec![*dst, *a];
-                                if let Some(vr) = b.vreg() { v.push(vr); }
-                                v
-                            },
+                let mut v = vec![*dst, *a];
+                if let Some(vr) = b.vreg() {
+                    v.push(vr);
+                }
+                v
+            }
             VmInstr::GprUnaryOp { dst, src, .. } => vec![*dst, *src],
             VmInstr::GprLoadImm { dst, .. } => vec![*dst],
             VmInstr::DotProduct { acc, a, b, .. } => vec![*acc, *a, *b],
-            VmInstr::ScaleApply { dst, acc, scale, zero, .. } => vec![*dst, *acc, *scale, *zero],
+            VmInstr::ScaleApply {
+                dst,
+                acc,
+                scale,
+                zero,
+                ..
+            } => vec![*dst, *acc, *scale, *zero],
             VmInstr::VecShuffle { dst, src, mask, .. } => {
-                                let mut v = vec![*dst, *src];
-                                if let super::instr::VecShuffleMask::Dynamic { ctrl } = mask { v.push(*ctrl); }
-                                v
-                            },
+                let mut v = vec![*dst, *src];
+                if let super::instr::VecShuffleMask::Dynamic { ctrl } = mask {
+                    v.push(*ctrl);
+                }
+                v
+            }
             _ => Self::referenced_vregs_arithc(instr),
         }
     }
@@ -856,7 +912,12 @@ impl<'a> RegAllocator<'a> {
         // Arith cluster c (3 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
         match instr {
             VmInstr::VecExtractLane { dst, src, .. } => vec![*dst, *src],
-            VmInstr::VecInsertLane { dst, src_vec, src_scalar, .. } => vec![*dst, *src_vec, *src_scalar],
+            VmInstr::VecInsertLane {
+                dst,
+                src_vec,
+                src_scalar,
+                ..
+            } => vec![*dst, *src_vec, *src_scalar],
             VmInstr::VecLoadConst { dst, .. } => vec![*dst],
             _ => unreachable!("Arith category mismatch in referenced_vregs"),
         }
@@ -865,19 +926,26 @@ impl<'a> RegAllocator<'a> {
     fn referenced_vregs_controla(instr: &VmInstr) -> Vec<VRegId> {
         // Control cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
         match instr {
-            VmInstr::LoopBegin { counter, byte_offset, bound, .. } => {
-                                let mut v = vec![*counter, *byte_offset];
-                                v.extend(Self::bound_vregs(bound));
-                                v
-                            },
+            VmInstr::LoopBegin {
+                counter,
+                byte_offset,
+                bound,
+                ..
+            } => {
+                let mut v = vec![*counter, *byte_offset];
+                v.extend(Self::bound_vregs(bound));
+                v
+            }
             VmInstr::ConditionalSkip { mask, .. } => vec![*mask],
             VmInstr::GprCondAction { cond, action } => {
-                                let mut v = cond.vregs();
-                                v.extend(action.vregs());
-                                v
-                            },
+                let mut v = cond.vregs();
+                v.extend(action.vregs());
+                v
+            }
             VmInstr::IndirectJump { index, .. } => vec![*index],
-            VmInstr::LoadLayerWeightOffset { dst, layer_idx_reg, .. } => vec![*layer_idx_reg, *dst],
+            VmInstr::LoadLayerWeightOffset {
+                dst, layer_idx_reg, ..
+            } => vec![*layer_idx_reg, *dst],
             VmInstr::ConditionalExit { condition, output } => vec![*condition, *output],
             VmInstr::BranchIfPtrNonNull { ptr, .. } => vec![*ptr],
             VmInstr::BranchIfGprZero { value, .. } => vec![*value],
@@ -891,9 +959,9 @@ impl<'a> RegAllocator<'a> {
         match instr {
             VmInstr::UnconditionalBranch { .. } => vec![],
             VmInstr::BreakLoop { return_value } => match return_value {
-                                ReturnValue::Const(_) => vec![],
-                                ReturnValue::VReg(v) => vec![*v],
-                            },
+                ReturnValue::Const(_) => vec![],
+                ReturnValue::VReg(v) => vec![*v],
+            },
             VmInstr::MarkLabel { .. } => vec![],
             VmInstr::ScopeBegin { .. } => vec![],
             VmInstr::ScopeEnd { .. } => vec![],
@@ -914,26 +982,36 @@ impl<'a> RegAllocator<'a> {
             // row_stride/rows/cols/dtype 是编译时常量, 非 vreg。
             // tmm 分配 (§6.2): RegAllocator 对 VRegKind::Tile 走独立 Tile 池
             // (isa_profile.tile_regs, AMX 上限 8 个 tmm0..tmm7), 映射 PhysReg::Tile。
-            VmInstr::TileLoad { dst_tile, base_ptr, k_offset, .. } => vec![*dst_tile, *base_ptr, *k_offset],
+            VmInstr::TileLoad {
+                dst_tile,
+                base_ptr,
+                k_offset,
+                ..
+            } => vec![*dst_tile, *base_ptr, *k_offset],
             VmInstr::TileMma { c, a, b, .. } => vec![*c, *a, *b],
-            VmInstr::TileStore { src_tile, base_ptr, out_offset, .. } => vec![*src_tile, *base_ptr, *out_offset],
+            VmInstr::TileStore {
+                src_tile,
+                base_ptr,
+                out_offset,
+                ..
+            } => vec![*src_tile, *base_ptr, *out_offset],
             VmInstr::TileConfig { .. } => vec![],
             VmInstr::TileRelease => vec![],
             VmInstr::TmemAlloc { .. } => vec![],
             VmInstr::TmemLoad { dst, .. } => {
-                                let mut v = vec![*dst];
-                                if let VmInstr::TmemLoad { offset, .. } = instr {
-                                    v.extend(Self::offset_vregs(offset));
-                                }
-                                v
-                            },
+                let mut v = vec![*dst];
+                if let VmInstr::TmemLoad { offset, .. } = instr {
+                    v.extend(Self::offset_vregs(offset));
+                }
+                v
+            }
             VmInstr::TmemStore { src, .. } => {
-                                let mut v = vec![*src];
-                                if let VmInstr::TmemStore { offset, .. } = instr {
-                                    v.extend(Self::offset_vregs(offset));
-                                }
-                                v
-                            },
+                let mut v = vec![*src];
+                if let VmInstr::TmemStore { offset, .. } = instr {
+                    v.extend(Self::offset_vregs(offset));
+                }
+                v
+            }
             _ => Self::referenced_vregs_tileb(instr),
         }
     }
@@ -949,9 +1027,24 @@ impl<'a> RegAllocator<'a> {
     fn referenced_vregs_quanta(instr: &VmInstr) -> Vec<VRegId> {
         // Quant cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
         match instr {
-            VmInstr::SparseMaskIntersect { dst_k0, dst_k1, a, b } => vec![*dst_k0, *dst_k1, *a, *b],
-            VmInstr::GgufSubScaleLoad { dst, scales_base, sub_block_idx, .. } => vec![*dst, *scales_base, *sub_block_idx],
-            VmInstr::GgufKQuantScaleLoad { dst, scales_base, sub_block_idx, .. } => vec![*dst, *scales_base, *sub_block_idx],
+            VmInstr::SparseMaskIntersect {
+                dst_k0,
+                dst_k1,
+                a,
+                b,
+            } => vec![*dst_k0, *dst_k1, *a, *b],
+            VmInstr::GgufSubScaleLoad {
+                dst,
+                scales_base,
+                sub_block_idx,
+                ..
+            } => vec![*dst, *scales_base, *sub_block_idx],
+            VmInstr::GgufKQuantScaleLoad {
+                dst,
+                scales_base,
+                sub_block_idx,
+                ..
+            } => vec![*dst, *scales_base, *sub_block_idx],
             VmInstr::KiviQuantChannel { .. } => vec![],
             VmInstr::KiviQuantToken { .. } => vec![],
             VmInstr::KiviDequantLoad { .. } => vec![],
@@ -967,15 +1060,58 @@ impl<'a> RegAllocator<'a> {
         match instr {
             VmInstr::QuantCodebookLookup { dst, indices, .. } => vec![*dst, *indices],
             VmInstr::QuantExtractBits { dst, src, .. } => vec![*dst, *src],
-            VmInstr::QuantDequantFma { dst, weight, activation, scale, zero_point, .. } => vec![*dst, *weight, *activation, *scale, *zero_point],
+            VmInstr::QuantDequantFma {
+                dst,
+                weight,
+                activation,
+                scale,
+                zero_point,
+                ..
+            } => vec![*dst, *weight, *activation, *scale, *zero_point],
             VmInstr::QuantInterleave { dst, lo, hi, .. } => vec![*dst, *lo, *hi],
             VmInstr::QuantConcatSeq { dst, lo, hi, .. } => vec![*dst, *lo, *hi],
-            VmInstr::Q3KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } => vec![*dst, *block_base, *lane_offset, *d_vreg],
-            VmInstr::Q6KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } => vec![*dst, *block_base, *lane_offset, *d_vreg],
-            VmInstr::Q5DecodeStep { dst, block_base, lane_offset, d_vreg, .. } => vec![*dst, *block_base, *lane_offset, *d_vreg],
-            VmInstr::Q5KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } => vec![*dst, *block_base, *lane_offset, *d_vreg],
-            VmInstr::BitwiseGemm { dst, sign_bits, input_sign_bits, scale, .. } => vec![*dst, *sign_bits, *input_sign_bits, *scale],
-            VmInstr::SparseGemm { acc, a_sparse, b_dense, sparse_mask_ptr, .. } => vec![*acc, *a_sparse, *b_dense, *sparse_mask_ptr],
+            VmInstr::Q3KDecodeStep {
+                dst,
+                block_base,
+                lane_offset,
+                d_vreg,
+                ..
+            } => vec![*dst, *block_base, *lane_offset, *d_vreg],
+            VmInstr::Q6KDecodeStep {
+                dst,
+                block_base,
+                lane_offset,
+                d_vreg,
+                ..
+            } => vec![*dst, *block_base, *lane_offset, *d_vreg],
+            VmInstr::Q5DecodeStep {
+                dst,
+                block_base,
+                lane_offset,
+                d_vreg,
+                ..
+            } => vec![*dst, *block_base, *lane_offset, *d_vreg],
+            VmInstr::Q5KDecodeStep {
+                dst,
+                block_base,
+                lane_offset,
+                d_vreg,
+                ..
+            } => vec![*dst, *block_base, *lane_offset, *d_vreg],
+            VmInstr::BitwiseGemm {
+                dst,
+                sign_bits,
+                input_sign_bits,
+                scale,
+                ..
+            } => vec![*dst, *sign_bits, *input_sign_bits, *scale],
+            VmInstr::SparseGemm {
+                acc,
+                a_sparse,
+                b_dense,
+                sparse_mask_ptr,
+                ..
+            } => vec![*acc, *a_sparse, *b_dense, *sparse_mask_ptr],
             _ => Self::referenced_vregs_quantc(instr),
         }
     }
@@ -983,20 +1119,64 @@ impl<'a> RegAllocator<'a> {
     fn referenced_vregs_quantc(instr: &VmInstr) -> Vec<VRegId> {
         // Quant cluster c (7 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
         match instr {
-            VmInstr::SparseFp8Gemm { acc, a_sparse, b_dense, sparse_mask_ptr, .. } => vec![*acc, *a_sparse, *b_dense, *sparse_mask_ptr],
-            VmInstr::NativeFp4Gemm { acc, a, b, scale_a, scale_b, .. } => vec![*acc, *a, *b, *scale_a, *scale_b],
-            VmInstr::NativeFp6Gemm { acc, a, b, scale_a, scale_b, .. } => vec![*acc, *a, *b, *scale_a, *scale_b],
-            VmInstr::TwoCtaFp4Gemm { acc, a, b, scale_a, scale_b, .. } => vec![*acc, *a, *b, *scale_a, *scale_b],
+            VmInstr::SparseFp8Gemm {
+                acc,
+                a_sparse,
+                b_dense,
+                sparse_mask_ptr,
+                ..
+            } => vec![*acc, *a_sparse, *b_dense, *sparse_mask_ptr],
+            VmInstr::NativeFp4Gemm {
+                acc,
+                a,
+                b,
+                scale_a,
+                scale_b,
+                ..
+            } => vec![*acc, *a, *b, *scale_a, *scale_b],
+            VmInstr::NativeFp6Gemm {
+                acc,
+                a,
+                b,
+                scale_a,
+                scale_b,
+                ..
+            } => vec![*acc, *a, *b, *scale_a, *scale_b],
+            VmInstr::TwoCtaFp4Gemm {
+                acc,
+                a,
+                b,
+                scale_a,
+                scale_b,
+                ..
+            } => vec![*acc, *a, *b, *scale_a, *scale_b],
             VmInstr::NativeFp8Gemm { acc, a, b, .. } => vec![*acc, *a, *b],
-            VmInstr::HwQuantDequant { dst, packed_weight, block_scale, global_scale, .. } => vec![*dst, *packed_weight, *block_scale, *global_scale],
+            VmInstr::HwQuantDequant {
+                dst,
+                packed_weight,
+                block_scale,
+                global_scale,
+                ..
+            } => vec![*dst, *packed_weight, *block_scale, *global_scale],
             VmInstr::QuantScalarCvtLoad { base, .. } => vec![*base],
-            VmInstr::QuantBlockLoad { dst, base, offset, unpack, .. } => {
-                                let mut v = vec![*dst, *base];
-                                v.extend(Self::offset_vregs(offset));
-                                v.extend(unpack.vregs());
-                                v
-                            },
-            VmInstr::QuantBiPlaneLoad { dst, qs_base, extra_base, .. } => vec![*dst, *qs_base, *extra_base],
+            VmInstr::QuantBlockLoad {
+                dst,
+                base,
+                offset,
+                unpack,
+                ..
+            } => {
+                let mut v = vec![*dst, *base];
+                v.extend(Self::offset_vregs(offset));
+                v.extend(unpack.vregs());
+                v
+            }
+            VmInstr::QuantBiPlaneLoad {
+                dst,
+                qs_base,
+                extra_base,
+                ..
+            } => vec![*dst, *qs_base, *extra_base],
             _ => unreachable!("Quant category mismatch in referenced_vregs"),
         }
     }
@@ -1012,13 +1192,13 @@ impl<'a> RegAllocator<'a> {
             VmInstr::AsyncWait { .. } => vec![],
             VmInstr::SharedMemAlloc { .. } => vec![],
             VmInstr::SharedMemStore { src, .. } => {
-                                let mut v = vec![*src];
-                                // Extract VReg from offset if needed
-                                if let VmInstr::SharedMemStore { dst_offset, .. } = instr {
-                                    v.extend(Self::offset_vregs(dst_offset));
-                                }
-                                v
-                            },
+                let mut v = vec![*src];
+                // Extract VReg from offset if needed
+                if let VmInstr::SharedMemStore { dst_offset, .. } = instr {
+                    v.extend(Self::offset_vregs(dst_offset));
+                }
+                v
+            }
             _ => Self::referenced_vregs_gpucommb(instr),
         }
     }
@@ -1027,20 +1207,20 @@ impl<'a> RegAllocator<'a> {
         // GpuComm cluster b (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
         match instr {
             VmInstr::SharedMemLoad { dst, .. } => {
-                                let mut v = vec![*dst];
-                                // Extract VReg from offset if needed
-                                if let VmInstr::SharedMemLoad { src_offset, .. } = instr {
-                                    v.extend(Self::offset_vregs(src_offset));
-                                }
-                                v
-                            },
+                let mut v = vec![*dst];
+                // Extract VReg from offset if needed
+                if let VmInstr::SharedMemLoad { src_offset, .. } = instr {
+                    v.extend(Self::offset_vregs(src_offset));
+                }
+                v
+            }
             VmInstr::SharedMemAsyncStore { src, .. } => {
-                                let mut v = vec![*src];
-                                if let VmInstr::SharedMemAsyncStore { dst_offset, .. } = instr {
-                                    v.extend(Self::offset_vregs(dst_offset));
-                                }
-                                v
-                            },
+                let mut v = vec![*src];
+                if let VmInstr::SharedMemAsyncStore { dst_offset, .. } = instr {
+                    v.extend(Self::offset_vregs(dst_offset));
+                }
+                v
+            }
             VmInstr::SharedMemAsyncWaitGroup { .. } => vec![],
             VmInstr::WeightPrefetchAsync { weight_base, .. } => vec![*weight_base],
             VmInstr::WeightPrefetchWait { .. } => vec![],
@@ -1055,25 +1235,33 @@ impl<'a> RegAllocator<'a> {
         // GpuComm cluster c (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
         match instr {
             VmInstr::ClusterStore { src, .. } => {
-                                let mut v = vec![*src];
-                                if let VmInstr::ClusterStore { offset, .. } = instr {
-                                    v.extend(Self::offset_vregs(offset));
-                                }
-                                v
-                            },
+                let mut v = vec![*src];
+                if let VmInstr::ClusterStore { offset, .. } = instr {
+                    v.extend(Self::offset_vregs(offset));
+                }
+                v
+            }
             VmInstr::ClusterLoad { dst, .. } => {
-                                let mut v = vec![*dst];
-                                if let VmInstr::ClusterLoad { offset, .. } = instr {
-                                    v.extend(Self::offset_vregs(offset));
-                                }
-                                v
-                            },
+                let mut v = vec![*dst];
+                if let VmInstr::ClusterLoad { offset, .. } = instr {
+                    v.extend(Self::offset_vregs(offset));
+                }
+                v
+            }
             VmInstr::SharedMemSwizzle { dst, raw_addr, .. } => vec![*dst, *raw_addr],
             VmInstr::WarpRoleDeclare { .. } => vec![],
             VmInstr::WarpBarrierArrive { .. } => vec![],
             VmInstr::WarpBarrierWait { .. } => vec![],
             #[cfg(feature = "nccl")]
-            VmInstr::AllReduceChunk { sendbuf, recvbuf, count, rank, world_size, chunk_idx, .. } => vec![*sendbuf, *recvbuf, *count, *rank, *world_size, *chunk_idx],
+            VmInstr::AllReduceChunk {
+                sendbuf,
+                recvbuf,
+                count,
+                rank,
+                world_size,
+                chunk_idx,
+                ..
+            } => vec![*sendbuf, *recvbuf, *count, *rank, *world_size, *chunk_idx],
             #[cfg(feature = "nccl")]
             VmInstr::CommBarrier { thread_count, .. } => vec![*thread_count],
             _ => Self::referenced_vregs_gpucommd(instr),
@@ -1086,15 +1274,76 @@ impl<'a> RegAllocator<'a> {
             #[cfg(feature = "nccl")]
             VmInstr::NvlinkAsyncCopy { dst, src, len, .. } => vec![*dst, *src, *len],
             #[cfg(feature = "nccl")]
-            VmInstr::RemotePageLookup { dst, seq_id, page_index, routing_table_base } => vec![*dst, *seq_id, *page_index, *routing_table_base],
+            VmInstr::RemotePageLookup {
+                dst,
+                seq_id,
+                page_index,
+                routing_table_base,
+            } => vec![*dst, *seq_id, *page_index, *routing_table_base],
             #[cfg(feature = "nccl")]
-            VmInstr::P2pPageFetch { local_buf, peer_buf, page_size, barrier } => vec![*local_buf, *peer_buf, *page_size, *barrier],
+            VmInstr::P2pPageFetch {
+                local_buf,
+                peer_buf,
+                page_size,
+                barrier,
+            } => vec![*local_buf, *peer_buf, *page_size, *barrier],
             #[cfg(feature = "nccl")]
-            VmInstr::RdmaPageFetch { local_buf, remote_addr, rkey, page_size, sq_desc, doorbell, cq_addr } => vec![*local_buf, *remote_addr, *rkey, *page_size, *sq_desc, *doorbell, *cq_addr],
+            VmInstr::RdmaPageFetch {
+                local_buf,
+                remote_addr,
+                rkey,
+                page_size,
+                sq_desc,
+                doorbell,
+                cq_addr,
+            } => vec![
+                *local_buf,
+                *remote_addr,
+                *rkey,
+                *page_size,
+                *sq_desc,
+                *doorbell,
+                *cq_addr,
+            ],
             #[cfg(feature = "nccl")]
-            VmInstr::RdmaPageFetchCompressed { local_buf, scratch_buf, page_size, remote_addr, rkey, sq_desc, doorbell, cq_addr, .. } => vec![*local_buf, *scratch_buf, *page_size, *remote_addr, *rkey, *sq_desc, *doorbell, *cq_addr],
+            VmInstr::RdmaPageFetchCompressed {
+                local_buf,
+                scratch_buf,
+                page_size,
+                remote_addr,
+                rkey,
+                sq_desc,
+                doorbell,
+                cq_addr,
+                ..
+            } => vec![
+                *local_buf,
+                *scratch_buf,
+                *page_size,
+                *remote_addr,
+                *rkey,
+                *sq_desc,
+                *doorbell,
+                *cq_addr,
+            ],
             #[cfg(feature = "nccl")]
-            VmInstr::RemotePageAttn { q_buf, k_remote_buf, v_remote_buf, output_buf, shared_buf, barrier, tile_bytes } => vec![*q_buf, *k_remote_buf, *v_remote_buf, *output_buf, *shared_buf, *barrier, *tile_bytes],
+            VmInstr::RemotePageAttn {
+                q_buf,
+                k_remote_buf,
+                v_remote_buf,
+                output_buf,
+                shared_buf,
+                barrier,
+                tile_bytes,
+            } => vec![
+                *q_buf,
+                *k_remote_buf,
+                *v_remote_buf,
+                *output_buf,
+                *shared_buf,
+                *barrier,
+                *tile_bytes,
+            ],
             #[cfg(feature = "nccl")]
             VmInstr::PageMigrationLock { dst, entry_addr } => vec![*dst, *entry_addr],
             #[cfg(feature = "nccl")]
@@ -1107,9 +1356,15 @@ impl<'a> RegAllocator<'a> {
         // GpuComm cluster e (4 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
         match instr {
             #[cfg(feature = "nccl")]
-            VmInstr::PageLocationUpdate { entry_addr, new_location, .. } => vec![*entry_addr, *new_location],
+            VmInstr::PageLocationUpdate {
+                entry_addr,
+                new_location,
+                ..
+            } => vec![*entry_addr, *new_location],
             VmInstr::TmaDescriptorInit { .. } => vec![],
-            VmInstr::Tma2DCopy { coord_x, coord_y, .. } => vec![*coord_x, *coord_y],
+            VmInstr::Tma2DCopy {
+                coord_x, coord_y, ..
+            } => vec![*coord_x, *coord_y],
             VmInstr::BarrierInit { .. } => vec![],
             _ => unreachable!("GpuComm category mismatch in referenced_vregs"),
         }
@@ -1118,17 +1373,56 @@ impl<'a> RegAllocator<'a> {
     fn referenced_vregs_samplinga(instr: &VmInstr) -> Vec<VRegId> {
         // Sampling cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
         match instr {
-            VmInstr::BatchSeqIdLookup { dst, pt_offset_out, token_index, batch_ctx_ptr } => vec![*dst, *pt_offset_out, *token_index, *batch_ctx_ptr],
-            VmInstr::BatchPerSeqArgmax { dst, seq_id, logits_flat_ptr, .. } => vec![*dst, *seq_id, *logits_flat_ptr],
-            VmInstr::BatchPerSeqStopCheck { seq_id, token_id, batch_ctx_ptr } => vec![*seq_id, *token_id, *batch_ctx_ptr],
+            VmInstr::BatchSeqIdLookup {
+                dst,
+                pt_offset_out,
+                token_index,
+                batch_ctx_ptr,
+            } => vec![*dst, *pt_offset_out, *token_index, *batch_ctx_ptr],
+            VmInstr::BatchPerSeqArgmax {
+                dst,
+                seq_id,
+                logits_flat_ptr,
+                ..
+            } => vec![*dst, *seq_id, *logits_flat_ptr],
+            VmInstr::BatchPerSeqStopCheck {
+                seq_id,
+                token_id,
+                batch_ctx_ptr,
+            } => vec![*seq_id, *token_id, *batch_ctx_ptr],
             // Mega-kernel instructions — must reference all VReg operands
             // to keep their live intervals correct across Argmax/StoreToken/etc.
-            VmInstr::Argmax { dst, logits_ptr, .. } => vec![*dst, *logits_ptr],
-            VmInstr::TemperatureScale { logits_ptr, temp_ptr, .. } => vec![*logits_ptr, *temp_ptr],
-            VmInstr::StoreToken { token_id, output_buf, counter, input_ids_ptr, prompt_len_bytes } => vec![*token_id, *output_buf, *counter, *input_ids_ptr, *prompt_len_bytes],
-            VmInstr::CheckStopCondition { token_id, counter, eos_ptr, max_tokens_ptr } => vec![*token_id, *counter, *eos_ptr, *max_tokens_ptr],
+            VmInstr::Argmax {
+                dst, logits_ptr, ..
+            } => vec![*dst, *logits_ptr],
+            VmInstr::TemperatureScale {
+                logits_ptr,
+                temp_ptr,
+                ..
+            } => vec![*logits_ptr, *temp_ptr],
+            VmInstr::StoreToken {
+                token_id,
+                output_buf,
+                counter,
+                input_ids_ptr,
+                prompt_len_bytes,
+            } => vec![
+                *token_id,
+                *output_buf,
+                *counter,
+                *input_ids_ptr,
+                *prompt_len_bytes,
+            ],
+            VmInstr::CheckStopCondition {
+                token_id,
+                counter,
+                eos_ptr,
+                max_tokens_ptr,
+            } => vec![*token_id, *counter, *eos_ptr, *max_tokens_ptr],
             // ── Sampling instructions ──
-            VmInstr::SoftmaxReduceMax { dst, logits_ptr, .. } => vec![*dst, *logits_ptr],
+            VmInstr::SoftmaxReduceMax {
+                dst, logits_ptr, ..
+            } => vec![*dst, *logits_ptr],
             _ => Self::referenced_vregs_samplingb(instr),
         }
     }
@@ -1136,13 +1430,40 @@ impl<'a> RegAllocator<'a> {
     fn referenced_vregs_samplingb(instr: &VmInstr) -> Vec<VRegId> {
         // Sampling cluster b (7 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
         match instr {
-            VmInstr::SoftmaxExpSum { sum_dst, logits_ptr, max_val, .. } => vec![*sum_dst, *logits_ptr, *max_val],
-            VmInstr::SoftmaxNormalize { logits_ptr, sum_val, .. } => vec![*logits_ptr, *sum_val],
-            VmInstr::SampleTopKFilter { probs_ptr, indices_ptr, k_ptr, .. } => vec![*probs_ptr, *indices_ptr, *k_ptr],
-            VmInstr::SampleTopPFilter { probs_ptr, p_ptr, .. } => vec![*probs_ptr, *p_ptr],
-            VmInstr::SampleMultinomial { dst, probs_ptr, rng_state_ptr, .. } => vec![*dst, *probs_ptr, *rng_state_ptr],
+            VmInstr::SoftmaxExpSum {
+                sum_dst,
+                logits_ptr,
+                max_val,
+                ..
+            } => vec![*sum_dst, *logits_ptr, *max_val],
+            VmInstr::SoftmaxNormalize {
+                logits_ptr,
+                sum_val,
+                ..
+            } => vec![*logits_ptr, *sum_val],
+            VmInstr::SampleTopKFilter {
+                probs_ptr,
+                indices_ptr,
+                k_ptr,
+                ..
+            } => vec![*probs_ptr, *indices_ptr, *k_ptr],
+            VmInstr::SampleTopPFilter {
+                probs_ptr, p_ptr, ..
+            } => vec![*probs_ptr, *p_ptr],
+            VmInstr::SampleMultinomial {
+                dst,
+                probs_ptr,
+                rng_state_ptr,
+                ..
+            } => vec![*dst, *probs_ptr, *rng_state_ptr],
             VmInstr::WarpPRNG { dst, rng_state_ptr } => vec![*dst, *rng_state_ptr],
-            VmInstr::SeqIdLookup { dst, token_index, seq_meta_base, num_seqs, .. } => vec![*dst, *token_index, *seq_meta_base, *num_seqs],
+            VmInstr::SeqIdLookup {
+                dst,
+                token_index,
+                seq_meta_base,
+                num_seqs,
+                ..
+            } => vec![*dst, *token_index, *seq_meta_base, *num_seqs],
             _ => unreachable!("Sampling category mismatch in referenced_vregs"),
         }
     }
@@ -1152,12 +1473,31 @@ impl<'a> RegAllocator<'a> {
         match instr {
             VmInstr::DeclareVReg { id, .. } => vec![*id],
             VmInstr::ReleaseVReg { id } => vec![*id],
-            VmInstr::LoadCallbackEntry { table_ptr, fn_ptr_out, ctx_out, .. } => vec![*table_ptr, *fn_ptr_out, *ctx_out],
-            VmInstr::NativeCall { ret_val, fn_ptr, ctx_ptr } => vec![*ret_val, *fn_ptr, *ctx_ptr],
+            VmInstr::LoadCallbackEntry {
+                table_ptr,
+                fn_ptr_out,
+                ctx_out,
+                ..
+            } => vec![*table_ptr, *fn_ptr_out, *ctx_out],
+            VmInstr::NativeCall {
+                ret_val,
+                fn_ptr,
+                ctx_ptr,
+            } => vec![*ret_val, *fn_ptr, *ctx_ptr],
             VmInstr::Comment(_) => vec![],
             VmInstr::HotpatchSlot { .. } => vec![],
-            VmInstr::Lz4Decode { src_ptr, dst_ptr, compressed_size, .. } => vec![*src_ptr, *dst_ptr, *compressed_size],
-            VmInstr::BitPackRleDecode { src_ptr, dst_ptr, compressed_size, .. } => vec![*src_ptr, *dst_ptr, *compressed_size],
+            VmInstr::Lz4Decode {
+                src_ptr,
+                dst_ptr,
+                compressed_size,
+                ..
+            } => vec![*src_ptr, *dst_ptr, *compressed_size],
+            VmInstr::BitPackRleDecode {
+                src_ptr,
+                dst_ptr,
+                compressed_size,
+                ..
+            } => vec![*src_ptr, *dst_ptr, *compressed_size],
             _ => Self::referenced_vregs_miscb(instr),
         }
     }
@@ -1173,7 +1513,6 @@ impl<'a> RegAllocator<'a> {
             _ => unreachable!("Misc category mismatch in referenced_vregs"),
         }
     }
-
 
     /// 线性扫描分配。
     pub fn allocate(&self, program: &VmProgram) -> Result<RegAllocation, String> {
@@ -1219,9 +1558,15 @@ impl<'a> RegAllocator<'a> {
         let interference = InterferenceGraph::build(&intervals);
 
         // DIAG: unique ID for each allocate_impl call
-        static ALLOC_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static ALLOC_COUNTER: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
         let alloc_id = ALLOC_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        eprintln!("[ALLOC-ID] allocate_impl #{}: {} instrs, {} intervals", alloc_id, program.instrs.len(), intervals.len());
+        eprintln!(
+            "[ALLOC-ID] allocate_impl #{}: {} instrs, {} intervals",
+            alloc_id,
+            program.instrs.len(),
+            intervals.len()
+        );
 
         // REQ-LC-004~006: 使用 ScopedSpillAllocator 替代顺序单调分配。
         // 预扫描 VmProgram 构建 scope 位置表，用于在 spill 分配时确定归属 scope。
@@ -1231,10 +1576,17 @@ impl<'a> RegAllocator<'a> {
         // clobber 位置表 (position → clobbered PhysGpr 集合)。x86 变量移位 clobber rcx
         // 在此显式建模，供下方 GPR 分配从候选池剔除活跃区间内被 clobber 的物理寄存器。
         // 仅 x86_64 有 clobber (见 instr_phys_clobbers)；AArch64/GPU 为空表，零开销。
-        let phys_clobbers: Vec<(usize, Vec<PhysGpr>)> = program.instrs.iter().enumerate()
+        let phys_clobbers: Vec<(usize, Vec<PhysGpr>)> = program
+            .instrs
+            .iter()
+            .enumerate()
             .filter_map(|(i, instr)| {
                 let c = Self::instr_phys_clobbers(instr, &self.profile.platform);
-                if c.is_empty() { None } else { Some((i, c)) }
+                if c.is_empty() {
+                    None
+                } else {
+                    Some((i, c))
+                }
             })
             .collect();
         // 按 position 排序，便于区间查询 (二分查找首个 clobber 落在区间内的位置)。
@@ -1266,9 +1618,13 @@ impl<'a> RegAllocator<'a> {
 
         for iv in &sorted {
             // 收集干涉邻居已占用的物理寄存器
-            let mut occupied_gpr: HashSet<PhysGpr> = interference.neighbors(iv.vreg)
+            let mut occupied_gpr: HashSet<PhysGpr> = interference
+                .neighbors(iv.vreg)
                 .filter_map(|n| mapping.get(n))
-                .filter_map(|p| match p { PhysReg::Gpr(g) => Some(*g), _ => None })
+                .filter_map(|p| match p {
+                    PhysReg::Gpr(g) => Some(*g),
+                    _ => None,
+                })
                 .collect();
             // BCE-20260715-REGALLOC-SHL-SHR-RCX-CLOBBER: 剔除活跃区间内被指令隐式
             // clobber 的物理寄存器 (x86 变量移位 clobber rcx)。若某 clobber 位置落在
@@ -1278,19 +1634,31 @@ impl<'a> RegAllocator<'a> {
             if !phys_clobbers_pos.is_empty() {
                 let start = phys_clobbers_pos.partition_point(|&p| p < iv.def_point);
                 for &(pos, ref clobbers) in phys_clobbers.iter().skip(start) {
-                    if pos > iv.last_use { break; }
+                    if pos > iv.last_use {
+                        break;
+                    }
                     // pos ∈ [def_point, last_use]: clobber 命中活跃区间
-                    for g in clobbers { occupied_gpr.insert(*g); }
+                    for g in clobbers {
+                        occupied_gpr.insert(*g);
+                    }
                 }
             }
-            let occupied_vec: HashSet<PhysVec> = interference.neighbors(iv.vreg)
+            let occupied_vec: HashSet<PhysVec> = interference
+                .neighbors(iv.vreg)
                 .filter_map(|n| mapping.get(n))
-                .filter_map(|p| match p { PhysReg::Vec(v) => Some(*v), _ => None })
+                .filter_map(|p| match p {
+                    PhysReg::Vec(v) => Some(*v),
+                    _ => None,
+                })
                 .collect();
             // HW-TIER TASK-D §6.2: Tile 干涉邻居占用集 (避免两个 live tile vreg 复用同一 tmm)
-            let occupied_tile: HashSet<PhysTile> = interference.neighbors(iv.vreg)
+            let occupied_tile: HashSet<PhysTile> = interference
+                .neighbors(iv.vreg)
                 .filter_map(|n| mapping.get(n))
-                .filter_map(|p| match p { PhysReg::Tile(t) => Some(*t), _ => None })
+                .filter_map(|p| match p {
+                    PhysReg::Tile(t) => Some(*t),
+                    _ => None,
+                })
                 .collect();
 
             match iv.kind {
@@ -1323,7 +1691,10 @@ impl<'a> RegAllocator<'a> {
                     }
                 }
                 VRegKind::Vec => {
-                    if let Some(reg) = self.profile.vec_regs.iter()
+                    if let Some(reg) = self
+                        .profile
+                        .vec_regs
+                        .iter()
                         .find(|r| !occupied_vec.contains(r))
                     {
                         mapping.insert(iv.vreg, PhysReg::Vec(*reg));
@@ -1343,7 +1714,10 @@ impl<'a> RegAllocator<'a> {
                     // HW-TIER TASK-D §6.2: 独立 Tile 池分配 — 每个 tile vreg 独占一个
                     // PhysTile (tmm0..tmm7), 避开干涉邻居已占用的 tmm。超出 8 上限 → Err。
                     // 物理 tmm 分配由 reg_alloc 统一管理; tile-vreg→tmm 映射存于 mapping。
-                    if let Some(reg) = self.profile.tile_regs.iter()
+                    if let Some(reg) = self
+                        .profile
+                        .tile_regs
+                        .iter()
                         .find(|r| !occupied_tile.contains(r) && !tile_used.contains(r))
                     {
                         mapping.insert(iv.vreg, PhysReg::Tile(*reg));
@@ -1364,34 +1738,86 @@ impl<'a> RegAllocator<'a> {
         }
 
         // 统计实际使用的 callee-saved
-        let callee_saved_used: Vec<PhysGpr> = self.profile.abi.callee_saved.iter()
+        let callee_saved_used: Vec<PhysGpr> = self
+            .profile
+            .abi
+            .callee_saved
+            .iter()
             .filter(|r| gpr_used.contains(r))
             .copied()
             .collect();
+
+        // BCE-20260724-PLAN-C-RESIDUAL-BREAK Dimension A: drain alloc-time
+        // overlap violations BEFORE into_spills() consumes the allocator.
+        // These are reported alongside the Dimension B diagnostic in compile.inc.rs.
+        let alloc_violations = scoped_alloc.drain_violations();
 
         // REQ-LC-004: 将 ScopedSpillAllocator 产物转换为兼容的 spills Vec。
         let spills = scoped_alloc.into_spills();
         let spill_total_bytes: usize = spills.iter().map(|s| s.size).sum();
 
+        // BCE-20260724-PLAN-C-RESIDUAL-BREAK Dimension A: if GLLM_VERIFY_SPILL=1
+        // and alloc-time violations were collected, dump them to stderr + log.
+        if !alloc_violations.is_empty() {
+            eprintln!(
+                "[GLLM_VERIFY_SPILL] {} alloc-time overlap violations detected:",
+                alloc_violations.len()
+            );
+            for v in &alloc_violations {
+                eprintln!("[GLLM_VERIFY_SPILL]   {v}");
+            }
+            // Also dump to /tmp/gllm_regalloc.log for persistence
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/gllm_regalloc.log")
+            {
+                use std::io::Write;
+                let _ = writeln!(
+                    f,
+                    "\n=== SPILL-OVERLAP (alloc-time, {} violations) ===",
+                    alloc_violations.len()
+                );
+                for v in &alloc_violations {
+                    let _ = writeln!(f, "  {v}");
+                }
+            }
+        }
+
         // Debug: dump GPR allocation and spills to file (avoid test harness truncation)
         if !spills.is_empty() || std::env::var("GLLM_REGALLOC_DEBUG").is_ok() {
             use std::io::Write;
             if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true).append(true)
+                .create(true)
+                .append(true)
                 .open("/tmp/gllm_regalloc.log")
             {
                 // Section header to separate multiple compiles
-                let _ = writeln!(f, "\n=== REGALLOC ({} instrs, {} intervals, {} spills) ===",
-                    program.instrs.len(), sorted.len(), spills.len());
+                let _ = writeln!(
+                    f,
+                    "\n=== REGALLOC ({} instrs, {} intervals, {} spills) ===",
+                    program.instrs.len(),
+                    sorted.len(),
+                    spills.len()
+                );
                 for iv in &sorted {
                     let phys = mapping.get(&iv.vreg);
-                    let _ = writeln!(f, "  v{} {:?} [def={}, last={}] → {:?}",
-                        iv.vreg.0, iv.kind, iv.def_point, iv.last_use, phys);
+                    let _ = writeln!(
+                        f,
+                        "  v{} {:?} [def={}, last={}] → {:?}",
+                        iv.vreg.0, iv.kind, iv.def_point, iv.last_use, phys
+                    );
                 }
                 if !spills.is_empty() {
-                    let _ = writeln!(f, "  spills: {} ({} bytes)", spills.len(), spill_total_bytes);
+                    let _ = writeln!(
+                        f,
+                        "  spills: {} ({} bytes)",
+                        spills.len(),
+                        spill_total_bytes
+                    );
                     for s in &spills {
-                        let _ = writeln!(f, "    v{} offset={} size={}", s.vreg.0, s.offset, s.size);
+                        let _ =
+                            writeln!(f, "    v{} offset={} size={}", s.vreg.0, s.offset, s.size);
                     }
                 }
             }
@@ -1410,7 +1836,11 @@ impl<'a> RegAllocator<'a> {
         Self::post_alloc_verify(&mapping, &intervals, &spills)?;
 
         // REQ-LC-010: Post-hoc consistency verification (rules 6/7/9)
-        let alloc = RegAllocation { mapping, spills, callee_saved_used };
+        let alloc = RegAllocation {
+            mapping,
+            spills,
+            callee_saved_used,
+        };
         super::verify::verify_after_alloc(program, &alloc, &intervals)
             .map_err(|e| format!("verify_after_alloc: {}", e))?;
 
@@ -1419,10 +1849,14 @@ impl<'a> RegAllocator<'a> {
             use crate::compiler::jit_context::ResourceKind;
             let gpr_capacity = ctx.budget().capacity(ResourceKind::Gpr);
             let vec_capacity = ctx.budget().capacity(ResourceKind::SimdVec);
-            let gpr_used_count = alloc.mapping.values()
+            let gpr_used_count = alloc
+                .mapping
+                .values()
                 .filter(|p| matches!(p, PhysReg::Gpr(_)))
                 .count();
-            let vec_used_count = alloc.mapping.values()
+            let vec_used_count = alloc
+                .mapping
+                .values()
                 .filter(|p| matches!(p, PhysReg::Vec(_)))
                 .count();
             if gpr_used_count > gpr_capacity && gpr_capacity > 0 {
@@ -1436,6 +1870,48 @@ impl<'a> RegAllocator<'a> {
                     "RegAllocator: Vec budget exceeded: used {} > capacity {} (REQ-JCTX-013)",
                     vec_used_count, vec_capacity
                 ));
+            }
+        }
+
+        // BCE-20260724-PLAN-C-RESIDUAL-BREAK Dimension B: Diagnostic spill-layout
+        // verification — collect ALL offset-overlap + live-range-intersection
+        // violations across the entire spill table. Gated by GLLM_VERIFY_SPILL=1.
+        // Diagnostic-only: reports violations to stderr + /tmp/gllm_regalloc.log,
+        // does NOT abort compilation (so the full Q5_K_M N=28 profile is collectable).
+        //
+        // Decision criterion:
+        //   - If violations reported → root-cause hypothesis CONFIRMED (spill slot
+        //     corruption via offset reuse / live-range overlap).
+        //   - If zero violations → root-cause NOT in spill layout; look at const_pool
+        //     layout (方案③方向) or native-call clobber instead.
+        // @trace REQ-LC-012 [req:post_alloc_verify] diagnostic spill layout verification gate
+        if std::env::var("GLLM_VERIFY_SPILL").map(|v| !v.is_empty() && v != "0").unwrap_or(false) {
+            // spill_base_off: callee_save_area is the x86 spill base (after callee-saved
+            // pushes). The full rbp_off includes ABI arg slots (48B on x86), but for
+            // diagnostic overlap detection the relative offset is what matters.
+            let callee_save_area = alloc.callee_saved_used.len() * 8;
+            let spill_base_off = -(callee_save_area as i32);
+            let violations = Self::verify_spill_layout_diagnostic(
+                &alloc.spills, &sorted, spill_base_off,
+            );
+            eprintln!(
+                "[GLLM_VERIFY_SPILL] Dimension B: {} spill-layout violations (spills={}, intervals={})",
+                violations.len(), alloc.spills.len(), sorted.len(),
+            );
+            for v in &violations {
+                eprintln!("[GLLM_VERIFY_SPILL]   {v}");
+            }
+            if !violations.is_empty() {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true).append(true)
+                    .open("/tmp/gllm_regalloc.log")
+                {
+                    use std::io::Write;
+                    let _ = writeln!(f, "\n=== SPILL-OVERLAP (Dimension B, {} violations) ===", violations.len());
+                    for v in &violations {
+                        let _ = writeln!(f, "  {v}");
+                    }
+                }
             }
         }
 
@@ -1458,7 +1934,8 @@ impl<'a> RegAllocator<'a> {
         mapping: &HashMap<VRegId, PhysReg>,
         intervals: &[LiveInterval],
     ) -> Result<(), String> {
-        let spilled_vregs: HashMap<VRegId, usize> = mapping.iter()
+        let spilled_vregs: HashMap<VRegId, usize> = mapping
+            .iter()
             .filter_map(|(vreg, phys)| match phys {
                 PhysReg::Spilled(slot) => Some((*vreg, *slot as usize)),
                 _ => None,
@@ -1470,14 +1947,12 @@ impl<'a> RegAllocator<'a> {
         }
 
         // Build interval lookup
-        let interval_map: HashMap<VRegId, &LiveInterval> = intervals.iter()
-            .map(|iv| (iv.vreg, iv))
-            .collect();
+        let interval_map: HashMap<VRegId, &LiveInterval> =
+            intervals.iter().map(|iv| (iv.vreg, iv)).collect();
 
         // For each spilled VReg, find first write and first read positions
-        let is_pure_write = |instr: &VmInstr, vreg: VRegId| -> bool {
-            validate_spill_is_pure_write(instr, vreg)
-        };
+        let is_pure_write =
+            |instr: &VmInstr, vreg: VRegId| -> bool { validate_spill_is_pure_write(instr, vreg) };
 
         let reads_vreg = |instr: &VmInstr, vreg: VRegId| -> bool {
             Self::referenced_vregs(instr).contains(&vreg)
@@ -1495,7 +1970,8 @@ impl<'a> RegAllocator<'a> {
                     first_write = Some(i);
                     write_instr = Self::instr_brief(instr);
                 }
-                if first_read.is_none() && reads_vreg(instr, *vreg) && !is_pure_write(instr, *vreg) {
+                if first_read.is_none() && reads_vreg(instr, *vreg) && !is_pure_write(instr, *vreg)
+                {
                     first_read = Some(i);
                     read_instr = Self::instr_brief(instr);
                 }
@@ -1525,16 +2001,23 @@ impl<'a> RegAllocator<'a> {
                     };
                     let ctx_start = read_pos.saturating_sub(2);
                     let ctx_end = (read_pos + 3).min(program.instrs.len());
-                    let ctx_dump: Vec<String> = (ctx_start..ctx_end).map(|i| {
-                        let marker = if i == read_pos { ">>>" } else { "   " };
-                        format!("{} [{}] {:?}", marker, i, program.instrs[i])
-                    }).collect();
+                    let ctx_dump: Vec<String> = (ctx_start..ctx_end)
+                        .map(|i| {
+                            let marker = if i == read_pos { ">>>" } else { "   " };
+                            format!("{} [{}] {:?}", marker, i, program.instrs[i])
+                        })
+                        .collect();
                     let msg = format!(
                         "Spill Safety Violation: v{} (slot {}) is read at instr {} ({:?}) \
                          but NEVER written. Prologue zero-inits → reads null → SIGSEGV.\n\
                          Read instr: {}\n\
                          Context:\n{}",
-                        vreg.0, slot, read_pos, read_instr, instr_dump, ctx_dump.join("\n"),
+                        vreg.0,
+                        slot,
+                        read_pos,
+                        read_instr,
+                        instr_dump,
+                        ctx_dump.join("\n"),
                     );
                     return Err(msg);
                 }
@@ -1547,7 +2030,7 @@ impl<'a> RegAllocator<'a> {
 
     /// Brief description of an instruction for diagnostics
     fn instr_brief(instr: &VmInstr) -> &'static str {
-                match instr.category() {
+        match instr.category() {
             super::vm_instr_category::InstrCategory::Memory => Self::instr_brief_memorya(instr),
             super::vm_instr_category::InstrCategory::Arith => Self::instr_brief_aritha(instr),
             super::vm_instr_category::InstrCategory::Control => Self::instr_brief_controla(instr),
@@ -1555,9 +2038,9 @@ impl<'a> RegAllocator<'a> {
             super::vm_instr_category::InstrCategory::Sampling => Self::instr_brief_samplinga(instr),
             super::vm_instr_category::InstrCategory::Misc => Self::instr_brief_misca(instr),
             _ => std::any::type_name::<VmInstr>()
-                                .split("::")
-                                .last()
-                                .unwrap_or("VmInstr"),
+                .split("::")
+                .last()
+                .unwrap_or("VmInstr"),
         }
     }
 
@@ -1584,9 +2067,9 @@ impl<'a> RegAllocator<'a> {
             VmInstr::AddPtr { .. } => "AddPtr",
             VmInstr::IntMulStride { .. } => "IntMulStride",
             _ => std::any::type_name::<VmInstr>()
-                                .split("::")
-                                .last()
-                                .unwrap_or("VmInstr"),
+                .split("::")
+                .last()
+                .unwrap_or("VmInstr"),
         }
     }
 
@@ -1600,9 +2083,9 @@ impl<'a> RegAllocator<'a> {
             VmInstr::Accumulate { .. } => "Accumulate",
             VmInstr::GprBinOp { .. } => "GprBinOp",
             _ => std::any::type_name::<VmInstr>()
-                                .split("::")
-                                .last()
-                                .unwrap_or("VmInstr"),
+                .split("::")
+                .last()
+                .unwrap_or("VmInstr"),
         }
     }
 
@@ -1612,9 +2095,9 @@ impl<'a> RegAllocator<'a> {
             VmInstr::LoopBegin { .. } => "LoopBegin",
             VmInstr::LoopEnd => "LoopEnd",
             _ => std::any::type_name::<VmInstr>()
-                                .split("::")
-                                .last()
-                                .unwrap_or("VmInstr"),
+                .split("::")
+                .last()
+                .unwrap_or("VmInstr"),
         }
     }
 
@@ -1624,9 +2107,9 @@ impl<'a> RegAllocator<'a> {
             VmInstr::GgufSubScaleLoad { .. } => "GgufSubScaleLoad",
             VmInstr::GgufKQuantScaleLoad { .. } => "GgufKQuantScaleLoad",
             _ => std::any::type_name::<VmInstr>()
-                                .split("::")
-                                .last()
-                                .unwrap_or("VmInstr"),
+                .split("::")
+                .last()
+                .unwrap_or("VmInstr"),
         }
     }
 
@@ -1638,9 +2121,9 @@ impl<'a> RegAllocator<'a> {
             VmInstr::CheckStopCondition { .. } => "CheckStopCondition",
             VmInstr::TemperatureScale { .. } => "TemperatureScale",
             _ => std::any::type_name::<VmInstr>()
-                                .split("::")
-                                .last()
-                                .unwrap_or("VmInstr"),
+                .split("::")
+                .last()
+                .unwrap_or("VmInstr"),
         }
     }
 
@@ -1650,12 +2133,11 @@ impl<'a> RegAllocator<'a> {
             VmInstr::DeclareVReg { .. } => "DeclareVReg",
             VmInstr::Comment(_) => "Comment",
             _ => std::any::type_name::<VmInstr>()
-                                .split("::")
-                                .last()
-                                .unwrap_or("VmInstr"),
+                .split("::")
+                .last()
+                .unwrap_or("VmInstr"),
         }
     }
-
 
     /// D6: Spill layout consistency validation (ARCH-VM-SPILL-LAYOUT)。
     ///
@@ -1730,8 +2212,12 @@ impl<'a> RegAllocator<'a> {
             if b.offset < a.offset + a.size {
                 return Err(format!(
                     "Spill Layout: physical overlap — v{} [{}, {}) overlaps v{} [{}, {})",
-                    a.vreg.0, a.offset, a.offset + a.size,
-                    b.vreg.0, b.offset, b.offset + b.size,
+                    a.vreg.0,
+                    a.offset,
+                    a.offset + a.size,
+                    b.vreg.0,
+                    b.offset,
+                    b.offset + b.size,
                 ));
             }
         }
@@ -1739,9 +2225,8 @@ impl<'a> RegAllocator<'a> {
         // Check 2: Simultaneously live VRegs must not share overlapping spill slots.
         // Since our allocator gives each VReg its own slot, this should always pass.
         // But if someone changes the allocator to reuse dead slots, this catches bugs.
-        let interval_map: HashMap<VRegId, &LiveInterval> = intervals.iter()
-            .map(|iv| (iv.vreg, iv))
-            .collect();
+        let interval_map: HashMap<VRegId, &LiveInterval> =
+            intervals.iter().map(|iv| (iv.vreg, iv)).collect();
 
         for i in 0..spills.len() {
             for j in (i + 1)..spills.len() {
@@ -1750,15 +2235,25 @@ impl<'a> RegAllocator<'a> {
                 // Check if spill slots physically overlap
                 if a.offset < b.offset + b.size && b.offset < a.offset + a.size {
                     // Check if they are simultaneously live
-                    if let (Some(ia), Some(ib)) = (interval_map.get(&a.vreg), interval_map.get(&b.vreg)) {
+                    if let (Some(ia), Some(ib)) =
+                        (interval_map.get(&a.vreg), interval_map.get(&b.vreg))
+                    {
                         if ia.def_point <= ib.last_use && ib.def_point <= ia.last_use {
                             return Err(format!(
                                 "Spill Layout: live overlap — v{} [{}, {}) and v{} [{}, {}) \
                                  are simultaneously live (v{}: [{},{}], v{}: [{},{}])",
-                                a.vreg.0, a.offset, a.offset + a.size,
-                                b.vreg.0, b.offset, b.offset + b.size,
-                                a.vreg.0, ia.def_point, ia.last_use,
-                                b.vreg.0, ib.def_point, ib.last_use,
+                                a.vreg.0,
+                                a.offset,
+                                a.offset + a.size,
+                                b.vreg.0,
+                                b.offset,
+                                b.offset + b.size,
+                                a.vreg.0,
+                                ia.def_point,
+                                ia.last_use,
+                                b.vreg.0,
+                                ib.def_point,
+                                ib.last_use,
                             ));
                         }
                     }
@@ -1767,13 +2262,14 @@ impl<'a> RegAllocator<'a> {
         }
 
         // Check 3: Spill slot size consistency with VRegKind
-        let kind_map: HashMap<VRegId, VRegKind> = intervals.iter()
-            .map(|iv| (iv.vreg, iv.kind))
-            .collect();
+        let kind_map: HashMap<VRegId, VRegKind> =
+            intervals.iter().map(|iv| (iv.vreg, iv.kind)).collect();
         for slot in spills {
             if let Some(kind) = kind_map.get(&slot.vreg) {
                 let expected_size = match kind {
-                    VRegKind::Ptr | VRegKind::Scalar | VRegKind::Counter | VRegKind::ByteOffset => 8,
+                    VRegKind::Ptr | VRegKind::Scalar | VRegKind::Counter | VRegKind::ByteOffset => {
+                        8
+                    }
                     VRegKind::Vec => 32, // minimum, can be 64 for AVX-512
                     _ => continue,
                 };
@@ -1788,19 +2284,170 @@ impl<'a> RegAllocator<'a> {
 
         Ok(())
     }
+
+    /// BCE-20260724-PLAN-C-RESIDUAL-BREAK Dimension B: Diagnostic spill-layout
+    /// verifier — collects ALL offset-overlap + live-range-intersection violations
+    /// across the entire spill table, returns a violation report (Vec<String>).
+    /// Does NOT abort — unlike `validate_spill_layout` (hard Err on first
+    /// violation), this collects the full profile so the Q5_K_M N=28 scenario
+    /// can be characterized: how many violations, which VRegs, which offsets.
+    ///
+    /// Two checks:
+    /// 1. Physical offset overlap: two Occupied spill slots [offset, offset+size)
+    ///    ranges intersect (should never happen with ARCH-SPILL-SAFE fresh offsets).
+    /// 2. Live-range intersection: if two Occupied slots physically overlap AND
+    ///    their live ranges [def_point, last_use] intersect, that is a confirmed
+    ///    "spill slot corruption" bug — two simultaneously-live VRegs share stack
+    ///    memory, writes to one clobber the other.
+    ///
+    /// Gated by GLLM_VERIFY_SPILL=1. Diagnostic-only (returns report, never Err).
+    /// @trace REQ-LC-012 [req:post_alloc_verify] post-allocation spill layout diagnostic verification
+    pub fn verify_spill_layout_diagnostic(
+        spills: &[SpillSlot],
+        intervals: &[LiveInterval],
+        spill_base_off: i32,
+    ) -> Vec<String> {
+        let mut violations: Vec<String> = Vec::new();
+        if spills.len() <= 1 {
+            return violations;
+        }
+
+        let interval_map: HashMap<VRegId, &LiveInterval> =
+            intervals.iter().map(|iv| (iv.vreg, iv)).collect();
+
+        // Collect Occupied slots (skip Freed placeholders with VRegId(u32::MAX))
+        let occupied: Vec<(usize, &SpillSlot)> = spills
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.vreg.0 != u32::MAX)
+            .collect();
+
+        // Check all pairs of Occupied slots
+        for i in 0..occupied.len() {
+            for j in (i + 1)..occupied.len() {
+                let (idx_a, a) = occupied[i];
+                let (idx_b, b) = occupied[j];
+                let a_end = a.offset + a.size;
+                let b_end = b.offset + b.size;
+                // Physical overlap: [a.offset, a_end) ∩ [b.offset, b_end) != ∅
+                if a.offset < b_end && b.offset < a_end {
+                    // Compute rbp_offset for diagnostic (matches compile.inc.rs dump format)
+                    let rbp_off_a = spill_base_off - a.offset as i32 - a.size as i32;
+                    let rbp_off_b = spill_base_off - b.offset as i32 - b.size as i32;
+                    // Check live-range intersection
+                    let live_intersect =
+                        match (interval_map.get(&a.vreg), interval_map.get(&b.vreg)) {
+                            (Some(ia), Some(ib)) => {
+                                ia.def_point <= ib.last_use && ib.def_point <= ia.last_use
+                            }
+                            _ => false,
+                        };
+                    let live_info = if let (Some(ia), Some(ib)) =
+                        (interval_map.get(&a.vreg), interval_map.get(&b.vreg))
+                    {
+                        format!(
+                            " live=[{},{}]vs[{},{}] intersect={}",
+                            ia.def_point, ia.last_use, ib.def_point, ib.last_use, live_intersect
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let severity = if live_intersect {
+                        "CORRUPTION"
+                    } else {
+                        "overlap"
+                    };
+                    let msg = format!(
+                        "SPILL-OVERLAP({severity}): v{} slot[{}] off=[{},{}) rbp={}] vs v{} slot[{}] off=[{},{}) rbp={}]{}",
+                        a.vreg.0, idx_a, a.offset, a_end, rbp_off_a,
+                        b.vreg.0, idx_b, b.offset, b_end, rbp_off_b,
+                        live_info,
+                    );
+                    violations.push(msg);
+                }
+            }
+        }
+
+        // Also check: same VRegId should not appear in two different slots
+        // (would indicate a double-alloc bug)
+        let mut vreg_to_slots: HashMap<VRegId, Vec<usize>> = HashMap::new();
+        for (idx, s) in occupied.iter() {
+            vreg_to_slots.entry(s.vreg).or_default().push(*idx);
+        }
+        for (vreg, slots) in &vreg_to_slots {
+            if slots.len() > 1 {
+                let msg = format!(
+                    "SPILL-DUP-VREG: v{} appears in {} slots {:?} (double-alloc bug)",
+                    vreg.0,
+                    slots.len(),
+                    slots,
+                );
+                violations.push(msg);
+            }
+        }
+
+        violations
+    }
+
+    /// BCE-20260724-PLAN-C-RESIDUAL-BREAK Dimension C: Runtime reload/store
+    /// consistency verification — DESIGN ONLY (not implemented).
+    ///
+    /// Design: At each spill-slot write (commit_gpr_write/commit_vec_write in
+    /// x86_lower/helpers.inc.rs), insert a magic-cookie check that verifies the
+    /// slot is not currently holding a different live VReg's data. At each
+    /// spill-slot read (resolve_gpr_read/resolve_vec_read), verify the loaded
+    /// value matches what was last stored (store-verify).
+    ///
+    /// Implementation would require:
+    /// 1. A shadow map (spill_offset → owning VRegId) maintained at JIT codegen
+    ///    time, baked into the prologue as a static table.
+    /// 2. Extra scratch register for store-verify (complex — regalloc already
+    ///    spill-bound, adding scratch pressure may itself cause spills).
+    /// 3. Per-access overhead (mov + cmp + jne trap) on every spill read/write
+    ///    — high hot-path cost, unsuitable for production.
+    ///
+    /// Recommended minimal runtime check: at native-call prologue/epilogue
+    /// boundaries only (not per-access), snapshot all spill slots to a
+    /// debug buffer and compare pre/post. This catches "spill slot clobbered
+    /// during native call" without per-access overhead.
+    ///
+    /// Gated by GLLM_VERIFY_SPILL_RUNTIME=1 (not yet implemented — design only).
+    /// Dimensions A+B (compile-time) are the primary diagnostic; if they find
+    /// violations, runtime verification is unnecessary. If A+B are clean,
+    /// runtime C is the next step.
+    ///
+    /// @trace REQ-LC-012 [req:post_alloc_verify] runtime spill consistency verification interface (design-only)
+    pub fn verify_spill_runtime_interface() -> &'static str {
+        // FUTURE-WORK(BCE-20260724-PLAN-C-RESIDUAL-BREAK): implement runtime spill
+        // verification gated by GLLM_VERIFY_SPILL_RUNTIME=1. See doc comment above.
+        // Returns the env var name that would gate the runtime check.
+        "GLLM_VERIFY_SPILL_RUNTIME"
+    }
 }
 
 /// Spill-safety pure-write predicate (hoisted from RegAllocator::validate_spill_safety
 /// for BCE-20260630-LOWER-INSTR-GOD-MATCH P3b — god-match split). Returns true if
 /// `instr` writes `vreg` without reading any prior value of it.
 fn validate_spill_is_pure_write(instr: &VmInstr, vreg: VRegId) -> bool {
-        match instr.category() {
-        super::vm_instr_category::InstrCategory::Memory => validate_spill_is_pure_write_memorya(instr, vreg),
-        super::vm_instr_category::InstrCategory::Arith => validate_spill_is_pure_write_aritha(instr, vreg),
-        super::vm_instr_category::InstrCategory::Control => validate_spill_is_pure_write_controla(instr, vreg),
-        super::vm_instr_category::InstrCategory::Quant => validate_spill_is_pure_write_quanta(instr, vreg),
-        super::vm_instr_category::InstrCategory::Sampling => validate_spill_is_pure_write_samplinga(instr, vreg),
-        super::vm_instr_category::InstrCategory::Misc => validate_spill_is_pure_write_misca(instr, vreg),
+    match instr.category() {
+        super::vm_instr_category::InstrCategory::Memory => {
+            validate_spill_is_pure_write_memorya(instr, vreg)
+        }
+        super::vm_instr_category::InstrCategory::Arith => {
+            validate_spill_is_pure_write_aritha(instr, vreg)
+        }
+        super::vm_instr_category::InstrCategory::Control => {
+            validate_spill_is_pure_write_controla(instr, vreg)
+        }
+        super::vm_instr_category::InstrCategory::Quant => {
+            validate_spill_is_pure_write_quanta(instr, vreg)
+        }
+        super::vm_instr_category::InstrCategory::Sampling => {
+            validate_spill_is_pure_write_samplinga(instr, vreg)
+        }
+        super::vm_instr_category::InstrCategory::Misc => {
+            validate_spill_is_pure_write_misca(instr, vreg)
+        }
         _ => false,
     }
 }
@@ -1838,17 +2485,22 @@ fn validate_spill_is_pure_write_aritha(instr: &VmInstr, vreg: VRegId) -> bool {
     //   (GprBinOp arm 保留原样 — b 是 GprOperand 需 b.vreg() Option 比较，无法用 &[])
     match instr {
         VmInstr::GprBinOp { dst, a, b, .. } => {
-                        let other_inputs_ok = *a != vreg && (b.vreg() != Some(vreg));
-                        *dst == vreg && other_inputs_ok
-                    },
+            let other_inputs_ok = *a != vreg && (b.vreg() != Some(vreg));
+            *dst == vreg && other_inputs_ok
+        }
         VmInstr::GprUnaryOp { dst, src, .. } => VmProgram::pure_write_check(*dst, vreg, &[*src]),
         VmInstr::GprLoadImm { dst, .. } => *dst == vreg,
         VmInstr::VecUnaryOp { dst, a, .. } => VmProgram::pure_write_check(*dst, vreg, &[*a]),
         VmInstr::VecBinOp { dst, a, b, .. } => VmProgram::pure_write_check(*dst, vreg, &[*a, *b]),
         VmInstr::VecCmp { dst, a, b, .. } => VmProgram::pure_write_check(*dst, vreg, &[*a, *b]),
         VmInstr::VecCast { dst, src, .. } => VmProgram::pure_write_check(*dst, vreg, &[*src]),
-        VmInstr::ConditionalSelect { dst, mask, true_val, false_val, .. } =>
-            VmProgram::pure_write_check(*dst, vreg, &[*mask, *true_val, *false_val]),
+        VmInstr::ConditionalSelect {
+            dst,
+            mask,
+            true_val,
+            false_val,
+            ..
+        } => VmProgram::pure_write_check(*dst, vreg, &[*mask, *true_val, *false_val]),
         _ => validate_spill_is_pure_write_arithb(instr, vreg),
     }
 }
@@ -1859,8 +2511,8 @@ fn validate_spill_is_pure_write_arithb(instr: &VmInstr, vreg: VRegId) -> bool {
         VmInstr::HReduce { dst, src, .. } => *dst == vreg && *src != vreg,
         VmInstr::Transcendental { dst, src, .. } => *dst == vreg && *src != vreg,
         VmInstr::Fma { dst, acc, a, b, .. } => {
-                        *dst == vreg && *acc != vreg && *a != vreg && *b != vreg
-                    },
+            *dst == vreg && *acc != vreg && *a != vreg && *b != vreg
+        }
         _ => false,
     }
 }
@@ -1868,9 +2520,11 @@ fn validate_spill_is_pure_write_arithb(instr: &VmInstr, vreg: VRegId) -> bool {
 fn validate_spill_is_pure_write_controla(instr: &VmInstr, vreg: VRegId) -> bool {
     // Control cluster a (1 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
     match instr {
-        VmInstr::LoopBegin { counter, byte_offset, .. } => {
-                        *counter == vreg || *byte_offset == vreg
-                    },
+        VmInstr::LoopBegin {
+            counter,
+            byte_offset,
+            ..
+        } => *counter == vreg || *byte_offset == vreg,
         _ => false,
     }
 }
@@ -1888,12 +2542,8 @@ fn validate_spill_is_pure_write_quanta(instr: &VmInstr, vreg: VRegId) -> bool {
         VmInstr::QuantBroadcastInt { dst, .. } => *dst == vreg,
         VmInstr::QuantExtractBits { dst, src, .. } => *dst == vreg && *src != vreg,
         VmInstr::QuantCodebookLookup { dst, indices, .. } => *dst == vreg && *indices != vreg,
-        VmInstr::QuantInterleave { dst, lo, hi, .. } => {
-                        *dst == vreg && *lo != vreg && *hi != vreg
-                    },
-        VmInstr::QuantConcatSeq { dst, lo, hi, .. } => {
-                        *dst == vreg && *lo != vreg && *hi != vreg
-                    },
+        VmInstr::QuantInterleave { dst, lo, hi, .. } => *dst == vreg && *lo != vreg && *hi != vreg,
+        VmInstr::QuantConcatSeq { dst, lo, hi, .. } => *dst == vreg && *lo != vreg && *hi != vreg,
         _ => validate_spill_is_pure_write_quantb(instr, vreg),
     }
 }
@@ -1901,23 +2551,49 @@ fn validate_spill_is_pure_write_quanta(instr: &VmInstr, vreg: VRegId) -> bool {
 fn validate_spill_is_pure_write_quantb(instr: &VmInstr, vreg: VRegId) -> bool {
     // Quant cluster b (3 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
     match instr {
-        VmInstr::Q3KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } => {
-                        *dst == vreg && *block_base != vreg && *lane_offset != vreg && *d_vreg != vreg
-                    },
-        VmInstr::Q6KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } => {
-                        *dst == vreg && *block_base != vreg && *lane_offset != vreg && *d_vreg != vreg
-                    },
-        VmInstr::Q5DecodeStep { dst, block_base, lane_offset, d_vreg, .. } => {
-                        *dst == vreg && *block_base != vreg && *lane_offset != vreg && *d_vreg != vreg
-                    },
-        VmInstr::Q5KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } => {
-                        *dst == vreg && *block_base != vreg && *lane_offset != vreg && *d_vreg != vreg
-                    },
+        VmInstr::Q3KDecodeStep {
+            dst,
+            block_base,
+            lane_offset,
+            d_vreg,
+            ..
+        } => *dst == vreg && *block_base != vreg && *lane_offset != vreg && *d_vreg != vreg,
+        VmInstr::Q6KDecodeStep {
+            dst,
+            block_base,
+            lane_offset,
+            d_vreg,
+            ..
+        } => *dst == vreg && *block_base != vreg && *lane_offset != vreg && *d_vreg != vreg,
+        VmInstr::Q5DecodeStep {
+            dst,
+            block_base,
+            lane_offset,
+            d_vreg,
+            ..
+        } => *dst == vreg && *block_base != vreg && *lane_offset != vreg && *d_vreg != vreg,
+        VmInstr::Q5KDecodeStep {
+            dst,
+            block_base,
+            lane_offset,
+            d_vreg,
+            ..
+        } => *dst == vreg && *block_base != vreg && *lane_offset != vreg && *d_vreg != vreg,
         VmInstr::QuantScalarCvtLoad { dst, base, .. } => *dst == vreg && *base != vreg,
-        VmInstr::QuantDequantFma { dst, weight, activation, scale, zero_point, .. } => {
-                        *dst == vreg && *weight != vreg && *activation != vreg
-                            && *scale != vreg && *zero_point != vreg
-                    },
+        VmInstr::QuantDequantFma {
+            dst,
+            weight,
+            activation,
+            scale,
+            zero_point,
+            ..
+        } => {
+            *dst == vreg
+                && *weight != vreg
+                && *activation != vreg
+                && *scale != vreg
+                && *zero_point != vreg
+        }
         _ => false,
     }
 }
@@ -1927,20 +2603,49 @@ fn validate_spill_is_pure_write_samplinga(instr: &VmInstr, vreg: VRegId) -> bool
     // BCE-20260630-L2-BODY: arm body 决策链 extract_function → VmProgram::pure_write_check
     match instr {
         // Sampling/softmax instructions that write dst
-        VmInstr::SoftmaxReduceMax { dst, logits_ptr, .. } => VmProgram::pure_write_check(*dst, vreg, &[*logits_ptr]),
-        VmInstr::SoftmaxExpSum { sum_dst, logits_ptr, max_val, .. } =>
-            VmProgram::pure_write_check(*sum_dst, vreg, &[*logits_ptr, *max_val]),
-        VmInstr::SampleMultinomial { dst, probs_ptr, rng_state_ptr, .. } =>
-            VmProgram::pure_write_check(*dst, vreg, &[*probs_ptr, *rng_state_ptr]),
-        VmInstr::WarpPRNG { dst, rng_state_ptr } => VmProgram::pure_write_check(*dst, vreg, &[*rng_state_ptr]),
-        VmInstr::Argmax { dst, logits_ptr, .. } => VmProgram::pure_write_check(*dst, vreg, &[*logits_ptr]),
-        VmInstr::BatchPerSeqArgmax { dst, seq_id, logits_flat_ptr, .. } =>
-            VmProgram::pure_write_check(*dst, vreg, &[*seq_id, *logits_flat_ptr]),
+        VmInstr::SoftmaxReduceMax {
+            dst, logits_ptr, ..
+        } => VmProgram::pure_write_check(*dst, vreg, &[*logits_ptr]),
+        VmInstr::SoftmaxExpSum {
+            sum_dst,
+            logits_ptr,
+            max_val,
+            ..
+        } => VmProgram::pure_write_check(*sum_dst, vreg, &[*logits_ptr, *max_val]),
+        VmInstr::SampleMultinomial {
+            dst,
+            probs_ptr,
+            rng_state_ptr,
+            ..
+        } => VmProgram::pure_write_check(*dst, vreg, &[*probs_ptr, *rng_state_ptr]),
+        VmInstr::WarpPRNG { dst, rng_state_ptr } => {
+            VmProgram::pure_write_check(*dst, vreg, &[*rng_state_ptr])
+        }
+        VmInstr::Argmax {
+            dst, logits_ptr, ..
+        } => VmProgram::pure_write_check(*dst, vreg, &[*logits_ptr]),
+        VmInstr::BatchPerSeqArgmax {
+            dst,
+            seq_id,
+            logits_flat_ptr,
+            ..
+        } => VmProgram::pure_write_check(*dst, vreg, &[*seq_id, *logits_flat_ptr]),
         // §20 BCI cumsum search: dst is pure write (seq_id lookup result).
-        VmInstr::SeqIdLookup { dst, token_index, seq_meta_base, num_seqs, .. } =>
-            VmProgram::pure_write_check(*dst, vreg, &[*token_index, *seq_meta_base, *num_seqs]),
-        VmInstr::BatchSeqIdLookup { dst, pt_offset_out, token_index, batch_ctx_ptr } =>
-            VmProgram::pure_write_check(*dst, vreg, &[*pt_offset_out, *token_index, *batch_ctx_ptr]),
+        VmInstr::SeqIdLookup {
+            dst,
+            token_index,
+            seq_meta_base,
+            num_seqs,
+            ..
+        } => VmProgram::pure_write_check(*dst, vreg, &[*token_index, *seq_meta_base, *num_seqs]),
+        VmInstr::BatchSeqIdLookup {
+            dst,
+            pt_offset_out,
+            token_index,
+            batch_ctx_ptr,
+        } => {
+            VmProgram::pure_write_check(*dst, vreg, &[*pt_offset_out, *token_index, *batch_ctx_ptr])
+        }
         _ => validate_spill_is_pure_write_samplingb(instr, vreg),
     }
 }
@@ -1948,7 +2653,11 @@ fn validate_spill_is_pure_write_samplinga(instr: &VmInstr, vreg: VRegId) -> bool
 fn validate_spill_is_pure_write_samplingb(instr: &VmInstr, vreg: VRegId) -> bool {
     // Sampling cluster b (3 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
     match instr {
-        VmInstr::SoftmaxNormalize { logits_ptr, sum_val, .. } => false,
+        VmInstr::SoftmaxNormalize {
+            logits_ptr,
+            sum_val,
+            ..
+        } => false,
         // in-place, no VReg dst
         VmInstr::SampleTopKFilter { .. } => false,
         // in-place, no VReg dst
@@ -1965,14 +2674,13 @@ fn validate_spill_is_pure_write_misca(instr: &VmInstr, vreg: VRegId) -> bool {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
-    use crate::compiler::trace::QuantPrecision;
     use super::*;
-    use crate::dispatch::DeviceProfile;
     use crate::compiler::codegen::vm::auto_select;
+    use crate::compiler::trace::QuantPrecision;
     use crate::compiler::trace::{TraceOp, ValueId};
+    use crate::dispatch::DeviceProfile;
 
     fn test_profile() -> IsaProfile {
         IsaProfile::from_device_profile(&DeviceProfile::detect())
@@ -1980,17 +2688,42 @@ mod tests {
 
     #[test]
     fn test_allocate_elementwise_no_spill() {
-        let body = vec![TraceOp::Input(0), TraceOp::Neg(ValueId(0)), TraceOp::Exp(ValueId(1)),
-            TraceOp::Const(1.0), TraceOp::Add(ValueId(2), ValueId(3)), TraceOp::Recip(ValueId(4)), TraceOp::Mul(ValueId(0), ValueId(5))];
+        let body = vec![
+            TraceOp::Input(0),
+            TraceOp::Neg(ValueId(0)),
+            TraceOp::Exp(ValueId(1)),
+            TraceOp::Const(1.0),
+            TraceOp::Add(ValueId(2), ValueId(3)),
+            TraceOp::Recip(ValueId(4)),
+            TraceOp::Mul(ValueId(0), ValueId(5)),
+        ];
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let vec_reg = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        prog.emit(VmInstr::VecLoad { dst: vec_reg, base: input_ptr, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None, });
-        let _slots = auto_select::auto_lower_trace_raw(&mut prog, &body, &[vec_reg], SimdWidth::W256, QuantPrecision::F32).unwrap();
+        prog.emit(VmInstr::VecLoad {
+            dst: vec_reg,
+            base: input_ptr,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
+        });
+        let _slots = auto_select::auto_lower_trace_raw(
+            &mut prog,
+            &body,
+            &[vec_reg],
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
         let profile = test_profile();
         let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
 
-        assert!(alloc.spills.is_empty(), "unexpected spills: {:?}", alloc.spills);
+        assert!(
+            alloc.spills.is_empty(),
+            "unexpected spills: {:?}",
+            alloc.spills
+        );
         assert!(alloc.mapping.len() >= 5);
     }
 
@@ -2004,12 +2737,47 @@ mod tests {
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let a_bc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let b_v = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::Const(0.0), width: SimdWidth::W256, dtype: QuantPrecision::F32, });
-        prog.emit(VmInstr::Broadcast { dst: a_bc, src: ScalarExpr::MemLoad(a_ptr, OffsetExpr::Const(0)), width: SimdWidth::W256, dtype: QuantPrecision::F32, });
-        prog.emit(VmInstr::VecLoad { dst: b_v, base: b_ptr, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None, });
-        let fma_body = [TraceOp::Input(0), TraceOp::Input(1), TraceOp::Fma(ValueId(0), ValueId(0), ValueId(1))];
-        let slots = auto_select::auto_lower_trace_raw(&mut prog, &fma_body, &[acc, a_bc, b_v], SimdWidth::W256, QuantPrecision::F32).unwrap();
-        prog.emit(VmInstr::VecStore { base: c_ptr, src: slots[0], offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None, });
+        prog.emit(VmInstr::Broadcast {
+            dst: acc,
+            src: ScalarExpr::Const(0.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+        });
+        prog.emit(VmInstr::Broadcast {
+            dst: a_bc,
+            src: ScalarExpr::MemLoad(a_ptr, OffsetExpr::Const(0)),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+        });
+        prog.emit(VmInstr::VecLoad {
+            dst: b_v,
+            base: b_ptr,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
+        });
+        let fma_body = [
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Fma(ValueId(0), ValueId(0), ValueId(1)),
+        ];
+        let slots = auto_select::auto_lower_trace_raw(
+            &mut prog,
+            &fma_body,
+            &[acc, a_bc, b_v],
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
+        prog.emit(VmInstr::VecStore {
+            base: c_ptr,
+            src: slots[0],
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
+        });
         let profile = test_profile();
         let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
 
@@ -2020,9 +2788,11 @@ mod tests {
             if let Some(phys) = alloc.get(iv.vreg) {
                 for neighbor in ig.neighbors(iv.vreg) {
                     if let Some(n_phys) = alloc.get(*neighbor) {
-                        assert_ne!(phys, n_phys,
+                        assert_ne!(
+                            phys, n_phys,
                             "conflict: v{} and v{} both mapped to {:?}",
-                            iv.vreg.0, neighbor.0, phys);
+                            iv.vreg.0, neighbor.0, phys
+                        );
                     }
                 }
             }
@@ -2035,8 +2805,22 @@ mod tests {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let vec_reg = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        prog.emit(VmInstr::VecLoad { dst: vec_reg, base: input_ptr, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None, });
-        let _slots = auto_select::auto_lower_trace_raw(&mut prog, &body, &[vec_reg], SimdWidth::W256, QuantPrecision::F32).unwrap();
+        prog.emit(VmInstr::VecLoad {
+            dst: vec_reg,
+            base: input_ptr,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
+        });
+        let _slots = auto_select::auto_lower_trace_raw(
+            &mut prog,
+            &body,
+            &[vec_reg],
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
         let profile = test_profile();
         let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
 
@@ -2048,9 +2832,30 @@ mod tests {
 
     #[test]
     fn test_interference_graph() {
-        let a = LiveInterval { vreg: VRegId(0), kind: VRegKind::Vec, width: SimdWidth::W256, def_point: 0, last_use: 10, lifecycle: LifecycleTag::BodyLocal };
-        let b = LiveInterval { vreg: VRegId(1), kind: VRegKind::Vec, width: SimdWidth::W256, def_point: 5, last_use: 15, lifecycle: LifecycleTag::BodyLocal };
-        let c = LiveInterval { vreg: VRegId(2), kind: VRegKind::Vec, width: SimdWidth::W256, def_point: 11, last_use: 20, lifecycle: LifecycleTag::BodyLocal };
+        let a = LiveInterval {
+            vreg: VRegId(0),
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+            def_point: 0,
+            last_use: 10,
+            lifecycle: LifecycleTag::BodyLocal,
+        };
+        let b = LiveInterval {
+            vreg: VRegId(1),
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+            def_point: 5,
+            last_use: 15,
+            lifecycle: LifecycleTag::BodyLocal,
+        };
+        let c = LiveInterval {
+            vreg: VRegId(2),
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+            def_point: 11,
+            last_use: 20,
+            lifecycle: LifecycleTag::BodyLocal,
+        };
 
         let ig = InterferenceGraph::build(&[a, b, c]);
         assert!(ig.interferes(VRegId(0), VRegId(1))); // [0,10] ∩ [5,15] ≠ ∅
@@ -2062,18 +2867,36 @@ mod tests {
 
     #[test]
     fn test_lifecycle_alloc_priority_ordering() {
-        assert!(LifecycleTag::Global.alloc_priority() < LifecycleTag::LoopInvariant.alloc_priority());
-        assert!(LifecycleTag::LoopInvariant.alloc_priority() == LifecycleTag::LoopCarried.alloc_priority());
-        assert!(LifecycleTag::LoopCarried.alloc_priority() < LifecycleTag::CrossScope.alloc_priority());
-        assert!(LifecycleTag::CrossScope.alloc_priority() < LifecycleTag::BodyLocal.alloc_priority());
+        assert!(
+            LifecycleTag::Global.alloc_priority() < LifecycleTag::LoopInvariant.alloc_priority()
+        );
+        assert!(
+            LifecycleTag::LoopInvariant.alloc_priority()
+                == LifecycleTag::LoopCarried.alloc_priority()
+        );
+        assert!(
+            LifecycleTag::LoopCarried.alloc_priority() < LifecycleTag::CrossScope.alloc_priority()
+        );
+        assert!(
+            LifecycleTag::CrossScope.alloc_priority() < LifecycleTag::BodyLocal.alloc_priority()
+        );
     }
 
     #[test]
     fn test_lifecycle_spill_priority_ordering() {
-        assert!(LifecycleTag::BodyLocal.spill_priority() < LifecycleTag::CrossScope.spill_priority());
-        assert!(LifecycleTag::CrossScope.spill_priority() < LifecycleTag::LoopCarried.spill_priority());
-        assert!(LifecycleTag::LoopCarried.spill_priority() < LifecycleTag::LoopInvariant.spill_priority());
-        assert!(LifecycleTag::LoopInvariant.spill_priority() < LifecycleTag::Global.spill_priority());
+        assert!(
+            LifecycleTag::BodyLocal.spill_priority() < LifecycleTag::CrossScope.spill_priority()
+        );
+        assert!(
+            LifecycleTag::CrossScope.spill_priority() < LifecycleTag::LoopCarried.spill_priority()
+        );
+        assert!(
+            LifecycleTag::LoopCarried.spill_priority()
+                < LifecycleTag::LoopInvariant.spill_priority()
+        );
+        assert!(
+            LifecycleTag::LoopInvariant.spill_priority() < LifecycleTag::Global.spill_priority()
+        );
     }
 
     #[test]
@@ -2096,7 +2919,9 @@ mod tests {
 
     // ── infer_lifecycle unit tests ─────────────────────────────────────
 
-    fn empty_hf() -> HashSet<(VRegId, usize)> { HashSet::new() }
+    fn empty_hf() -> HashSet<(VRegId, usize)> {
+        HashSet::new()
+    }
 
     #[test]
     fn test_infer_lifecycle_global_def_at_zero_last_at_end() {
@@ -2128,57 +2953,112 @@ mod tests {
 
     #[test]
     fn test_infer_lifecycle_loop_invariant_outside_def_read_inside() {
-        let tag = infer_lifecycle(VRegId(0), VRegKind::Ptr, 2, 20,
-            &[(5, 15)], &empty_hf(), &[], 100);
+        let tag = infer_lifecycle(
+            VRegId(0),
+            VRegKind::Ptr,
+            2,
+            20,
+            &[(5, 15)],
+            &empty_hf(),
+            &[],
+            100,
+        );
         assert_eq!(tag, LifecycleTag::LoopInvariant);
     }
 
     #[test]
     fn test_infer_lifecycle_loop_carried_defined_inside_used_past() {
-        let tag = infer_lifecycle(VRegId(0), VRegKind::Ptr, 8, 25,
-            &[(5, 15)], &empty_hf(), &[], 100);
+        let tag = infer_lifecycle(
+            VRegId(0),
+            VRegKind::Ptr,
+            8,
+            25,
+            &[(5, 15)],
+            &empty_hf(),
+            &[],
+            100,
+        );
         assert_eq!(tag, LifecycleTag::LoopCarried);
     }
 
     #[test]
     fn test_infer_lifecycle_body_local_defined_and_used_inside_loop() {
-        let tag = infer_lifecycle(VRegId(0), VRegKind::Ptr, 7, 12,
-            &[(5, 15)], &empty_hf(), &[], 100);
+        let tag = infer_lifecycle(
+            VRegId(0),
+            VRegKind::Ptr,
+            7,
+            12,
+            &[(5, 15)],
+            &empty_hf(),
+            &[],
+            100,
+        );
         assert_eq!(tag, LifecycleTag::BodyLocal);
     }
 
     #[test]
     fn test_infer_lifecycle_body_local_no_loops() {
-        let tag = infer_lifecycle(VRegId(0), VRegKind::Ptr, 10, 30,
-            &[], &empty_hf(), &[], 100);
+        let tag = infer_lifecycle(VRegId(0), VRegKind::Ptr, 10, 30, &[], &empty_hf(), &[], 100);
         assert_eq!(tag, LifecycleTag::BodyLocal);
     }
 
     #[test]
     fn test_infer_lifecycle_cross_scope() {
-        let tag = infer_lifecycle(VRegId(0), VRegKind::Ptr, 2, 25,
-            &[], &empty_hf(), &[(5, 20)], 100);
+        let tag = infer_lifecycle(
+            VRegId(0),
+            VRegKind::Ptr,
+            2,
+            25,
+            &[],
+            &empty_hf(),
+            &[(5, 20)],
+            100,
+        );
         assert_eq!(tag, LifecycleTag::CrossScope);
     }
 
     #[test]
     fn test_infer_lifecycle_cross_scope_not_if_defined_inside() {
-        let tag = infer_lifecycle(VRegId(0), VRegKind::Ptr, 8, 25,
-            &[], &empty_hf(), &[(5, 20)], 100);
+        let tag = infer_lifecycle(
+            VRegId(0),
+            VRegKind::Ptr,
+            8,
+            25,
+            &[],
+            &empty_hf(),
+            &[(5, 20)],
+            100,
+        );
         assert_ne!(tag, LifecycleTag::CrossScope);
     }
 
     #[test]
     fn test_infer_lifecycle_counter_forced_loop_carried() {
-        let tag = infer_lifecycle(VRegId(0), VRegKind::Counter, 10, 30,
-            &[], &empty_hf(), &[], 100);
+        let tag = infer_lifecycle(
+            VRegId(0),
+            VRegKind::Counter,
+            10,
+            30,
+            &[],
+            &empty_hf(),
+            &[],
+            100,
+        );
         assert_eq!(tag, LifecycleTag::LoopCarried);
     }
 
     #[test]
     fn test_infer_lifecycle_byte_offset_forced_loop_carried() {
-        let tag = infer_lifecycle(VRegId(0), VRegKind::ByteOffset, 10, 30,
-            &[], &empty_hf(), &[], 100);
+        let tag = infer_lifecycle(
+            VRegId(0),
+            VRegKind::ByteOffset,
+            10,
+            30,
+            &[],
+            &empty_hf(),
+            &[],
+            100,
+        );
         assert_eq!(tag, LifecycleTag::LoopCarried);
     }
 
@@ -2186,8 +3066,7 @@ mod tests {
     fn test_infer_lifecycle_loop_invariant_with_first_found_read() {
         let mut hf = HashSet::new();
         hf.insert((VRegId(0), 5));
-        let tag = infer_lifecycle(VRegId(0), VRegKind::Ptr, 2, 15,
-            &[(5, 15)], &hf, &[], 100);
+        let tag = infer_lifecycle(VRegId(0), VRegKind::Ptr, 2, 15, &[(5, 15)], &hf, &[], 100);
         assert_eq!(tag, LifecycleTag::LoopInvariant);
     }
 
@@ -2195,8 +3074,7 @@ mod tests {
     fn test_infer_lifecycle_loop_invariant_first_found_write_short_last_use() {
         let mut hf = HashSet::new();
         hf.insert((VRegId(0), 5));
-        let tag = infer_lifecycle(VRegId(0), VRegKind::Ptr, 2, 10,
-            &[(5, 15)], &hf, &[], 100);
+        let tag = infer_lifecycle(VRegId(0), VRegKind::Ptr, 2, 10, &[(5, 15)], &hf, &[], 100);
         assert_ne!(tag, LifecycleTag::LoopInvariant);
     }
 
@@ -2204,15 +3082,31 @@ mod tests {
     fn test_infer_lifecycle_loop_invariant_with_two_loops() {
         // def_point=2 is outside both loops, used inside both => LoopInvariant
         // (loop_carried requires def_point inside a loop, which doesn't apply here)
-        let tag = infer_lifecycle(VRegId(0), VRegKind::Ptr, 2, 25,
-            &[(5, 15), (10, 20)], &empty_hf(), &[], 100);
+        let tag = infer_lifecycle(
+            VRegId(0),
+            VRegKind::Ptr,
+            2,
+            25,
+            &[(5, 15), (10, 20)],
+            &empty_hf(),
+            &[],
+            100,
+        );
         assert_eq!(tag, LifecycleTag::LoopInvariant);
     }
 
     #[test]
     fn test_infer_lifecycle_nested_loops_one_carried_one_invariant() {
-        let tag = infer_lifecycle(VRegId(0), VRegKind::Ptr, 2, 18,
-            &[(5, 10), (8, 18)], &empty_hf(), &[], 100);
+        let tag = infer_lifecycle(
+            VRegId(0),
+            VRegKind::Ptr,
+            2,
+            18,
+            &[(5, 10), (8, 18)],
+            &empty_hf(),
+            &[],
+            100,
+        );
         assert!(tag == LifecycleTag::LoopInvariant || tag == LifecycleTag::LoopCarried);
     }
 
@@ -2227,8 +3121,12 @@ mod tests {
     #[test]
     fn test_ig_single_interval_no_interference() {
         let a = LiveInterval {
-            vreg: VRegId(0), kind: VRegKind::Vec, width: SimdWidth::W256,
-            def_point: 0, last_use: 10, lifecycle: LifecycleTag::BodyLocal,
+            vreg: VRegId(0),
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+            def_point: 0,
+            last_use: 10,
+            lifecycle: LifecycleTag::BodyLocal,
         };
         let ig = InterferenceGraph::build(&[a]);
         assert!(!ig.interferes(VRegId(0), VRegId(0)));
@@ -2237,12 +3135,20 @@ mod tests {
     #[test]
     fn test_ig_disjoint_same_class_no_interference() {
         let a = LiveInterval {
-            vreg: VRegId(0), kind: VRegKind::Vec, width: SimdWidth::W256,
-            def_point: 0, last_use: 5, lifecycle: LifecycleTag::BodyLocal,
+            vreg: VRegId(0),
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+            def_point: 0,
+            last_use: 5,
+            lifecycle: LifecycleTag::BodyLocal,
         };
         let b = LiveInterval {
-            vreg: VRegId(1), kind: VRegKind::Vec, width: SimdWidth::W256,
-            def_point: 6, last_use: 10, lifecycle: LifecycleTag::BodyLocal,
+            vreg: VRegId(1),
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+            def_point: 6,
+            last_use: 10,
+            lifecycle: LifecycleTag::BodyLocal,
         };
         let ig = InterferenceGraph::build(&[a, b]);
         assert!(!ig.interferes(VRegId(0), VRegId(1)));
@@ -2252,12 +3158,20 @@ mod tests {
     #[test]
     fn test_ig_overlapping_same_class_interferes() {
         let a = LiveInterval {
-            vreg: VRegId(0), kind: VRegKind::Vec, width: SimdWidth::W256,
-            def_point: 0, last_use: 10, lifecycle: LifecycleTag::BodyLocal,
+            vreg: VRegId(0),
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+            def_point: 0,
+            last_use: 10,
+            lifecycle: LifecycleTag::BodyLocal,
         };
         let b = LiveInterval {
-            vreg: VRegId(1), kind: VRegKind::Vec, width: SimdWidth::W256,
-            def_point: 5, last_use: 15, lifecycle: LifecycleTag::BodyLocal,
+            vreg: VRegId(1),
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+            def_point: 5,
+            last_use: 15,
+            lifecycle: LifecycleTag::BodyLocal,
         };
         let ig = InterferenceGraph::build(&[a, b]);
         assert!(ig.interferes(VRegId(0), VRegId(1)));
@@ -2267,12 +3181,20 @@ mod tests {
     #[test]
     fn test_ig_different_classes_no_interference() {
         let a = LiveInterval {
-            vreg: VRegId(0), kind: VRegKind::Vec, width: SimdWidth::W256,
-            def_point: 0, last_use: 10, lifecycle: LifecycleTag::BodyLocal,
+            vreg: VRegId(0),
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+            def_point: 0,
+            last_use: 10,
+            lifecycle: LifecycleTag::BodyLocal,
         };
         let b = LiveInterval {
-            vreg: VRegId(1), kind: VRegKind::Ptr, width: SimdWidth::Scalar,
-            def_point: 5, last_use: 15, lifecycle: LifecycleTag::BodyLocal,
+            vreg: VRegId(1),
+            kind: VRegKind::Ptr,
+            width: SimdWidth::Scalar,
+            def_point: 5,
+            last_use: 15,
+            lifecycle: LifecycleTag::BodyLocal,
         };
         let ig = InterferenceGraph::build(&[a, b]);
         assert!(!ig.interferes(VRegId(0), VRegId(1)));
@@ -2281,12 +3203,20 @@ mod tests {
     #[test]
     fn test_ig_neighbors_empty_for_isolated() {
         let a = LiveInterval {
-            vreg: VRegId(0), kind: VRegKind::Vec, width: SimdWidth::W256,
-            def_point: 0, last_use: 5, lifecycle: LifecycleTag::BodyLocal,
+            vreg: VRegId(0),
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+            def_point: 0,
+            last_use: 5,
+            lifecycle: LifecycleTag::BodyLocal,
         };
         let b = LiveInterval {
-            vreg: VRegId(1), kind: VRegKind::Vec, width: SimdWidth::W256,
-            def_point: 10, last_use: 20, lifecycle: LifecycleTag::BodyLocal,
+            vreg: VRegId(1),
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+            def_point: 10,
+            last_use: 20,
+            lifecycle: LifecycleTag::BodyLocal,
         };
         let ig = InterferenceGraph::build(&[a, b]);
         assert_eq!(ig.neighbors(VRegId(0)).count(), 0);
@@ -2296,16 +3226,28 @@ mod tests {
     #[test]
     fn test_ig_neighbors_count_for_chain() {
         let a = LiveInterval {
-            vreg: VRegId(0), kind: VRegKind::Vec, width: SimdWidth::W256,
-            def_point: 0, last_use: 10, lifecycle: LifecycleTag::BodyLocal,
+            vreg: VRegId(0),
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+            def_point: 0,
+            last_use: 10,
+            lifecycle: LifecycleTag::BodyLocal,
         };
         let b = LiveInterval {
-            vreg: VRegId(1), kind: VRegKind::Vec, width: SimdWidth::W256,
-            def_point: 5, last_use: 15, lifecycle: LifecycleTag::BodyLocal,
+            vreg: VRegId(1),
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+            def_point: 5,
+            last_use: 15,
+            lifecycle: LifecycleTag::BodyLocal,
         };
         let c = LiveInterval {
-            vreg: VRegId(2), kind: VRegKind::Vec, width: SimdWidth::W256,
-            def_point: 8, last_use: 18, lifecycle: LifecycleTag::BodyLocal,
+            vreg: VRegId(2),
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+            def_point: 8,
+            last_use: 18,
+            lifecycle: LifecycleTag::BodyLocal,
         };
         let ig = InterferenceGraph::build(&[a, b, c]);
         assert_eq!(ig.neighbors(VRegId(0)).count(), 2);
@@ -2316,26 +3258,45 @@ mod tests {
     #[test]
     fn test_ig_symmetry() {
         let a = LiveInterval {
-            vreg: VRegId(0), kind: VRegKind::Ptr, width: SimdWidth::Scalar,
-            def_point: 0, last_use: 10, lifecycle: LifecycleTag::BodyLocal,
+            vreg: VRegId(0),
+            kind: VRegKind::Ptr,
+            width: SimdWidth::Scalar,
+            def_point: 0,
+            last_use: 10,
+            lifecycle: LifecycleTag::BodyLocal,
         };
         let b = LiveInterval {
-            vreg: VRegId(1), kind: VRegKind::Ptr, width: SimdWidth::Scalar,
-            def_point: 5, last_use: 15, lifecycle: LifecycleTag::BodyLocal,
+            vreg: VRegId(1),
+            kind: VRegKind::Ptr,
+            width: SimdWidth::Scalar,
+            def_point: 5,
+            last_use: 15,
+            lifecycle: LifecycleTag::BodyLocal,
         };
         let ig = InterferenceGraph::build(&[a, b]);
-        assert_eq!(ig.interferes(VRegId(0), VRegId(1)), ig.interferes(VRegId(1), VRegId(0)));
+        assert_eq!(
+            ig.interferes(VRegId(0), VRegId(1)),
+            ig.interferes(VRegId(1), VRegId(0))
+        );
     }
 
     #[test]
     fn test_ig_touching_boundaries_interfere() {
         let a = LiveInterval {
-            vreg: VRegId(0), kind: VRegKind::Vec, width: SimdWidth::W256,
-            def_point: 0, last_use: 10, lifecycle: LifecycleTag::BodyLocal,
+            vreg: VRegId(0),
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+            def_point: 0,
+            last_use: 10,
+            lifecycle: LifecycleTag::BodyLocal,
         };
         let b = LiveInterval {
-            vreg: VRegId(1), kind: VRegKind::Vec, width: SimdWidth::W256,
-            def_point: 10, last_use: 20, lifecycle: LifecycleTag::BodyLocal,
+            vreg: VRegId(1),
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+            def_point: 10,
+            last_use: 20,
+            lifecycle: LifecycleTag::BodyLocal,
         };
         let ig = InterferenceGraph::build(&[a, b]);
         // last_use=10 >= def_point=10 => they interfere
@@ -2345,12 +3306,20 @@ mod tests {
     #[test]
     fn test_ig_counter_and_ptr_same_class_interfere() {
         let a = LiveInterval {
-            vreg: VRegId(0), kind: VRegKind::Counter, width: SimdWidth::Scalar,
-            def_point: 0, last_use: 20, lifecycle: LifecycleTag::LoopCarried,
+            vreg: VRegId(0),
+            kind: VRegKind::Counter,
+            width: SimdWidth::Scalar,
+            def_point: 0,
+            last_use: 20,
+            lifecycle: LifecycleTag::LoopCarried,
         };
         let b = LiveInterval {
-            vreg: VRegId(1), kind: VRegKind::Ptr, width: SimdWidth::Scalar,
-            def_point: 5, last_use: 15, lifecycle: LifecycleTag::BodyLocal,
+            vreg: VRegId(1),
+            kind: VRegKind::Ptr,
+            width: SimdWidth::Scalar,
+            def_point: 5,
+            last_use: 15,
+            lifecycle: LifecycleTag::BodyLocal,
         };
         let ig = InterferenceGraph::build(&[a, b]);
         assert!(ig.interferes(VRegId(0), VRegId(1)));
@@ -2358,10 +3327,16 @@ mod tests {
 
     #[test]
     fn test_ig_many_concurrent_intervals() {
-        let intervals: Vec<LiveInterval> = (0..20).map(|i| LiveInterval {
-            vreg: VRegId(i), kind: VRegKind::Vec, width: SimdWidth::W256,
-            def_point: 0, last_use: 100, lifecycle: LifecycleTag::BodyLocal,
-        }).collect();
+        let intervals: Vec<LiveInterval> = (0..20)
+            .map(|i| LiveInterval {
+                vreg: VRegId(i),
+                kind: VRegKind::Vec,
+                width: SimdWidth::W256,
+                def_point: 0,
+                last_use: 100,
+                lifecycle: LifecycleTag::BodyLocal,
+            })
+            .collect();
         let ig = InterferenceGraph::build(&intervals);
         for i in 0..20u32 {
             assert_eq!(ig.neighbors(VRegId(i)).count(), 19);
@@ -2370,10 +3345,16 @@ mod tests {
 
     #[test]
     fn test_ig_staircase_pattern() {
-        let intervals: Vec<LiveInterval> = (0..4u32).map(|i| LiveInterval {
-            vreg: VRegId(i), kind: VRegKind::Vec, width: SimdWidth::W256,
-            def_point: i as usize, last_use: i as usize + 2, lifecycle: LifecycleTag::BodyLocal,
-        }).collect();
+        let intervals: Vec<LiveInterval> = (0..4u32)
+            .map(|i| LiveInterval {
+                vreg: VRegId(i),
+                kind: VRegKind::Vec,
+                width: SimdWidth::W256,
+                def_point: i as usize,
+                last_use: i as usize + 2,
+                lifecycle: LifecycleTag::BodyLocal,
+            })
+            .collect();
         let ig = InterferenceGraph::build(&intervals);
         assert!(ig.interferes(VRegId(0), VRegId(1)));
         assert!(ig.interferes(VRegId(0), VRegId(2)));
@@ -2383,12 +3364,30 @@ mod tests {
     #[test]
     fn test_ig_non_overlapping_chain() {
         let intervals = vec![
-            LiveInterval { vreg: VRegId(0), kind: VRegKind::Vec, width: SimdWidth::W256,
-                def_point: 0, last_use: 5, lifecycle: LifecycleTag::BodyLocal },
-            LiveInterval { vreg: VRegId(1), kind: VRegKind::Vec, width: SimdWidth::W256,
-                def_point: 6, last_use: 10, lifecycle: LifecycleTag::BodyLocal },
-            LiveInterval { vreg: VRegId(2), kind: VRegKind::Vec, width: SimdWidth::W256,
-                def_point: 11, last_use: 15, lifecycle: LifecycleTag::BodyLocal },
+            LiveInterval {
+                vreg: VRegId(0),
+                kind: VRegKind::Vec,
+                width: SimdWidth::W256,
+                def_point: 0,
+                last_use: 5,
+                lifecycle: LifecycleTag::BodyLocal,
+            },
+            LiveInterval {
+                vreg: VRegId(1),
+                kind: VRegKind::Vec,
+                width: SimdWidth::W256,
+                def_point: 6,
+                last_use: 10,
+                lifecycle: LifecycleTag::BodyLocal,
+            },
+            LiveInterval {
+                vreg: VRegId(2),
+                kind: VRegKind::Vec,
+                width: SimdWidth::W256,
+                def_point: 11,
+                last_use: 15,
+                lifecycle: LifecycleTag::BodyLocal,
+            },
         ];
         let ig = InterferenceGraph::build(&intervals);
         assert!(!ig.interferes(VRegId(0), VRegId(1)));
@@ -2401,7 +3400,9 @@ mod tests {
     #[test]
     fn test_reg_allocation_get_returns_none_for_missing() {
         let alloc = RegAllocation {
-            mapping: HashMap::new(), spills: vec![], callee_saved_used: vec![],
+            mapping: HashMap::new(),
+            spills: vec![],
+            callee_saved_used: vec![],
         };
         assert!(alloc.get(VRegId(0)).is_none());
     }
@@ -2410,7 +3411,11 @@ mod tests {
     fn test_reg_allocation_get_gpr_returns_correct() {
         let mut mapping = HashMap::new();
         mapping.insert(VRegId(0), PhysReg::Gpr(PhysGpr(3)));
-        let alloc = RegAllocation { mapping, spills: vec![], callee_saved_used: vec![] };
+        let alloc = RegAllocation {
+            mapping,
+            spills: vec![],
+            callee_saved_used: vec![],
+        };
         assert_eq!(alloc.get_gpr(VRegId(0)), Some(PhysGpr(3)));
         assert!(alloc.get_vec(VRegId(0)).is_none());
     }
@@ -2419,7 +3424,11 @@ mod tests {
     fn test_reg_allocation_get_vec_returns_correct() {
         let mut mapping = HashMap::new();
         mapping.insert(VRegId(1), PhysReg::Vec(PhysVec(5)));
-        let alloc = RegAllocation { mapping, spills: vec![], callee_saved_used: vec![] };
+        let alloc = RegAllocation {
+            mapping,
+            spills: vec![],
+            callee_saved_used: vec![],
+        };
         assert_eq!(alloc.get_vec(VRegId(1)), Some(PhysVec(5)));
         assert!(alloc.get_gpr(VRegId(1)).is_none());
     }
@@ -2428,7 +3437,11 @@ mod tests {
     fn test_reg_allocation_get_spilled() {
         let mut mapping = HashMap::new();
         mapping.insert(VRegId(2), PhysReg::Spilled(0));
-        let alloc = RegAllocation { mapping, spills: vec![], callee_saved_used: vec![] };
+        let alloc = RegAllocation {
+            mapping,
+            spills: vec![],
+            callee_saved_used: vec![],
+        };
         assert!(alloc.get_gpr(VRegId(2)).is_none());
         assert!(alloc.get_vec(VRegId(2)).is_none());
         assert_eq!(alloc.get(VRegId(2)), Some(PhysReg::Spilled(0)));
@@ -2439,7 +3452,11 @@ mod tests {
         let mut mapping = HashMap::new();
         mapping.insert(VRegId(10), PhysReg::Tile(PhysTile(0)));
         mapping.insert(VRegId(11), PhysReg::Mask(PhysMask(0)));
-        let alloc = RegAllocation { mapping, spills: vec![], callee_saved_used: vec![] };
+        let alloc = RegAllocation {
+            mapping,
+            spills: vec![],
+            callee_saved_used: vec![],
+        };
         assert_eq!(alloc.get(VRegId(10)), Some(PhysReg::Tile(PhysTile(0))));
         assert_eq!(alloc.get(VRegId(11)), Some(PhysReg::Mask(PhysMask(0))));
     }
@@ -2469,12 +3486,20 @@ mod tests {
         let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::VecLoad {
-            dst: vec0, base: ptr, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            dst: vec0,
+            base: ptr,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         prog.emit(VmInstr::VecStore {
-            base: ptr, src: vec0, offset: OffsetExpr::Const(16),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            base: ptr,
+            src: vec0,
+            offset: OffsetExpr::Const(16),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         let intervals = RegAllocator::compute_intervals(&prog);
         let ptr_iv = intervals.iter().find(|iv| iv.vreg == ptr).unwrap();
@@ -2490,23 +3515,37 @@ mod tests {
         let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::VecLoad {
-            dst: vec0, base: ptr, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            dst: vec0,
+            base: ptr,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         prog.emit(VmInstr::VecStore {
-            base: ptr, src: vec0, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            base: ptr,
+            src: vec0,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         let vec1 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::LoopBegin {
-            counter, byte_offset: byte_off,
-            bound: BoundExpr::Const(10), step_bytes: 4,
+            counter,
+            byte_offset: byte_off,
+            bound: BoundExpr::Const(10),
+            step_bytes: 4,
         });
         prog.emit(VmInstr::VecLoad {
-            dst: vec1, base: ptr, offset: OffsetExpr::LoopOffset(byte_off),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            dst: vec1,
+            base: ptr,
+            offset: OffsetExpr::LoopOffset(byte_off),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         prog.emit(VmInstr::LoopEnd);
         prog.emit(VmInstr::Comment("after loop".to_string()));
@@ -2591,7 +3630,10 @@ mod tests {
 
     #[test]
     fn test_offset_vregs_loop_offset() {
-        assert_eq!(RegAllocator::offset_vregs(&OffsetExpr::LoopOffset(VRegId(7))), vec![VRegId(7)]);
+        assert_eq!(
+            RegAllocator::offset_vregs(&OffsetExpr::LoopOffset(VRegId(7))),
+            vec![VRegId(7)]
+        );
     }
 
     #[test]
@@ -2606,7 +3648,10 @@ mod tests {
 
     #[test]
     fn test_ptr_vregs_vreg_plus_const() {
-        assert_eq!(RegAllocator::ptr_vregs(&PtrExpr::VRegPlusConst(VRegId(3), 16)), vec![VRegId(3)]);
+        assert_eq!(
+            RegAllocator::ptr_vregs(&PtrExpr::VRegPlusConst(VRegId(3), 16)),
+            vec![VRegId(3)]
+        );
     }
 
     #[test]
@@ -2622,7 +3667,10 @@ mod tests {
 
     #[test]
     fn test_bound_vregs_dynamic_vreg() {
-        assert_eq!(RegAllocator::bound_vregs(&BoundExpr::DynamicVReg(VRegId(7))), vec![VRegId(7)]);
+        assert_eq!(
+            RegAllocator::bound_vregs(&BoundExpr::DynamicVReg(VRegId(7))),
+            vec![VRegId(7)]
+        );
     }
 
     #[test]
@@ -2632,7 +3680,8 @@ mod tests {
 
     #[test]
     fn test_scalar_expr_vregs_mem_load() {
-        let vregs = RegAllocator::scalar_expr_vregs(&ScalarExpr::MemLoad(VRegId(2), OffsetExpr::Const(0)));
+        let vregs =
+            RegAllocator::scalar_expr_vregs(&ScalarExpr::MemLoad(VRegId(2), OffsetExpr::Const(0)));
         assert_eq!(vregs[0], VRegId(2));
     }
 
@@ -2656,7 +3705,10 @@ mod tests {
     #[test]
     fn test_referenced_vregs_fma() {
         let instr = VmInstr::Fma {
-            dst: VRegId(0), acc: VRegId(0), a: VRegId(1), b: VRegId(2),
+            dst: VRegId(0),
+            acc: VRegId(0),
+            a: VRegId(1),
+            b: VRegId(2),
             dtype: QuantPrecision::F32,
         };
         let vregs = RegAllocator::referenced_vregs(&instr);
@@ -2666,8 +3718,10 @@ mod tests {
     #[test]
     fn test_referenced_vregs_loop_begin() {
         let instr = VmInstr::LoopBegin {
-            counter: VRegId(0), byte_offset: VRegId(1),
-            bound: BoundExpr::DynamicVReg(VRegId(2)), step_bytes: 4,
+            counter: VRegId(0),
+            byte_offset: VRegId(1),
+            bound: BoundExpr::DynamicVReg(VRegId(2)),
+            step_bytes: 4,
         };
         let vregs = RegAllocator::referenced_vregs(&instr);
         assert!(vregs.contains(&VRegId(0)));
@@ -2678,7 +3732,10 @@ mod tests {
     #[test]
     fn test_referenced_vregs_gpr_bin_op_imm() {
         let instr = VmInstr::GprBinOp {
-            dst: VRegId(0), a: VRegId(1), b: GprOperand::Imm(4), op: GprOp::Add,
+            dst: VRegId(0),
+            a: VRegId(1),
+            b: GprOperand::Imm(4),
+            op: GprOp::Add,
         };
         let vregs = RegAllocator::referenced_vregs(&instr);
         assert_eq!(vregs.len(), 2);
@@ -2687,7 +3744,10 @@ mod tests {
     #[test]
     fn test_referenced_vregs_gpr_bin_op_vreg() {
         let instr = VmInstr::GprBinOp {
-            dst: VRegId(0), a: VRegId(1), b: GprOperand::VReg(VRegId(2)), op: GprOp::Add,
+            dst: VRegId(0),
+            a: VRegId(1),
+            b: GprOperand::VReg(VRegId(2)),
+            op: GprOp::Add,
         };
         let vregs = RegAllocator::referenced_vregs(&instr);
         assert_eq!(vregs.len(), 3);
@@ -2701,27 +3761,55 @@ mod tests {
     fn test_instr_phys_clobbers_shl_vreg_x86_clobbers_rcx() {
         // GprBinOp{Shl, VReg} → shl dst, cl → clobber rcx (PhysGpr(1))
         let instr = VmInstr::GprBinOp {
-            dst: VRegId(0), a: VRegId(1), b: GprOperand::VReg(VRegId(2)), op: GprOp::Shl,
+            dst: VRegId(0),
+            a: VRegId(1),
+            b: GprOperand::VReg(VRegId(2)),
+            op: GprOp::Shl,
         };
         let plat = super::super::isa_profile::Platform::X86_64 {
-            has_avx512: false, has_bf16: false, has_vnni: false, has_avx512fp16: false,
-            has_f16c: false, has_amx: false, has_amx_fp16: false, has_amx_complex: false,
-            has_amx_transpose: false, has_amx_fp8: false, has_avx10_2: false, has_apx: false,
+            has_avx512: false,
+            has_bf16: false,
+            has_vnni: false,
+            has_avx512fp16: false,
+            has_f16c: false,
+            has_amx: false,
+            has_amx_fp16: false,
+            has_amx_complex: false,
+            has_amx_transpose: false,
+            has_amx_fp8: false,
+            has_avx10_2: false,
+            has_apx: false,
             has_sparse_mask_intersect: false,
         };
         let c = RegAllocator::instr_phys_clobbers(&instr, &plat);
-        assert_eq!(c, vec![PhysGpr(1)], "x86 Shl VReg must clobber rcx (PhysGpr(1))");
+        assert_eq!(
+            c,
+            vec![PhysGpr(1)],
+            "x86 Shl VReg must clobber rcx (PhysGpr(1))"
+        );
     }
 
     #[test]
     fn test_instr_phys_clobbers_shr_vreg_x86_clobbers_rcx() {
         let instr = VmInstr::GprBinOp {
-            dst: VRegId(0), a: VRegId(1), b: GprOperand::VReg(VRegId(2)), op: GprOp::Shr,
+            dst: VRegId(0),
+            a: VRegId(1),
+            b: GprOperand::VReg(VRegId(2)),
+            op: GprOp::Shr,
         };
         let plat = super::super::isa_profile::Platform::X86_64 {
-            has_avx512: false, has_bf16: false, has_vnni: false, has_avx512fp16: false,
-            has_f16c: false, has_amx: false, has_amx_fp16: false, has_amx_complex: false,
-            has_amx_transpose: false, has_amx_fp8: false, has_avx10_2: false, has_apx: false,
+            has_avx512: false,
+            has_bf16: false,
+            has_vnni: false,
+            has_avx512fp16: false,
+            has_f16c: false,
+            has_amx: false,
+            has_amx_fp16: false,
+            has_amx_complex: false,
+            has_amx_transpose: false,
+            has_amx_fp8: false,
+            has_avx10_2: false,
+            has_apx: false,
             has_sparse_mask_intersect: false,
         };
         let c = RegAllocator::instr_phys_clobbers(&instr, &plat);
@@ -2732,12 +3820,24 @@ mod tests {
     fn test_instr_phys_clobbers_bittest_vreg_x86_clobbers_rcx() {
         // BitTest VReg 也会 mov rcx,b; shr dst,cl → clobber rcx
         let instr = VmInstr::GprBinOp {
-            dst: VRegId(0), a: VRegId(1), b: GprOperand::VReg(VRegId(2)), op: GprOp::BitTest,
+            dst: VRegId(0),
+            a: VRegId(1),
+            b: GprOperand::VReg(VRegId(2)),
+            op: GprOp::BitTest,
         };
         let plat = super::super::isa_profile::Platform::X86_64 {
-            has_avx512: false, has_bf16: false, has_vnni: false, has_avx512fp16: false,
-            has_f16c: false, has_amx: false, has_amx_fp16: false, has_amx_complex: false,
-            has_amx_transpose: false, has_amx_fp8: false, has_avx10_2: false, has_apx: false,
+            has_avx512: false,
+            has_bf16: false,
+            has_vnni: false,
+            has_avx512fp16: false,
+            has_f16c: false,
+            has_amx: false,
+            has_amx_fp16: false,
+            has_amx_complex: false,
+            has_amx_transpose: false,
+            has_amx_fp8: false,
+            has_avx10_2: false,
+            has_apx: false,
             has_sparse_mask_intersect: false,
         };
         let c = RegAllocator::instr_phys_clobbers(&instr, &plat);
@@ -2748,28 +3848,55 @@ mod tests {
     fn test_instr_phys_clobbers_shl_imm_x86_no_clobber() {
         // Shl + Imm (立即数移位 shl reg, imm8) 不用 cl → 不 clobber rcx
         let instr = VmInstr::GprBinOp {
-            dst: VRegId(0), a: VRegId(1), b: GprOperand::Imm(3), op: GprOp::Shl,
+            dst: VRegId(0),
+            a: VRegId(1),
+            b: GprOperand::Imm(3),
+            op: GprOp::Shl,
         };
         let plat = super::super::isa_profile::Platform::X86_64 {
-            has_avx512: false, has_bf16: false, has_vnni: false, has_avx512fp16: false,
-            has_f16c: false, has_amx: false, has_amx_fp16: false, has_amx_complex: false,
-            has_amx_transpose: false, has_amx_fp8: false, has_avx10_2: false, has_apx: false,
+            has_avx512: false,
+            has_bf16: false,
+            has_vnni: false,
+            has_avx512fp16: false,
+            has_f16c: false,
+            has_amx: false,
+            has_amx_fp16: false,
+            has_amx_complex: false,
+            has_amx_transpose: false,
+            has_amx_fp8: false,
+            has_avx10_2: false,
+            has_apx: false,
             has_sparse_mask_intersect: false,
         };
         let c = RegAllocator::instr_phys_clobbers(&instr, &plat);
-        assert!(c.is_empty(), "x86 Shl Imm must NOT clobber rcx (uses imm8, not cl)");
+        assert!(
+            c.is_empty(),
+            "x86 Shl Imm must NOT clobber rcx (uses imm8, not cl)"
+        );
     }
 
     #[test]
     fn test_instr_phys_clobbers_add_vreg_x86_no_clobber() {
         // 非 shift 算术 (Add VReg) 不 clobber rcx (用 lea/add, 无 cl)
         let instr = VmInstr::GprBinOp {
-            dst: VRegId(0), a: VRegId(1), b: GprOperand::VReg(VRegId(2)), op: GprOp::Add,
+            dst: VRegId(0),
+            a: VRegId(1),
+            b: GprOperand::VReg(VRegId(2)),
+            op: GprOp::Add,
         };
         let plat = super::super::isa_profile::Platform::X86_64 {
-            has_avx512: false, has_bf16: false, has_vnni: false, has_avx512fp16: false,
-            has_f16c: false, has_amx: false, has_amx_fp16: false, has_amx_complex: false,
-            has_amx_transpose: false, has_amx_fp8: false, has_avx10_2: false, has_apx: false,
+            has_avx512: false,
+            has_bf16: false,
+            has_vnni: false,
+            has_avx512fp16: false,
+            has_f16c: false,
+            has_amx: false,
+            has_amx_fp16: false,
+            has_amx_complex: false,
+            has_amx_transpose: false,
+            has_amx_fp8: false,
+            has_avx10_2: false,
+            has_apx: false,
             has_sparse_mask_intersect: false,
         };
         let c = RegAllocator::instr_phys_clobbers(&instr, &plat);
@@ -2780,18 +3907,28 @@ mod tests {
     fn test_instr_phys_clobbers_shl_vreg_aarch64_no_clobber() {
         // AArch64 LSL Xd,Xn,Xm 用通用寄存器作移位，无隐式 clobber
         let instr = VmInstr::GprBinOp {
-            dst: VRegId(0), a: VRegId(1), b: GprOperand::VReg(VRegId(2)), op: GprOp::Shl,
+            dst: VRegId(0),
+            a: VRegId(1),
+            b: GprOperand::VReg(VRegId(2)),
+            op: GprOp::Shl,
         };
-        let profile = super::super::isa_profile::IsaProfile::aarch64(false, false, 16, false, false, false);
+        let profile =
+            super::super::isa_profile::IsaProfile::aarch64(false, false, 16, false, false, false);
         let c = RegAllocator::instr_phys_clobbers(&instr, &profile.platform);
-        assert!(c.is_empty(), "AArch64 Shl VReg must NOT clobber (uses LSL Xd,Xn,Xm)");
+        assert!(
+            c.is_empty(),
+            "AArch64 Shl VReg must NOT clobber (uses LSL Xd,Xn,Xm)"
+        );
     }
 
     #[test]
     fn test_instr_phys_clobbers_shr_vreg_gpu_no_clobber() {
         // GPU 不走 CPU 线性扫描，clobber 表应为空
         let instr = VmInstr::GprBinOp {
-            dst: VRegId(0), a: VRegId(1), b: GprOperand::VReg(VRegId(2)), op: GprOp::Shr,
+            dst: VRegId(0),
+            a: VRegId(1),
+            b: GprOperand::VReg(VRegId(2)),
+            op: GprOp::Shr,
         };
         let profile = super::super::isa_profile::IsaProfile::cuda(80);
         let c = RegAllocator::instr_phys_clobbers(&instr, &profile.platform);
@@ -2804,7 +3941,10 @@ mod tests {
         // rcx (PhysGpr(1))。这是 BCE-20260715-REGALLOC-SHL-SHR-RCX-CLOBBER 的回归断言。
         // 仅在 x86_64 host 上有确定性 (test_profile 用探测到的设备)。
         let profile = test_profile();
-        if !matches!(profile.platform, super::super::isa_profile::Platform::X86_64 { .. }) {
+        if !matches!(
+            profile.platform,
+            super::super::isa_profile::Platform::X86_64 { .. }
+        ) {
             // 非 x86_64 host: 跳过 (rcx 是 x86 专属概念，AArch64 host 无法验证)
             return;
         }
@@ -2813,16 +3953,28 @@ mod tests {
         let live_vreg = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         let shift_amt = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         let shift_dst = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        prog.emit(VmInstr::GprLoadImm { dst: live_vreg, value: 42 });
-        prog.emit(VmInstr::GprLoadImm { dst: shift_amt, value: 3 });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: live_vreg,
+            value: 42,
+        });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: shift_amt,
+            value: 3,
+        });
         // 变量移位 (clobber rcx): shift_dst = shift_amt << shift_amt
         prog.emit(VmInstr::GprBinOp {
-            dst: shift_dst, a: shift_amt, b: GprOperand::VReg(shift_amt), op: GprOp::Shl,
+            dst: shift_dst,
+            a: shift_amt,
+            b: GprOperand::VReg(shift_amt),
+            op: GprOp::Shl,
         });
         // live_vreg 仍活跃 (使用它) → 其活跃区间跨过上面的 Shl
         let sink = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         prog.emit(VmInstr::GprBinOp {
-            dst: sink, a: live_vreg, b: GprOperand::Imm(1), op: GprOp::Add,
+            dst: sink,
+            a: live_vreg,
+            b: GprOperand::Imm(1),
+            op: GprOp::Add,
         });
 
         let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
@@ -2830,9 +3982,13 @@ mod tests {
         let live_phys = alloc.get_gpr(live_vreg);
         // 若被 spill (register pressure 极高)，则不存在冲突；仅当分到 GPR 时检查
         if let Some(g) = live_phys {
-            assert_ne!(g, PhysGpr(1),
+            assert_ne!(
+                g,
+                PhysGpr(1),
                 "live VReg spanning Shl VReg must NOT be in rcx (PhysGpr(1)); got {:?}. \
-                 BCE-20260715-REGALLOC-SHL-SHR-RCX-CLOBBER regression.", g);
+                 BCE-20260715-REGALLOC-SHL-SHR-RCX-CLOBBER regression.",
+                g
+            );
         }
     }
 
@@ -2846,14 +4002,34 @@ mod tests {
     #[test]
     fn test_validate_spill_layout_non_overlapping() {
         let spills = vec![
-            SpillSlot { vreg: VRegId(0), offset: 0, size: 32 },
-            SpillSlot { vreg: VRegId(1), offset: 32, size: 32 },
+            SpillSlot {
+                vreg: VRegId(0),
+                offset: 0,
+                size: 32,
+            },
+            SpillSlot {
+                vreg: VRegId(1),
+                offset: 32,
+                size: 32,
+            },
         ];
         let intervals = vec![
-            LiveInterval { vreg: VRegId(0), kind: VRegKind::Vec, width: SimdWidth::W256,
-                def_point: 0, last_use: 10, lifecycle: LifecycleTag::BodyLocal },
-            LiveInterval { vreg: VRegId(1), kind: VRegKind::Vec, width: SimdWidth::W256,
-                def_point: 15, last_use: 30, lifecycle: LifecycleTag::BodyLocal },
+            LiveInterval {
+                vreg: VRegId(0),
+                kind: VRegKind::Vec,
+                width: SimdWidth::W256,
+                def_point: 0,
+                last_use: 10,
+                lifecycle: LifecycleTag::BodyLocal,
+            },
+            LiveInterval {
+                vreg: VRegId(1),
+                kind: VRegKind::Vec,
+                width: SimdWidth::W256,
+                def_point: 15,
+                last_use: 30,
+                lifecycle: LifecycleTag::BodyLocal,
+            },
         ];
         assert!(RegAllocator::validate_spill_layout(&spills, &intervals).is_ok());
     }
@@ -2861,14 +4037,34 @@ mod tests {
     #[test]
     fn test_validate_spill_layout_physical_overlap_rejected() {
         let spills = vec![
-            SpillSlot { vreg: VRegId(0), offset: 0, size: 32 },
-            SpillSlot { vreg: VRegId(1), offset: 16, size: 32 },
+            SpillSlot {
+                vreg: VRegId(0),
+                offset: 0,
+                size: 32,
+            },
+            SpillSlot {
+                vreg: VRegId(1),
+                offset: 16,
+                size: 32,
+            },
         ];
         let intervals = vec![
-            LiveInterval { vreg: VRegId(0), kind: VRegKind::Vec, width: SimdWidth::W256,
-                def_point: 0, last_use: 10, lifecycle: LifecycleTag::BodyLocal },
-            LiveInterval { vreg: VRegId(1), kind: VRegKind::Vec, width: SimdWidth::W256,
-                def_point: 15, last_use: 30, lifecycle: LifecycleTag::BodyLocal },
+            LiveInterval {
+                vreg: VRegId(0),
+                kind: VRegKind::Vec,
+                width: SimdWidth::W256,
+                def_point: 0,
+                last_use: 10,
+                lifecycle: LifecycleTag::BodyLocal,
+            },
+            LiveInterval {
+                vreg: VRegId(1),
+                kind: VRegKind::Vec,
+                width: SimdWidth::W256,
+                def_point: 15,
+                last_use: 30,
+                lifecycle: LifecycleTag::BodyLocal,
+            },
         ];
         assert!(RegAllocator::validate_spill_layout(&spills, &intervals).is_err());
     }
@@ -2877,14 +4073,34 @@ mod tests {
     fn test_validate_spill_layout_gpr_too_small_rejected() {
         // Need >= 2 spills because validate_spill_layout returns Ok for len <= 1
         let spills = vec![
-            SpillSlot { vreg: VRegId(0), offset: 0, size: 32 },
-            SpillSlot { vreg: VRegId(1), offset: 32, size: 4 }, // Ptr needs >= 8
+            SpillSlot {
+                vreg: VRegId(0),
+                offset: 0,
+                size: 32,
+            },
+            SpillSlot {
+                vreg: VRegId(1),
+                offset: 32,
+                size: 4,
+            }, // Ptr needs >= 8
         ];
         let intervals = vec![
-            LiveInterval { vreg: VRegId(0), kind: VRegKind::Vec, width: SimdWidth::W256,
-                def_point: 0, last_use: 10, lifecycle: LifecycleTag::BodyLocal },
-            LiveInterval { vreg: VRegId(1), kind: VRegKind::Ptr, width: SimdWidth::Scalar,
-                def_point: 15, last_use: 30, lifecycle: LifecycleTag::BodyLocal },
+            LiveInterval {
+                vreg: VRegId(0),
+                kind: VRegKind::Vec,
+                width: SimdWidth::W256,
+                def_point: 0,
+                last_use: 10,
+                lifecycle: LifecycleTag::BodyLocal,
+            },
+            LiveInterval {
+                vreg: VRegId(1),
+                kind: VRegKind::Ptr,
+                width: SimdWidth::Scalar,
+                def_point: 15,
+                last_use: 30,
+                lifecycle: LifecycleTag::BodyLocal,
+            },
         ];
         assert!(RegAllocator::validate_spill_layout(&spills, &intervals).is_err());
     }
@@ -2894,8 +4110,12 @@ mod tests {
     #[test]
     fn test_post_alloc_verify_all_mapped() {
         let intervals = vec![LiveInterval {
-            vreg: VRegId(0), kind: VRegKind::Vec, width: SimdWidth::W256,
-            def_point: 0, last_use: 10, lifecycle: LifecycleTag::BodyLocal,
+            vreg: VRegId(0),
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+            def_point: 0,
+            last_use: 10,
+            lifecycle: LifecycleTag::BodyLocal,
         }];
         let mut mapping = HashMap::new();
         mapping.insert(VRegId(0), PhysReg::Vec(PhysVec(0)));
@@ -2905,8 +4125,12 @@ mod tests {
     #[test]
     fn test_post_alloc_verify_missing_mapping_rejected() {
         let intervals = vec![LiveInterval {
-            vreg: VRegId(0), kind: VRegKind::Vec, width: SimdWidth::W256,
-            def_point: 0, last_use: 10, lifecycle: LifecycleTag::BodyLocal,
+            vreg: VRegId(0),
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+            def_point: 0,
+            last_use: 10,
+            lifecycle: LifecycleTag::BodyLocal,
         }];
         let mapping = HashMap::new();
         assert!(RegAllocator::post_alloc_verify(&mapping, &intervals, &[]).is_err());
@@ -2915,20 +4139,32 @@ mod tests {
     #[test]
     fn test_post_alloc_verify_counter_spilled_accepted() {
         let intervals = vec![LiveInterval {
-            vreg: VRegId(0), kind: VRegKind::Counter, width: SimdWidth::Scalar,
-            def_point: 0, last_use: 10, lifecycle: LifecycleTag::LoopCarried,
+            vreg: VRegId(0),
+            kind: VRegKind::Counter,
+            width: SimdWidth::Scalar,
+            def_point: 0,
+            last_use: 10,
+            lifecycle: LifecycleTag::LoopCarried,
         }];
         let mut mapping = HashMap::new();
         mapping.insert(VRegId(0), PhysReg::Spilled(0));
-        let spills = vec![SpillSlot { vreg: VRegId(0), offset: 0, size: 8 }];
+        let spills = vec![SpillSlot {
+            vreg: VRegId(0),
+            offset: 0,
+            size: 8,
+        }];
         assert!(RegAllocator::post_alloc_verify(&mapping, &intervals, &spills).is_ok());
     }
 
     #[test]
     fn test_post_alloc_verify_counter_in_gpr_ok() {
         let intervals = vec![LiveInterval {
-            vreg: VRegId(0), kind: VRegKind::Counter, width: SimdWidth::Scalar,
-            def_point: 0, last_use: 10, lifecycle: LifecycleTag::LoopCarried,
+            vreg: VRegId(0),
+            kind: VRegKind::Counter,
+            width: SimdWidth::Scalar,
+            def_point: 0,
+            last_use: 10,
+            lifecycle: LifecycleTag::LoopCarried,
         }];
         let mut mapping = HashMap::new();
         mapping.insert(VRegId(0), PhysReg::Gpr(PhysGpr(3)));
@@ -2945,15 +4181,25 @@ mod tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let vec1 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::VecLoad {
-            dst: vec0, base: ptr, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            dst: vec0,
+            base: ptr,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         prog.emit(VmInstr::VecUnaryOp {
-            dst: vec1, a: vec0, op: VecUnaryOp::Neg,
+            dst: vec1,
+            a: vec0,
+            op: VecUnaryOp::Neg,
         });
         prog.emit(VmInstr::VecStore {
-            base: ptr, src: vec1, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            base: ptr,
+            src: vec1,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
         assert!(alloc.get(ptr).is_some());
@@ -2969,15 +4215,27 @@ mod tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let vec1 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::VecLoad {
-            dst: vec0, base: ptr, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            dst: vec0,
+            base: ptr,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         prog.emit(VmInstr::VecLoad {
-            dst: vec1, base: ptr, offset: OffsetExpr::Const(32),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            dst: vec1,
+            base: ptr,
+            offset: OffsetExpr::Const(32),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         prog.emit(VmInstr::VecBinOp {
-            dst: vec0, a: vec0, b: vec1, op: VecOp::Add, dtype: QuantPrecision::F32,
+            dst: vec0,
+            a: vec0,
+            b: vec1,
+            op: VecOp::Add,
+            dtype: QuantPrecision::F32,
         });
         let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
         let phys0 = alloc.get_vec(vec0);
@@ -2994,12 +4252,20 @@ mod tests {
         let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::VecLoad {
-            dst: vec0, base: ptr, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            dst: vec0,
+            base: ptr,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         prog.emit(VmInstr::VecStore {
-            base: ptr, src: vec0, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            base: ptr,
+            src: vec0,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
         assert!(alloc.get_gpr(ptr).is_some());
@@ -3013,8 +4279,12 @@ mod tests {
         let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::VecLoad {
-            dst: vec0, base: ptr, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            dst: vec0,
+            base: ptr,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         let alloc = RegAllocator::new(&gpu_profile).allocate(&prog).unwrap();
         assert!(alloc.mapping.is_empty());
@@ -3036,12 +4306,20 @@ mod tests {
         let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::VecLoad {
-            dst: vec0, base: ptr, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            dst: vec0,
+            base: ptr,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         prog.emit(VmInstr::VecStore {
-            base: ptr, src: vec0, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            base: ptr,
+            src: vec0,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         let mut mapping = HashMap::new();
         mapping.insert(vec0, PhysReg::Spilled(0));
@@ -3054,8 +4332,12 @@ mod tests {
     #[test]
     fn test_live_interval_fields() {
         let iv = LiveInterval {
-            vreg: VRegId(42), kind: VRegKind::Vec, width: SimdWidth::W512,
-            def_point: 10, last_use: 20, lifecycle: LifecycleTag::BodyLocal,
+            vreg: VRegId(42),
+            kind: VRegKind::Vec,
+            width: SimdWidth::W512,
+            def_point: 10,
+            last_use: 20,
+            lifecycle: LifecycleTag::BodyLocal,
         };
         assert_eq!(iv.vreg, VRegId(42));
         assert_eq!(iv.kind, VRegKind::Vec);
@@ -3067,8 +4349,12 @@ mod tests {
     #[test]
     fn test_live_interval_clone() {
         let iv = LiveInterval {
-            vreg: VRegId(1), kind: VRegKind::Ptr, width: SimdWidth::Scalar,
-            def_point: 0, last_use: 5, lifecycle: LifecycleTag::Global,
+            vreg: VRegId(1),
+            kind: VRegKind::Ptr,
+            width: SimdWidth::Scalar,
+            def_point: 0,
+            last_use: 5,
+            lifecycle: LifecycleTag::Global,
         };
         let cloned = iv.clone();
         assert_eq!(iv.vreg, cloned.vreg);
@@ -3082,7 +4368,11 @@ mod tests {
 
     #[test]
     fn test_spill_slot_fields() {
-        let slot = SpillSlot { vreg: VRegId(7), offset: 64, size: 32 };
+        let slot = SpillSlot {
+            vreg: VRegId(7),
+            offset: 64,
+            size: 32,
+        };
         assert_eq!(slot.vreg, VRegId(7));
         assert_eq!(slot.offset, 64);
         assert_eq!(slot.size, 32);
@@ -3090,7 +4380,11 @@ mod tests {
 
     #[test]
     fn test_spill_slot_clone() {
-        let slot = SpillSlot { vreg: VRegId(3), offset: 128, size: 64 };
+        let slot = SpillSlot {
+            vreg: VRegId(3),
+            offset: 128,
+            size: 64,
+        };
         let cloned = slot.clone();
         assert_eq!(slot.vreg, cloned.vreg);
         assert_eq!(slot.offset, cloned.offset);
@@ -3101,16 +4395,32 @@ mod tests {
 
     #[test]
     fn test_instr_brief_known_variants() {
-        assert_eq!(RegAllocator::instr_brief(&VmInstr::VecLoad {
-            dst: VRegId(0), base: VRegId(1), offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
-        }), "VecLoad");
+        assert_eq!(
+            RegAllocator::instr_brief(&VmInstr::VecLoad {
+                dst: VRegId(0),
+                base: VRegId(1),
+                offset: OffsetExpr::Const(0),
+                width: SimdWidth::W256,
+                dtype: QuantPrecision::F32,
+                predicate: None,
+            }),
+            "VecLoad"
+        );
         assert_eq!(RegAllocator::instr_brief(&VmInstr::LoopEnd), "LoopEnd");
-        assert_eq!(RegAllocator::instr_brief(&VmInstr::Fma {
-            dst: VRegId(0), acc: VRegId(0), a: VRegId(1), b: VRegId(2),
-            dtype: QuantPrecision::F32,
-        }), "Fma");
-        assert_eq!(RegAllocator::instr_brief(&VmInstr::Comment("x".to_string())), "Comment");
+        assert_eq!(
+            RegAllocator::instr_brief(&VmInstr::Fma {
+                dst: VRegId(0),
+                acc: VRegId(0),
+                a: VRegId(1),
+                b: VRegId(2),
+                dtype: QuantPrecision::F32,
+            }),
+            "Fma"
+        );
+        assert_eq!(
+            RegAllocator::instr_brief(&VmInstr::Comment("x".to_string())),
+            "Comment"
+        );
     }
 
     // ── LifecycleTag Copy + PartialEq ──────────────────────────────────
@@ -3151,14 +4461,22 @@ mod tests {
     #[test]
     fn test_vreg_kind_all_variants_distinct() {
         let kinds = [
-            VRegKind::Ptr, VRegKind::Vec, VRegKind::Scalar,
-            VRegKind::Counter, VRegKind::ByteOffset, VRegKind::Tile, VRegKind::Mask,
+            VRegKind::Ptr,
+            VRegKind::Vec,
+            VRegKind::Scalar,
+            VRegKind::Counter,
+            VRegKind::ByteOffset,
+            VRegKind::Tile,
+            VRegKind::Mask,
         ];
         // Every pair must be distinct (no duplicates in the enum)
         for i in 0..kinds.len() {
             for j in (i + 1)..kinds.len() {
-                assert_ne!(kinds[i], kinds[j],
-                    "VRegKind variants at index {} and {} should differ", i, j);
+                assert_ne!(
+                    kinds[i], kinds[j],
+                    "VRegKind variants at index {} and {} should differ",
+                    i, j
+                );
             }
         }
     }
@@ -3171,18 +4489,32 @@ mod tests {
         mapping.insert(VRegId(0), PhysReg::Gpr(PhysGpr(1)));
         mapping.insert(VRegId(1), PhysReg::Vec(PhysVec(0)));
         mapping.insert(VRegId(2), PhysReg::Spilled(0));
-        let alloc = RegAllocation { mapping, spills: vec![], callee_saved_used: vec![] };
+        let alloc = RegAllocation {
+            mapping,
+            spills: vec![],
+            callee_saved_used: vec![],
+        };
         assert_eq!(alloc.num_vregs(), 3);
     }
 
     #[test]
     fn test_reg_allocation_spill_slots_accessor() {
         let spills = vec![
-            SpillSlot { vreg: VRegId(5), offset: 0, size: 32 },
-            SpillSlot { vreg: VRegId(7), offset: 32, size: 8 },
+            SpillSlot {
+                vreg: VRegId(5),
+                offset: 0,
+                size: 32,
+            },
+            SpillSlot {
+                vreg: VRegId(7),
+                offset: 32,
+                size: 8,
+            },
         ];
         let alloc = RegAllocation {
-            mapping: HashMap::new(), spills, callee_saved_used: vec![],
+            mapping: HashMap::new(),
+            spills,
+            callee_saved_used: vec![],
         };
         assert_eq!(alloc.spill_slots().len(), 2);
         assert_eq!(alloc.spill_slots()[0].vreg, VRegId(5));
@@ -3205,12 +4537,18 @@ mod tests {
         // for alloc, and BodyLocal < CrossScope < LoopCarried < LoopInvariant < Global
         // for spill (inverse ordering).
         let alloc_order = [
-            LifecycleTag::Global, LifecycleTag::LoopInvariant,
-            LifecycleTag::LoopCarried, LifecycleTag::CrossScope, LifecycleTag::BodyLocal,
+            LifecycleTag::Global,
+            LifecycleTag::LoopInvariant,
+            LifecycleTag::LoopCarried,
+            LifecycleTag::CrossScope,
+            LifecycleTag::BodyLocal,
         ];
         let spill_order = [
-            LifecycleTag::BodyLocal, LifecycleTag::CrossScope,
-            LifecycleTag::LoopCarried, LifecycleTag::LoopInvariant, LifecycleTag::Global,
+            LifecycleTag::BodyLocal,
+            LifecycleTag::CrossScope,
+            LifecycleTag::LoopCarried,
+            LifecycleTag::LoopInvariant,
+            LifecycleTag::Global,
         ];
         for i in 0..4 {
             assert!(alloc_order[i].alloc_priority() <= alloc_order[i + 1].alloc_priority());
@@ -3222,10 +4560,19 @@ mod tests {
 
     #[test]
     fn test_simd_width_bytes_equals_f32_lanes_times_four() {
-        let widths = [SimdWidth::Scalar, SimdWidth::W128, SimdWidth::W256, SimdWidth::W512];
+        let widths = [
+            SimdWidth::Scalar,
+            SimdWidth::W128,
+            SimdWidth::W256,
+            SimdWidth::W512,
+        ];
         for w in widths {
-            assert_eq!(w.bytes(), w.f32_lanes() * 4,
-                "SimdWidth::{:?}.bytes() must equal f32_lanes()*4", w);
+            assert_eq!(
+                w.bytes(),
+                w.f32_lanes() * 4,
+                "SimdWidth::{:?}.bytes() must equal f32_lanes()*4",
+                w
+            );
         }
     }
 
@@ -3261,5 +4608,392 @@ mod tests {
     fn test_scalar_expr_vregs_vreg_variant() {
         let vregs = RegAllocator::scalar_expr_vregs(&ScalarExpr::VReg(VRegId(12)));
         assert_eq!(vregs, vec![VRegId(12)]);
+    }
+
+    // ── BCE-20260724-PLAN-C-RESIDUAL-BREAK: verify_spill_layout_diagnostic ──
+
+    /// Dimension B: diagnostic verifier returns empty for clean spill table.
+    #[test]
+    fn verify_spill_diagnostic_clean_no_violations() {
+        let spills = vec![
+            SpillSlot {
+                vreg: VRegId(0),
+                offset: 0,
+                size: 8,
+            },
+            SpillSlot {
+                vreg: VRegId(1),
+                offset: 8,
+                size: 8,
+            },
+            SpillSlot {
+                vreg: VRegId(2),
+                offset: 16,
+                size: 16,
+            },
+        ];
+        let intervals = vec![
+            LiveInterval {
+                vreg: VRegId(0),
+                kind: VRegKind::Ptr,
+                width: SimdWidth::Scalar,
+                def_point: 0,
+                last_use: 5,
+                lifecycle: LifecycleTag::Global,
+            },
+            LiveInterval {
+                vreg: VRegId(1),
+                kind: VRegKind::Ptr,
+                width: SimdWidth::Scalar,
+                def_point: 6,
+                last_use: 10,
+                lifecycle: LifecycleTag::BodyLocal,
+            },
+            LiveInterval {
+                vreg: VRegId(2),
+                kind: VRegKind::Vec,
+                width: SimdWidth::W256,
+                def_point: 11,
+                last_use: 15,
+                lifecycle: LifecycleTag::BodyLocal,
+            },
+        ];
+        let violations = RegAllocator::verify_spill_layout_diagnostic(&spills, &intervals, -16);
+        assert!(
+            violations.is_empty(),
+            "expected no violations, got: {:?}",
+            violations
+        );
+    }
+
+    /// Dimension B: detects physical offset overlap (no live intersection).
+    #[test]
+    fn verify_spill_diagnostic_detects_physical_overlap() {
+        // v0 @ [0,8) and v1 @ [4,12) — overlap [4,8), but live ranges disjoint
+        let spills = vec![
+            SpillSlot {
+                vreg: VRegId(0),
+                offset: 0,
+                size: 8,
+            },
+            SpillSlot {
+                vreg: VRegId(1),
+                offset: 4,
+                size: 8,
+            },
+        ];
+        let intervals = vec![
+            LiveInterval {
+                vreg: VRegId(0),
+                kind: VRegKind::Ptr,
+                width: SimdWidth::Scalar,
+                def_point: 0,
+                last_use: 5,
+                lifecycle: LifecycleTag::Global,
+            },
+            LiveInterval {
+                vreg: VRegId(1),
+                kind: VRegKind::Ptr,
+                width: SimdWidth::Scalar,
+                def_point: 10,
+                last_use: 15,
+                lifecycle: LifecycleTag::BodyLocal,
+            },
+        ];
+        let violations = RegAllocator::verify_spill_layout_diagnostic(&spills, &intervals, -16);
+        assert_eq!(
+            violations.len(),
+            1,
+            "expected 1 overlap violation, got: {:?}",
+            violations
+        );
+        assert!(
+            violations[0].contains("SPILL-OVERLAP"),
+            "violation should be SPILL-OVERLAP: {}",
+            violations[0]
+        );
+        // Live ranges disjoint → not CORRUPTION
+        assert!(
+            !violations[0].contains("CORRUPTION"),
+            "should not be CORRUPTION (live disjoint): {}",
+            violations[0]
+        );
+    }
+
+    /// Dimension B: detects physical overlap AND live intersection = CORRUPTION.
+    /// This is the decisive test for the Q5_K_M N=28 root-cause hypothesis.
+    #[test]
+    fn verify_spill_diagnostic_detects_live_corruption() {
+        // v0 @ [0,8) live [0..10], v1 @ [4,12) live [5..15] — overlap + live intersect
+        let spills = vec![
+            SpillSlot {
+                vreg: VRegId(0),
+                offset: 0,
+                size: 8,
+            },
+            SpillSlot {
+                vreg: VRegId(1),
+                offset: 4,
+                size: 8,
+            },
+        ];
+        let intervals = vec![
+            LiveInterval {
+                vreg: VRegId(0),
+                kind: VRegKind::Ptr,
+                width: SimdWidth::Scalar,
+                def_point: 0,
+                last_use: 10,
+                lifecycle: LifecycleTag::LoopCarried,
+            },
+            LiveInterval {
+                vreg: VRegId(1),
+                kind: VRegKind::Ptr,
+                width: SimdWidth::Scalar,
+                def_point: 5,
+                last_use: 15,
+                lifecycle: LifecycleTag::LoopCarried,
+            },
+        ];
+        let violations = RegAllocator::verify_spill_layout_diagnostic(&spills, &intervals, -16);
+        assert_eq!(
+            violations.len(),
+            1,
+            "expected 1 corruption violation, got: {:?}",
+            violations
+        );
+        assert!(
+            violations[0].contains("CORRUPTION"),
+            "should be CORRUPTION (live intersect): {}",
+            violations[0]
+        );
+    }
+
+    /// Dimension B: skips Freed slot placeholders (VRegId(u32::MAX)).
+    #[test]
+    fn verify_spill_diagnostic_skips_freed_placeholders() {
+        let spills = vec![
+            SpillSlot {
+                vreg: VRegId(0),
+                offset: 0,
+                size: 8,
+            },
+            SpillSlot {
+                vreg: VRegId(u32::MAX),
+                offset: 0,
+                size: 8,
+            }, // Freed placeholder
+            SpillSlot {
+                vreg: VRegId(1),
+                offset: 8,
+                size: 8,
+            },
+        ];
+        let intervals = vec![
+            LiveInterval {
+                vreg: VRegId(0),
+                kind: VRegKind::Ptr,
+                width: SimdWidth::Scalar,
+                def_point: 0,
+                last_use: 5,
+                lifecycle: LifecycleTag::Global,
+            },
+            LiveInterval {
+                vreg: VRegId(1),
+                kind: VRegKind::Ptr,
+                width: SimdWidth::Scalar,
+                def_point: 6,
+                last_use: 10,
+                lifecycle: LifecycleTag::BodyLocal,
+            },
+        ];
+        let violations = RegAllocator::verify_spill_layout_diagnostic(&spills, &intervals, -16);
+        assert!(
+            violations.is_empty(),
+            "Freed placeholder should be skipped, got: {:?}",
+            violations
+        );
+    }
+
+    /// Dimension B: detects duplicate VRegId in multiple slots (double-alloc bug).
+    #[test]
+    fn verify_spill_diagnostic_detects_duplicate_vreg() {
+        let spills = vec![
+            SpillSlot {
+                vreg: VRegId(0),
+                offset: 0,
+                size: 8,
+            },
+            SpillSlot {
+                vreg: VRegId(0),
+                offset: 8,
+                size: 8,
+            }, // same vreg, different slot
+        ];
+        let intervals = vec![LiveInterval {
+            vreg: VRegId(0),
+            kind: VRegKind::Ptr,
+            width: SimdWidth::Scalar,
+            def_point: 0,
+            last_use: 5,
+            lifecycle: LifecycleTag::Global,
+        }];
+        let violations = RegAllocator::verify_spill_layout_diagnostic(&spills, &intervals, -16);
+        assert!(
+            violations.iter().any(|v| v.contains("SPILL-DUP-VREG")),
+            "should detect dup vreg: {:?}",
+            violations
+        );
+    }
+
+    /// Dimension B: collects ALL violations (does not abort on first).
+    #[test]
+    fn verify_spill_diagnostic_collects_all_violations() {
+        // 3 overlapping pairs → should report all 3
+        let spills = vec![
+            SpillSlot {
+                vreg: VRegId(0),
+                offset: 0,
+                size: 8,
+            },
+            SpillSlot {
+                vreg: VRegId(1),
+                offset: 4,
+                size: 8,
+            }, // overlaps v0
+            SpillSlot {
+                vreg: VRegId(2),
+                offset: 8,
+                size: 8,
+            }, // overlaps v1
+        ];
+        let intervals = vec![
+            LiveInterval {
+                vreg: VRegId(0),
+                kind: VRegKind::Ptr,
+                width: SimdWidth::Scalar,
+                def_point: 0,
+                last_use: 20,
+                lifecycle: LifecycleTag::Global,
+            },
+            LiveInterval {
+                vreg: VRegId(1),
+                kind: VRegKind::Ptr,
+                width: SimdWidth::Scalar,
+                def_point: 0,
+                last_use: 20,
+                lifecycle: LifecycleTag::Global,
+            },
+            LiveInterval {
+                vreg: VRegId(2),
+                kind: VRegKind::Ptr,
+                width: SimdWidth::Scalar,
+                def_point: 0,
+                last_use: 20,
+                lifecycle: LifecycleTag::Global,
+            },
+        ];
+        let violations = RegAllocator::verify_spill_layout_diagnostic(&spills, &intervals, -16);
+        assert!(
+            violations.len() >= 2,
+            "should collect multiple violations, got: {:?}",
+            violations
+        );
+    }
+
+    /// Dimension B: empty spill table → no violations.
+    #[test]
+    fn verify_spill_diagnostic_empty_spills() {
+        let violations = RegAllocator::verify_spill_layout_diagnostic(&[], &[], -16);
+        assert!(violations.is_empty());
+    }
+
+    /// Dimension B: single spill → no violations.
+    #[test]
+    fn verify_spill_diagnostic_single_spill() {
+        let spills = vec![SpillSlot {
+            vreg: VRegId(0),
+            offset: 0,
+            size: 8,
+        }];
+        let intervals = vec![LiveInterval {
+            vreg: VRegId(0),
+            kind: VRegKind::Ptr,
+            width: SimdWidth::Scalar,
+            def_point: 0,
+            last_use: 5,
+            lifecycle: LifecycleTag::Global,
+        }];
+        let violations = RegAllocator::verify_spill_layout_diagnostic(&spills, &intervals, -16);
+        assert!(violations.is_empty());
+    }
+
+    /// Dimension C: runtime interface returns the env var name (design-only).
+    #[test]
+    fn verify_spill_runtime_interface_returns_env_name() {
+        let env_var = RegAllocator::verify_spill_runtime_interface();
+        assert_eq!(env_var, "GLLM_VERIFY_SPILL_RUNTIME");
+    }
+
+    // ── BCE-20260724-PLAN-C-RESIDUAL-BREAK: Dimension A (ScopedSpillAllocator) ──
+
+    /// Dimension A: alloc with GLLM_VERIFY_SPILL=1 does not false-positive on
+    /// sequential non-overlapping allocs. Uses scan_overlap_violations (not
+    /// env-gated) to avoid test parallelism issues with env vars.
+    #[test]
+    fn scoped_spill_alloc_verify_clean_when_no_overlap() {
+        let mut allocator = super::super::stack_frame::ScopedSpillAllocator::new();
+        allocator.alloc(VRegId(0), 8, None);
+        allocator.alloc(VRegId(1), 8, None);
+        allocator.alloc(VRegId(2), 16, None);
+        let violations = allocator.scan_overlap_violations();
+        assert!(
+            violations.is_empty(),
+            "sequential non-overlapping allocs should have no violations: {:?}",
+            violations
+        );
+    }
+
+    /// Dimension A: detects when a manually-corrupted slot overlaps.
+    /// (We simulate a bug by directly mutating slot offsets to overlap.)
+    #[test]
+    fn scoped_spill_alloc_verify_detects_manual_overlap() {
+        let mut allocator = super::super::stack_frame::ScopedSpillAllocator::new();
+        allocator.alloc(VRegId(0), 8, None);
+        allocator.alloc(VRegId(1), 8, None);
+        // Corrupt: manually set slot 1's offset to overlap slot 0.
+        allocator.corrupt_slot_offset_for_test(1, 4); // overlaps [0,8)
+        let violations = allocator.scan_overlap_violations();
+        assert!(
+            !violations.is_empty(),
+            "manual overlap should be detected: {:?}",
+            violations
+        );
+        assert!(
+            violations[0].contains("SPILL-OVERLAP"),
+            "should be SPILL-OVERLAP: {}",
+            violations[0]
+        );
+    }
+
+    /// Dimension A: when GLLM_VERIFY_SPILL is unset, the alloc-time env-gated
+    /// check is inactive (zero overhead). scan_overlap_violations still works
+    /// for explicit diagnostic calls.
+    #[test]
+    fn scoped_spill_alloc_verify_env_gated_inactive() {
+        std::env::remove_var("GLLM_VERIFY_SPILL");
+        let mut allocator = super::super::stack_frame::ScopedSpillAllocator::new();
+        allocator.alloc(VRegId(0), 8, None);
+        allocator.alloc(VRegId(1), 8, None);
+        // env unset → alloc-time check inactive → violations Vec stays empty
+        let drain = allocator.drain_violations();
+        assert!(
+            drain.is_empty(),
+            "env unset → no alloc-time violations: {:?}",
+            drain
+        );
+        // but explicit scan still works
+        let scan = allocator.scan_overlap_violations();
+        assert!(scan.is_empty(), "no overlap → scan clean: {:?}", scan);
     }
 }
