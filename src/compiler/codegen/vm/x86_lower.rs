@@ -112,6 +112,13 @@ pub struct X86Lower {
     epilogue_label: Option<CodeLabel>,
     dispatch_labels: HashMap<usize, CodeLabel>,
     source_map: super::debug_map::JitSourceMap,
+    /// VmInstr index 计数器 (每次 lower_instr 自增, 不改 lower_instr 签名 —
+    /// 方案 (b), 最小侵入, 不波及 aarch64/gpu 对应方法)。
+    vm_instr_counter: usize,
+    /// VmInstr → iced 指令索引区间 (lower_instr 成功路径记录)。
+    /// finalize 中 assemble_options(RETURN_NEW_INSTRUCTION_OFFSETS) 后,
+    /// 用 new_instruction_offsets 把 [pre_iced_idx, post_iced_idx) 转成字节偏移。
+    vm_instr_offsets: Vec<super::debug_map::VmInstrOffsetEntry>,
     zero_vregs: HashSet<VRegId>,
     /// ARCH-SPILL-SAFE-ISA: Maps VRegId → immutable reload recipe.
     /// Under extreme register pressure (4120+ spills), spill slots can be corrupted by other VReg

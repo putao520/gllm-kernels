@@ -47,6 +47,8 @@ impl X86Lower {
             epilogue_label: None,
             dispatch_labels: HashMap::new(),
             source_map: super::debug_map::JitSourceMap::new(),
+            vm_instr_counter: 0,
+            vm_instr_offsets: Vec::new(),
             zero_vregs: HashSet::new(),
             stack_arg_vregs: HashMap::new(),
         }

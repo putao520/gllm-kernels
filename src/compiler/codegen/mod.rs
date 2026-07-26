@@ -156,6 +156,22 @@ pub struct CodegenOutput {
     /// RoPE cos/sin 表需求 (Some 当图中包含 RoPE 算子)。
     /// caller 必须在调用 kernel 前按该 layout 预填 scratchpad[cache_offset..]。
     pub rope_cache: Option<RopeCacheRequirement>,
+    /// VmInstr → 机器码字节偏移 map (仅 X86_64 MachineCode 路径, 其他后端 None)。
+    ///
+    /// 诊断工具 (BCE-20260724-PLAN-C-RESIDUAL-BREAK): 不依赖 GDB 定位 SIGSEGV 崩溃
+    /// VmInstr。JIT 代码 + VmInstr 序列 + 此 map → 静态读偏移即可定位崩溃机器码偏移
+    /// 对应的 VmInstr。由 `X86Lower::finalize` 在 assemble_options 后构建。
+    ///
+    /// @trace REQ-DUMP-003 [entity:ENT-COMPILER-GRAPH] VmInstr offset map 输出
+    pub vm_instr_map: Option<crate::compiler::codegen::vm::debug_map::VmInstrOffsetMap>,
+    /// const_pool / data_tables 布局审计 (仅 X86_64 MachineCode 路径, 其他后端 None)。
+    ///
+    /// 诊断工具 (BCE-20260724-PLAN-C-RESIDUAL-BREAK): 验证 "代码大小敏感的布局 bug"
+    /// 假设。dump 每个 entry 的 label/偏移/大小 + 所有引用该 label 的 RIP-relative
+    /// 指令的偏移 + disp32 值。
+    ///
+    /// @trace REQ-DUMP-003 [entity:ENT-COMPILER-GRAPH] const_pool 审计输出
+    pub const_pool_audit: Option<crate::compiler::codegen::vm::debug_map::ConstPoolAudit>,
 }
 
 #[cfg(test)]
@@ -359,6 +375,8 @@ mod tests {
             scratchpad_bytes: 4096,
             hotpatch_points: vec![(16, 0xDEAD, vec![0xBEEF])],
             rope_cache: None,
+            vm_instr_map: None,
+            const_pool_audit: None,
         };
         assert_eq!(out.code, vec![0x90, 0xC3]);
         assert_eq!(out.format, CodeFormat::MachineCode);
@@ -376,6 +394,8 @@ mod tests {
             scratchpad_bytes: 0,
             hotpatch_points: vec![],
             rope_cache: None,
+            vm_instr_map: None,
+            const_pool_audit: None,
         };
         assert_eq!(out.format, CodeFormat::Ptx);
         assert!(out.code.starts_with(b".version"));
@@ -395,6 +415,8 @@ mod tests {
             scratchpad_bytes: 65536,
             hotpatch_points: vec![],
             rope_cache: Some(rope),
+            vm_instr_map: None,
+            const_pool_audit: None,
         };
         let rc = out.rope_cache.unwrap();
         assert_eq!(rc.cache_offset, 256);
@@ -511,6 +533,8 @@ mod tests {
             scratchpad_bytes: 0,
             hotpatch_points: vec![],
             rope_cache: None,
+            vm_instr_map: None,
+            const_pool_audit: None,
         };
         assert_eq!(out.format, CodeFormat::Hip);
         assert!(!out.code.is_empty());
@@ -525,6 +549,8 @@ mod tests {
             scratchpad_bytes: 1024,
             hotpatch_points: vec![(0, 100, vec![200, 300])],
             rope_cache: None,
+            vm_instr_map: None,
+            const_pool_audit: None,
         };
         assert_eq!(out.format, CodeFormat::Msl);
         assert_eq!(out.hotpatch_points.len(), 1);
@@ -542,6 +568,8 @@ mod tests {
                 (20, 0xCCCC, vec![0xDDDD, 0xEEEE]),
             ],
             rope_cache: None,
+            vm_instr_map: None,
+            const_pool_audit: None,
         };
         assert_eq!(out.hotpatch_points.len(), 2);
         assert_eq!(out.hotpatch_points[1].0, 20);

@@ -46,8 +46,20 @@ pub fn compile_layer_with_sym_map(
     let dwc_req = compute_dwc_requirement(plan, graph, alloc, rope_req.as_ref(), ple_req.as_ref())?;
 
     // Stage 1: FusionPlan → VmProgram (IsaHook 驱动多算法选择)
-    let mut program = lower_fusion_plan_inner_with_sym_map(plan, graph, alloc, registry, &profile,
-        Some(hook.as_ref()), rope_req.as_ref(), ple_req.as_ref(), dwc_req.as_ref(), false, Some(sym_map), &topology)?;
+    let mut program = lower_fusion_plan_inner_with_sym_map(
+        plan,
+        graph,
+        alloc,
+        registry,
+        &profile,
+        Some(hook.as_ref()),
+        rope_req.as_ref(),
+        ple_req.as_ref(),
+        dwc_req.as_ref(),
+        false,
+        Some(sym_map),
+        &topology,
+    )?;
 
     // Stage 1.5: 符号验证 — catch 低级错误 (栈对齐, 寄存器配对, 嵌套 skip)
     // 在 ISA lowering 前运行, 违规返回 Err 而非产生错误机器码。
@@ -57,14 +69,18 @@ pub fn compile_layer_with_sym_map(
     let (mr, nr) = hook.gemm_microkernel_shape();
     let _ = (mr, nr);
     // 从 plan 中找到第一个 GEMM op 的真实维度 (用于 epi_place 推导)
-    if let Some((m_dim, n, k)) = plan.groups.iter()
+    if let Some((m_dim, n, k)) = plan
+        .groups
+        .iter()
         .filter_map(|g| graph.op(g.anchor))
         .filter_map(|op| extract_gemm_dims_sym(op, graph).ok())
         .next()
     {
         let m_alloc = match &m_dim {
             SymDim::Concrete(v) => *v,
-            SymDim::Symbolic { max_value, .. } => max_value.expect("GEMM M Symbolic needs max_value"),
+            SymDim::Symbolic { max_value, .. } => {
+                max_value.expect("GEMM M Symbolic needs max_value")
+            }
         };
         // ARCH-EPILOGUE-PLACE: epilogue_strategy 基于累加器数量和 epilogue 操作数决定执行位置
         let epi_place = hook.epilogue_strategy(m_alloc * n.min(k), 2);
@@ -72,9 +88,11 @@ pub fn compile_layer_with_sym_map(
     }
 
     // §14.1 管线铁律: validate_provenance + validate_structure
-    program.validate_provenance()
+    program
+        .validate_provenance()
         .map_err(|e| CompilerError::CodegenViolation(format!("provenance: {e}")))?;
-    program.validate_structure()
+    program
+        .validate_structure()
         .map_err(|e| CompilerError::CodegenViolation(format!("structure: {e}")))?;
 
     // D2: 操作数类型一致性 + D3: SIMD 宽度一致性 + D1: 值域验证
@@ -85,7 +103,9 @@ pub fn compile_layer_with_sym_map(
         return Err(CompilerError::CodegenViolation(format!("width-check: {e}")));
     }
     if let Err(e) = program.validate_value_domains() {
-        return Err(CompilerError::CodegenViolation(format!("value-domain: {e}")));
+        return Err(CompilerError::CodegenViolation(format!(
+            "value-domain: {e}"
+        )));
     }
 
     // Stage 2: VM 优化
@@ -111,14 +131,21 @@ pub fn compile_layer_with_sym_map(
         static CALL_IDX: AtomicUsize = AtomicUsize::new(0);
         let idx = CALL_IDX.fetch_add(1, Ordering::SeqCst);
         let _ = std::fs::create_dir_all(&dir);
-        let anchor = plan.groups.first()
+        let anchor = plan
+            .groups
+            .first()
             .and_then(|g| graph.op(g.anchor))
             .map(|op| format!("{:?}", op.op).chars().take(30).collect::<String>())
             .unwrap_or_else(|| "unknown".to_string())
             .replace(|c: char| !c.is_alphanumeric(), "_");
         let path = format!("{}/{:04}_{}.pre.txt", dir, idx, anchor);
         if let Ok(mut f) = std::fs::File::create(&path) {
-            writeln!(f, "=== VmProgram ({} instrs, pre-RegAlloc) ===", program.instrs.len()).ok();
+            writeln!(
+                f,
+                "=== VmProgram ({} instrs, pre-RegAlloc) ===",
+                program.instrs.len()
+            )
+            .ok();
             for (i, instr) in program.instrs.iter().enumerate() {
                 writeln!(f, "{:4}: {:?}", i, instr).ok();
             }
@@ -126,8 +153,15 @@ pub fn compile_layer_with_sym_map(
     }
 
     // Stage 3: 寄存器分配
-    let alloc_result = RegAllocator::new(&profile).allocate(&program)
+    let alloc_result = RegAllocator::new(&profile)
+        .allocate(&program)
         .map_err(|e| CompilerError::CodegenViolation(format!("RegAlloc: {e}")))?;
+
+    // BCE-20260724-PLAN-C-RESIDUAL-BREAK Dimension B: spill-layout diagnostic
+    // verification is mounted INSIDE RegAllocator::allocate_impl (reg_alloc.rs),
+    // not here — to avoid conflicting with parallel agent's compile.inc.rs changes.
+    // When GLLM_VERIFY_SPILL=1, allocate_impl runs verify_spill_layout_diagnostic
+    // and reports to stderr + /tmp/gllm_regalloc.log.
 
     // GLLM_DUMP_VM_REG=<dir>: 每个 compile_layer dump VmProgram + RegAlloc
     // mapping 到 dir/<idx>_<anchor_op>.txt, 供逐层数值调试。
@@ -137,7 +171,9 @@ pub fn compile_layer_with_sym_map(
         static CALL_IDX: AtomicUsize = AtomicUsize::new(0);
         let idx = CALL_IDX.fetch_add(1, Ordering::SeqCst);
         let _ = std::fs::create_dir_all(&dir);
-        let anchor = plan.groups.first()
+        let anchor = plan
+            .groups
+            .first()
             .and_then(|g| graph.op(g.anchor))
             .map(|op| format!("{:?}", op.op).chars().take(30).collect::<String>())
             .unwrap_or_else(|| "unknown".to_string())
@@ -157,14 +193,24 @@ pub fn compile_layer_with_sym_map(
             writeln!(f, "\n=== Spill Slots ===").ok();
             writeln!(f, "  total_spills={}", alloc_result.spills.len()).ok();
             for (i, spill) in alloc_result.spills.iter().enumerate() {
-                writeln!(f, "  slot[{}]: vreg={} offset={} size={}", i, spill.vreg.0, spill.offset, spill.size).ok();
+                writeln!(
+                    f,
+                    "  slot[{}]: vreg={} offset={} size={}",
+                    i, spill.vreg.0, spill.offset, spill.size
+                )
+                .ok();
             }
             writeln!(f, "\n=== Spill Offset → VReg ===").ok();
             for (i, spill) in alloc_result.spills.iter().enumerate() {
                 if spill.vreg.0 != u32::MAX {
                     // Calculate rbp_offset for this spill
                     let rbp_off = -(88 + spill.offset as i32 + spill.size as i32);
-                    writeln!(f, "  offset={} → slot[{}] vreg={} rbp_off={}", spill.offset, i, spill.vreg.0, rbp_off).ok();
+                    writeln!(
+                        f,
+                        "  offset={} → slot[{}] vreg={} rbp_off={}",
+                        spill.offset, i, spill.vreg.0, rbp_off
+                    )
+                    .ok();
                 }
             }
         }
@@ -177,8 +223,18 @@ pub fn compile_layer_with_sym_map(
 
     // Stage 5: ISA Lower — 根据 profile.platform 分派到对应 backend
     // ARCH-CODEGEN-DISPATCH: X86_64 → X86Lower, AArch64 → AArch64Lower, GPU → GpuLower
-    let (code, format) = match &profile.platform {
-        super::isa_profile::Platform::X86_64 { has_avx512, has_avx512fp16, has_bf16, has_vnni, .. } => {
+    //
+    // X86_64 路径额外返回 VmInstr offset map + const_pool 审计 (诊断工具,
+    // BCE-20260724-PLAN-C-RESIDUAL-BREAK); AArch64/GPU 路径返回 None。
+    // @trace REQ-DUMP-003 [entity:ENT-COMPILER-GRAPH] VmInstr offset map / const_pool 审计 (X86_64 路径)
+    let (code, format, vm_instr_map, const_pool_audit) = match &profile.platform {
+        super::isa_profile::Platform::X86_64 {
+            has_avx512,
+            has_avx512fp16,
+            has_bf16,
+            has_vnni,
+            ..
+        } => {
             let mut lowerer = X86Lower::with_sym_map(*has_avx512, sym_map.clone());
             lowerer.set_has_avx512fp16(*has_avx512fp16);
             // NO-SILENT-FALLBACK + NO-HW-DEGRADATION: BF16/VNNI 是独立硬件特性,非 AVX-512 子集。
@@ -195,7 +251,13 @@ pub fn compile_layer_with_sym_map(
                 lowerer.lower_instr(instr, &alloc_result)?;
             }
             lowerer.emit_epilogue(&frame, &alloc_result)?;
-            (lowerer.finalize()?, crate::compiler::codegen::CodeFormat::MachineCode)
+            let (code, vm_map, audit) = lowerer.finalize_with_diag()?;
+            (
+                code,
+                crate::compiler::codegen::CodeFormat::MachineCode,
+                Some(vm_map),
+                Some(audit),
+            )
         }
         super::isa_profile::Platform::AArch64 { .. } => {
             let mut lowerer = super::aarch64_lower::AArch64Lower::with_profile(&profile);
@@ -204,22 +266,38 @@ pub fn compile_layer_with_sym_map(
                 lowerer.lower_instr(instr, &alloc_result)?;
             }
             lowerer.emit_epilogue(&frame, &alloc_result)?;
-            (lowerer.finalize()?, crate::compiler::codegen::CodeFormat::MachineCode)
+            (
+                lowerer.finalize()?,
+                crate::compiler::codegen::CodeFormat::MachineCode,
+                None,
+                None,
+            )
         }
         super::isa_profile::Platform::Cuda { sm_version, .. } => {
-            let dialect = super::gpu_lower::GpuDialect::Ptx { sm_version: *sm_version };
+            let dialect = super::gpu_lower::GpuDialect::Ptx {
+                sm_version: *sm_version,
+            };
             let (text, fmt) = compile_gpu(&program, &frame, &alloc_result, dialect)?;
-            (text.into_bytes(), fmt)
+            (text.into_bytes(), fmt, None, None)
         }
-        super::isa_profile::Platform::Hip { gfx_arch, wave_size, .. } => {
-            let dialect = super::gpu_lower::GpuDialect::Hip { gfx_arch: *gfx_arch, wave_size: *wave_size };
+        super::isa_profile::Platform::Hip {
+            gfx_arch,
+            wave_size,
+            ..
+        } => {
+            let dialect = super::gpu_lower::GpuDialect::Hip {
+                gfx_arch: *gfx_arch,
+                wave_size: *wave_size,
+            };
             let (text, fmt) = compile_gpu(&program, &frame, &alloc_result, dialect)?;
-            (text.into_bytes(), fmt)
+            (text.into_bytes(), fmt, None, None)
         }
         super::isa_profile::Platform::Metal { gpu_family, .. } => {
-            let dialect = super::gpu_lower::GpuDialect::Metal { gpu_family: *gpu_family };
+            let dialect = super::gpu_lower::GpuDialect::Metal {
+                gpu_family: *gpu_family,
+            };
             let (text, fmt) = compile_gpu(&program, &frame, &alloc_result, dialect)?;
-            (text.into_bytes(), fmt)
+            (text.into_bytes(), fmt, None, None)
         }
     };
 
@@ -252,6 +330,10 @@ pub fn compile_layer_with_sym_map(
         scratchpad_bytes: total_scratchpad,
         hotpatch_points: vec![],
         rope_cache: rope_req,
+        // X86_64 路径的 diagnostic map 由 finalize 填充 (其他后端 None)。
+        // @trace REQ-DUMP-003 [entity:ENT-COMPILER-GRAPH] VmInstr offset map / const_pool 审计输出
+        vm_instr_map,
+        const_pool_audit,
     })
 }
 
@@ -324,7 +406,9 @@ pub(crate) fn extract_op_trace(
     // 没有 registry 或 registry 中没有该算子 → 返回 Err
     // (除了 Reshape/Transpose 是元数据操作，不需要 trace)
     match op.op_resolved(graph) {
-        Some(Op::Reshape { .. }) | Some(Op::Transpose { .. }) | Some(Op::SliceView { .. }) => Ok(vec![]),
+        Some(Op::Reshape { .. }) | Some(Op::Transpose { .. }) | Some(Op::SliceView { .. }) => {
+            Ok(vec![])
+        }
         // Gather has its own dedicated lower path, no scalar trace needed
         Some(Op::Gather { .. }) => Ok(vec![]),
         // QuantGather has its own dedicated lower path (emit_quant_gather_inline), no scalar trace needed
@@ -332,7 +416,9 @@ pub(crate) fn extract_op_trace(
         // ColumnSlice: memory-bound row-major copy, dedicated lower path (lower_column_slice)
         Some(Op::ColumnSlice { .. }) => Ok(vec![]),
         // AltUp ops: Injective, dispatched via emit_injective_inline
-        Some(Op::AltUpPredict { .. }) | Some(Op::AltUpCorrect { .. }) | Some(Op::AltUpInject { .. }) => Ok(vec![]),
+        Some(Op::AltUpPredict { .. })
+        | Some(Op::AltUpCorrect { .. })
+        | Some(Op::AltUpInject { .. }) => Ok(vec![]),
         // MoERouter: opaque composite op (GEMM + softmax + top-k), specialized dispatch
         Some(Op::MoERouter { .. }) => Ok(vec![]),
         // MoEDispatchPacked: opaque 复合算子 (mxfp4 dequant + SwiGLU + GEMV), 专用分发
@@ -349,21 +435,19 @@ pub(crate) fn extract_op_trace(
             let cap_val = cap as f64;
             let inv_cap = 1.0 / cap_val;
             Ok(vec![
-                TraceOp::Input(0),       // [0] x
-                TraceOp::Const(inv_cap), // [1] 1/cap
-                TraceOp::Mul(ValueId(0), ValueId(1)),      // [2] x * (1/cap)
-                TraceOp::Tanh(ValueId(2)),        // [3] tanh(x * (1/cap))
-                TraceOp::Const(cap_val), // [4] cap
-                TraceOp::Mul(ValueId(3), ValueId(4)),      // [5] cap * tanh(...)
+                TraceOp::Input(0),                    // [0] x
+                TraceOp::Const(inv_cap),              // [1] 1/cap
+                TraceOp::Mul(ValueId(0), ValueId(1)), // [2] x * (1/cap)
+                TraceOp::Tanh(ValueId(2)),            // [3] tanh(x * (1/cap))
+                TraceOp::Const(cap_val),              // [4] cap
+                TraceOp::Mul(ValueId(3), ValueId(4)), // [5] cap * tanh(...)
             ])
         }
-        _ => Err(CompilerError::CodegenViolation(
-            format!(
-                "extract_op_trace: Op {:?} 没有在 ScalarOpRegistry 中注册。\
+        _ => Err(CompilerError::CodegenViolation(format!(
+            "extract_op_trace: Op {:?} 没有在 ScalarOpRegistry 中注册。\
                  违反 §14.1 四阶段管线铁律——所有算子必须走 Scalar→SymExec→TraceOp 管线。",
-                op.op
-            )
-        )),
+            op.op
+        ))),
     }
 }
 
@@ -415,8 +499,6 @@ fn rewrite_logit_softcap_cap(body: &mut [TraceOp], cap: f32) {
     body[4] = TraceOp::Const(cap as f64);
 }
 
-
-
 /// 从 ComputePattern 提取主体 TraceOp 序列。
 fn extract_body_from_pattern(pattern: &ComputePattern) -> Vec<TraceOp> {
     match pattern {
@@ -463,16 +545,26 @@ fn try_auto_dispatch_elementwise(
     // - Structural ops: Injective traces are skeletal, need dedicated lowering
     // - NormLike/Reduction ops: dedicated lower_op paths with
     //   specialized weight/bias handling not supported by generic emission
-    if matches!(op.op_resolved(graph),
-        Some(Op::ColumnSlice { .. }) | Some(Op::Gather { .. }) |
-        Some(Op::DepthwiseConv1D { .. }) | Some(Op::PatchEmbed { .. }) |
-        Some(Op::LearnedPos2D { .. }) |
-        Some(Op::AltUpPredict { .. }) | Some(Op::AltUpCorrect { .. }) | Some(Op::AltUpInject { .. }) |
-        Some(Op::RmsNorm(_)) | Some(Op::LayerNorm(_)) |
-        Some(Op::ValueNorm(_)) | Some(Op::QkNorm { .. }) |
-        Some(Op::HeadRmsNorm { .. }) | Some(Op::Softmax) |
-        Some(Op::L2Normalize { .. }) | Some(Op::MeanPool { .. }) |
-        Some(Op::Argmax { .. }) | Some(Op::MtpDraft { .. })
+    if matches!(
+        op.op_resolved(graph),
+        Some(Op::ColumnSlice { .. })
+            | Some(Op::Gather { .. })
+            | Some(Op::DepthwiseConv1D { .. })
+            | Some(Op::PatchEmbed { .. })
+            | Some(Op::LearnedPos2D { .. })
+            | Some(Op::AltUpPredict { .. })
+            | Some(Op::AltUpCorrect { .. })
+            | Some(Op::AltUpInject { .. })
+            | Some(Op::RmsNorm(_))
+            | Some(Op::LayerNorm(_))
+            | Some(Op::ValueNorm(_))
+            | Some(Op::QkNorm { .. })
+            | Some(Op::HeadRmsNorm { .. })
+            | Some(Op::Softmax)
+            | Some(Op::L2Normalize { .. })
+            | Some(Op::MeanPool { .. })
+            | Some(Op::Argmax { .. })
+            | Some(Op::MtpDraft { .. })
     ) {
         return Ok(false);
     }
@@ -497,19 +589,40 @@ fn try_auto_dispatch_elementwise(
     let body = match &trace.pattern {
         ComputePattern::Elementwise { body } => body.clone(),
         ComputePattern::BinaryElementwise { body } => body.clone(),
-        ComputePattern::Injective { body, num_inputs, num_outputs } => {
+        ComputePattern::Injective {
+            body,
+            num_inputs,
+            num_outputs,
+        } => {
             if *num_inputs > 2 || *num_outputs > 1 {
                 return Ok(false);
             }
             body.clone()
         }
         ComputePattern::Reduction { .. } => {
-            return try_dispatch_reduction(prog, op, graph, &trace.pattern, ctx,
-                input_ptr, output_ptr, seq_bound_override);
+            return try_dispatch_reduction(
+                prog,
+                op,
+                graph,
+                &trace.pattern,
+                ctx,
+                input_ptr,
+                output_ptr,
+                seq_bound_override,
+            );
         }
         ComputePattern::NormLike { .. } => {
-            return try_dispatch_normlike(prog, op, graph, &trace.pattern, ctx,
-                input_ptr, weight_ptr, output_ptr, seq_bound_override);
+            return try_dispatch_normlike(
+                prog,
+                op,
+                graph,
+                &trace.pattern,
+                ctx,
+                input_ptr,
+                weight_ptr,
+                output_ptr,
+                seq_bound_override,
+            );
         }
         _ => return Ok(false),
     };
@@ -531,17 +644,25 @@ fn try_auto_dispatch_elementwise(
     let (out_shape, _) = infer_output_shape_sym(op, graph)?;
     let is_binary = op.inputs.len() > 1;
 
-    let resolved_input = op.inputs.first().copied()
+    let resolved_input = op
+        .inputs
+        .first()
+        .copied()
         .and_then(|tid| resolver.materialize(prog, tid, abi))
         .unwrap_or(input_ptr);
     let resolved_weight = if is_binary {
-        op.inputs.get(1).copied()
+        op.inputs
+            .get(1)
+            .copied()
             .and_then(|tid| resolver.materialize(prog, tid, abi))
             .unwrap_or(weight_ptr)
     } else {
         weight_ptr
     };
-    let resolved_output = op.outputs.first().copied()
+    let resolved_output = op
+        .outputs
+        .first()
+        .copied()
         .and_then(|tid| resolver.materialize(prog, tid, abi))
         .unwrap_or(output_ptr);
 
@@ -550,7 +671,8 @@ fn try_auto_dispatch_elementwise(
     // row_weight 不按 outer offset 偏移，始终指向 weight_ptr[0..feature_dim]。
     let weight_is_broadcast = if is_binary {
         let weight_tid = op.inputs[1];
-        let weight_shape = graph.tensor(weight_tid)
+        let weight_shape = graph
+            .tensor(weight_tid)
             .map(|t| t.shape.clone())
             .unwrap_or_default();
         let outer_sym_in_out = out_shape.iter().find(|d| d.is_symbolic());
@@ -562,9 +684,20 @@ fn try_auto_dispatch_elementwise(
         false
     };
 
-    let _acc = emit_elementwise_inline(prog, &body, &out_shape, ctx.session.width, is_binary,
+    let _acc = emit_elementwise_inline(
+        prog,
+        &body,
+        &out_shape,
+        ctx.session.width,
+        is_binary,
         weight_is_broadcast,
-        resolved_input, resolved_weight, resolved_output, ctx.session.sym_map, seq_bound_override, ctx.accum_dtype)?;
+        resolved_input,
+        resolved_weight,
+        resolved_output,
+        ctx.session.sym_map,
+        seq_bound_override,
+        ctx.accum_dtype,
+    )?;
 
     Ok(true)
 }
@@ -592,7 +725,9 @@ fn try_dispatch_normlike(
     let (out_shape, feature_dim) = infer_output_shape_sym(op, graph)?;
     if feature_dim == 0 {
         return Err(CompilerError::CodegenViolation(format!(
-            "NormLike op {:?}: feature_dim=0, cannot emit normlike", op.id)));
+            "NormLike op {:?}: feature_dim=0, cannot emit normlike",
+            op.id
+        )));
     }
     let seq_bound = seq_bound_override
         .cloned()
@@ -607,14 +742,24 @@ fn try_dispatch_normlike(
         },
         None => NormKind::RmsNorm,
     };
-    let weight_dtype = op.inputs.get(1)
+    let weight_dtype = op
+        .inputs
+        .get(1)
         .and_then(|&tid| graph.tensor(tid))
         .map(|t| t.dtype.to_quant_precision())
         .unwrap_or(ctx.accum_dtype);
     emit_normlike_inline(
-        prog, pattern, feature_dim, /*groups_per_row=*/1,
-        /*broadcast_weight=*/false, norm_kind,
-        ctx.session.width, seq_bound, input_ptr, weight_ptr, output_ptr,
+        prog,
+        pattern,
+        feature_dim,
+        /*groups_per_row=*/ 1,
+        /*broadcast_weight=*/ false,
+        norm_kind,
+        ctx.session.width,
+        seq_bound,
+        input_ptr,
+        weight_ptr,
+        output_ptr,
         ctx.accum_dtype,
         weight_dtype, // BCE-20260629-011: 传递 weight dtype
     )?;
@@ -638,8 +783,16 @@ pub(crate) fn try_dispatch_reduction(
     use crate::compiler::trace::ComputePattern;
 
     let (identity, combine, normalize) = match pattern {
-        ComputePattern::Reduction { identity, combine, normalize, .. } => {
-            eprintln!("[REDUCTION-DIAG] identity={} combine={:?} normalize={:?}", identity, combine, normalize);
+        ComputePattern::Reduction {
+            identity,
+            combine,
+            normalize,
+            ..
+        } => {
+            eprintln!(
+                "[REDUCTION-DIAG] identity={} combine={:?} normalize={:?}",
+                identity, combine, normalize
+            );
             (*identity, combine.clone(), normalize.clone())
         }
         _ => return Ok(false),
@@ -658,23 +811,24 @@ pub(crate) fn try_dispatch_reduction(
     } else if matches!(op.op_resolved(graph), Some(Op::L2Normalize { .. })) {
         BoundExpr::Const(1)
     } else {
-        let input_dim = op.inputs.first()
+        let input_dim = op
+            .inputs
+            .first()
             .and_then(|&tid| graph.tensor(tid))
             .and_then(|t| t.shape.first());
         match input_dim {
-            Some(SymDim::Symbolic { name, max_value }) => {
-                BoundExpr::Symbolic(SymBound {
-                    name: name.clone(),
-                    max_alloc: max_value.expect("Symbolic dim needs max_value"),
-                })
-            }
+            Some(SymDim::Symbolic { name, max_value }) => BoundExpr::Symbolic(SymBound {
+                name: name.clone(),
+                max_alloc: max_value.expect("Symbolic dim needs max_value"),
+            }),
             _ => BoundExpr::Const(geom.seq_len),
         }
     };
 
     if feature_dim == 0 {
         return Err(CompilerError::CodegenViolation(
-            "try_dispatch_reduction: zero feature_dim".into()));
+            "try_dispatch_reduction: zero feature_dim".into(),
+        ));
     }
 
     let width = ctx.session.width;
@@ -711,10 +865,20 @@ pub(crate) fn try_dispatch_reduction(
     match &seq_bound {
         BoundExpr::Const(n) if *n > 0 => {
             let inv_n = 1.0f32 / *n as f32;
-            prog.emit(VmInstr::Broadcast { dst: scale, src: ScalarExpr::Const(inv_n), width, dtype: ctx.accum_dtype, });
+            prog.emit(VmInstr::Broadcast {
+                dst: scale,
+                src: ScalarExpr::Const(inv_n),
+                width,
+                dtype: ctx.accum_dtype,
+            });
         }
         BoundExpr::Const(_) => {
-            prog.emit(VmInstr::Broadcast { dst: scale, src: ScalarExpr::Const(1.0), width, dtype: ctx.accum_dtype, });
+            prog.emit(VmInstr::Broadcast {
+                dst: scale,
+                src: ScalarExpr::Const(1.0),
+                width,
+                dtype: ctx.accum_dtype,
+            });
         }
         BoundExpr::Symbolic(sb) => {
             // NO-SILENT-FALLBACK + ARCH-SYMDIM-NO-CONST-DEGRADE:
@@ -735,37 +899,103 @@ pub(crate) fn try_dispatch_reduction(
             // ptr_expr points to an integer (i32/u32) in memory — LoadPtr reads it
             // into a GPR, then IndexToScalar converts to f32 for 1/N division.
             let n_gpr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoadPtr { dst: n_gpr, src: ptr_expr.clone() });
+            prog.emit(VmInstr::LoadPtr {
+                dst: n_gpr,
+                src: ptr_expr.clone(),
+            });
             let n_float = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
-            prog.emit(VmInstr::IndexToScalar { dst: n_float, src: n_gpr });
+            prog.emit(VmInstr::IndexToScalar {
+                dst: n_float,
+                src: n_gpr,
+            });
             let n_vec = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Broadcast { dst: n_vec, src: ScalarExpr::VReg(n_float), width, dtype: ctx.accum_dtype, });
+            prog.emit(VmInstr::Broadcast {
+                dst: n_vec,
+                src: ScalarExpr::VReg(n_float),
+                width,
+                dtype: ctx.accum_dtype,
+            });
             let ones = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Broadcast { dst: ones, src: ScalarExpr::Const(1.0), width, dtype: ctx.accum_dtype, });
-            prog.emit(VmInstr::VecBinOp { dst: scale, a: ones, b: n_vec, op: VecOp::Div, dtype: ctx.accum_dtype, });
+            prog.emit(VmInstr::Broadcast {
+                dst: ones,
+                src: ScalarExpr::Const(1.0),
+                width,
+                dtype: ctx.accum_dtype,
+            });
+            prog.emit(VmInstr::VecBinOp {
+                dst: scale,
+                a: ones,
+                b: n_vec,
+                op: VecOp::Div,
+                dtype: ctx.accum_dtype,
+            });
         }
         BoundExpr::DynamicVReg(vreg) => {
             // DynamicVReg: 外层 loop counter 的 GPR 值通过 IndexToScalar 转为 float,
             // 计算 1/N — 与 Runtime 分支同路径,跳过 LoadPtr(值已在 GPR 中).
             let n_float = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
-            prog.emit(VmInstr::IndexToScalar { dst: n_float, src: *vreg });
+            prog.emit(VmInstr::IndexToScalar {
+                dst: n_float,
+                src: *vreg,
+            });
             let n_vec = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Broadcast { dst: n_vec, src: ScalarExpr::VReg(n_float), width, dtype: ctx.accum_dtype, });
+            prog.emit(VmInstr::Broadcast {
+                dst: n_vec,
+                src: ScalarExpr::VReg(n_float),
+                width,
+                dtype: ctx.accum_dtype,
+            });
             let ones = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Broadcast { dst: ones, src: ScalarExpr::Const(1.0), width, dtype: ctx.accum_dtype, });
-            prog.emit(VmInstr::VecBinOp { dst: scale, a: ones, b: n_vec, op: VecOp::Div, dtype: ctx.accum_dtype, });
+            prog.emit(VmInstr::Broadcast {
+                dst: ones,
+                src: ScalarExpr::Const(1.0),
+                width,
+                dtype: ctx.accum_dtype,
+            });
+            prog.emit(VmInstr::VecBinOp {
+                dst: scale,
+                a: ones,
+                b: n_vec,
+                op: VecOp::Div,
+                dtype: ctx.accum_dtype,
+            });
         }
         BoundExpr::DynamicVRegPlusOne(vreg) => {
             // DynamicVRegPlusOne: N = vreg + 1. IndexToScalar + float add 1.0 + div.
             let n_float = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
-            prog.emit(VmInstr::IndexToScalar { dst: n_float, src: *vreg });
+            prog.emit(VmInstr::IndexToScalar {
+                dst: n_float,
+                src: *vreg,
+            });
             let n_vec = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Broadcast { dst: n_vec, src: ScalarExpr::VReg(n_float), width, dtype: ctx.accum_dtype, });
+            prog.emit(VmInstr::Broadcast {
+                dst: n_vec,
+                src: ScalarExpr::VReg(n_float),
+                width,
+                dtype: ctx.accum_dtype,
+            });
             let one = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Broadcast { dst: one, src: ScalarExpr::Const(1.0), width, dtype: ctx.accum_dtype, });
+            prog.emit(VmInstr::Broadcast {
+                dst: one,
+                src: ScalarExpr::Const(1.0),
+                width,
+                dtype: ctx.accum_dtype,
+            });
             let n_plus_one = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecBinOp { dst: n_plus_one, a: n_vec, b: one, op: VecOp::Add, dtype: ctx.accum_dtype, });
-            prog.emit(VmInstr::VecBinOp { dst: scale, a: one, b: n_plus_one, op: VecOp::Div, dtype: ctx.accum_dtype, });
+            prog.emit(VmInstr::VecBinOp {
+                dst: n_plus_one,
+                a: n_vec,
+                b: one,
+                op: VecOp::Add,
+                dtype: ctx.accum_dtype,
+            });
+            prog.emit(VmInstr::VecBinOp {
+                dst: scale,
+                a: one,
+                b: n_plus_one,
+                op: VecOp::Div,
+                dtype: ctx.accum_dtype,
+            });
         }
     }
 
@@ -781,38 +1011,67 @@ pub(crate) fn try_dispatch_reduction(
     // 外层: 列向量化循环 (Const)
     // 内层: 行循环 — 用 LoadPtr 计算行基地址
     if vec_count > 0 {
-        prog.emit_loop(BoundExpr::Const(vec_count), step, |prog, _col_ctr, col_off| {
-            prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::Const(identity as f32), width, dtype: ctx.accum_dtype, });
+        prog.emit_loop(
+            BoundExpr::Const(vec_count),
+            step,
+            |prog, _col_ctr, col_off| {
+                prog.emit(VmInstr::Broadcast {
+                    dst: acc,
+                    src: ScalarExpr::Const(identity as f32),
+                    width,
+                    dtype: ctx.accum_dtype,
+                });
 
-            prog.emit_loop(seq_bound.clone(), row_bytes, |prog, _row_ctr, row_off| {
-                prog.emit(VmInstr::LoadPtr {
-                    dst: row_base,
-                    src: PtrExpr::VRegPlusVReg(input_ptr, row_off),
-                });
-                prog.emit(VmInstr::VecLoad {
-                    dst: tmp, base: row_base, offset: OffsetExpr::LoopOffset(col_off), width,
-                    dtype: ctx.accum_dtype, predicate: None,
-                });
-                if combine_is_simple_add {
-                    // Simple Add: Accumulate handles acc += tmp directly
-                    prog.emit(VmInstr::Accumulate { acc, src: tmp });
-                } else {
-                    // Complex combine: let trace handle it, skip redundant Accumulate
-                    super::auto_select::auto_lower_trace(prog, &combine, &[acc, tmp], width, dtype)
+                prog.emit_loop(seq_bound.clone(), row_bytes, |prog, _row_ctr, row_off| {
+                    prog.emit(VmInstr::LoadPtr {
+                        dst: row_base,
+                        src: PtrExpr::VRegPlusVReg(input_ptr, row_off),
+                    });
+                    prog.emit(VmInstr::VecLoad {
+                        dst: tmp,
+                        base: row_base,
+                        offset: OffsetExpr::LoopOffset(col_off),
+                        width,
+                        dtype: ctx.accum_dtype,
+                        predicate: None,
+                    });
+                    if combine_is_simple_add {
+                        // Simple Add: Accumulate handles acc += tmp directly
+                        prog.emit(VmInstr::Accumulate { acc, src: tmp });
+                    } else {
+                        // Complex combine: let trace handle it, skip redundant Accumulate
+                        super::auto_select::auto_lower_trace(
+                            prog,
+                            &combine,
+                            &[acc, tmp],
+                            width,
+                            dtype,
+                        )
                         .expect("try_dispatch_reduction: combine trace invariant violation");
-                }
-            });
+                    }
+                });
 
-            if let Some(ref norm_body) = normalize {
-                super::auto_select::auto_lower_trace(prog, norm_body, &[acc, scale], width, dtype)
+                if let Some(ref norm_body) = normalize {
+                    super::auto_select::auto_lower_trace(
+                        prog,
+                        norm_body,
+                        &[acc, scale],
+                        width,
+                        dtype,
+                    )
                     .expect("try_dispatch_reduction: normalize trace invariant violation");
-            }
+                }
 
-            prog.emit(VmInstr::VecStore {
-                base: output_ptr, offset: OffsetExpr::LoopOffset(col_off), src: acc, width,
-                dtype: ctx.accum_dtype, predicate: None,
-            });
-        });
+                prog.emit(VmInstr::VecStore {
+                    base: output_ptr,
+                    offset: OffsetExpr::LoopOffset(col_off),
+                    src: acc,
+                    width,
+                    dtype: ctx.accum_dtype,
+                    predicate: None,
+                });
+            },
+        );
     }
 
     Ok(true)
@@ -881,9 +1140,16 @@ pub(super) fn emit_standalone_op(
     // 纯 Elementwise/BinaryElementwise 算子自动通过 registry trace pipeline dispatch，
     // 不需要手写 match arm。GELU/Tanh/Sigmoid/Relu/Add/Mul/SwiGLU 等全走此路径。
     if try_auto_dispatch_elementwise(
-        prog, op, graph, ctx,
-        input_ptr, weight_ptr, output_ptr,
-        seq_bound_override.as_ref(), resolver, abi,
+        prog,
+        op,
+        graph,
+        ctx,
+        input_ptr,
+        weight_ptr,
+        output_ptr,
+        seq_bound_override.as_ref(),
+        resolver,
+        abi,
     )? {
         // ── Telemetry post-hooks for elementwise ops ──
         // §13.5 SiLU dead neuron telemetry: post-hook after auto-dispatch.
@@ -891,7 +1157,14 @@ pub(super) fn emit_standalone_op(
         // handled by lower_op when graph.telemetry.residual_cosine_sim is true.
         if matches!(op.op_resolved(graph), Some(Op::Silu)) && graph.telemetry.silu_dead_neuron {
             let (out_shape, _) = infer_output_shape_sym(op, graph)?;
-            emit_silu_dead_neuron_telemetry(prog, input_ptr, &out_shape, width, sym_map, ctx.accum_dtype)?;
+            emit_silu_dead_neuron_telemetry(
+                prog,
+                input_ptr,
+                &out_shape,
+                width,
+                sym_map,
+                ctx.accum_dtype,
+            )?;
         }
         return Ok(());
     }
@@ -903,7 +1176,8 @@ pub(super) fn emit_standalone_op(
 
     // lower_op 未处理 → 报错（所有 ops 应通过 lower_op 处理）
     Err(CompilerError::CodegenViolation(format!(
-        "emit_standalone_op: op {:?} 未被 lower_op 处理", op.op
+        "emit_standalone_op: op {:?} 未被 lower_op 处理",
+        op.op
     )))
 }
 
@@ -915,8 +1189,12 @@ pub(super) fn emit_standalone_op(
 /// **Category D** (permanent, cannot use auto_select):
 /// GEMM 维度提取——保留完整 SymDim（ARCH-SYMDIM-NO-UNWRAP）。
 /// 返回 (m_sym, n, k)。调用方通过 sym_map.to_bound(&m_sym) 获取循环 bound。
-pub(super) fn extract_gemm_dims_sym(op: &crate::compiler::graph::CompilerOp, graph: &CompilerGraph) -> Result<(SymDim, usize, usize), CompilerError> {
-    op.op_gemm_dims(graph).ok_or_else(|| CompilerError::CodegenViolation(format!("not a GEMM op: {:?}", op.op)))
+pub(super) fn extract_gemm_dims_sym(
+    op: &crate::compiler::graph::CompilerOp,
+    graph: &CompilerGraph,
+) -> Result<(SymDim, usize, usize), CompilerError> {
+    op.op_gemm_dims(graph)
+        .ok_or_else(|| CompilerError::CodegenViolation(format!("not a GEMM op: {:?}", op.op)))
 }
 
 /// 从 FusionGroup 的 epilogue ops 收集合并的 TraceOp 链。
@@ -932,13 +1210,16 @@ pub(super) fn collect_epilogue_trace(
     // Filter to ops that have trace bodies (Argmax, StoreToken, etc. return empty
     // traces — they have specialized lowering and should not participate in epilogue
     // trace chaining). Only trace-bearing ops count toward the multi-op limit.
-    let trace_ops: Vec<_> = group.epilogue.iter()
+    let trace_ops: Vec<_> = group
+        .epilogue
+        .iter()
         .filter_map(|&op_id| {
             let op = graph.op(op_id)?;
             Some((op_id, op))
         })
         .collect();
-    let trace_bodies: Vec<Vec<TraceOp>> = trace_ops.iter()
+    let trace_bodies: Vec<Vec<TraceOp>> = trace_ops
+        .iter()
         .map(|(_, op)| extract_op_trace(op, registry, graph))
         .collect::<Result<Vec<_>, _>>()?;
     let trace_bearing_count = trace_bodies.iter().filter(|b| !b.is_empty()).count();
@@ -961,13 +1242,21 @@ pub(super) fn collect_epilogue_trace(
 /// 返回 (outer_dims: Vec<SymDim>, feature_dim: usize)。
 /// outer_dims 可能包含 Symbolic 维度（如 seq_len），feature_dim 始终 Concrete。
 /// ARCH-SYMDIM-NO-CONST-DEGRADE: 禁止用 max_for_allocation 压平 Symbolic 维度。
-pub(crate) fn infer_output_shape_sym(op: &crate::compiler::graph::CompilerOp, graph: &CompilerGraph) -> Result<(Vec<SymDim>, usize), CompilerError> {
-    let out_tid = op.outputs.first()
-        .ok_or_else(|| CompilerError::CodegenViolation(format!("op '{}' has no outputs", op.label)))?;
-    let tensor = graph.tensor(*out_tid)
-        .ok_or_else(|| CompilerError::CodegenViolation(format!("tensor {:?} not in graph", out_tid)))?;
+pub(crate) fn infer_output_shape_sym(
+    op: &crate::compiler::graph::CompilerOp,
+    graph: &CompilerGraph,
+) -> Result<(Vec<SymDim>, usize), CompilerError> {
+    let out_tid = op.outputs.first().ok_or_else(|| {
+        CompilerError::CodegenViolation(format!("op '{}' has no outputs", op.label))
+    })?;
+    let tensor = graph.tensor(*out_tid).ok_or_else(|| {
+        CompilerError::CodegenViolation(format!("tensor {:?} not in graph", out_tid))
+    })?;
     if tensor.shape.is_empty() {
-        return Err(CompilerError::CodegenViolation(format!("op '{}' output has empty shape", op.label)));
+        return Err(CompilerError::CodegenViolation(format!(
+            "op '{}' output has empty shape",
+            op.label
+        )));
     }
     let feature_dim = tensor.shape.last()
         .and_then(|d| d.as_concrete())
@@ -980,33 +1269,56 @@ pub(crate) fn infer_output_shape_sym(op: &crate::compiler::graph::CompilerOp, gr
 
 /// RmsNorm / ValueNorm 的标量 pattern。LayerNorm 不用此 pattern — 它走
 /// RmsNorm/ValueNorm NormLike pattern builder (LayerNorm uses emit_layernorm_auto)。
-pub(crate) fn build_norm_pattern(op: &crate::compiler::graph::CompilerOp, graph: &CompilerGraph) -> Result<ComputePattern, CompilerError> {
-    let meta = op.op_resolved(graph).and_then(|o| o.norm_meta())
-        .ok_or_else(|| CompilerError::CodegenViolation(
-            format!("build_norm_pattern: expected NormLike op, got op {:?}", op.op)
-        ))?;
+pub(crate) fn build_norm_pattern(
+    op: &crate::compiler::graph::CompilerOp,
+    graph: &CompilerGraph,
+) -> Result<ComputePattern, CompilerError> {
+    let meta = op
+        .op_resolved(graph)
+        .and_then(|o| o.norm_meta())
+        .ok_or_else(|| {
+            CompilerError::CodegenViolation(format!(
+                "build_norm_pattern: expected NormLike op, got op {:?}",
+                op.op
+            ))
+        })?;
     // 仅 RmsNorm/ValueNorm 走 build_norm_pattern（LayerNorm 走 emit_layernorm_auto）
-    if !matches!(meta.variant, crate::compiler::graph::NormVariant::RmsNorm | crate::compiler::graph::NormVariant::ValueNorm) {
-        return Err(CompilerError::CodegenViolation(
-            format!("build_norm_pattern: only RmsNorm/ValueNorm supported, got {:?}", op.op)
-        ));
+    if !matches!(
+        meta.variant,
+        crate::compiler::graph::NormVariant::RmsNorm
+            | crate::compiler::graph::NormVariant::ValueNorm
+    ) {
+        return Err(CompilerError::CodegenViolation(format!(
+            "build_norm_pattern: only RmsNorm/ValueNorm supported, got {:?}",
+            op.op
+        )));
     }
     let eps = meta.eps;
     let has_weight = meta.has_weight;
     let transform = if has_weight {
         vec![
-            TraceOp::Input(0), TraceOp::Input(1), TraceOp::Input(2),
-            TraceOp::Mul(ValueId(0), ValueId(1)),  // x * scale
-            TraceOp::Mul(ValueId(3), ValueId(2)),  // (x * scale) * weight
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Input(2),
+            TraceOp::Mul(ValueId(0), ValueId(1)), // x * scale
+            TraceOp::Mul(ValueId(3), ValueId(2)), // (x * scale) * weight
         ]
     } else {
-        vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))]
+        vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ]
     };
     Ok(ComputePattern::NormLike {
         reduce: vec![TraceOp::Input(0), TraceOp::Mul(ValueId(0), ValueId(0))],
         finalize: vec![
-            TraceOp::Input(0), TraceOp::Input(1), TraceOp::Div(ValueId(0), ValueId(1)),
-            TraceOp::Const(eps as f64), TraceOp::Add(ValueId(2), ValueId(3)), TraceOp::Rsqrt(ValueId(4)),
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Div(ValueId(0), ValueId(1)),
+            TraceOp::Const(eps as f64),
+            TraceOp::Add(ValueId(2), ValueId(3)),
+            TraceOp::Rsqrt(ValueId(4)),
         ],
         transform,
     })
@@ -1019,13 +1331,19 @@ pub(crate) fn build_norm_pattern_head_rms(eps: f32) -> Result<ComputePattern, Co
     Ok(ComputePattern::NormLike {
         reduce: vec![TraceOp::Input(0), TraceOp::Mul(ValueId(0), ValueId(0))],
         finalize: vec![
-            TraceOp::Input(0), TraceOp::Input(1), TraceOp::Div(ValueId(0), ValueId(1)),
-            TraceOp::Const(eps as f64), TraceOp::Add(ValueId(2), ValueId(3)), TraceOp::Rsqrt(ValueId(4)),
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Div(ValueId(0), ValueId(1)),
+            TraceOp::Const(eps as f64),
+            TraceOp::Add(ValueId(2), ValueId(3)),
+            TraceOp::Rsqrt(ValueId(4)),
         ],
         transform: vec![
-            TraceOp::Input(0), TraceOp::Input(1), TraceOp::Input(2),
-            TraceOp::Mul(ValueId(0), ValueId(1)),  // x * scale
-            TraceOp::Mul(ValueId(3), ValueId(2)),  // (x * scale) * weight
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Input(2),
+            TraceOp::Mul(ValueId(0), ValueId(1)), // x * scale
+            TraceOp::Mul(ValueId(3), ValueId(2)), // (x * scale) * weight
         ],
     })
 }
@@ -1039,25 +1357,27 @@ pub(crate) fn build_norm_pattern_head_rms(eps: f32) -> Result<ComputePattern, Co
 ///
 /// finalize body: [Input(0)=sum_sq, Sqrt(0)=√sum_sq, Const(eps), Add(1,2), Const(1.0), Div(4,3), Const(√head_dim), Mul(5,6)]
 /// transform body: [Input(0)=x, Input(1)=inv_norm_scale, Mul(0,1)]  (no weight)
-pub(crate) fn build_norm_pattern_qk(eps: f32, head_dim: usize) -> Result<ComputePattern, CompilerError> {
+pub(crate) fn build_norm_pattern_qk(
+    eps: f32,
+    head_dim: usize,
+) -> Result<ComputePattern, CompilerError> {
     let sqrt_head_dim = (head_dim as f64).sqrt();
     Ok(ComputePattern::NormLike {
         reduce: vec![TraceOp::Input(0), TraceOp::Mul(ValueId(0), ValueId(0))],
         finalize: vec![
-            TraceOp::Input(0),          // slot 0: sum_sq
-            TraceOp::Sqrt(ValueId(0)),           // slot 1: sqrt(sum_sq)
-            TraceOp::Const(eps as f64), // slot 2: eps
-            TraceOp::Add(ValueId(1), ValueId(2)),         // slot 3: sqrt(sum_sq) + eps
-            TraceOp::Const(1.0),        // slot 4: 1.0
-            TraceOp::Div(ValueId(4), ValueId(3)),         // slot 5: 1 / (sqrt(sum_sq) + eps) = inv_norm
-            TraceOp::Const(sqrt_head_dim), // slot 6: √head_dim
-            TraceOp::Mul(ValueId(5), ValueId(6)),         // slot 7: inv_norm * √head_dim
+            TraceOp::Input(0),                    // slot 0: sum_sq
+            TraceOp::Sqrt(ValueId(0)),            // slot 1: sqrt(sum_sq)
+            TraceOp::Const(eps as f64),           // slot 2: eps
+            TraceOp::Add(ValueId(1), ValueId(2)), // slot 3: sqrt(sum_sq) + eps
+            TraceOp::Const(1.0),                  // slot 4: 1.0
+            TraceOp::Div(ValueId(4), ValueId(3)), // slot 5: 1 / (sqrt(sum_sq) + eps) = inv_norm
+            TraceOp::Const(sqrt_head_dim),        // slot 6: √head_dim
+            TraceOp::Mul(ValueId(5), ValueId(6)), // slot 7: inv_norm * √head_dim
         ],
         transform: vec![
-            TraceOp::Input(0),  // x
-            TraceOp::Input(1),  // inv_norm * √head_dim (from finalize result)
+            TraceOp::Input(0),                    // x
+            TraceOp::Input(1),                    // inv_norm * √head_dim (from finalize result)
             TraceOp::Mul(ValueId(0), ValueId(1)), // x * inv_norm_scale
         ],
     })
 }
-

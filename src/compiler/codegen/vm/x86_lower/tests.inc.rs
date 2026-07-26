@@ -63,6 +63,102 @@ mod tests {
         assert!(code.len() > 100, "SiLU code should be substantial: {} bytes", code.len());
     }
 
+    /// VmInstr offset map 正确性测试 (BCE-20260724-PLAN-C-RESIDUAL-BREAK)。
+    ///
+    // @trace REQ-DUMP-003 [entity:ENT-COMPILER-GRAPH] VmInstr offset map 正确性验证
+    #[test]
+    fn test_finalize_with_diag_offset_map() {
+        let prog = build_prog_from_body(&[TraceOp::Input(0)]);
+
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
+        let frame = super::super::stack_frame::StackFrame::compute(&alloc, &profile, 0);
+
+        let mut lower = X86Lower::new();
+        lower.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            lower.lower_instr(instr, &alloc).unwrap();
+        }
+        lower.emit_epilogue(&frame, &alloc).unwrap();
+
+        let (code, vm_map, audit) = lower.finalize_with_diag().unwrap();
+
+        // code 非空 (与 finalize() 一致)
+        assert!(!code.is_empty(), "should produce non-empty code");
+
+        // VmInstr offset map: 每个 VmInstr 应有一条 entry
+        // prog.instrs.len() 条 VmInstr (不含 prologue/epilogue — 它们不走 lower_instr)
+        assert_eq!(vm_map.entries.len(), prog.instrs.len(),
+            "VmInstr offset map should have one entry per VmInstr: got {} expected {}",
+            vm_map.entries.len(), prog.instrs.len());
+
+        // 所有 entry 的字节区间应在 [0, code.len()) 内
+        // (start <= end; start == end 表示该 VmInstr lowering 产出 0 条机器指令,
+        //  如 Input(0) 透传 op — 合法, 字节区间为空)
+        for e in &vm_map.entries {
+            assert!(e.start_byte_off <= e.end_byte_off,
+                "VmInstr[{}] byte range start {:x} should be <= end {:x}",
+                e.vm_instr_index, e.start_byte_off, e.end_byte_off);
+            assert!(e.end_byte_off as usize <= code.len(),
+                "VmInstr[{}] end {:x} should be <= code.len() {:x}",
+                e.vm_instr_index, e.end_byte_off, code.len());
+        }
+
+        // lookup_byte_offset: 产出非空区间的 VmInstr 的 start_byte_off 应能查到该 VmInstr
+        for e in &vm_map.entries {
+            if e.start_byte_off == e.end_byte_off {
+                continue; // 空区间, 跳过 lookup 检查
+            }
+            let found = vm_map.lookup_byte_offset(e.start_byte_off);
+            assert_eq!(found, Some(e.vm_instr_index),
+                "lookup_byte_offset({:#x}) should return VmInstr[{}], got {:?}",
+                e.start_byte_off, e.vm_instr_index, found);
+        }
+
+        // const_pool audit: 应非空 (至少有空 entries 结构), 即便无 const_pool 也能调用
+        // (audit.entries 可能为 0 条, 但 to_text 应能运行)
+        let _audit_text = audit.to_text(); // 不 panic 即可
+    }
+
+    /// VmInstr offset map 与 finalize() 一致性测试: finalize() 应产出与
+    /// finalize_with_diag() 相同的 code bytes。
+    ///
+    // @trace REQ-DUMP-003 [entity:ENT-COMPILER-GRAPH] finalize/finalize_with_diag 一致性
+    #[test]
+    fn test_finalize_with_diag_code_matches_finalize() {
+        let body = vec![
+            TraceOp::Input(0), TraceOp::Neg(ValueId(0)), TraceOp::Exp(ValueId(1)),
+            TraceOp::Const(1.0), TraceOp::Add(ValueId(2), ValueId(3)), TraceOp::Recip(ValueId(4)), TraceOp::Mul(ValueId(0), ValueId(5)),
+        ];
+        let prog = build_prog_from_body(&body);
+
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
+        let frame = super::super::stack_frame::StackFrame::compute(&alloc, &profile, 0);
+
+        // finalize_with_diag
+        let mut lower1 = X86Lower::new();
+        lower1.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            lower1.lower_instr(instr, &alloc).unwrap();
+        }
+        lower1.emit_epilogue(&frame, &alloc).unwrap();
+        let (code1, _map, _audit) = lower1.finalize_with_diag().unwrap();
+
+        // finalize (旧接口, 应产出相同 code)
+        let mut lower2 = X86Lower::new();
+        lower2.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            lower2.lower_instr(instr, &alloc).unwrap();
+        }
+        lower2.emit_epilogue(&frame, &alloc).unwrap();
+        let code2 = lower2.finalize().unwrap();
+
+        assert_eq!(code1, code2, "finalize() and finalize_with_diag() should produce identical code bytes");
+    }
+
     #[test]
     fn scratch_slot_alloc_sequential() {
         let mut state = ScratchSlotState::new(3);

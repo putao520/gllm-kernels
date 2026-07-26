@@ -124,6 +124,7 @@ impl X86Lower {
 
     pub fn lower_instr(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         let pre_len = self.asm.instructions().len();
+        let vm_instr_idx = self.vm_instr_counter;
         let result = self.lower_instr_inner(instr, alloc);
         if result.is_err() {
             let post_len = self.asm.instructions().len();
@@ -137,7 +138,22 @@ impl X86Lower {
             for (i, ins) in instrs.iter().enumerate().skip(start).take(5) {
                 eprintln!("  [{}] {:?}", i, ins);
             }
+        } else {
+            // 成功路径: 记录 VmInstr → iced 指令索引区间 (BCE-20260724-PLAN-C-RESIDUAL-BREAK)。
+            // finalize 中 assemble_options(RETURN_NEW_INSTRUCTION_OFFSETS) 后,
+            // 用 new_instruction_offsets 把 [pre_len, post_len) 转成字节偏移。
+            // @trace REQ-DUMP-003 [entity:ENT-COMPILER-GRAPH] VmInstr offset map 收集
+            let post_len = self.asm.instructions().len();
+            let instr_short = format!("{:?}", instr);
+            let instr_name = instr_short.split('{').next().unwrap_or("?").to_string();
+            self.vm_instr_offsets.push(super::debug_map::VmInstrOffsetEntry {
+                vm_instr_index: vm_instr_idx,
+                start_byte_off: pre_len as u32, // 暂存 iced 指令索引, finalize 中转字节偏移
+                end_byte_off: post_len as u32,
+                instr_debug: instr_name,
+            });
         }
+        self.vm_instr_counter += 1;
         result
     }
 

@@ -3,7 +3,13 @@ impl X86Lower {
         std::mem::take(&mut self.source_map)
     }
 
-    pub fn finalize(mut self) -> Result<Vec<u8>, CompilerError> {
+    /// finalize 并返回 VmInstr offset map + const_pool 审计 (诊断工具)。
+    ///
+    /// 与 `finalize` 相同的副作用, 但额外返回诊断 map (BCE-20260724-PLAN-C-RESIDUAL-BREAK)。
+    /// compile.inc.rs X86_64 分支调此方法, 将 map 填入 CodegenOutput。
+    ///
+    // @trace REQ-DUMP-003 [entity:ENT-COMPILER-GRAPH] VmInstr offset map + const_pool 审计返回
+    pub fn finalize_with_diag(mut self) -> Result<(Vec<u8>, super::debug_map::VmInstrOffsetMap, super::debug_map::ConstPoolAudit), CompilerError> {
         // SPEC 15 REQ-JCTX-022: 编译后资源泄漏检测
         let report = self.jit_ctx.usage_report();
         if !report.warnings.is_empty() {
@@ -41,7 +47,138 @@ impl X86Lower {
             self.asm.set_label(label).map_err(Self::err)?;
             self.asm.db(bytes).map_err(Self::err)?;
         }
-        let code = self.asm.assemble(0x0).map_err(|e| CompilerError::Internal(format!("assemble: {e}")))?;
+
+        // ── BCE-20260724-PLAN-C-RESIDUAL-BREAK 诊断工具 ──
+        // 用 assemble_options + RETURN_NEW_INSTRUCTION_OFFSETS 获取 per-instruction
+        // 字节偏移, 构建 VmInstr → 机器码字节偏移 map + const_pool/data_tables 审计。
+        // 不默认开启 dump (GLLM_DUMP_OFFSETMAP=1 或 GLLM_DUMP_MEGA 时 dump)。
+        //
+        // @trace REQ-DUMP-003 [entity:ENT-COMPILER-GRAPH] VmInstr offset map 构建
+        let dump_offsetmap = std::env::var("GLLM_DUMP_OFFSETMAP").is_ok()
+            || std::env::var("GLLM_DUMP_MEGA").is_ok();
+
+        let asm_result = self.asm.assemble_options(0x0, iced_x86::BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS)
+            .map_err(|e| CompilerError::Internal(format!("assemble_options: {e}")))?;
+        // 先用 label_ip 收集所有 label 偏移 + new_offsets (asm_result 仍完整), 再移出 code_buffer。
+        // const_pool entries: ([f32; 8], CodeLabel) — 每个 32 字节
+        let const_pool_labels: Vec<(usize, u32)> = self.const_pool.iter().enumerate()
+            .filter_map(|(i, (_, label))| {
+                asm_result.label_ip(label).ok().map(|ip| (i, ip as u32))
+            })
+            .collect();
+        // data_tables entries: (Vec<u8>, CodeLabel)
+        let data_table_labels: Vec<(usize, u32, u32)> = self.data_tables.iter().enumerate()
+            .filter_map(|(i, (bytes, label))| {
+                asm_result.label_ip(label).ok().map(|ip| (i, ip as u32, bytes.len() as u32))
+            })
+            .collect();
+        // 收集 new_offsets (clone, 避免借用 asm_result 后再 move code_buffer 冲突)。
+        let new_offsets: Vec<u32> = asm_result.inner.new_instruction_offsets.clone();
+        // RIP-relative 引用: 遍历 pre-assemble instructions (用 new_offsets)。
+        let rip_refs: Vec<super::debug_map::RipRelRef> = {
+            let mut refs = Vec::new();
+            for (i, instr) in self.asm.instructions().iter().enumerate() {
+                if !instr.is_ip_rel_memory_operand() {
+                    continue;
+                }
+                let instr_off = if i < new_offsets.len() && new_offsets[i] != u32::MAX {
+                    new_offsets[i]
+                } else {
+                    continue; // 被重写的指令, 跳过
+                };
+                let disp = instr.memory_displacement64() as i32;
+                // target = next_ip + disp; next_ip = instr_off + instr.len()
+                // 但 pre-assemble 的 instr.len() 可能未设 (iced codeasm 后才设)。
+                // 用近似的 next_ip = new_offsets[i+1] (下一条指令的偏移) 或 code.len() (稍后修正)。
+                let next_ip = if i + 1 < new_offsets.len() && new_offsets[i + 1] != u32::MAX {
+                    new_offsets[i + 1] as u64
+                } else {
+                    // 退化: 用 0, 稍后在拿到 code.len() 后无法修正 (但此分支极少命中)。
+                    0
+                };
+                let target = next_ip.wrapping_add(disp as i64 as u64);
+                refs.push(super::debug_map::RipRelRef {
+                    instr_byte_off: instr_off,
+                    disp32: disp,
+                    target_byte_off: target,
+                });
+            }
+            refs
+        };
+        // 现在可以安全移出 code_buffer (asm_result 不再需要)。
+        let code = asm_result.inner.code_buffer;
+
+        // 构建 VmInstr → 字节偏移 map: 把 vm_instr_offsets 中的 iced 指令索引区间
+        // 转成字节偏移区间 (用 new_offsets)。
+        let total_iced = self.asm.instructions().len();
+        let mut vm_map = super::debug_map::VmInstrOffsetMap::new();
+        for entry in &self.vm_instr_offsets {
+            let pre = entry.start_byte_off as usize;
+            let post = entry.end_byte_off as usize;
+            // start_byte_off = new_offsets[pre] (pre 条 iced 指令的字节偏移)
+            let start_off = if pre < new_offsets.len() && new_offsets[pre] != u32::MAX {
+                new_offsets[pre]
+            } else {
+                // pre 指令被重写或越界 — 用前一个 entry 的 end 或 0
+                vm_map.entries.last().map(|e: &super::debug_map::VmInstrOffsetEntry| e.end_byte_off).unwrap_or(0)
+            };
+            // end_byte_off = post 条 iced 指令的字节偏移 (若 post < total, 则是下一条指令的起始;
+            // 若 post == total, 则是 code.len())
+            let end_off = if post < new_offsets.len() && new_offsets[post] != u32::MAX {
+                new_offsets[post]
+            } else if post == total_iced || post >= new_offsets.len() {
+                code.len() as u32
+            } else {
+                // post 指令被重写 — 用 start_off + 1 作为退化区间 (至少非空)
+                (start_off + 1).max(code.len() as u32)
+            };
+            vm_map.entries.push(super::debug_map::VmInstrOffsetEntry {
+                vm_instr_index: entry.vm_instr_index,
+                start_byte_off: start_off,
+                end_byte_off: end_off,
+                instr_debug: entry.instr_debug.clone(),
+            });
+        }
+        vm_map.sort_by_offset();
+
+        // 构建 const_pool/data_tables 审计 (用前面收集的 label 偏移)。
+        //
+        // @trace REQ-DUMP-003 [entity:ENT-COMPILER-GRAPH] const_pool 审计构建
+        let mut audit = super::debug_map::ConstPoolAudit::new();
+        for (i, byte_off) in const_pool_labels {
+            audit.entries.push(super::debug_map::PoolTableEntry {
+                table_kind: "const_pool".to_string(),
+                entry_index: i,
+                byte_offset: byte_off,
+                size: 32, // [f32; 8] = 32 bytes
+            });
+        }
+        for (i, byte_off, size) in data_table_labels {
+            audit.entries.push(super::debug_map::PoolTableEntry {
+                table_kind: "data_tables".to_string(),
+                entry_index: i,
+                byte_offset: byte_off,
+                size,
+            });
+        }
+        audit.rip_refs = rip_refs;
+
+        if dump_offsetmap {
+            // Dump offset map + const_pool audit 到 stderr (与 GLLM_DUMP_VM_REG 同模式)。
+            eprintln!("[X86-LOWER] VmInstr offset map ({} entries, code={} bytes):",
+                vm_map.entries.len(), code.len());
+            eprint!("{}", vm_map.to_text());
+            eprint!("{}", audit.to_text());
+        }
+
+        Ok((code, vm_map, audit))
+    }
+
+    /// finalize (向后兼容: 返回 code bytes, 丢弃诊断 map)。
+    ///
+    /// 诊断 map 由 `finalize_with_diag` 返回。测试和旧代码调此方法。
+    pub fn finalize(self) -> Result<Vec<u8>, CompilerError> {
+        let (code, _vm_map, _audit) = self.finalize_with_diag()?;
         Ok(code)
     }
 
