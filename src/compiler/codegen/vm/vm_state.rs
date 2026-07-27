@@ -385,9 +385,19 @@ pub struct EmitState {
     /// `Always` = no guard active. When consecutive ops share the same guard,
     /// only one GprCondAction is emitted covering all of them.
     pub active_guard: crate::compiler::graph::LayerCondition,
-    /// Index of the pending `GprCondAction { Skip(0) }` instruction to patch-back
-    /// once the guard run ends. `None` = no guard run in progress.
-    pub guard_skip_patch: Option<usize>,
+    /// Target label_id of the pending `GprCondAction { JumpToLabel(end_label) }`
+    /// guard run. `None` = no guard run in progress.
+    ///
+    /// The matching `VmInstr::MarkLabel { label_id: end_label }` is emitted by
+    /// `close_guard_run` / `close_pending_guard_run` when the guard run ends
+    /// (either a different guard opens or all groups are processed).
+    ///
+    /// Replaces the fragile `guard_skip_patch: Option<usize>` + `Skip(N)` count
+    /// mechanism (BCE-20260724-PLAN-C-RESIDUAL-BREAK): counting non-meta instrs
+    /// from patch_idx+1 to program-end over-counted into subsequent groups'
+    /// instructions, causing Q5_K_M SIGSEGV when Plan C's AddPtr shifted the count.
+    /// JumpToLabel + MarkLabel makes the jump target explicit and count-independent.
+    pub guard_end_label: Option<usize>,
 }
 
 #[cfg(test)]

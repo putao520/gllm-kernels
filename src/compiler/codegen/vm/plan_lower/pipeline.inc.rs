@@ -277,7 +277,7 @@ pub(super) fn emit_fusion_groups(
         hetero_global_layer_idx: None,
         hetero_outer_seg_counter: None,
         active_guard: LayerCondition::Always,
-        guard_skip_patch: None,
+        guard_end_label: None,
     };
 
     // Alias ABI ptrs for convenient access inside the loop.
@@ -396,25 +396,16 @@ pub(super) fn emit_fusion_groups(
             use std::io::Write;
             std::io::stderr().flush().ok();
         }
-        // BCE-20260713-ACTIVATION-SWAP-PARITY (Plan C): 每组重置 ping/pong 到初始 buffer.
-        // ⚠️ BCE-20260724-PLAN-C-RESIDUAL-BREAK: Plan C 破坏 BF16 残差(每组前 ping=emb →
-        // attn_resid=emb+attn_output 而非 prev_layer_out+attn_output), N=28 logits 趋同
-        // (argmax 恒定). 但删除后 Q5_K_M N=28 core dump (GDB 定位: Q5KDecodeStep block_base
-        // spill 槽被覆盖 → reload 得 0 → NULL 解引用, 详见 BUG-KNOWLEDGE 方向66i).
-        // 真根因是 regalloc spill slot 管理 bug (Q5 大代码下复用覆盖活跃 VReg), Plan C 的
-        // AddPtr 改变 regalloc 决策"碰巧"避开冲突 spill 槽. 待 regalloc 修复后再删 Plan C.
-        if let Some((ping_ptr, pong_ptr)) = locals.activation_swap_vregs {
-            let ping_off = fctx.alloc.slots.iter()
-                .find(|s| s.tensor_id.0 == 0xFFFF_FF00)
-                .map(|s| s.offset);
-            let pong_off = fctx.alloc.slots.iter()
-                .find(|s| s.tensor_id.0 == 0xFFFF_FF01)
-                .map(|s| s.offset);
-            if let (Some(po), Some(ngo)) = (ping_off, pong_off) {
-                prog.emit(VmInstr::AddPtr { dst: ping_ptr, base: locals.scratch_base, offset: po });
-                prog.emit(VmInstr::AddPtr { dst: pong_ptr, base: locals.scratch_base, offset: ngo });
-            }
-        }
+        // BCE-20260724-PLAN-C-RESIDUAL-BREAK: Plan C (per-group ping/pong AddPtr
+        // reset) DELETED. Root cause of Q5_K_M SIGSEGV was the Skip(N) count
+        // over-reaching into subsequent groups' instructions (including Plan C's
+        // AddPtr) in close_guard_run/close_pending_guard_run — now fixed by
+        // JumpToLabel + MarkLabel. Plan C's AddPtr was papering over the count
+        // bug (shifting regalloc decisions to "happen to" avoid spill conflicts)
+        // while simultaneously breaking BF16 residual stream (each group reset
+        // ping=embedding → attn_resid=emb+attn_output instead of
+        // prev_layer_out+attn_output → N=28 logits converge, argmax frozen).
+        // With the Skip(N) count bug eradicated, Plan C is no longer needed.
         emit_one_fusion_group(
             fctx, prog, current_abi, resolver, &mut state, group, &locals,
         )?;
@@ -463,19 +454,16 @@ pub(super) fn emit_fusion_groups(
     Ok(())
 }
 
-/// 关闭未闭合的 guard run: patch-back Skip 计数 (仅计非 meta 指令)。
+/// 关闭未闭合的 guard run: emit MarkLabel to anchor the JumpToLabel target.
+///
+/// The guard's `GprCondAction { JumpToLabel(end_label) }` was emitted with a
+/// label_id allocated up-front; here we emit the matching `MarkLabel` at the
+/// guard run's end. This replaces the fragile `Skip(N)` count-back mechanism
+/// (BCE-20260724-PLAN-C-RESIDUAL-BREAK) whose non-meta instruction count
+/// over-reached into subsequent groups' instructions.
 fn close_pending_guard_run(prog: &mut VmProgram, state: &mut EmitState) {
-    if let Some(patch_idx) = state.guard_skip_patch.take() {
-        // Skip count must only include non-meta instructions (see comment in emit_group_guard_and_body).
-        let skip_n = prog.instrs[patch_idx + 1..]
-            .iter()
-            .filter(|i| !i.is_meta())
-            .count();
-        if let VmInstr::GprCondAction {
-            action: GprBranchAction::Skip(ref mut n), ..
-        } = prog.instrs[patch_idx] {
-            *n = skip_n;
-        }
+    if let Some(end_label) = state.guard_end_label.take() {
+        prog.emit(VmInstr::MarkLabel { label_id: end_label });
     }
 }
 
@@ -528,8 +516,11 @@ fn close_layer_loop(
     // The last iteration wrote to pong, then swapped — so pong_ptr now
     // points to the WRONG buffer. One more swap restores correctness.
     // BCE-20260713-ACTIVATION-SWAP-PARITY: restored (was removed in 210b0d6e
-    // which broke N=odd post-loop). Plan C adds per-group reset to cover the
-    // cross-group flip that this parity fix causes.
+    // which broke N=odd post-loop).
+    // Note: Plan C's per-group AddPtr reset (which previously "covered" the
+    // cross-group flip) was DELETED in BCE-20260724-PLAN-C-RESIDUAL-BREAK
+    // (root-caused as papering over the Skip(N) count bug in guard close,
+    // and breaking BF16 residual stream). This post-loop parity swap remains.
     if let Some((ping, pong)) = locals.activation_swap_vregs {
         prog.emit(VmInstr::ActivationSwap { ptr_a: ping, ptr_b: pong });
     }
@@ -1303,11 +1294,15 @@ fn emit_group_guard_and_body(
                         }
                         LayerCondition::Always => unreachable!(),
                     };
+                    // BCE-20260724-PLAN-C-RESIDUAL-BREAK: JumpToLabel + MarkLabel
+                    // replaces Skip(N) count-back (count over-reached into later
+                    // groups' instrs → Q5_K_M SIGSEGV when Plan C shifted counts).
+                    let end_label = prog.alloc_label();
                     prog.emit(VmInstr::GprCondAction {
                         cond: skip_cond,
-                        action: GprBranchAction::Skip(0),
+                        action: GprBranchAction::JumpToLabel(end_label),
                     });
-                    state.guard_skip_patch = Some(prog.instrs.len() - 1);
+                    state.guard_end_label = Some(end_label);
                 }
             }
 
@@ -1380,11 +1375,15 @@ fn emit_group_guard_and_body(
                     }
                     LayerCondition::Always => unreachable!(),
                 };
+                // BCE-20260724-PLAN-C-RESIDUAL-BREAK: JumpToLabel + MarkLabel
+                // replaces Skip(N) count-back (count over-reached into later
+                // groups' instrs → Q5_K_M SIGSEGV when Plan C shifted counts).
+                let end_label = prog.alloc_label();
                 prog.emit(VmInstr::GprCondAction {
                     cond: skip_cond,
-                    action: GprBranchAction::Skip(0),
+                    action: GprBranchAction::JumpToLabel(end_label),
                 });
-                state.guard_skip_patch = Some(prog.instrs.len() - 1);
+                state.guard_end_label = Some(end_label);
             }
         }
 
@@ -1426,21 +1425,15 @@ fn emit_group_guard_and_body(
     Ok(())
 }
 
-/// 关闭一个 guard run: patch-back GprCondAction.Skip 计数 (仅计非 meta 指令)。
+/// 关闭一个 guard run: emit MarkLabel to anchor the JumpToLabel target.
 ///
-/// x86 codegen only decrements the skip counter for non-meta instructions,
-/// so counting meta ones here would extend the skip range past the intended boundary.
+/// Mirrors `close_pending_guard_run`: emits the matching `MarkLabel` for the
+/// pending `GprCondAction { JumpToLabel(end_label) }` so the conditional jump
+/// lands exactly at the guard run boundary — no fragile instruction counting.
+/// (BCE-20260724-PLAN-C-RESIDUAL-BREAK)
 fn close_guard_run(prog: &mut VmProgram, state: &mut EmitState) {
-    if let Some(patch_idx) = state.guard_skip_patch.take() {
-        let skip_n = prog.instrs[patch_idx + 1..]
-            .iter()
-            .filter(|i| !i.is_meta())
-            .count();
-        if let VmInstr::GprCondAction {
-            action: GprBranchAction::Skip(ref mut n), ..
-        } = prog.instrs[patch_idx] {
-            *n = skip_n;
-        }
+    if let Some(end_label) = state.guard_end_label.take() {
+        prog.emit(VmInstr::MarkLabel { label_id: end_label });
     }
 }
 
