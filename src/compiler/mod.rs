@@ -105,6 +105,13 @@ pub struct MegaKernelCompileOutput {
     /// JIT source map — 仅当 debug_jit=true 时生成。
     /// 包含 VmInstr → 机器码偏移 → Op 标签的映射，供 DAP 调试器使用。
     pub source_map: Option<codegen::vm::debug_map::JitSourceMap>,
+    /// VmInstr → 机器码字节偏移区间映射 (BCE-20260724-PLAN-C-RESIDUAL-BREAK)。
+    /// 仅 X86_64 MachineCode 路径生成 (finalize_with_diag)；其他后端 None。
+    /// 诊断工具: 崩溃 RIP → 此 map → 定位崩溃 VmInstr (无需 GDB)。
+    pub vm_instr_map: Option<codegen::vm::debug_map::VmInstrOffsetMap>,
+    /// const_pool / data_tables 布局审计 (BCE-20260724-PLAN-C-RESIDUAL-BREAK)。
+    /// 仅 X86_64 MachineCode 路径生成 (finalize_with_diag)；其他后端 None。
+    pub const_pool_audit: Option<codegen::vm::debug_map::ConstPoolAudit>,
     /// BCE-20260629-006: Intermediate tensor sources (TensorId → TensorPtrSource)
     /// 供 DIAG harness 动态查询 intermediate tensor 的 scratchpad offset。
     /// 之前 compile 内部丢弃了 BufferAllocation.tensor_sources，现在透出。
@@ -737,7 +744,12 @@ impl InferenceCompiler {
             lowerer.emit_epilogue(&frame, &alloc_result)
                 .map_err(InferenceError::CompileError)?;
             let lowerer_source_map = lowerer.take_source_map();
-            let code = lowerer.finalize()
+            // BCE-20260724-PLAN-C-RESIDUAL-BREAK: finalize_with_diag 返回
+            // (code, VmInstrOffsetMap, ConstPoolAudit) — 诊断工具透传到
+            // MegaKernelCompileOutput → MegaKernelExecutor → dump_offset_map。
+            // 非 X86_64 后端无 finalize_with_diag (该 impl 仅 x86), 但 compile_cpu
+            // 的 jit-x86 feature gate 保证此处只编译 x86 路径。
+            let (code, vm_instr_map, const_pool_audit) = lowerer.finalize_with_diag()
                 .map_err(InferenceError::CompileError)?;
             eprintln!("[JIT-TIME] Total code size: {} bytes", code.len());
             // Dump JIT machine code for debugging
@@ -795,6 +807,18 @@ impl InferenceCompiler {
                 None
             };
 
+            // BCE-20260724-PLAN-C-RESIDUAL-BREAK: VmInstr offset map + const_pool audit
+            // 仅在 debug 路径保留 (GLLM_DUMP_OFFSETMAP / GLLM_DUMP_MEGA / debug_jit 任一)。
+            // 非 debug 编译丢弃 → 生产零开销 (Option::None)。
+            let dump_diag = config.debug_jit
+                || std::env::var("GLLM_DUMP_OFFSETMAP").is_ok()
+                || std::env::var("GLLM_DUMP_MEGA").is_ok();
+            let (vm_instr_map, const_pool_audit) = if dump_diag {
+                (Some(vm_instr_map), Some(const_pool_audit))
+            } else {
+                (None, None)
+            };
+
             // BCE-20260623-001 regression guard: scratchpad must be large enough
             // for the output copy in execute_as_mega_kernel (copy_nonoverlapping
             // reads output_float_elems f32 from scratchpad[logits_scratch_offset]).
@@ -817,6 +841,8 @@ impl InferenceCompiler {
                 logits_scratch_offset,
                 hetero_layout,
                 source_map,
+                vm_instr_map,
+                const_pool_audit,
                 tensor_sources: {
                     // BCE-20260706-ACTSWAP-FIX (根治): tensor_sources 由 build_tensor_sources 正确构建.
                     // 删除旧 BCE-20260629-005 的 gather 强制 Intermediate (会覆盖 in_tid=embedding
@@ -1377,6 +1403,8 @@ mod tests {
             hetero_layout: None,
             tensor_sources: std::collections::HashMap::new(),
             source_map: None,
+            vm_instr_map: None,
+            const_pool_audit: None,
         };
 
         // Assert: field values preserved
@@ -1388,6 +1416,8 @@ mod tests {
         assert!(output.rope_cache.is_none());
         assert!(output.hetero_layout.is_none());
         assert!(output.source_map.is_none());
+        assert!(output.vm_instr_map.is_none());
+        assert!(output.const_pool_audit.is_none());
         assert!(output.layer_code.code_size() > 0);
     }
 
@@ -1806,6 +1836,8 @@ mod tests {
             hetero_layout: None,
             tensor_sources: std::collections::HashMap::new(),
             source_map: None,
+            vm_instr_map: None,
+            const_pool_audit: None,
         };
         // Verify field access works
         assert_eq!(output.num_layers, 1);
