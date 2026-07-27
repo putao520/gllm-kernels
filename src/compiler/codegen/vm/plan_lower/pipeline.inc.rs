@@ -565,10 +565,6 @@ fn emit_one_fusion_group(
 
     // ── Heterogeneous / mixed-quant / standard layer loop handling ──
     if fctx.graph.hetero_layer_loop_config.is_some() {
-        // DEBUG: trace hetero phase + layer_loop_counter for each group
-        let anchor = fctx.graph.op(group.ops[0]).map(|op| op.label.as_str()).unwrap_or("?");
-        eprintln!("[HETERO-TRACE] group ops[0]={:?} hetero_type={:?} phase={:?} counter={}",
-            anchor, group.hetero_layer_type, state.hetero_phase, state.abi.layer_loop_counter.is_some());
         handle_hetero_layer_loop(fctx, prog, state, group, locals)?;
     } else if fctx.graph.mixed_quant_layer_loop_config.is_some() {
         handle_mixed_quant_layer_loop(fctx, prog, state, group, locals)?;

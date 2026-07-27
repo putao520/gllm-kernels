@@ -866,10 +866,12 @@ fn assign_hetero_markers(
     let mut labeled_layer_indices = Vec::new();
     let mut in_layer_run = false;
     for (i, group) in groups.iter().enumerate() {
-        let anchor_label = graph.op(group.ops[0])
-            .map(|op| op.label.as_str())
+        // Search all ops (fusion may reorder, ops[0] may not carry layer prefix)
+        let group_label = group.ops.iter()
+            .find_map(|&oid| graph.op(oid).map(|op| op.label.as_str()))
+            .filter(|l| l.contains("layer_"))
             .unwrap_or("");
-        if anchor_label.starts_with("layer.") {
+        if group_label.starts_with("layer_") {
             labeled_layer_indices.push(i);
             in_layer_run = true;
         } else if in_layer_run {
@@ -968,17 +970,19 @@ fn derive_hetero_layer_type(
     // label prefixes per layer type: "layer_sliding_small", "layer_full_small",
     // "layer_sliding_large", "layer_full_large". This is more reliable than
     // head_dim (which can be identical for sliding/full in some Gemma4 variants
-    // like E2B where key_length=512 for all layers).
-    let anchor_label = graph.op(group.ops[0])
-        .map(|op| op.label.as_str())
+    // like E2B where key_length=512 for all layers). Check ALL ops in the group
+    // (fusion may reorder ops, so ops[0] may not carry the layer prefix).
+    let group_label = group.ops.iter()
+        .find_map(|&oid| graph.op(oid).map(|op| op.label.as_str()))
+        .filter(|l| l.contains("layer_"))
         .unwrap_or("");
-    if anchor_label.starts_with("layer_sliding_small") {
+    if group_label.starts_with("layer_sliding_small") {
         return Some(HeteroLayerType::SlidingSmall);
-    } else if anchor_label.starts_with("layer_full_small") {
+    } else if group_label.starts_with("layer_full_small") {
         return Some(HeteroLayerType::FullSmall);
-    } else if anchor_label.starts_with("layer_sliding_large") {
+    } else if group_label.starts_with("layer_sliding_large") {
         return Some(HeteroLayerType::SlidingLarge);
-    } else if anchor_label.starts_with("layer_full_large") {
+    } else if group_label.starts_with("layer_full_large") {
         return Some(HeteroLayerType::FullLarge);
     }
 
