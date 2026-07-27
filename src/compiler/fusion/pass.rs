@@ -928,12 +928,12 @@ fn extract_hetero_dims(graph: &CompilerGraph) -> Option<HeteroDims> {
     head_dims.sort_unstable();
     head_dims.dedup();
 
-    if head_dims.len() < 2 {
-        return None;
-    }
-
-    let sliding_head_dim = head_dims[0];
-    let full_head_dim = head_dims[1];
+    // Gemma4 E2B has uniform head_dim across all layers (sliding vs full
+    // distinguished by attention window, not head_dim). When only 1 distinct
+    // head_dim exists, still return Some so derive_hetero_layer_type can use
+    // label-based detection (layer_sliding_*/layer_full_* prefixes).
+    let sliding_head_dim = head_dims.first().copied().unwrap_or(0);
+    let full_head_dim = if head_dims.len() >= 2 { head_dims[1] } else { sliding_head_dim };
 
     intermediates.sort_unstable();
     intermediates.dedup();
@@ -964,7 +964,26 @@ fn derive_hetero_layer_type(
 ) -> Option<super::types::HeteroLayerType> {
     use super::types::HeteroLayerType;
 
-    // Determine if this group has sliding or full attention
+    // ── Label-based detection (primary): Gemma4 build_graph assigns distinct
+    // label prefixes per layer type: "layer_sliding_small", "layer_full_small",
+    // "layer_sliding_large", "layer_full_large". This is more reliable than
+    // head_dim (which can be identical for sliding/full in some Gemma4 variants
+    // like E2B where key_length=512 for all layers).
+    let anchor_label = graph.op(group.ops[0])
+        .map(|op| op.label.as_str())
+        .unwrap_or("");
+    if anchor_label.starts_with("layer_sliding_small") {
+        return Some(HeteroLayerType::SlidingSmall);
+    } else if anchor_label.starts_with("layer_full_small") {
+        return Some(HeteroLayerType::FullSmall);
+    } else if anchor_label.starts_with("layer_sliding_large") {
+        return Some(HeteroLayerType::SlidingLarge);
+    } else if anchor_label.starts_with("layer_full_large") {
+        return Some(HeteroLayerType::FullLarge);
+    }
+
+    // ── Head_dim-based detection (fallback): when labels are absent, use
+    // attention head_dim to distinguish sliding vs full.
     let is_sliding = group.ops.iter().any(|&oid| {
         graph.op(oid).map_or(false, |op| {
             op.op_attention_head_dim(graph) == Some(dims.sliding_head_dim)
