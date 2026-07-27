@@ -278,12 +278,13 @@ fn emit_sparse_masked_load(
     match bitmap_val {
         Some(bmp) => {
             // Test bit `channel_group` in the bitmap.
-            // If the bit is clear (inactive channel) → skip VecLoad + Branch, broadcast 0.0.
+            // If the bit is clear (inactive channel) → jump to inactive_label for zero fill.
             // If the bit is set (active channel)   → perform normal VecLoad, branch past broadcast.
-            let patch_idx = prog.instrs.len();
+            // BCE-20260727-SKIP-COUNT-OVERREACH: migrated Skip(N) counting to JumpToLabel+MarkLabel.
+            let inactive_label = prog.alloc_label();
             prog.emit(VmInstr::GprCondAction {
                 cond: GprCondition::BitClear(bmp, channel_group as u8),
-                action: GprBranchAction::Skip(0), // patched below
+                action: GprBranchAction::JumpToLabel(inactive_label),
             });
             // Active path: load the channel data
             prog.emit(VmInstr::VecLoad { dst, base, offset, width, dtype , predicate: None });
@@ -291,12 +292,9 @@ fn emit_sparse_masked_load(
             let done_label = prog.alloc_label();
             prog.emit(VmInstr::UnconditionalBranch { target_label: done_label });
             // Inactive path: zero out the channel
+            prog.emit(VmInstr::MarkLabel { label_id: inactive_label });
             prog.emit(VmInstr::Broadcast { dst, src: ScalarExpr::Const(0.0), width, dtype });
             prog.emit(VmInstr::MarkLabel { label_id: done_label });
-            // Patch: BitClear → skip over VecLoad + UnconditionalBranch (2 instructions)
-            if let VmInstr::GprCondAction { action: GprBranchAction::Skip(ref mut sc), .. } = prog.instrs[patch_idx] {
-                *sc = 2;
-            }
         }
         None => {
             prog.emit(VmInstr::VecLoad { dst, base, offset, width, dtype , predicate: None });
@@ -399,11 +397,12 @@ fn emit_decompress_page(
     let dst_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     prog.emit(VmInstr::AddPtr { dst: dst_ptr, base: ctx.scratch_ptr, offset: kv_h * head_bytes });
     let bpr_label = prog.alloc_label();
+    // BCE-20260727-SKIP-COUNT-OVERREACH: migrated Skip(N) counting to JumpToLabel.
+    // CmpEq(codec,1) → jump to done_skip_label (same landing as former Skip-to-end).
     prog.emit(VmInstr::GprCondAction {
         cond: GprCondition::CmpEq(codec_gpr, 1),
-        action: GprBranchAction::Skip(0),
+        action: GprBranchAction::JumpToLabel(done_skip_label),
     });
-    let bpr_patch = prog.instrs.len() - 1;
     emit_lz4_decode(prog, src_ptr, dst_ptr, csz_gpr, ctx.page_decompress_bytes);
     let done_label = prog.alloc_label();
     prog.emit(VmInstr::UnconditionalBranch { target_label: done_label });
@@ -413,10 +412,6 @@ fn emit_decompress_page(
     prog.emit(VmInstr::MemFence { order: MemFenceOrder::AcqRel });
     prog.emit(VmInstr::AddPtr { dst: k_row, base: ctx.scratch_ptr, offset: kv_h * head_bytes });
     prog.emit(VmInstr::AddPtr { dst: v_row, base: ctx.scratch_ptr, offset: kv_h * head_bytes });
-    let skip_count = prog.instrs[bpr_patch + 1..].iter().filter(|i| !i.is_meta()).count();
-    if let VmInstr::GprCondAction { action: GprBranchAction::Skip(ref mut sc), .. } = prog.instrs[bpr_patch] {
-        *sc = skip_count;
-    }
     prog.emit(VmInstr::UnconditionalBranch { target_label: done_skip_label });
     prog.emit(VmInstr::MarkLabel { label_id: skip_label });
     prog.emit(VmInstr::AddPtr { dst: k_row, base: k_row, offset: 56 });
@@ -782,17 +777,16 @@ pub(crate) fn emit_tiled_attention_inline(
             }
         }
 
-        let mut sparse_skip_patch_idx: Option<usize> = None;
+        // BCE-20260727-SKIP-COUNT-OVERREACH: migrated Skip(N) counting to JumpToLabel+MarkLabel.
+        // BitClear(bitmap, kv_h) → jump to head_end_label (skip entire head loop body).
+        let head_end_label = prog.alloc_label();
         let sparse_bitmap_val = sparse_bitmap_ptr.map(|_| prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar));
         if let (Some(bmp_ptr), Some(bitmap_val)) = (sparse_bitmap_ptr, sparse_bitmap_val) {
             prog.emit(VmInstr::ScalarLoad { dst: bitmap_val, base: bmp_ptr, offset: OffsetExpr::Const(0) });
-            let patch_idx = prog.instrs.len();
-            prog.emit(VmInstr::GprCondAction { cond: GprCondition::BitClear(bitmap_val, kv_h as u8), action: GprBranchAction::Skip(0) });
-            sparse_skip_patch_idx = Some(patch_idx);
+            prog.emit(VmInstr::GprCondAction { cond: GprCondition::BitClear(bitmap_val, kv_h as u8), action: GprBranchAction::JumpToLabel(head_end_label) });
         }
         // Auto mode needs sparse_bitmap too (runtime tier dispatch may select Sparse path)
         let sparse_bmp_for_loads = if kv_load_mode == KvLoadMode::Sparse || kv_load_mode == KvLoadMode::Auto { sparse_bitmap_val } else { None };
-        let head_body_start = prog.instrs.len();
 
         let sink_init = sinks_ptr.map(|sv| {
             let sink_vec = prog.alloc_vreg(VRegKind::Vec, width);
@@ -1020,10 +1014,7 @@ pub(crate) fn emit_tiled_attention_inline(
             emit_normalize_store(prog, o_row, &o_acc, running_sum, hd_vecs, vec_step, width, dtype);
         }); // end qi
 
-        if let Some(patch_idx) = sparse_skip_patch_idx {
-            let skip_count = prog.instrs[head_body_start..].iter().filter(|i| !i.is_meta()).count();
-            if let VmInstr::GprCondAction { action: GprBranchAction::Skip(ref mut sc), .. } = prog.instrs[patch_idx] { *sc = skip_count; }
-        }
+        prog.emit(VmInstr::MarkLabel { label_id: head_end_label });
     } // end head
     Ok(())
 }
@@ -1055,7 +1046,7 @@ mod tests {
     /// 3. UnconditionalBranch (skip broadcast)
     /// 4. Broadcast 0.0 (inactive path)
     /// 5. MarkLabel (done)
-    /// And the Skip count is patched to 2.
+    /// And the action is JumpToLabel to the inactive (zero-fill) path.
     #[test]
     fn test_sparse_masked_load_with_bitmap() {
         let mut prog = VmProgram::new();
@@ -1068,7 +1059,7 @@ mod tests {
             Some(bmp), 4, SimdWidth::W256, QuantPrecision::F32,
         );
 
-        // Should have 5 instructions: GprCondAction, VecLoad, UnconditionalBranch, Broadcast, MarkLabel
+        // Should have 6 instructions: GprCondAction, VecLoad, UnconditionalBranch, MarkLabel(inactive), Broadcast, MarkLabel(done)
         let non_meta: Vec<_> = prog.instrs.iter().filter(|i| !i.is_meta()).collect();
         assert!(non_meta.len() >= 3, "sparse path should emit at least GprCondAction + VecLoad + Broadcast");
 
@@ -1081,8 +1072,8 @@ mod tests {
                     cond
                 );
                 assert!(
-                    matches!(action, GprBranchAction::Skip(2)),
-                    "expected Skip(2), got {:?}",
+                    matches!(action, GprBranchAction::JumpToLabel(_)),
+                    "expected JumpToLabel, got {:?}",
                     action
                 );
             }
@@ -1124,8 +1115,8 @@ mod tests {
                         ch, ch, cond
                     );
                     assert!(
-                        matches!(action, GprBranchAction::Skip(2)),
-                        "channel {}: expected Skip(2), got {:?}",
+                        matches!(action, GprBranchAction::JumpToLabel(_)),
+                        "channel {}: expected JumpToLabel, got {:?}",
                         ch, action
                     );
                 }
