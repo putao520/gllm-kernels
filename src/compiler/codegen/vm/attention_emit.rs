@@ -95,28 +95,26 @@ fn emit_tier_dispatch_k_load(
 
     // ── Path 1: Sparse (tier == 4) ──
     let sparse_label = prog.alloc_label();
+    // BCE-20260727-SKIP-COUNT-OVERREACH: migrated Skip(N)+patch-back to JumpToLabel+MarkLabel.
     prog.emit(VmInstr::GprCondAction {
         cond: GprCondition::CmpEq(tier_gpr, 4),
-        action: GprBranchAction::Skip(0), // patched below
+        action: GprBranchAction::JumpToLabel(sparse_label),
     });
-    let sparse_check_patch = prog.instrs.len() - 1;
 
     // ── Path 2: KIVI (tier == 2 or tier == 3) ──
     // Check tier == 2
     let kivi2_label = prog.alloc_label();
     prog.emit(VmInstr::GprCondAction {
         cond: GprCondition::CmpEq(tier_gpr, 2),
-        action: GprBranchAction::Skip(0),
+        action: GprBranchAction::JumpToLabel(kivi2_label),
     });
-    let kivi2_check_patch = prog.instrs.len() - 1;
 
     // Check tier == 3
     let kivi3_label = prog.alloc_label();
     prog.emit(VmInstr::GprCondAction {
         cond: GprCondition::CmpEq(tier_gpr, 3),
-        action: GprBranchAction::Skip(0),
+        action: GprBranchAction::JumpToLabel(kivi3_label),
     });
-    let kivi3_check_patch = prog.instrs.len() - 1;
 
     // ── Default path: Direct VecLoad (FP16=0, FP8=1, or unknown) ──
     prog.emit(VmInstr::VecLoad { dst, base: k_row, offset: d_off.clone(), width, dtype , predicate: None });
@@ -140,21 +138,6 @@ fn emit_tier_dispatch_k_load(
     // fall through to done_label
 
     prog.emit(VmInstr::MarkLabel { label_id: done_label });
-
-    // Patch skip counts: each GprCondAction.Skip(N) means "skip N non-meta instructions"
-    // sparse_check: skip over kivi2_check + kivi3_check + VecLoad + UnconditionalBranch = 4
-    patch_skip_count(prog, sparse_check_patch, 4);
-    // kivi2_check: skip over kivi3_check + VecLoad + UnconditionalBranch + sparse_path = ?
-    // We need to count non-meta instructions from kivi3_check_patch+1 to MarkLabel(kivi2_label)
-    let kivi2_skip = count_non_meta_between(prog, kivi2_check_patch + 1, |i| {
-        matches!(prog.instrs[i], VmInstr::MarkLabel { label_id } if label_id == kivi2_label)
-    });
-    patch_skip_count(prog, kivi2_check_patch, kivi2_skip);
-    // kivi3_check: skip over VecLoad + UnconditionalBranch + sparse_path
-    let kivi3_skip = count_non_meta_between(prog, kivi3_check_patch + 1, |i| {
-        matches!(prog.instrs[i], VmInstr::MarkLabel { label_id } if label_id == kivi3_label)
-    });
-    patch_skip_count(prog, kivi3_check_patch, kivi3_skip);
 }
 
 /// Emit a V-load with runtime tier dispatch (KvLoadMode::Auto).
@@ -182,26 +165,24 @@ fn emit_tier_dispatch_v_load(
 
     // Path 1: Sparse (tier == 4)
     let sparse_label = prog.alloc_label();
+    // BCE-20260727-SKIP-COUNT-OVERREACH: migrated Skip(N)+patch-back to JumpToLabel+MarkLabel.
     prog.emit(VmInstr::GprCondAction {
         cond: GprCondition::CmpEq(tier_gpr, 4),
-        action: GprBranchAction::Skip(0),
+        action: GprBranchAction::JumpToLabel(sparse_label),
     });
-    let sparse_check_patch = prog.instrs.len() - 1;
 
     // Path 2: KIVI (tier == 2 or 3)
     let kivi2_label = prog.alloc_label();
     prog.emit(VmInstr::GprCondAction {
         cond: GprCondition::CmpEq(tier_gpr, 2),
-        action: GprBranchAction::Skip(0),
+        action: GprBranchAction::JumpToLabel(kivi2_label),
     });
-    let kivi2_check_patch = prog.instrs.len() - 1;
 
     let kivi3_label = prog.alloc_label();
     prog.emit(VmInstr::GprCondAction {
         cond: GprCondition::CmpEq(tier_gpr, 3),
-        action: GprBranchAction::Skip(0),
+        action: GprBranchAction::JumpToLabel(kivi3_label),
     });
-    let kivi3_check_patch = prog.instrs.len() - 1;
 
     // Default: Direct VecLoad
     prog.emit(VmInstr::VecLoad { dst, base: v_row, offset: d_off.clone(), width, dtype , predicate: None });
@@ -224,37 +205,6 @@ fn emit_tier_dispatch_v_load(
     }
 
     prog.emit(VmInstr::MarkLabel { label_id: done_label });
-
-    patch_skip_count(prog, sparse_check_patch, 4);
-    let kivi2_skip = count_non_meta_between(prog, kivi2_check_patch + 1, |i| {
-        matches!(prog.instrs[i], VmInstr::MarkLabel { label_id } if label_id == kivi2_label)
-    });
-    patch_skip_count(prog, kivi2_check_patch, kivi2_skip);
-    let kivi3_skip = count_non_meta_between(prog, kivi3_check_patch + 1, |i| {
-        matches!(prog.instrs[i], VmInstr::MarkLabel { label_id } if label_id == kivi3_label)
-    });
-    patch_skip_count(prog, kivi3_check_patch, kivi3_skip);
-}
-
-/// Patch the Skip count of a GprCondAction at `patch_idx`.
-fn patch_skip_count(prog: &mut VmProgram, patch_idx: usize, count: usize) {
-    if let VmInstr::GprCondAction { action: GprBranchAction::Skip(ref mut sc), .. } = prog.instrs[patch_idx] {
-        *sc = count;
-    }
-}
-
-/// Count non-meta instructions from `start` until the predicate matches (inclusive of matching index).
-fn count_non_meta_between(prog: &VmProgram, start: usize, until: impl Fn(usize) -> bool) -> usize {
-    let mut count = 0;
-    for i in start..prog.instrs.len() {
-        if until(i) {
-            return count;
-        }
-        if !prog.instrs[i].is_meta() {
-            count += 1;
-        }
-    }
-    count
 }
 
 /// MUSTAFAR sparse channel-group masked load (REQ-KV-OPT-005).
@@ -1783,78 +1733,6 @@ mod tests {
             "precision_tier field must be at byte offset 28 in KvPageHeader");
     }
 
-    /// Verify `patch_skip_count` correctly updates the Skip count of a GprCondAction
-    /// at a given index and leaves other instructions unchanged.
-    #[test]
-    fn test_patch_skip_count_updates_correct_instruction() {
-        let mut prog = VmProgram::new();
-        let gpr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-
-        prog.emit(VmInstr::Broadcast { dst: gpr, src: ScalarExpr::Const(0.0), width: SimdWidth::Scalar, dtype: QuantPrecision::F32 });
-        // GprCondAction with Skip(0) — the target for patching
-        prog.emit(VmInstr::GprCondAction {
-            cond: GprCondition::CmpEq(gpr, 4),
-            action: GprBranchAction::Skip(0),
-        });
-        let patch_idx = prog.instrs.len() - 1;
-        prog.emit(VmInstr::Broadcast { dst: gpr, src: ScalarExpr::Const(1.0), width: SimdWidth::Scalar, dtype: QuantPrecision::F32 });
-
-        patch_skip_count(&mut prog, patch_idx, 7);
-
-        match &prog.instrs[patch_idx] {
-            VmInstr::GprCondAction { action: GprBranchAction::Skip(n), .. } => {
-                assert_eq!(*n, 7, "patch_skip_count should set Skip to 7");
-            }
-            other => panic!("expected GprCondAction at patch_idx, got {:?}", other),
-        }
-
-        // Verify surrounding instructions are unchanged
-        let broadcasts: Vec<_> = prog.instrs.iter()
-            .filter(|i| matches!(i, VmInstr::Broadcast { .. }))
-            .collect();
-        assert_eq!(broadcasts.len(), 2, "surrounding Broadcasts should be unchanged");
-    }
-
-    /// Verify `count_non_meta_between` returns 0 when the predicate immediately matches
-    /// at the start index.
-    #[test]
-    fn test_count_non_meta_between_immediate_match() {
-        let mut prog = VmProgram::new();
-        let v = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let label = prog.alloc_label();
-
-        prog.emit(VmInstr::Broadcast { dst: v, src: ScalarExpr::Const(0.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
-        prog.emit(VmInstr::MarkLabel { label_id: label });
-        let mark_idx = prog.instrs.len() - 1;
-
-        // Start scanning at mark_idx, predicate matches immediately → count = 0
-        let count = count_non_meta_between(&prog, mark_idx, |i| i == mark_idx);
-        assert_eq!(count, 0, "immediate match should return 0");
-    }
-
-    /// Verify `count_non_meta_between` correctly skips meta instructions and counts
-    /// only non-meta ones until the predicate matches.
-    #[test]
-    fn test_count_non_meta_between_skips_meta() {
-        let mut prog = VmProgram::new();
-        let v = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let label = prog.alloc_label();
-
-        let start_idx = prog.instrs.len();
-        // Non-meta: Broadcast
-        prog.emit(VmInstr::Broadcast { dst: v, src: ScalarExpr::Const(0.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
-        // Meta: Comment
-        prog.emit(VmInstr::Comment("test".into()));
-        // Non-meta: another Broadcast
-        prog.emit(VmInstr::Broadcast { dst: v, src: ScalarExpr::Const(1.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
-        // Meta: MarkLabel (this is the target)
-        prog.emit(VmInstr::MarkLabel { label_id: label });
-        let target_idx = prog.instrs.len() - 1;
-
-        let count = count_non_meta_between(&prog, start_idx, |i| i == target_idx);
-        assert_eq!(count, 2, "should count 2 non-meta Broadcast instructions before MarkLabel");
-    }
-
     /// Verify `emit_kv_row_ptrs` with paged KV and page_header_dst allocates
     /// a PageTableAddr for the page header with ki_byte_off=0 and base_offset=0.
     #[test]
@@ -2417,29 +2295,6 @@ mod tests {
         }
     }
 
-    /// Verify `patch_skip_count` is a no-op when the instruction at `patch_idx`
-    /// is not a GprCondAction (e.g., it's a Broadcast) — the instruction should
-    /// remain unchanged.
-    // @trace TEST-12k64
-    #[test]
-    fn test_patch_skip_count_noop_on_non_cond_action() {
-        let mut prog = VmProgram::new();
-        let v = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        prog.emit(VmInstr::Broadcast { dst: v, src: ScalarExpr::Const(42.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
-        let broadcast_idx = prog.instrs.len() - 1;
-
-        // Act: patch_skip_count on a Broadcast should silently do nothing
-        patch_skip_count(&mut prog, broadcast_idx, 99);
-
-        // Assert: instruction is unchanged
-        match &prog.instrs[broadcast_idx] {
-            VmInstr::Broadcast { src: ScalarExpr::Const(v), .. } => {
-                assert_eq!(*v, 42.0, "Broadcast should be unchanged after no-op patch");
-            }
-            other => panic!("expected unchanged Broadcast, got {:?}", other),
-        }
-    }
-
     /// Verify `emit_tiled_attention_inline` with causal=true compiles successfully
     /// and emits a DynamicVRegPlusOne bound for the ki loop (causal mask).
     // @trace TEST-12k64
@@ -2677,30 +2532,6 @@ mod tests {
             VmInstr::Broadcast { src: ScalarExpr::MemLoad(..), .. }
         ));
         assert!(has_memload_sink, "with sinks, running_max should init from MemLoad(sinks_ptr)");
-    }
-
-    /// Verify `count_non_meta_between` returns the correct count when all instructions
-    /// between start and the predicate are non-meta (no Comments or MarkLabels interspersed).
-    // @trace TEST-12k64
-    #[test]
-    fn test_count_non_meta_between_all_non_meta() {
-        let mut prog = VmProgram::new();
-        let v = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let label = prog.alloc_label();
-
-        let start_idx = prog.instrs.len();
-        // 3 non-meta instructions
-        prog.emit(VmInstr::Broadcast { dst: v, src: ScalarExpr::Const(0.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
-        prog.emit(VmInstr::Broadcast { dst: v, src: ScalarExpr::Const(1.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
-        prog.emit(VmInstr::Broadcast { dst: v, src: ScalarExpr::Const(2.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
-        prog.emit(VmInstr::MarkLabel { label_id: label });
-        let target_idx = prog.instrs.len() - 1;
-
-        // Act
-        let count = count_non_meta_between(&prog, start_idx, |i| i == target_idx);
-
-        // Assert: 3 non-meta instructions before the MarkLabel
-        assert_eq!(count, 3, "should count exactly 3 non-meta Broadcast instructions");
     }
 
     // ── Wave 12k87: +10 new tests ────────────────────────────────────────────
@@ -3327,23 +3158,6 @@ mod tests {
             .filter(|i| matches!(i, VmInstr::SharedMemAsyncStore { .. }))
             .count();
         assert_eq!(async_stores, 0, "sync mode should not emit SharedMemAsyncStore");
-    }
-
-    /// Verify `count_non_meta_between` returns 0 when start equals program length
-    /// (empty scan range, no instructions to examine).
-    // @trace TEST-12kar
-    #[test]
-    fn test_count_non_meta_between_empty_range() {
-        let mut prog = VmProgram::new();
-        let v = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        prog.emit(VmInstr::Broadcast { dst: v, src: ScalarExpr::Const(0.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
-
-        // Start at len() — no instructions to scan, predicate never matches
-        let start = prog.instrs.len();
-        let count = count_non_meta_between(&prog, start, |_i| false);
-
-        // Should return 0 because there are no instructions in range
-        assert_eq!(count, 0, "empty scan range should return 0");
     }
 
     /// Verify `emit_decompress_page` emits a ScalarLoad at offset 0x2C for
