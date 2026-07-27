@@ -50,7 +50,24 @@ pub struct AArch64Lower {
     /// 目标平台特性
     platform: AArch64Features,
     /// 标签表: label_id -> code_offset (用于 MarkLabel 和分支回填)
+    ///
+    /// 历史遗留字段，被 lower_branch_if_ptr_non_null_aarch64 / lower_mark_label_aarch64
+    /// 写入但从未被读取回填 (BCE-20260727-AARCH64-JUMPTOLABEL)。
+    /// 新代码应使用 `pending_labels` + `resolved_labels` 两阶段回填机制。
     labels: std::collections::HashMap<usize, usize>,
+    /// 待回填的 label 引用: label_id -> (分支指令 patch site byte offset, is_imm26) 列表。
+    ///
+    /// JumpToLabel / BranchIfPtrNonNull emit 条件分支占位 (imm=0) 时记录
+    /// patch site；MarkLabel emit 时用目标 offset 回填所有引用该 label 的
+    /// patch site 的 imm19 (条件分支) 或 imm26 (无条件 B)。支持前向引用
+    /// (JumpToLabel 先于 MarkLabel)。
+    /// BCE-20260727-AARCH64-JUMPTOLABEL: 替代旧 `labels` map 的 dead-write 机制。
+    pending_labels: std::collections::HashMap<usize, Vec<(usize, bool)>>,
+    /// 已解析的 label 目标: label_id -> code_offset。
+    ///
+    /// MarkLabel emit 时记录。支持后向引用 (MarkLabel 先于 JumpToLabel):
+    /// JumpToLabel emit 时若 label 已解析则立即回填，否则记录 pending patch site。
+    resolved_labels: std::collections::HashMap<usize, usize>,
     /// 硬件资源生命周期追踪 (SPEC 15 REQ-JCTX-011)
     jit_ctx: crate::compiler::jit_context::JitContext,
 }

@@ -2549,33 +2549,51 @@ Ok(())
     fn lower_gpr_cond_action_aarch64(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
             VmInstr::GprCondAction { cond, action } => {
-
-                if matches!(action, GprBranchAction::JumpToLabel(_)) {
-                    return Err("GprCondAction: JumpToLabel is GPU-only, not supported on AArch64".into());
-                }
+                // @trace REQ-VR-003 [req:GprCondAction-JumpToLabel-AArch64] BCE-20260727-AARCH64-JUMPTOLABEL:
+                // aarch64 GprCondAction JumpToLabel 支持 (替代旧 GPU-only 拒绝)。
+                // 6 个 GprCondition 分支 (IsNull/IsNonNull/BitClear/BitSet/CmpEq/CmpLtU/CmpGeU)
+                // 各自 emit 条件分支占位 + pending_labels 回填 imm19。
                 let scratch = 17u8; // x17 IP register (caller-saved scratch)
                 let extra_instrs: u32;
                 match cond {
                     GprCondition::IsNull(ptr) => {
                         let xn = self.resolve_gpr(*ptr, alloc)?;
-                        let skip_instrs = match action {
-                            GprBranchAction::Skip(n) => *n as u32 + 1,
-                            GprBranchAction::Exit(_) => 1,
-                            GprBranchAction::JumpToLabel(_) => unreachable!(),
-                        };
-                        let imm19 = skip_instrs & 0x7FFFF;
-                        self.emit32(0xB4000000 | (imm19 << 5) | (xn as u32));
+                        match action {
+                            GprBranchAction::Skip(n) => {
+                                let skip_instrs = *n as u32 + 1;
+                                let imm19 = skip_instrs & 0x7FFFF;
+                                self.emit32(0xB4000000 | (imm19 << 5) | (xn as u32));
+                            }
+                            GprBranchAction::Exit(_) => {
+                                self.emit32(0xB4000000 | (1u32 << 5) | (xn as u32));
+                            }
+                            GprBranchAction::JumpToLabel(label_id) => {
+                                // CBZ Xn, label (0xB4 = CBZ, 0xB5 = CBNZ)
+                                let branch_offset = self.current_offset();
+                                self.emit32(0xB4000000 | (xn as u32));
+                                self.record_label_patch_site(*label_id, branch_offset, false);
+                            }
+                        }
                         return Ok(());
                     }
                     GprCondition::IsNonNull(ptr) => {
                         let xn = self.resolve_gpr(*ptr, alloc)?;
-                        let skip_instrs = match action {
-                            GprBranchAction::Skip(n) => *n as u32 + 1,
-                            GprBranchAction::Exit(_) => 1,
-                            GprBranchAction::JumpToLabel(_) => unreachable!(),
-                        };
-                        let imm19 = skip_instrs & 0x7FFFF;
-                        self.emit32(0xB5000000 | (imm19 << 5) | (xn as u32));
+                        match action {
+                            GprBranchAction::Skip(n) => {
+                                let skip_instrs = *n as u32 + 1;
+                                let imm19 = skip_instrs & 0x7FFFF;
+                                self.emit32(0xB5000000 | (imm19 << 5) | (xn as u32));
+                            }
+                            GprBranchAction::Exit(_) => {
+                                self.emit32(0xB5000000 | (1u32 << 5) | (xn as u32));
+                            }
+                            GprBranchAction::JumpToLabel(label_id) => {
+                                // CBNZ Xn, label
+                                let branch_offset = self.current_offset();
+                                self.emit32(0xB5000000 | (xn as u32));
+                                self.record_label_patch_site(*label_id, branch_offset, false);
+                            }
+                        }
                         return Ok(());
                     }
                     GprCondition::BitClear(bitmap, bit) => {
@@ -2586,13 +2604,23 @@ Ok(())
                         let instr = ((1u32 << 31) | (0b100 << 28) | (0b100110 << 22))
                             | (immr << 16) | (imms << 10) | ((xn as u32) << 5) | (scratch as u32);
                         self.emit32(instr);
-                        let skip_instrs = match action {
-                            GprBranchAction::Skip(n) => *n as u32 + 2,
-                            GprBranchAction::Exit(_) => 2,
-                            GprBranchAction::JumpToLabel(_) => unreachable!(),
-                        };
-                        let imm19 = skip_instrs & 0x7FFFF;
-                        self.emit32(0xB4000000 | (imm19 << 5) | (scratch as u32));
+                        match action {
+                            GprBranchAction::Skip(n) => {
+                                let skip_instrs = *n as u32 + 2;
+                                let imm19 = skip_instrs & 0x7FFFF;
+                                self.emit32(0xB4000000 | (imm19 << 5) | (scratch as u32));
+                            }
+                            GprBranchAction::Exit(_) => {
+                                let imm19 = 2u32 & 0x7FFFF;
+                                self.emit32(0xB4000000 | (imm19 << 5) | (scratch as u32));
+                            }
+                            GprBranchAction::JumpToLabel(label_id) => {
+                                // bit clear → CBZ scratch, label (bit==0 means clear)
+                                let branch_offset = self.current_offset();
+                                self.emit32(0xB4000000 | (scratch as u32));
+                                self.record_label_patch_site(*label_id, branch_offset, false);
+                            }
+                        }
                         return Ok(());
                     }
                     GprCondition::BitSet(bitmap, bit) => {
@@ -2603,13 +2631,23 @@ Ok(())
                         let instr = ((1u32 << 31) | (0b100 << 28) | (0b100110 << 22))
                             | (immr << 16) | (imms << 10) | ((xn as u32) << 5) | (scratch as u32);
                         self.emit32(instr);
-                        let skip_instrs = match action {
-                            GprBranchAction::Skip(n) => *n as u32 + 2,
-                            GprBranchAction::Exit(_) => 2,
-                            GprBranchAction::JumpToLabel(_) => unreachable!(),
-                        };
-                        let imm19 = skip_instrs & 0x7FFFF;
-                        self.emit32(0xB5000000 | (imm19 << 5) | (scratch as u32));
+                        match action {
+                            GprBranchAction::Skip(n) => {
+                                let skip_instrs = *n as u32 + 2;
+                                let imm19 = skip_instrs & 0x7FFFF;
+                                self.emit32(0xB5000000 | (imm19 << 5) | (scratch as u32));
+                            }
+                            GprBranchAction::Exit(_) => {
+                                let imm19 = 2u32 & 0x7FFFF;
+                                self.emit32(0xB5000000 | (imm19 << 5) | (scratch as u32));
+                            }
+                            GprBranchAction::JumpToLabel(label_id) => {
+                                // bit set → CBNZ scratch, label
+                                let branch_offset = self.current_offset();
+                                self.emit32(0xB5000000 | (scratch as u32));
+                                self.record_label_patch_site(*label_id, branch_offset, false);
+                            }
+                        }
                         return Ok(());
                     }
                     GprCondition::CmpEq(vreg, val) => {
@@ -2623,59 +2661,94 @@ Ok(())
                             }
                             self.emit32(self.enc_cmp_reg(xn, scratch));
                         }
-                        extra_instrs = if *val <= 0xFFF { 1 } else if (*val >> 16) != 0 { 3 } else { 2 };
+                        extra_instrs = if *val <= 0xfff { 1 } else if (*val >> 16) != 0 { 3 } else { 2 };
+                        // fall through to common B.NE skip/exit/JumpToLabel below
                     }
                     GprCondition::CmpLtU(vreg, val) => {
                         let xn = self.resolve_gpr(*vreg, alloc)?;
-                        if *val <= 0xFFF {
+                        if *val <= 0xfff {
                             self.emit32(self.enc_cmp_imm(xn, *val as u32));
                         } else {
-                            self.emit32(self.enc_movz_x(scratch, (*val & 0xFFFF) as u16));
+                            self.emit32(self.enc_movz_x(scratch, (*val & 0xffff) as u16));
                             if (*val >> 16) != 0 {
-                                self.emit32(self.enc_movk_x_lsl16(scratch, ((*val >> 16) & 0xFFFF) as u16));
+                                self.emit32(self.enc_movk_x_lsl16(scratch, ((*val >> 16) & 0xffff) as u16));
                             }
                             self.emit32(self.enc_cmp_reg(xn, scratch));
                         }
-                        let setup_instrs = if *val <= 0xFFF { 1 } else if (*val >> 16) != 0 { 3 } else { 2 };
-                        let skip_instrs = match action {
-                            GprBranchAction::Skip(n) => *n as u32 + setup_instrs + 1,
-                            GprBranchAction::Exit(_) => setup_instrs + 1,
-                            GprBranchAction::JumpToLabel(_) => unreachable!(),
-                        };
-                        let imm19 = skip_instrs & 0x7FFFF;
-                        self.emit32(0x54000000u32 | (2u32 << 12) | (imm19 << 5));
+                        let setup_instrs = if *val <= 0xfff { 1 } else if (*val >> 16) != 0 { 3 } else { 2 };
+                        match action {
+                            GprBranchAction::Skip(n) => {
+                                let skip_instrs = *n as u32 + setup_instrs + 1;
+                                let imm19 = skip_instrs & 0x7FFFF;
+                                // B.LO label (cond=3 for LO/CC = unsigned lower)
+                                self.emit32(0x54000000u32 | (3u32 << 12) | (imm19 << 5));
+                            }
+                            GprBranchAction::Exit(_) => {
+                                let imm19 = (setup_instrs + 1) & 0x7FFFF;
+                                self.emit32(0x54000000u32 | (3u32 << 12) | (imm19 << 5));
+                            }
+                            GprBranchAction::JumpToLabel(label_id) => {
+                                // B.LO label — unsigned lower-than condition
+                                let branch_offset = self.current_offset();
+                                self.emit32(0x54000000u32 | (3u32 << 12));
+                                self.record_label_patch_site(*label_id, branch_offset, false);
+                            }
+                        }
                         return Ok(());
                     }
                     GprCondition::CmpGeU(vreg, val) => {
                         let xn = self.resolve_gpr(*vreg, alloc)?;
-                        if *val <= 0xFFF {
+                        if *val <= 0xfff {
                             self.emit32(self.enc_cmp_imm(xn, *val as u32));
                         } else {
-                            self.emit32(self.enc_movz_x(scratch, (*val & 0xFFFF) as u16));
+                            self.emit32(self.enc_movz_x(scratch, (*val & 0xffff) as u16));
                             if (*val >> 16) != 0 {
-                                self.emit32(self.enc_movk_x_lsl16(scratch, ((*val >> 16) & 0xFFFF) as u16));
+                                self.emit32(self.enc_movk_x_lsl16(scratch, ((*val >> 16) & 0xffff) as u16));
                             }
                             self.emit32(self.enc_cmp_reg(xn, scratch));
                         }
-                        let setup_instrs = if *val <= 0xFFF { 1 } else if (*val >> 16) != 0 { 3 } else { 2 };
-                        let skip_instrs = match action {
-                            GprBranchAction::Skip(n) => *n as u32 + setup_instrs + 1,
-                            GprBranchAction::Exit(_) => setup_instrs + 1,
-                            GprBranchAction::JumpToLabel(_) => unreachable!(),
-                        };
-                        let imm19 = skip_instrs & 0x7FFFF;
-                        self.emit32(0x54000000u32 | (3u32 << 12) | (imm19 << 5));
+                        let setup_instrs = if *val <= 0xfff { 1 } else if (*val >> 16) != 0 { 3 } else { 2 };
+                        match action {
+                            GprBranchAction::Skip(n) => {
+                                let skip_instrs = *n as u32 + setup_instrs + 1;
+                                let imm19 = skip_instrs & 0x7FFFF;
+                                // B.HS label (cond=2 for HS/CS = unsigned higher-or-same)
+                                self.emit32(0x54000000u32 | (2u32 << 12) | (imm19 << 5));
+                            }
+                            GprBranchAction::Exit(_) => {
+                                let imm19 = (setup_instrs + 1) & 0x7FFFF;
+                                self.emit32(0x54000000u32 | (2u32 << 12) | (imm19 << 5));
+                            }
+                            GprBranchAction::JumpToLabel(label_id) => {
+                                // B.HS label — unsigned greater-or-equal condition
+                                let branch_offset = self.current_offset();
+                                self.emit32(0x54000000u32 | (2u32 << 12));
+                                self.record_label_patch_site(*label_id, branch_offset, false);
+                            }
+                        }
                         return Ok(());
                     }
                 }
-                // CmpEq: B.NE to skip/exit
-                let skip_instrs = match action {
-                    GprBranchAction::Skip(n) => *n as u32 + extra_instrs + 1,
-                    GprBranchAction::Exit(_) => extra_instrs + 1,
-                    GprBranchAction::JumpToLabel(_) => unreachable!(),
-                };
-                let imm19 = skip_instrs & 0x7FFFF;
-                self.emit32(0x54000000u32 | (1u32 << 12) | (imm19 << 5));
+                // CmpEq: B.NE to skip/exit/JumpToLabel
+                // (CmpEq falls through here because it uses extra_instrs computed above)
+                match action {
+                    GprBranchAction::Skip(n) => {
+                        let skip_instrs = *n as u32 + extra_instrs + 1;
+                        let imm19 = skip_instrs & 0x7FFFF;
+                        // B.NE label (cond=1 for NE)
+                        self.emit32(0x54000000u32 | (1u32 << 12) | (imm19 << 5));
+                    }
+                    GprBranchAction::Exit(_) => {
+                        let imm19 = (extra_instrs + 1) & 0x7FFFF;
+                        self.emit32(0x54000000u32 | (1u32 << 12) | (imm19 << 5));
+                    }
+                    GprBranchAction::JumpToLabel(label_id) => {
+                        // B.NE label — not-equal condition
+                        let branch_offset = self.current_offset();
+                        self.emit32(0x54000000u32 | (1u32 << 12));
+                        self.record_label_patch_site(*label_id, branch_offset, false);
+                    }
+                }
                 Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
@@ -2775,12 +2848,14 @@ Ok(())
     fn lower_branch_if_ptr_non_null_aarch64(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
             VmInstr::BranchIfPtrNonNull { ptr, target_label } => {
-
-                let _ = target_label;
+                // BCE-20260727-AARCH64-JUMPTOLABEL: 用 pending_labels 两阶段回填
+                // 机制替代旧 `self.labels.insert` dead-write。CBNZ Xn, label
+                // 占位 imm=0，MarkLabel 时回填 imm19。
                 let xn = self.resolve_gpr(*ptr, alloc)?;
-                let current_offset = self.code.len();
-                self.emit32(0xB5000000 | (xn as u32) & 0x1F);
-                self.labels.insert(*target_label, current_offset);
+                let branch_offset = self.current_offset();
+                // CBNZ Xn, #imm19 (0xB5 = CBNZ)
+                self.emit32(0xB5000000 | (xn as u32));
+                self.record_label_patch_site(*target_label, branch_offset, false);
                 Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
@@ -2790,9 +2865,14 @@ Ok(())
 
     fn lower_branch_if_gpr_zero_aarch64(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::BranchIfGprZero { .. } => {
-
-                Err(CompilerError::CodegenViolation("BranchIfGprZero not yet lowered for AArch64".into()))
+            VmInstr::BranchIfGprZero { value, target_label } => {
+                // BCE-20260727-AARCH64-JUMPTOLABEL: 补 label 回填机制实现。
+                // CBZ Xn, label — value == 0 则跳转。
+                let xn = self.resolve_gpr(*value, alloc)?;
+                let branch_offset = self.current_offset();
+                self.emit32(0xB4000000 | (xn as u32));
+                self.record_label_patch_site(*target_label, branch_offset, false);
+                Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_branch_if_gpr_zero_aarch64: expected VmInstr::BranchIfGprZero, got {:?}", instr))),
@@ -2801,9 +2881,17 @@ Ok(())
 
     fn lower_branch_if_gpr_lt_u_aarch64(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::BranchIfGprLtU { .. } => {
-
-                Err(CompilerError::CodegenViolation("BranchIfGprLtU not yet lowered for AArch64".into()))
+            VmInstr::BranchIfGprLtU { a, b, target_label } => {
+                // BCE-20260727-AARCH64-JUMPTOLABEL: 补 label 回填机制实现。
+                // CMP Xa, Xb; B.LO label — a < b (unsigned) 则跳转。
+                let xa = self.resolve_gpr(*a, alloc)?;
+                let xb = self.resolve_gpr(*b, alloc)?;
+                self.emit32(self.enc_cmp_reg(xa, xb));
+                let branch_offset = self.current_offset();
+                // B.LO (cond=3 = CC/LO = unsigned lower)
+                self.emit32(0x54000000u32 | (3u32 << 12));
+                self.record_label_patch_site(*target_label, branch_offset, false);
+                Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_branch_if_gpr_lt_u_aarch64: expected VmInstr::BranchIfGprLtU, got {:?}", instr))),
@@ -2812,9 +2900,17 @@ Ok(())
 
     fn lower_unconditional_branch_aarch64(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::UnconditionalBranch { .. } => {
-
-                Err(CompilerError::CodegenViolation("UnconditionalBranch not yet lowered for AArch64".into()))
+            VmInstr::UnconditionalBranch { target_label } => {
+                // BCE-20260727-AARCH64-JUMPTOLABEL: 补 label 回填机制实现。
+                // B label — 无条件跳转，用 imm26 (±128MB) 而非 imm19。
+                // 编码: 0x14000000 | imm26 (bits [25:0], signed instruction offset)
+                let branch_offset = self.current_offset();
+                self.emit32(0x14000000u32);
+                // imm26 回填 (不用 imm19 的 patch_branch_imm19)
+                // 但 pending_labels 用同一套 patch site 记录，回填时区分 imm19/imm26
+                // 简化：UnconditionalBranch 用 imm26，单独处理回填
+                self.record_label_patch_site(*target_label, branch_offset, true);
+                Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_unconditional_branch_aarch64: expected VmInstr::UnconditionalBranch, got {:?}", instr))),
@@ -2824,8 +2920,11 @@ Ok(())
     fn lower_mark_label_aarch64(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
             VmInstr::MarkLabel { label_id } => {
-
-                self.labels.insert(*label_id, self.current_offset());
+                // BCE-20260727-AARCH64-JUMPTOLABEL: 用 pending_labels 回填机制
+                // 替代旧 `self.labels.insert` dead-write。MarkLabel 时 target offset
+                // 已知 (current_offset)，回填所有 pending patch site 的 imm19/imm26。
+                let target_offset = self.current_offset();
+                self.resolve_label(*label_id, target_offset);
                 Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(

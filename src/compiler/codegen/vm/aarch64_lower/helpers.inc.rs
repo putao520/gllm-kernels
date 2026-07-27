@@ -7,6 +7,8 @@ impl AArch64Lower {
             loop_stack: Vec::new(),
             platform: AArch64Features::default(),
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             jit_ctx: crate::compiler::jit_context::JitContext::new(&IsaProfile::from_device_profile(
                 &crate::dispatch::device_profile::DeviceProfile::detect(),
             )),
@@ -36,6 +38,8 @@ impl AArch64Lower {
             loop_stack: Vec::new(),
             platform,
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             jit_ctx: crate::compiler::jit_context::JitContext::new(profile),
         }
     }
@@ -52,6 +56,107 @@ impl AArch64Lower {
     fn patch32(&mut self, offset: usize, instr: u32) {
         let bytes = instr.to_le_bytes();
         self.code[offset..offset + 4].copy_from_slice(&bytes);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  Label 回填机制 (BCE-20260727-AARCH64-JUMPTOLABEL)
+    //  @trace REQ-VR-003 [req:GprCondAction-JumpToLabel-AArch64]
+    //
+    //  aarch64 无 iced 原生 label，需手动两阶段回填：
+    //    1. JumpToLabel/BranchIfPtrNonNull/UnconditionalBranch emit 分支占位
+    //       (imm=0) → 记录 patch site byte offset + is_imm26 到 pending_labels[label_id]
+    //    2. MarkLabel emit 时 target offset 已知 → 回填所有 pending patch
+    //       site 的 imm19 (条件分支) 或 imm26 (无条件 B)
+    //
+    //  支持双向引用：
+    //    - 前向 (JumpToLabel 先于 MarkLabel): pending patch site 等回填
+    //    - 后向 (MarkLabel 先于 JumpToLabel): resolved_labels 命中 → 立即回填
+    //  替代旧 `labels` map 的 dead-write 机制 (insert 但从未读取回填)。
+    // ══════════════════════════════════════════════════════════════════
+
+    /// 记录一个 label 引用的 patch site (分支指令在 code 中的 byte offset)。
+    ///
+    /// 若 label 已被 MarkLabel 解析 (后向引用)，立即回填 imm19/imm26；
+    /// 否则加入 pending_labels 等待 MarkLabel 时回填 (前向引用)。
+    ///
+    /// `is_imm26` = true 表示无条件 B 指令 (imm26, bits [25:0], ±128MB)；
+    /// false 表示条件分支 (imm19, bits [23:5], ±1MB)。
+    fn record_label_patch_site(&mut self, label_id: usize, branch_offset: usize, is_imm26: bool) {
+        if let Some(&target_offset) = self.resolved_labels.get(&label_id) {
+            // 后向引用：label 已解析，立即回填
+            if is_imm26 {
+                self.patch_branch_imm26(branch_offset, target_offset);
+            } else {
+                self.patch_branch_imm19(branch_offset, target_offset);
+            }
+        } else {
+            // 前向引用：加入 pending 等待 MarkLabel
+            self.pending_labels.entry(label_id).or_default().push((branch_offset, is_imm26));
+        }
+    }
+
+    /// 回填一个条件分支指令的 imm19 字段 (19-bit signed 指令偏移)。
+    ///
+    /// imm19 = (target_offset - branch_offset) / 4，写入 bits [23:5]。
+    /// AArch64 CBZ/CBNZ/B.cond 系列 imm19 范围 ±1MB (指令数)，guard 块够用。
+    fn patch_branch_imm19(&mut self, branch_offset: usize, target_offset: usize) {
+        let delta = target_offset as i64 - branch_offset as i64;
+        let instr_delta = delta / 4;
+        if instr_delta < -(1 << 18) || instr_delta >= (1 << 18) {
+            // imm19 范围 ±256K instructions = ±1MB bytes。超出 = 编译错误
+            // (guard 块通常很小，不会触发；若触发需改用 B + label trampoline)
+            eprintln!(
+                "[AArch64Lower] WARNING: label branch delta {} instrs out of imm19 range (branch={}, target={})",
+                instr_delta, branch_offset, target_offset
+            );
+        }
+        let imm19 = (instr_delta as u32) & 0x7FFFF;
+        let old = u32::from_le_bytes(
+            self.code[branch_offset..branch_offset + 4].try_into().unwrap()
+        );
+        // 清 imm19 bits [23:5] 并写入新值
+        let new = (old & !(0x7FFFF << 5)) | (imm19 << 5);
+        self.patch32(branch_offset, new);
+    }
+
+    /// 回填一个无条件 B 指令的 imm26 字段 (26-bit signed 指令偏移)。
+    ///
+    /// imm26 = (target_offset - branch_offset) / 4，写入 bits [25:0]。
+    /// AArch64 B 指令 imm26 范围 ±128MB (bytes)，足够任何函数内跳转。
+    fn patch_branch_imm26(&mut self, branch_offset: usize, target_offset: usize) {
+        let delta = target_offset as i64 - branch_offset as i64;
+        let instr_delta = delta / 4;
+        if instr_delta < -(1 << 25) || instr_delta >= (1 << 25) {
+            // imm26 范围 ±32M instructions = ±128MB bytes。超出 = 编译错误
+            eprintln!(
+                "[AArch64Lower] WARNING: unconditional branch delta {} instrs out of imm26 range (branch={}, target={})",
+                instr_delta, branch_offset, target_offset
+            );
+        }
+        let imm26 = (instr_delta as u32) & 0x3FFFFFF;
+        let old = u32::from_le_bytes(
+            self.code[branch_offset..branch_offset + 4].try_into().unwrap()
+        );
+        // 清 imm26 bits [25:0] 并写入新值 (保留 opcode bits [31:26])
+        let new = (old & !0x3FFFFFF) | imm26;
+        self.patch32(branch_offset, new);
+    }
+
+    /// MarkLabel 处理：记录 label 目标 offset，回填所有 pending patch site。
+    ///
+    /// 调用时机：emit MarkLabel VmInstr 时 (label 目标 = current_offset)。
+    /// 回填后清空 pending_labels[label_id] (已全部解析)。
+    fn resolve_label(&mut self, label_id: usize, target_offset: usize) {
+        self.resolved_labels.insert(label_id, target_offset);
+        if let Some(patch_sites) = self.pending_labels.remove(&label_id) {
+            for (branch_offset, is_imm26) in patch_sites {
+                if is_imm26 {
+                    self.patch_branch_imm26(branch_offset, target_offset);
+                } else {
+                    self.patch_branch_imm19(branch_offset, target_offset);
+                }
+            }
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════

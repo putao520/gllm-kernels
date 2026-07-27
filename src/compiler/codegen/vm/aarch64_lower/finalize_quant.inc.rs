@@ -40,6 +40,20 @@ impl AArch64Lower {
             self.patch32(adr_offset, adr | rd);
             self.code.extend_from_slice(&bytes);
         }
+        // BCE-20260727-AARCH64-JUMPTOLABEL: 检查 label 回填完整性。
+        // @trace REQ-VR-003 [req:GprCondAction-JumpToLabel-AArch64]
+        // 所有 pending_labels 在 MarkLabel 处理时应已回填清空。若仍有未回填的
+        // patch site，说明对应的 MarkLabel 缺失（JumpToLabel/BranchIfPtrNonNull
+        // 引用了从未 emit MarkLabel 的 label_id）= 编译错误，imm 占位为 0 会
+        // 导致运行时跳转到错误地址。fail-closed 而非 silent fallback。
+        if !self.pending_labels.is_empty() {
+            let unresolved: Vec<usize> = self.pending_labels.keys().copied().collect();
+            return Err(CompilerError::CodegenViolation(format!(
+                "AArch64 finalize: {} label(s) referenced by JumpToLabel/BranchIfPtrNonNull/UnconditionalBranch but never MarkLabel-ed: {:?}",
+                unresolved.len(),
+                unresolved
+            )));
+        }
         Ok(self.code)
     }
 

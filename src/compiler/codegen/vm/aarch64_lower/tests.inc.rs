@@ -52,6 +52,8 @@ mod tests {
             data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: true, has_sve2: true, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 32 },
             jit_ctx: make_test_jit_ctx(),
         };
@@ -135,6 +137,8 @@ mod tests {
             data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: true, has_sve2: true, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 32 },
             jit_ctx: make_test_jit_ctx(),
         };
@@ -192,6 +196,8 @@ mod tests {
             data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: true, has_sve2: true, has_sme2: true, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 32 },
             jit_ctx: make_test_jit_ctx(),
         };
@@ -236,6 +242,8 @@ mod tests {
             data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
@@ -276,6 +284,8 @@ mod tests {
             data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: true, has_sve2: true, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 32 },
             jit_ctx: make_test_jit_ctx(),
         };
@@ -314,6 +324,8 @@ mod tests {
             data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
@@ -352,6 +364,8 @@ mod tests {
             data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
@@ -393,6 +407,8 @@ mod tests {
             data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
@@ -427,6 +443,8 @@ mod tests {
             data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
@@ -461,6 +479,8 @@ mod tests {
             data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
@@ -494,6 +514,8 @@ mod tests {
             data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
@@ -528,6 +550,8 @@ mod tests {
             data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
@@ -561,6 +585,8 @@ mod tests {
             data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
@@ -712,6 +738,8 @@ mod tests {
             data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
@@ -754,6 +782,8 @@ mod tests {
             data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
@@ -792,6 +822,8 @@ mod tests {
             data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
@@ -828,6 +860,8 @@ mod tests {
             data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
@@ -913,6 +947,8 @@ mod tests {
             data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: true, has_sve2: true, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 32 },
             jit_ctx: make_test_jit_ctx(),
         };
@@ -955,6 +991,8 @@ mod tests {
             data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             platform: features,
             jit_ctx: make_test_jit_ctx(),
         }
@@ -1074,6 +1112,8 @@ mod tests {
             data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: true, has_sve2: true, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 32 },
             jit_ctx: make_test_jit_ctx(),
         };
@@ -1102,6 +1142,8 @@ mod tests {
             data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: true, has_sve2: true, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 32 },
             jit_ctx: make_test_jit_ctx(),
         };
@@ -1146,6 +1188,8 @@ mod tests {
             data_tables: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: true, has_sve2: true, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 32 },
             jit_ctx: make_test_jit_ctx(),
         };
@@ -1199,6 +1243,8 @@ mod tests {
             code: Vec::new(), const_pool: Vec::new(),
             data_tables: Vec::new(), loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
+            pending_labels: std::collections::HashMap::new(),
+            resolved_labels: std::collections::HashMap::new(),
             platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
@@ -1313,6 +1359,146 @@ mod tests {
         let immhi = (adr >> 5) & 0x7FFFF;
         let delta = (immhi << 2) | immlo;
         assert_eq!(delta, 12, "ADR immediate must reach table at offset 12 (delta=12)");
+    }
+
+    // ── BCE-20260727-AARCH64-JUMPTOLABEL: label 回填机制单测 ──
+    // 验证 pending_labels 两阶段回填：前向引用 + 后向引用 + 未回填 finalize 报错。
+
+    #[test]
+    fn test_aarch64_label_forward_reference_backpatch() {
+        // 前向引用: JumpToLabel 先于 MarkLabel
+        // CBZ X0, label  ; 占位 imm19=0
+        // NOP            ; 一条指令
+        // MarkLabel      ; label 目标 = NOP 之后
+        // 期望: CBZ 的 imm19 回填为 +1 (跳过 NOP 到 MarkLabel)
+        let mut lower = AArch64Lower::new();
+        let alloc = RegAllocation {
+            mapping: std::collections::HashMap::new(),
+            spills: vec![],
+            callee_saved_used: vec![],
+        };
+        let label_id = 5000usize;
+        // CBZ X0, label (X0 = reg 0) — emit 占位 imm19=0
+        let branch_offset = lower.current_offset();
+        lower.emit32(0xB4000000 | 0u32); // CBZ X0
+        lower.record_label_patch_site(label_id, branch_offset, false);
+        // NOP (1 instruction)
+        lower.emit32(0xD503201F); // NOP
+        // MarkLabel — 触发回填
+        let target_offset = lower.current_offset();
+        lower.resolve_label(label_id, target_offset);
+        // 验证 CBZ imm19 = +1 (跳过 1 条 NOP 到 MarkLabel)
+        let cbz = u32::from_le_bytes(
+            lower.code[branch_offset..branch_offset + 4].try_into().unwrap()
+        );
+        let imm19 = ((cbz >> 5) & 0x7FFFF) as i32;
+        let imm19_signed = if imm19 >= (1 << 18) { imm19 - (1 << 19) } else { imm19 };
+        assert_eq!(imm19_signed, 2, "CBZ imm19 must be +2 to skip NOP and land on MarkLabel (branch at 0, NOP at 4, MarkLabel at 8)");
+    }
+
+    #[test]
+    fn test_aarch64_label_backward_reference_immediate_backpatch() {
+        // 后向引用: MarkLabel 先于 JumpToLabel
+        // MarkLabel      ; label 目标 = 此处
+        // NOP            ; 一条指令
+        // CBZ X0, label  ; label 已解析，立即回填 imm19
+        // 期望: CBZ 的 imm19 = -1 (跳回 NOP 之前 = MarkLabel)
+        let mut lower = AArch64Lower::new();
+        let alloc = RegAllocation {
+            mapping: std::collections::HashMap::new(),
+            spills: vec![],
+            callee_saved_used: vec![],
+        };
+        let label_id = 5001usize;
+        // MarkLabel — 记录 resolved_labels
+        let target_offset = lower.current_offset();
+        lower.resolve_label(label_id, target_offset);
+        // NOP
+        lower.emit32(0xD503201F); // NOP
+        // CBZ X0, label — label 已解析，立即回填
+        let branch_offset = lower.current_offset();
+        lower.emit32(0xB4000000 | 0u32); // CBZ X0
+        lower.record_label_patch_site(label_id, branch_offset, false);
+        // 验证 CBZ imm19 = -1 (跳回 MarkLabel，target 在 branch 之前 4 字节)
+        let cbz = u32::from_le_bytes(
+            lower.code[branch_offset..branch_offset + 4].try_into().unwrap()
+        );
+        let imm19 = ((cbz >> 5) & 0x7FFFF) as i32;
+        let imm19_signed = if imm19 >= (1 << 18) { imm19 - (1 << 19) } else { imm19 };
+        assert_eq!(imm19_signed, -1, "CBZ imm19 must be -1 to jump back to MarkLabel");
+    }
+
+    #[test]
+    fn test_aarch64_unconditional_branch_imm26_backpatch() {
+        // 无条件 B 指令用 imm26 (±128MB)，验证 imm26 回填而非 imm19。
+        // B label  ; 占位 imm26=0
+        // NOP ×3
+        // MarkLabel
+        // 期望: B 的 imm26 = +3 (跳过 3 条 NOP)
+        let mut lower = AArch64Lower::new();
+        let label_id = 5002usize;
+        let branch_offset = lower.current_offset();
+        lower.emit32(0x14000000u32); // B label (占位 imm26=0)
+        lower.record_label_patch_site(label_id, branch_offset, true);
+        for _ in 0..3 {
+            lower.emit32(0xD503201F); // NOP ×3
+        }
+        let target_offset = lower.current_offset();
+        lower.resolve_label(label_id, target_offset);
+        let b_instr = u32::from_le_bytes(
+            lower.code[branch_offset..branch_offset + 4].try_into().unwrap()
+        );
+        let imm26 = (b_instr & 0x3FFFFFF) as i32;
+        let imm26_signed = if imm26 >= (1 << 25) { imm26 - (1 << 26) } else { imm26 };
+        assert_eq!(imm26_signed, 4, "B imm26 must be +4 to skip B itself + 3 NOPs to MarkLabel (branch at 0, NOPs at 4/8/12, MarkLabel at 16)");
+    }
+
+    #[test]
+    fn test_aarch64_finalize_errors_on_unresolved_label() {
+        // 未回填的 pending label = MarkLabel 缺失 = 编译错误。
+        // Emit CBZ X0, label 但不 emit MarkLabel → finalize 必须返回 Err。
+        let mut lower = AArch64Lower::new();
+        let label_id = 5003usize;
+        let branch_offset = lower.current_offset();
+        lower.emit32(0xB4000000 | 0u32); // CBZ X0
+        lower.record_label_patch_site(label_id, branch_offset, false);
+        // 不 emit MarkLabel — pending_labels 非空
+        let result = lower.finalize();
+        match result {
+            Err(CompilerError::CodegenViolation(msg)) => {
+                assert!(msg.contains("label") && msg.contains("MarkLabel"),
+                    "finalize error must mention unresolved label and MarkLabel, got: {}", msg);
+            }
+            _ => panic!("finalize must return Err on unresolved pending_labels, got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_aarch64_gpr_cond_action_jumptolabel_isnull_emits_cbz() {
+        // GprCondAction { IsNull, JumpToLabel } 应 emit CBZ Xn, label
+        // (BCE-20260727: 旧版直接 Err "GPU-only"，现支持)
+        let mut lower = AArch64Lower::new();
+        let mut mapping = std::collections::HashMap::new();
+        mapping.insert(VRegId(0), PhysReg::Gpr(PhysGpr(5)));
+        let alloc = RegAllocation {
+            mapping,
+            spills: vec![],
+            callee_saved_used: vec![],
+        };
+        let label_id = 5004usize;
+        let instr = VmInstr::GprCondAction {
+            cond: GprCondition::IsNull(VRegId(0)),
+            action: GprBranchAction::JumpToLabel(label_id),
+        };
+        // emit CBZ X5, label
+        let result = lower.lower_gpr_cond_action_aarch64(&instr, &alloc);
+        assert!(result.is_ok(), "GprCondAction IsNull+JumpToLabel must succeed on AArch64, got {:?}", result);
+        // 验证 emit 了 CBZ X5 (0xB4 + reg 5)
+        let cbz = u32::from_le_bytes(lower.code[0..4].try_into().unwrap());
+        assert_eq!(cbz & 0xFF00001F, 0xB4000005, "must be CBZ X5, got {:#010x}", cbz);
+        // pending_labels 应记录该 label
+        assert!(lower.pending_labels.contains_key(&label_id),
+            "pending_labels must contain label_id after JumpToLabel emit");
     }
 
 }
