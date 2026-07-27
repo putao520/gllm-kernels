@@ -856,10 +856,31 @@ fn assign_hetero_markers(
         return;
     }
 
-    // For hetero models, find groups with cycling signatures.
-    // The cycle period = groups_per_segment (e.g., 5 for Gemma 4: 4 sliding + 1 full).
-    // Detect by finding the shortest repeating pattern in signatures.
-    let layer_group_indices = find_cycling_run(signatures, num_segments);
+    // SharedKvRef adds LayerIdxGe guards to only the K/V projections. Those
+    // guards are semantic metadata and can make otherwise identical layer
+    // signatures differ, so signature cycling is not a complete detector. The
+    // layer.* label is the graph's explicit layer-boundary marker and must be
+    // preferred whenever present; this guarantees guarded MHA remains inside
+    // the same loop as its K/V projections and receives the layer counter.
+    // @trace REQ-UMK-012
+    let mut labeled_layer_indices = Vec::new();
+    let mut in_layer_run = false;
+    for (i, group) in groups.iter().enumerate() {
+        let anchor_label = graph.op(group.ops[0])
+            .map(|op| op.label.as_str())
+            .unwrap_or("");
+        if anchor_label.starts_with("layer.") {
+            labeled_layer_indices.push(i);
+            in_layer_run = true;
+        } else if in_layer_run {
+            break;
+        }
+    }
+    let layer_group_indices = if labeled_layer_indices.is_empty() {
+        find_cycling_run(signatures, num_segments)
+    } else {
+        labeled_layer_indices
+    };
 
     if layer_group_indices.is_empty() {
         return;
