@@ -154,14 +154,14 @@ impl CompilerGraph {
 
     /// Total number of elements for allocation purposes.
     ///
-    /// Unlike `tensor_numel` which treats symbolic dims as 0, this uses
-    /// `max_for_allocation` so symbolic dims contribute their `max_value`
-    /// (or `default` if no max is specified). Used by `weight_layout` to
-    /// allocate buffers large enough for the compiled loop bounds.
-    pub fn tensor_numel_for_alloc(&self, id: TensorId, default_max: usize) -> Option<usize> {
+    /// Unlike `tensor_numel` which treats symbolic dims as 0, this uses the
+    /// capped allocation bound so symbolic dimensions cannot expand an
+    /// allocation beyond the caller's sequence cap. Concrete dimensions retain
+    /// their exact values. Used by `weight_layout` and scratchpad sizing.
+    pub fn tensor_numel_for_alloc(&self, id: TensorId, alloc_cap: usize) -> Option<usize> {
         self.tensor(id).map(|t| {
             let product: usize = t.shape.iter()
-                .map(|d| d.max_for_allocation(default_max))
+                .map(|d| d.max_for_allocation_capped(alloc_cap))
                 .product();
             product.max(1)
         })
@@ -242,7 +242,10 @@ impl CompilerGraph {
             if let Some(&qb) = self.quant_weight_bytes.get(&tid) {
                 cursor += qb;
             } else {
-                let numel = self.tensor_numel_for_alloc(tid, self.max_seq_len).unwrap_or(0);
+                let numel = self.tensor_numel_for_alloc(
+                    tid,
+                    self.max_seq_len.min(crate::compiler::buffer_alloc::ALLOC_SEQ_CAP),
+                ).unwrap_or(0);
                 let dtype_size = self.tensor(tid)
                     .map(|t| t.dtype.size_bytes()).unwrap_or(DType::F32.size_bytes());
                 cursor += numel * dtype_size;

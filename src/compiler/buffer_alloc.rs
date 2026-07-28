@@ -314,7 +314,7 @@ pub fn analyze_lifetimes(
             // 实际推理 seq_len 远小于 max_position_embeddings；ALLOC_SEQ_CAP 覆盖绝大多数场景。
             let alloc_max_seq_len = graph.max_seq_len.min(ALLOC_SEQ_CAP);
             let numel: usize = tensor.shape.iter()
-                .map(|d| d.max_for_allocation(alloc_max_seq_len))
+                .map(|d| d.max_for_allocation_capped(alloc_max_seq_len))
                 .product::<usize>()
                 .max(1);
             let size_bytes = numel * elem_bytes;

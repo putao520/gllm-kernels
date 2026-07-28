@@ -71,6 +71,20 @@ impl SymDim {
         }
     }
 
+    /// Return an allocation-safe upper bound for a symbolic dimension.
+    ///
+    /// The cap applies only to symbolic dimensions: concrete dimensions (for
+    /// example vocabulary or hidden-size dimensions) must retain their exact
+    /// value even when the sequence cap is smaller. A symbolic `max_value`
+    /// larger than `cap` is limited to `cap`; an absent `max_value` uses `cap`
+    /// as its defensive allocation bound.
+    pub fn max_for_allocation_capped(&self, cap: usize) -> usize {
+        match self {
+            SymDim::Concrete(v) => *v,
+            SymDim::Symbolic { max_value, .. } => max_value.unwrap_or(cap).min(cap),
+        }
+    }
+
     /// 严格版本: Symbolic 无 max_value 时返回 Err，禁止静默兜底。
     /// 用于成本模型、并行规划、融合决策等影响行为的场景。
     pub fn max_for_allocation_strict(&self) -> Result<usize, CompilerError> {

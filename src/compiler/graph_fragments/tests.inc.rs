@@ -218,6 +218,24 @@ mod tests {
     }
 
     #[test]
+    fn symdim_max_for_allocation_capped_preserves_concrete_dimensions() {
+        let dim = SymDim::Concrete(100);
+        assert_eq!(dim.max_for_allocation_capped(64), 100);
+    }
+
+    #[test]
+    fn symdim_max_for_allocation_capped_limits_symbolic_max() {
+        let dim = SymDim::Symbolic { name: "seq".to_string(), max_value: Some(512) };
+        assert_eq!(dim.max_for_allocation_capped(128), 128);
+    }
+
+    #[test]
+    fn symdim_max_for_allocation_capped_defaults_symbolic_max() {
+        let dim = SymDim::Symbolic { name: "seq".to_string(), max_value: None };
+        assert_eq!(dim.max_for_allocation_capped(256), 256);
+    }
+
+    #[test]
     fn symdim_max_for_allocation_strict_concrete() {
         let dim = SymDim::Concrete(64);
         assert_eq!(dim.max_for_allocation_strict().unwrap(), 64);

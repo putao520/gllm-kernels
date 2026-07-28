@@ -2670,6 +2670,19 @@ mod tests {
         assert_eq!(graph.tensor_numel_for_alloc(t_symbolic, 2048), Some(32768));
     }
 
+    /// Verify symbolic allocation bounds honor the caller's cap.
+    #[test]
+    fn test_tensor_numel_for_alloc_caps_symbolic_max() {
+        let mut graph = CompilerGraph::new();
+        let tensor = graph.add_tensor(
+            "large_symbolic",
+            vec![SymDim::Symbolic { name: "seq".into(), max_value: Some(131_072) }, SymDim::Concrete(4)],
+            DType::F32,
+        );
+
+        assert_eq!(graph.tensor_numel_for_alloc(tensor, 8_192), Some(32_768));
+    }
+
     /// Verify Display trait formats graph with op count and tensor count.
     #[test]
     fn test_graph_display_format() {
