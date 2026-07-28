@@ -474,6 +474,12 @@ impl IsaProfile {
         };
         let vec_regs: Vec<PhysVec> = (0..vec_count)
             .filter(|&r| !scratch_vec_regs.iter().any(|s| s.0 == r))
+            // BCE-20260728-EVEX-OOB: 限制 allocatable Vec 到 ≤15。iced 1.21 的 code_asm
+            // 对 vaddps/vmulps 等算术指令在 assemble 时走 VEX 编码，不支持 ymm16-31
+            // （需 EVEX 前缀但 BlockEncoder 不自动选择 EVEX）。只有 vmovups（spill
+            // scratch 用）支持 0-31。因此 regalloc 只分配 0-12（去 scratch 后），
+            // 16-31 仅留给 spill scratch 的 vmovups。
+            .filter(|&r| r < 16)
             .map(PhysVec)
             .collect();
 
