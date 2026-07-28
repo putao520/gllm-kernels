@@ -713,7 +713,16 @@ impl BufferLayout {
         max_seq_len: usize,
         sg_enabled: bool,
     ) -> Self {
-        Self::build(geo.storage_dtype.size_bytes(), max_seq_len, geo.hidden, geo.vocab_size, sg_enabled)
+        // The single-sequence mega-kernel emits one decode row at a time. Its
+        // sampling pipeline always reads row 0, so logits storage is one vocab
+        // row even though activations retain the configured sequence bound.
+        Self::build_single_sequence(
+            geo.storage_dtype.size_bytes(),
+            max_seq_len,
+            geo.hidden,
+            geo.vocab_size,
+            sg_enabled,
+        )
     }
 
     /// Compute buffer layout for batched inference (SPEC/20 REQ-BCI-010).
@@ -736,17 +745,57 @@ impl BufferLayout {
         Self::build(geo.storage_dtype.size_bytes(), max_M, geo.hidden, geo.vocab_size, sg_enabled)
     }
 
+    /// Build buffer layout for the single-sequence mega-kernel.
+    ///
+    /// Activations retain the configured sequence bound, while logits are
+    /// emitted and sampled one row at a time (row 0). This distinction is
+    /// required by the MegaKernelFn execution contract and prevents a
+    /// `[max_seq_len, vocab]` logits allocation in the single-sequence path.
+    fn build_single_sequence(
+        elem_bytes: usize,
+        activation_dim: usize,
+        hidden: usize,
+        vocab_size: usize,
+        sg_enabled: bool,
+    ) -> Self {
+        Self::build_with_logits_rows(elem_bytes, activation_dim, 1, hidden, vocab_size, sg_enabled)
+    }
+
     /// Build buffer layout from raw dimensions.
     ///
-    /// `activation_dim` is the M dimension (max_seq_len for single-seq, max_M for batched).
-    /// It drives activation ping/pong and logits buffer sizing.
+    /// `activation_dim` drives activation ping/pong. `logits_rows` independently
+    /// controls logits storage so batched layouts can retain their M dimension.
     ///
     /// [FIX-PSC29] `sg_enabled` controls whether SG detect/knowledge buffers are allocated.
     /// When false (most models), sg_data_bytes = 0 and no SG space is included in
     /// total_scratchpad_bytes — saving hidden * elem_bytes * 2 bytes per inference.
-    fn build(elem_bytes: usize, activation_dim: usize, hidden: usize, vocab_size: usize, sg_enabled: bool) -> Self {
+    fn build(
+        elem_bytes: usize,
+        activation_dim: usize,
+        hidden: usize,
+        vocab_size: usize,
+        sg_enabled: bool,
+    ) -> Self {
+        Self::build_with_logits_rows(
+            elem_bytes,
+            activation_dim,
+            activation_dim,
+            hidden,
+            vocab_size,
+            sg_enabled,
+        )
+    }
+
+    fn build_with_logits_rows(
+        elem_bytes: usize,
+        activation_dim: usize,
+        logits_rows: usize,
+        hidden: usize,
+        vocab_size: usize,
+        sg_enabled: bool,
+    ) -> Self {
         let activation_bytes = activation_dim * hidden * elem_bytes;
-        let logits_bytes = activation_dim * vocab_size * elem_bytes;
+        let logits_bytes = logits_rows * vocab_size * elem_bytes;
         // Sampling workspace: 4x vocab_bytes (indices + PRNG + reserved CDF + reserved temp).
         // See gllm abi_types.inc.rs SAMPLING_WORKSPACE_MULTIPLIER for LEGAL justification.
         let sampling_workspace_bytes = vocab_size * elem_bytes * 4;
@@ -1027,6 +1076,18 @@ mod tests {
         let bl = BufferLayout::build(2, 512, 4096, 32000, true);
         assert_eq!(bl.logits_offset, bl.activation_b_offset + bl.activation_bytes);
         assert_eq!(bl.logits_bytes, 512 * 32000 * 2);
+    }
+
+    #[test]
+    fn buffer_layout_single_sequence_logits_use_one_row() {
+        let bl = BufferLayout::build_single_sequence(4, 8192, 1536, 262_144, false);
+        assert_eq!(bl.activation_bytes, 8192 * 1536 * 4);
+        assert_eq!(bl.logits_bytes, 262_144 * 4);
+        assert_eq!(bl.sampling_workspace_bytes, 4 * 262_144 * 4);
+        assert_eq!(
+            bl.sampling_workspace_offset,
+            bl.logits_offset + 262_144 * 4,
+        );
     }
 
     #[test]
