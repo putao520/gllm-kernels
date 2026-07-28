@@ -447,7 +447,10 @@ impl IsaProfile {
 
         // 向量寄存器 (ARCH-ISA-SCRATCH-VEC: 末六个保留为 Lower scratch)
         // 见 IsaProfile.scratch_vec_regs 文档说明拆分原因。
-        let vec_count: u8 = if kc.use_avx512 { 32 } else { 16 };
+        // BCE-20260728-AVX512-CODEGEN-DIFF: AVX-512 的 vec_count=32 产生和 AVX2 完全不同的
+        // regalloc 决策（26 vs 10 allocatable Vec）→ 不同机器码 → 5070Ti SIGSEGV。
+        // 强制 vec_count=16（完全 AVX2 配置），消除 AVX-512 特有 codegen 路径。
+        let vec_count: u8 = 16;
         // BCE-20260702-REGALLOC-AVX2-OOB: 内部 scratch (0..3) 用于 SSE scalar 指令
         // (vmovss/vmovsd/vmovd — scratch_xmm → lower_scalar_load_x86 / xmm_const_i32)
         // 以及 HReduce/broadcast。iced_x86 的 code_asm vmovss 仅接受 xmm0..15 (VEX
