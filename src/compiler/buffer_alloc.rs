@@ -69,6 +69,40 @@ fn resolve_alias_to_physical(
     Some(current)
 }
 
+/// Return every tensor in a logits-to-sink producer chain.
+///
+/// Generation graphs may place output-preserving operators (for example
+/// `LogitSoftcap`) between the vocabulary GEMM and `Argmax`.  The complete
+/// chain is written through the caller-provided output pointer, so none of its
+/// tensors may receive an intermediate scratchpad slot.  Traversal stops at a
+/// GEMM producer to avoid treating the hidden activation or weight inputs as
+/// logits outputs.
+pub(crate) fn logits_chain_tensors(graph: &CompilerGraph) -> HashSet<TensorId> {
+    let mut chain = HashSet::new();
+    for sink_op in &graph.ops {
+        let is_sink = matches!(sink_op.op_resolved(graph),
+            Some(crate::compiler::graph::Op::Argmax { .. }) |
+            Some(crate::compiler::graph::Op::WriteLogits { .. }));
+        if !is_sink {
+            continue;
+        }
+        let mut frontier: Vec<TensorId> = sink_op.inputs.iter().copied().collect();
+        while let Some(tid) = frontier.pop() {
+            if !chain.insert(tid) {
+                continue;
+            }
+            let Some(producer) = graph.ops.iter().find(|op| op.outputs.contains(&tid)) else {
+                continue;
+            };
+            if producer.op_is_quant_gemm(graph) || producer.op_is_gemm_like(graph) {
+                continue;
+            }
+            frontier.extend(producer.inputs.iter().copied());
+        }
+    }
+    chain
+}
+
 /// A tensor's lifetime interval: [first_use, last_use] in schedule order.
 #[derive(Debug, Clone, Copy)]
 pub struct Lifetime {
@@ -258,34 +292,7 @@ pub fn analyze_lifetimes(
     // BCE-20260728-LOGITS-CHAIN-ALLOC: 从 Argmax/WriteLogits 反向遍历生产者链，
     // 穿过 LogitSoftcap/TemperatureScale 等 output-preserving post-op，到 GEMM producer。
     // 整条 logits 链由 mega-kernel output_ptr (logits_scratch_offset) 管理，不进 intermediate alloc。
-    let mut logits_chain_tids: HashSet<TensorId> = HashSet::new();
-    for sink_op in &graph.ops {
-        let is_sink = matches!(sink_op.op_resolved(graph),
-            Some(crate::compiler::graph::Op::Argmax { .. }) |
-            Some(crate::compiler::graph::Op::WriteLogits { .. }));
-        if !is_sink {
-            continue;
-        }
-        // Seed from the sink input, then walk each producer's inputs backwards.
-        let mut frontier: Vec<TensorId> = sink_op.inputs.iter().copied().collect();
-        while let Some(cur) = frontier.pop() {
-            if !logits_chain_tids.insert(cur) {
-                continue;
-            }
-            // Find the producer of this tensor.  Stop at the GEMM head: cur is
-            // already the logits output and has been recorded in the chain.
-            if let Some(producer) = graph.ops.iter().find(|op| op.outputs.contains(&cur)) {
-                if producer.op_is_quant_gemm(graph) || producer.op_is_gemm_like(graph) {
-                    continue;
-                }
-                // Non-GEMM post-op (LogitSoftcap/TemperatureScale, etc.):
-                // continue walking towards its producer.
-                for &inp in &producer.inputs {
-                    frontier.push(inp);
-                }
-            }
-        }
-    }
+    let logits_chain_tids = logits_chain_tensors(graph);
 
     let mut lifetimes = Vec::new();
     for tensor in &graph.tensors {
@@ -731,6 +738,13 @@ fn build_tensor_sources(
             map.insert(tid, TensorPtrSource::Output { offset: cursor });
             cursor += numel * elem_bytes;
         }
+    }
+
+    // BCE-20260728-LOGITS-CHAIN-ALLOC: every tensor between the vocabulary
+    // producer and Argmax/WriteLogits shares the mega-kernel output region.
+    // Keep the resolver mapping in sync with the allocation exclusion above.
+    for tid in logits_chain_tensors(graph) {
+        map.insert(tid, TensorPtrSource::Output { offset: 0 });
     }
 
     // Intermediate: BufferAllocation slots

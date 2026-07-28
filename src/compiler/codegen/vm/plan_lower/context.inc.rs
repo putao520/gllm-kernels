@@ -400,6 +400,12 @@ fn build_tensor_sources_fallback(
         }
     }
 
+    // BCE-20260728-LOGITS-CHAIN-ALLOC: keep skipped vocabulary producer
+    // tensors materializable in the fallback resolver as well.
+    for tid in crate::compiler::buffer_alloc::logits_chain_tensors(graph) {
+        map.insert(tid, TensorPtrSource::Output { offset: 0 });
+    }
+
     for slot in &alloc.slots {
         map.entry(slot.tensor_id).or_insert(TensorPtrSource::Intermediate { offset: slot.offset });
     }
