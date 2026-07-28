@@ -69,35 +69,44 @@ fn resolve_alias_to_physical(
     Some(current)
 }
 
-/// Return every tensor in a logits-to-sink producer chain.
+/// Return every tensor in the primary logits-to-sink producer chain.
 ///
 /// Generation graphs may place output-preserving operators (for example
-/// `LogitSoftcap`) between the vocabulary GEMM and `Argmax`.  The complete
-/// chain is written through the caller-provided output pointer, so none of its
-/// tensors may receive an intermediate scratchpad slot.  Traversal stops at a
-/// GEMM producer to avoid treating the hidden activation or weight inputs as
-/// logits outputs.
+/// `LogitSoftcap`) between the vocabulary GEMM and `Argmax`. The complete
+/// primary chain is written through the caller-provided output pointer, so
+/// none of its tensors may receive an intermediate scratchpad slot. The
+/// primary sink is the last Argmax/WriteLogits in graph order, matching the
+/// topology analysis used by mega-kernel emission. Earlier sinks belong to
+/// auxiliary paths such as MTP and must retain their own storage.
+///
+/// Traversal stops at GEMM producers and only crosses unary operators. This
+/// prevents unrelated inputs (for example a bias tensor on a binary epilogue)
+/// from being classified as logits output storage.
 pub(crate) fn logits_chain_tensors(graph: &CompilerGraph) -> HashSet<TensorId> {
+    let Some(sink_op) = graph.ops.iter().rev().find(|op| matches!(
+        op.op_resolved(graph),
+        Some(crate::compiler::graph::Op::Argmax { .. })
+            | Some(crate::compiler::graph::Op::WriteLogits { .. })
+    )) else {
+        return HashSet::new();
+    };
+
     let mut chain = HashSet::new();
-    for sink_op in &graph.ops {
-        let is_sink = matches!(sink_op.op_resolved(graph),
-            Some(crate::compiler::graph::Op::Argmax { .. }) |
-            Some(crate::compiler::graph::Op::WriteLogits { .. }));
-        if !is_sink {
+    let mut frontier: Vec<TensorId> = sink_op.inputs.iter().copied().collect();
+    while let Some(tid) = frontier.pop() {
+        let Some(producer) = graph.ops.iter().find(|op| op.outputs.contains(&tid)) else {
+            // A sink fed directly from an external graph input is not an
+            // allocated logits tensor.
+            continue;
+        };
+        if !chain.insert(tid) {
             continue;
         }
-        let mut frontier: Vec<TensorId> = sink_op.inputs.iter().copied().collect();
-        while let Some(tid) = frontier.pop() {
-            if !chain.insert(tid) {
-                continue;
-            }
-            let Some(producer) = graph.ops.iter().find(|op| op.outputs.contains(&tid)) else {
-                continue;
-            };
-            if producer.op_is_quant_gemm(graph) || producer.op_is_gemm_like(graph) {
-                continue;
-            }
-            frontier.extend(producer.inputs.iter().copied());
+        if producer.op_is_quant_gemm(graph) || producer.op_is_gemm_like(graph) {
+            continue;
+        }
+        if producer.inputs.len() == 1 && producer.outputs.len() == 1 {
+            frontier.push(producer.inputs[0]);
         }
     }
     chain
@@ -1158,13 +1167,79 @@ pub fn compute_scratch_requirements(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::graph::{CompilerGraph, TensorId};
+    use crate::compiler::graph::{CompilerGraph, GemmSpec, Op, SymDim, TensorId};
     use crate::compiler::ir::LayerIR;
     use crate::compiler::fusion;
     use crate::compiler::registry::ScalarOpRegistry;
     use crate::compiler::planner::ExecutionPlan;
     use crate::dispatch::DeviceProfile;
     use crate::types::ModelConfig;
+
+    #[test]
+    fn logits_chain_stops_at_primary_gemm_and_excludes_auxiliary_sink() {
+        let mut graph = CompilerGraph::new();
+        let hidden = graph.add_tensor_concrete("hidden", &[1, 4], DType::F32);
+        let main_logits = graph.add_tensor_concrete("logits", &[1, 8], DType::F32);
+        let softcapped = graph.add_tensor_concrete("logits_softcapped", &[1, 8], DType::F32);
+        let main_token = graph.add_tensor_concrete("token_id", &[1], DType::F32);
+        let aux_logits = graph.add_tensor_concrete("mtp_logits", &[1, 8], DType::F32);
+        let aux_token = graph.add_tensor_concrete("mtp_token", &[1], DType::F32);
+        let main_weight = graph.add_tensor_concrete("lm_head", &[8, 4], DType::F32);
+        let aux_weight = graph.add_tensor_concrete("mtp_proj", &[8, 4], DType::F32);
+
+        // Auxiliary MTP sink comes first in graph order. The primary sink is
+        // appended last, matching the topology's final Argmax predecessor.
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 8,
+                k: 4,
+                dtype: DType::F32,
+                trans_b: true,
+                has_bias: false,
+            }),
+            vec![hidden, aux_weight],
+            vec![aux_logits],
+            "mtp_proj_0",
+        );
+        graph.add_op(
+            Op::Argmax { vocab_size: 8 },
+            vec![aux_logits],
+            vec![aux_token],
+            "mtp_argmax_0",
+        );
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 8,
+                k: 4,
+                dtype: DType::F32,
+                trans_b: true,
+                has_bias: false,
+            }),
+            vec![hidden, main_weight],
+            vec![main_logits],
+            "lm_head",
+        );
+        graph.add_op(
+            Op::LogitSoftcap { cap: 30.0 },
+            vec![main_logits],
+            vec![softcapped],
+            "logit_softcap",
+        );
+        graph.add_op(
+            Op::Argmax { vocab_size: 8 },
+            vec![softcapped],
+            vec![main_token],
+            "argmax",
+        );
+
+        let chain = logits_chain_tensors(&graph);
+        assert!(chain.contains(&main_logits));
+        assert!(chain.contains(&softcapped));
+        assert!(!chain.contains(&hidden));
+        assert!(!chain.contains(&aux_logits));
+    }
 
     #[test]
     fn test_non_overlapping_reuse() {
