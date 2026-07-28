@@ -343,7 +343,7 @@ pub(super) fn emit_fusion_groups(
                 // Derive hidden_dim from the per-layer stride.
                 // stride = max_seq_len × hidden × elem_bytes (F32 → 4 bytes)
                 // hidden = stride / (max_seq_len × 4)
-                let max_seq = fctx.graph.max_seq_len.max(1);
+                let max_seq = fctx.graph.max_seq_len.min(ALLOC_SEQ_CAP).max(1);
                 let elem_bytes = crate::types::DType::F32.size_bytes();
                 let hidden_dim = fctx.alloc.layer_capture_stride / (max_seq * elem_bytes);
                 if hidden_dim > 0 {

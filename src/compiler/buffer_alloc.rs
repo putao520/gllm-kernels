@@ -15,6 +15,14 @@ use crate::compiler::virtual_activation::VirtualActivationMap;
 use crate::compiler::layout_negotiator::LayoutAssignment;
 use crate::types::DType;
 
+/// Upper bound for sequence dimensions used in allocation and offset arithmetic.
+///
+/// Model config `max_position_embeddings` can greatly exceed the sequence lengths
+/// supported by the runtime. Using that raw symbolic bound in scratchpad layouts
+/// makes offsets exceed the allocated region (BCE-20260728-MAXSEQLEN-OFFSET-LEAK).
+/// This cap applies only to allocation/layout sizing, never to runtime dimensions.
+pub const ALLOC_SEQ_CAP: usize = 8192;
+
 /// §0.2.3 一个 CompilerGraph 张量在运行时的物理位置分类。
 ///
 /// R3 BufferAllocation 输出 — 在 buffer 分配阶段一次性推导，
@@ -303,8 +311,8 @@ pub fn analyze_lifetimes(
             // ARCH-SYMDIM: buffer 分配用 graph.max_seq_len 作为 Symbolic 维度上界。
             // BCE-20260728-SCRATCHPAD-MISMATCH: 限制编译期分配上界避免 PLE 等
             // per-layer intermediate 膨胀（Gemma4 E2B max_seq_len=131072 → 278GB OOM）。
-            // 实际推理 seq_len 远小于 max_position_embeddings；8192 覆盖绝大多数场景。
-            let alloc_max_seq_len = graph.max_seq_len.min(8192);
+            // 实际推理 seq_len 远小于 max_position_embeddings；ALLOC_SEQ_CAP 覆盖绝大多数场景。
+            let alloc_max_seq_len = graph.max_seq_len.min(ALLOC_SEQ_CAP);
             let numel: usize = tensor.shape.iter()
                 .map(|d| d.max_for_allocation(alloc_max_seq_len))
                 .product::<usize>()
@@ -648,7 +656,7 @@ fn compute_layer_capture_region(
         if hidden == 0 {
             return (0, 0, 0);
         }
-        let max_seq_len = graph.max_seq_len.min(8192).max(1); // BCE-20260728: limit alloc upper bound
+        let max_seq_len = graph.max_seq_len.min(ALLOC_SEQ_CAP).max(1); // BCE-20260728: limit alloc upper bound
         // Compute dtype is F32 (see graph_dtype in context.inc.rs).
         let elem_bytes = DType::F32.size_bytes();
         let per_layer_stride = max_seq_len * hidden * elem_bytes;
@@ -710,7 +718,7 @@ fn build_tensor_sources(
     {
         let mut cursor = 0usize;
         for &tid in &graph.outputs {
-            let numel = graph.tensor_numel_for_alloc(tid, graph.max_seq_len.min(8192)).unwrap_or(0);
+            let numel = graph.tensor_numel_for_alloc(tid, graph.max_seq_len.min(ALLOC_SEQ_CAP)).unwrap_or(0);
             let elem_bytes = graph.tensor(tid)
                 .map(|t| t.dtype.size_bytes())
                 .unwrap_or(DType::F32.size_bytes()); // 安全回退: 无 tensor meta 时默认 F32

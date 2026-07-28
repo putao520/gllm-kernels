@@ -1587,7 +1587,7 @@ fn lower_attention_v2(
             });
 
             let kv_row_stride = spec.geometry.num_kv_heads * spec.geometry.head_dim * dtype.elem_bytes();
-            let max_seq = graph.max_seq_len;
+            let max_seq = graph.max_seq_len.min(ALLOC_SEQ_CAP);
             let kv_layer_stride = 2 * max_seq * kv_row_stride;
 
             // K cache base = kv_cache_ptr + layer_ctr * kv_layer_stride

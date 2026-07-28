@@ -110,7 +110,7 @@ impl VirtualActivationMap {
                     .map(|t| t.elem_bytes())
                     .unwrap_or(DType::F32.size_bytes());
                 // BCE-20260728-SCRATCHPAD-MISMATCH: 限制编译期分配上界（同 buffer_alloc.rs）
-                graph.tensor_numel_for_alloc(*tid, graph.max_seq_len.min(8192))
+                graph.tensor_numel_for_alloc(*tid, graph.max_seq_len.min(crate::compiler::buffer_alloc::ALLOC_SEQ_CAP))
                     .map(|numel| numel * elem_bytes)
                     .unwrap_or(0)
             })
