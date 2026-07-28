@@ -69,44 +69,38 @@ fn resolve_alias_to_physical(
     Some(current)
 }
 
-/// Return every tensor in the primary logits-to-sink producer chain.
+/// Return every tensor in all logits-to-sink producer chains.
 ///
 /// Generation graphs may place output-preserving operators (for example
-/// `LogitSoftcap`) between the vocabulary GEMM and `Argmax`. The complete
-/// primary chain is written through the caller-provided output pointer, so
-/// none of its tensors may receive an intermediate scratchpad slot. The
-/// primary sink is the last Argmax/WriteLogits in graph order, matching the
-/// topology analysis used by mega-kernel emission. Earlier sinks belong to
-/// auxiliary paths such as MTP and must retain their own storage.
-///
-/// Traversal stops at GEMM producers and only crosses unary operators. This
-/// prevents unrelated inputs (for example a bias tensor on a binary epilogue)
-/// from being classified as logits output storage.
+/// `LogitSoftcap`) between a vocabulary GEMM and `Argmax`. Every sink chain is
+/// written through the caller-provided output pointer, so none of its tensors
+/// may receive an intermediate scratchpad slot. Traversal stops at GEMM
+/// producers and only crosses unary operators, preventing unrelated inputs
+/// (for example a bias tensor on a binary epilogue) from being classified as
+/// logits output storage.
 pub(crate) fn logits_chain_tensors(graph: &CompilerGraph) -> HashSet<TensorId> {
-    let Some(sink_op) = graph.ops.iter().rev().find(|op| matches!(
+    let mut chain = HashSet::new();
+    for sink_op in graph.ops.iter().filter(|op| matches!(
         op.op_resolved(graph),
         Some(crate::compiler::graph::Op::Argmax { .. })
             | Some(crate::compiler::graph::Op::WriteLogits { .. })
-    )) else {
-        return HashSet::new();
-    };
-
-    let mut chain = HashSet::new();
-    let mut frontier: Vec<TensorId> = sink_op.inputs.iter().copied().collect();
-    while let Some(tid) = frontier.pop() {
-        let Some(producer) = graph.ops.iter().find(|op| op.outputs.contains(&tid)) else {
-            // A sink fed directly from an external graph input is not an
-            // allocated logits tensor.
-            continue;
-        };
-        if !chain.insert(tid) {
-            continue;
-        }
-        if producer.op_is_quant_gemm(graph) || producer.op_is_gemm_like(graph) {
-            continue;
-        }
-        if producer.inputs.len() == 1 && producer.outputs.len() == 1 {
-            frontier.push(producer.inputs[0]);
+    )) {
+        let mut frontier: Vec<TensorId> = sink_op.inputs.iter().copied().collect();
+        while let Some(tid) = frontier.pop() {
+            let Some(producer) = graph.ops.iter().find(|op| op.outputs.contains(&tid)) else {
+                // A sink fed directly from an external graph input is not an
+                // allocated logits tensor.
+                continue;
+            };
+            if !chain.insert(tid) {
+                continue;
+            }
+            if producer.op_is_quant_gemm(graph) || producer.op_is_gemm_like(graph) {
+                continue;
+            }
+            if producer.inputs.len() == 1 && producer.outputs.len() == 1 {
+                frontier.push(producer.inputs[0]);
+            }
         }
     }
     chain
@@ -1176,7 +1170,7 @@ mod tests {
     use crate::types::ModelConfig;
 
     #[test]
-    fn logits_chain_stops_at_primary_gemm_and_excludes_auxiliary_sink() {
+    fn logits_chain_walks_every_sink_and_stops_at_each_gemm() {
         let mut graph = CompilerGraph::new();
         let hidden = graph.add_tensor_concrete("hidden", &[1, 4], DType::F32);
         let main_logits = graph.add_tensor_concrete("logits", &[1, 8], DType::F32);
@@ -1237,8 +1231,8 @@ mod tests {
         let chain = logits_chain_tensors(&graph);
         assert!(chain.contains(&main_logits));
         assert!(chain.contains(&softcapped));
+        assert!(chain.contains(&aux_logits));
         assert!(!chain.contains(&hidden));
-        assert!(!chain.contains(&aux_logits));
     }
 
     #[test]
