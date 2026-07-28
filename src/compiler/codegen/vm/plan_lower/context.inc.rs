@@ -394,7 +394,7 @@ fn build_tensor_sources_fallback(
         let elem = dtype.elem_bytes();
         let mut cursor = 0usize;
         for &tid in &graph.outputs {
-            let numel = graph.tensor_numel_for_alloc(tid, graph.max_seq_len).unwrap_or(0);
+            let numel = graph.tensor_numel_for_alloc(tid, graph.max_seq_len.min(8192)).unwrap_or(0);
             map.insert(tid, TensorPtrSource::Output { offset: cursor });
             cursor += numel * elem;
         }

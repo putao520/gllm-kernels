@@ -648,7 +648,7 @@ fn compute_layer_capture_region(
         if hidden == 0 {
             return (0, 0, 0);
         }
-        let max_seq_len = graph.max_seq_len.max(1);
+        let max_seq_len = graph.max_seq_len.min(8192).max(1); // BCE-20260728: limit alloc upper bound
         // Compute dtype is F32 (see graph_dtype in context.inc.rs).
         let elem_bytes = DType::F32.size_bytes();
         let per_layer_stride = max_seq_len * hidden * elem_bytes;
@@ -710,7 +710,7 @@ fn build_tensor_sources(
     {
         let mut cursor = 0usize;
         for &tid in &graph.outputs {
-            let numel = graph.tensor_numel_for_alloc(tid, graph.max_seq_len).unwrap_or(0);
+            let numel = graph.tensor_numel_for_alloc(tid, graph.max_seq_len.min(8192)).unwrap_or(0);
             let elem_bytes = graph.tensor(tid)
                 .map(|t| t.dtype.size_bytes())
                 .unwrap_or(DType::F32.size_bytes()); // 安全回退: 无 tensor meta 时默认 F32
