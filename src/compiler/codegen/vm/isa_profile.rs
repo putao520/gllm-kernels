@@ -384,7 +384,11 @@ impl IsaProfile {
     /// 最优 SIMD 宽度
     pub fn optimal_simd_width(&self) -> super::instr::SimdWidth {
         match &self.platform {
-            Platform::X86_64 { has_avx512: true, .. } => super::instr::SimdWidth::W512,
+            // BCE-20260728-W512-HEAP-CORRUPTION: 强制 AVX-512 用 W256 而非 W512。
+            // 5070Ti (9950X3D) W512 路径的 zmm store 导致 glibc 堆损坏
+            // (corrupted size vs prev_size)。W256 (ymm) 在 AVX-512 CPU 上完全正确，
+            // 只是少一半 SIMD 宽度。根因待深挖（zmm spill slot 对齐或宽度不匹配）。
+            Platform::X86_64 { has_avx512: true, .. } => super::instr::SimdWidth::W256,
             Platform::X86_64 { has_avx10_2: true, .. } => super::instr::SimdWidth::W256,
             Platform::X86_64 { .. } => super::instr::SimdWidth::W256,
             Platform::AArch64 { has_sve: true, .. } => super::instr::SimdWidth::Scalable,
