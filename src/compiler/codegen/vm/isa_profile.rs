@@ -454,13 +454,15 @@ impl IsaProfile {
         // AVX2  (vec_count=16): [15,14,13, 12,11,10]   (全部 ≤15, 与原设计一致)
         // AVX512(vec_count=32): [15,14,13, 31,30,29]   (内部 ≤15, spill 高位)
         let scratch_vec_regs: Vec<PhysVec> = if kc.use_avx512 {
+            // BCE-20260728-EVEX-OOB: 所有 Vec 寄存器限制 ≤15（iced 1.21 code_asm
+            // 不正确编码 ymm16-31 的 EVEX 指令）。spill scratch 也用 ≤15。
             vec![
-                PhysVec(15), // zmm15 — 内部 scratch 0 (HReduce/FWHT, SSE scalar 安全)
-                PhysVec(14), // zmm14 — 内部 scratch 1 (FWHT, SSE scalar 安全)
-                PhysVec(13), // zmm13 — 内部 scratch 2 (broadcast/Sigmoid/ScalarLoad, SSE scalar 安全)
-                PhysVec(31), // zmm31 — spill scratch A (vmovups, 支持 16..31)
-                PhysVec(30), // zmm30 — spill scratch B (vmovups, 支持 16..31)
-                PhysVec(29), // zmm29 — spill scratch C (vmovups, 支持 16..31)
+                PhysVec(15), // ymm15 — 内部 scratch 0 (HReduce/FWHT, SSE scalar 安全)
+                PhysVec(14), // ymm14 — 内部 scratch 1 (FWHT, SSE scalar 安全)
+                PhysVec(13), // ymm13 — 内部 scratch 2 (broadcast/Sigmoid/ScalarLoad, SSE scalar 安全)
+                PhysVec(12), // ymm12 — spill scratch A (输入 a)
+                PhysVec(11), // ymm11 — spill scratch B (输入 b)
+                PhysVec(10), // ymm10 — spill scratch C (acc/dst 中转)
             ]
         } else {
             vec![
