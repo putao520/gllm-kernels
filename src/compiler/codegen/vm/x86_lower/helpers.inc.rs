@@ -17,8 +17,13 @@ impl X86Lower {
             _ => (false, false, false),
         };
         let jit_ctx = crate::compiler::jit_context::JitContext::from_device_profile(&dp);
+        let mut asm = CodeAssembler::new(64).expect("64-bit");
+        // @trace REQ-HW-TIER-001 [req:AVX512-EVEX-RegisterRange] Keep AVX-512
+        // vector registers in the EVEX encoding family; iced defaults to VEX
+        // whenever both encodings are available, but VEX cannot address ymm16-31.
+        asm.set_prefer_vex(!use_avx512);
         Self {
-            asm: CodeAssembler::new(64).expect("64-bit"),
+            asm,
             use_avx512,
             has_avx512fp16,
             has_bf16,
