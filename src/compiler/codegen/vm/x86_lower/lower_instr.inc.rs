@@ -260,7 +260,7 @@ impl X86Lower {
         // Load first vector, horizontal max → max_xmm
         self.asm.vmovups(tmp, ymmword_ptr(base_saved)).map_err(Self::err)?;
         // Horizontal max: extract high 128, max pairwise down to scalar
-        self.asm.vextractf128(val_xmm, tmp, 1).map_err(Self::err)?;
+        self.safe_vextractf128(val_xmm, tmp, 1)?;
         self.asm.vmaxps(tmp_xmm, tmp_xmm, val_xmm).map_err(Self::err)?;
         self.asm.vmovhlps(val_xmm, tmp_xmm, tmp_xmm).map_err(Self::err)?;
         self.asm.vmaxps(tmp_xmm, tmp_xmm, val_xmm).map_err(Self::err)?;
@@ -275,7 +275,7 @@ impl X86Lower {
 
         self.asm.set_label(&mut scan_label).map_err(Self::err)?;
         self.asm.vmovups(tmp, ymmword_ptr(base_saved + offset_reg)).map_err(Self::err)?;
-        self.asm.vextractf128(val_xmm, tmp, 1).map_err(Self::err)?;
+        self.safe_vextractf128(val_xmm, tmp, 1)?;
         self.asm.vmaxps(tmp_xmm, tmp_xmm, val_xmm).map_err(Self::err)?;
         self.asm.vmovhlps(val_xmm, tmp_xmm, tmp_xmm).map_err(Self::err)?;
         self.asm.vmaxps(tmp_xmm, tmp_xmm, val_xmm).map_err(Self::err)?;
@@ -1005,7 +1005,7 @@ impl X86Lower {
         // 16→8: ymm_lo = op(ymm_lo, ymm_hi) (lanes 0-7 ← op(lanes 0-7, lanes 8-15))
         Self::xmm_reduce_op(&mut self.asm, op, xm_lo, xm_hi)?;
         // 8→4: vextractf128 + op
-        self.asm.vextractf128(xm_hi, ymm_lo, 1i32).map_err(Self::err)?;
+        self.safe_vextractf128(xm_hi, ymm_lo, 1i32)?;
         Self::xmm_reduce_op(&mut self.asm, op, xm_lo, xm_hi)?;
         // 4→2
         self.asm.vmovhlps(xm_hi, xm_lo, xm_lo).map_err(Self::err)?;
@@ -1153,7 +1153,7 @@ impl X86Lower {
         self.asm.xor(offset_reg, offset_reg).map_err(Self::err)?;
         self.asm.vmovups(tmp_ymm, ymmword_ptr(base_saved)).map_err(Self::err)?;
         // Horizontal max of first vector → max_xmm
-        self.asm.vextractf128(val_xmm, tmp_ymm, 1).map_err(Self::err)?;
+        self.safe_vextractf128(val_xmm, tmp_ymm, 1)?;
         self.asm.vmaxps(tmp_xmm, tmp_xmm, val_xmm).map_err(Self::err)?;
         self.asm.vmovhlps(val_xmm, tmp_xmm, tmp_xmm).map_err(Self::err)?;
         self.asm.vmaxps(tmp_xmm, tmp_xmm, val_xmm).map_err(Self::err)?;
@@ -1172,7 +1172,7 @@ impl X86Lower {
         // Load vector at [base_saved + offset_reg]
         self.asm.vmovups(tmp_ymm, ymmword_ptr(base_saved + offset_reg)).map_err(Self::err)?;
         // Horizontal max reduction: tmp_ymm → tmp_xmm (scalar)
-        self.asm.vextractf128(val_xmm, tmp_ymm, 1).map_err(Self::err)?;
+        self.safe_vextractf128(val_xmm, tmp_ymm, 1)?;
         self.asm.vmaxps(tmp_xmm, tmp_xmm, val_xmm).map_err(Self::err)?;
         self.asm.vmovhlps(val_xmm, tmp_xmm, tmp_xmm).map_err(Self::err)?;
         self.asm.vmaxps(tmp_xmm, tmp_xmm, val_xmm).map_err(Self::err)?;

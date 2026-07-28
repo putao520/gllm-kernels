@@ -273,7 +273,7 @@ impl X86Lower {
                 self.asm.vextractps(dword_ptr(rax), src_xmm, i as i32).map_err(Self::err)?;
             } else {
                 // 提取高 128 位到临时 xmm0
-                self.asm.vextractf128(xmm0, src_ymm, 1).map_err(Self::err)?;
+                self.safe_vextractf128(xmm0, src_ymm, 1)?;
                 self.asm.vextractps(dword_ptr(rax), xmm0, (i - 4) as i32).map_err(Self::err)?;
             }
         }

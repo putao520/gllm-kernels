@@ -1829,7 +1829,7 @@ impl X86Lower {
                 }
                 // 8→4: vextractf128 + op
                 let xd = Self::ymm_to_xmm(d);
-                self.asm.vextractf128(xmm_scratch, d, 1i32).map_err(Self::err)?;
+                self.safe_vextractf128(xmm_scratch, d, 1i32)?;
                 Self::xmm_reduce_op(&mut self.asm, *op, xd, xmm_scratch)?;
                 // 4→2
                 self.asm.vmovhlps(xmm_scratch, xd, xd).map_err(Self::err)?;
@@ -3940,7 +3940,7 @@ impl X86Lower {
                     } else {
                         let idx_hi_xmm = if dst_ymm != ymm5 && scratch_ymm != ymm5 { Self::ymm_to_xmm(ymm5) }
                                          else { Self::ymm_to_xmm(ymm6) };
-                        self.asm.vextractf128(idx_hi_xmm, idx_ymm, 1).map_err(Self::err)?;
+                        self.safe_vextractf128(idx_hi_xmm, idx_ymm, 1)?;
                         self.asm.vpextrd(eax, idx_hi_xmm, (lane - 4) as u32).map_err(Self::err)?;
                     }
                     // Apply mask to get valid codebook index

@@ -129,6 +129,27 @@ impl X86Lower {
 
     /// 返回指定索引的 scratch YMM 寄存器。
     fn scratch_ymm(&self, idx: usize) -> AsmRegisterYmm { Self::ymm(self.scratch_vec_ids[idx]) }
+
+    /// Emit a safe 128-bit extraction from a YMM register.
+    ///
+    /// `vextractf128` is VEX-only and cannot encode YMM16..YMM31.  The
+    /// AVX-512 path therefore uses the EVEX equivalent, which accepts the
+    /// complete YMM register file; AVX2 keeps the original VEX instruction.
+    // @trace REQ-HW-TIER-001 [req:AVX512-EVEX-RegisterRange]
+    fn safe_vextractf128(
+        &mut self,
+        dst: AsmRegisterXmm,
+        src: AsmRegisterYmm,
+        imm: i32,
+    ) -> Result<(), CompilerError> {
+        if self.use_avx512 {
+            self.asm.vextractf32x4(dst, src, imm).map_err(Self::err)?;
+        } else {
+            self.asm.vextractf128(dst, src, imm).map_err(Self::err)?;
+        }
+        Ok(())
+    }
+
     /// 返回指定索引的 scratch XMM 寄存器。
     fn scratch_xmm(&self, idx: usize) -> AsmRegisterXmm {
         // BCE-20260702-REGALLOC-AVX2-OOB: S 类 scratch (idx 0..3) 走 SSE scalar 指令
