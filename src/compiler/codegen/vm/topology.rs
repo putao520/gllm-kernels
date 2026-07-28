@@ -12,6 +12,9 @@
 //! - decoder 裁剪为 EncodeToLayer: 裁掉 lm_head 及后续
 //! - 编译器看裁剪后的图 ops 推导一切，完全不读 output_modes
 
+use std::collections::HashSet;
+
+use crate::compiler::buffer_alloc::logits_chain_tensors;
 use crate::compiler::graph::{CompilerGraph, Op, TensorId};
 use crate::compiler::mega_kernel_abi::MtpKernelConfig;
 
@@ -124,7 +127,14 @@ pub struct GraphTopologyAnalysis {
     pub logits_producer_op_idx: Option<usize>,
 
     /// logits 产出的 tensor ID — logits_producer_op_idx 对应 op 的 output[0]。
+    /// 保留该单 tensor 指针供输出尺寸推导和 MTP 权重定位使用。
     pub logits_output_tid: Option<TensorId>,
+
+    /// logits producer 到 Argmax/WriteLogits sink 的完整 tensor 链。
+    ///
+    /// 输出保留算子（如 LogitSoftcap）之间的 tensor 均由 mega-kernel
+    /// output 区管理，不能进入 intermediate scratchpad 分配。
+    pub logits_chain_tids: HashSet<TensorId>,
 
     /// MTP 配置 — 从 Op::MtpDraft { depth: , hidden_size: , vocab_size:  } 推导。
     pub mtp_config: Option<MtpKernelConfig>,
@@ -237,6 +247,11 @@ impl GraphTopologyAnalysis {
         let logits_output_tid = logits_producer_op_idx.and_then(|idx| {
             graph.ops.get(idx)?.outputs.first().copied()
         });
+        // Keep topology and buffer allocation on the same chain derivation.
+        // The helper starts at Argmax/WriteLogits sinks and stops at the
+        // vocabulary GEMM producer, so every skipped tensor is materializable
+        // through the mega-kernel output pointer.
+        let logits_chain_tids = logits_chain_tensors(graph);
 
         // MTP 配置从 Op::MtpDraft 推导（胖 opcode 自描述）
         let mtp_config = graph.ops.iter().find_map(|op| {
@@ -266,6 +281,7 @@ impl GraphTopologyAnalysis {
             vocab_size,
             logits_producer_op_idx,
             logits_output_tid,
+            logits_chain_tids,
             mtp_config,
             sg_detect_hidden_dim,
             sg_inject_hidden_dim,
@@ -373,6 +389,7 @@ mod tests {
 
         assert_eq!(topo.logits_producer_op_idx, Some(0));
         assert_eq!(topo.logits_output_tid, Some(gemm_out));
+        assert!(topo.logits_chain_tids.contains(&gemm_out));
         assert_eq!(topo.sg_ops, SgOpsPresence::None);
     }
 

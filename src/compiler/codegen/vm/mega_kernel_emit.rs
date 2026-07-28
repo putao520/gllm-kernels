@@ -1264,9 +1264,12 @@ pub fn compile_mega_kernel_vm(
     //
     // 拓扑驱动：logits 产出者的 output tensor 重定向到 output buffer。
     // 替代旧代码中的 `find(|op| op.label == "lm_head")` label 约定搜索。
-    if let Some(logits_tid) = topology.logits_output_tid {
-        // 有 logits producer 的图: logits producer 的 output 写入输出区
-        resolver.override_source(logits_tid, TensorPtrSource::Output { offset: 0 });
+    if !topology.logits_chain_tids.is_empty() {
+        // 有 logits producer 的图: producer 到 sink 的整条 chain 写入输出区。
+        // buffer allocation 跳过的每个 tensor 都必须有 materialize source。
+        for &tid in &topology.logits_chain_tids {
+            resolver.override_source(tid, TensorPtrSource::Output { offset: 0 });
+        }
     } else if let Some(&output_tid) = graph.outputs.first() {
         // 无 logits producer 的图: 图输出（MeanPool/classifier 结果）写入输出区
         resolver.override_source(output_tid, TensorPtrSource::Output { offset: 0 });
@@ -1981,8 +1984,8 @@ fn emit_batch_mode_path(
 
         let mut batch_resolver = TensorPtrResolver::build(mk.graph, mk.alloc, &mk.topology);
         // Redirect logits output for batch — mk.topology-driven
-        if let Some(logits_tid) = mk.topology.logits_output_tid {
-            batch_resolver.override_source(logits_tid, TensorPtrSource::Output { offset: 0 });
+        for &tid in &mk.topology.logits_chain_tids {
+            batch_resolver.override_source(tid, TensorPtrSource::Output { offset: 0 });
         }
 
         let batch_session = CompileSession {
