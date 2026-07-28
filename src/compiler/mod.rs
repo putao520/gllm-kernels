@@ -772,7 +772,10 @@ impl InferenceCompiler {
             // output tensor is written to scratchpad[logits_scratch_offset] and
             // copy_nonoverlapping reads output_float_elems f32 from there — the scratchpad
             // must be large enough to hold the full output tensor.
-            let generate_logits_bytes = alloc_max_seq * geometry.vocab_size * elem_bytes;
+            // Generate mode emits and samples one decode row at a time; the logits
+            // region is therefore exactly one vocabulary row. Single-pass output
+            // sizing remains covered independently by `single_pass_output_bytes`.
+            let generate_logits_bytes = vocab_bytes;
             let single_pass_output_bytes = output_float_elems * elem_bytes;
             let logits_end = logits_scratch_offset + generate_logits_bytes.max(single_pass_output_bytes);
             let sg_end = if buffer_layout.sg_data_bytes > 0 {
@@ -1093,7 +1096,10 @@ impl InferenceCompiler {
         let sampling_bytes = vocab_bytes * SAMPLING_WORKSPACE_MULTIPLIER;
         // BCE-20260623-001 fix (GPU path): total_scratch must also cover
         // single-pass output tensor bytes when output_float_elems > 0.
-        let generate_logits_bytes = alloc_max_seq * geometry.vocab_size * elem_bytes;
+        // Generate mode emits and samples one decode row at a time; the logits
+        // region is therefore exactly one vocabulary row. Single-pass output
+        // sizing remains covered independently by `single_pass_output_bytes`.
+        let generate_logits_bytes = vocab_bytes;
         let single_pass_output_bytes = gpu_output_float_elems * elem_bytes;
         let logits_end = logits_scratch_offset + generate_logits_bytes.max(single_pass_output_bytes);
         // [FIX-PSC5] GPU path must include sg_end and dwc_end in scratchpad sizing,
