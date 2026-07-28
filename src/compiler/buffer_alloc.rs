@@ -255,31 +255,37 @@ pub fn analyze_lifetimes(
         }
     }
 
-    // §0.2.3: Logits tensor (last GEMM output before Argmax) is managed by
-    // mega-kernel output_ptr (scratchpad logits region), NOT by intermediate
-    // scratchpad allocation.  Exclude it to avoid allocating max_seq_len *
-    // vocab_size bytes (e.g. 32768 * 151669 * 4 = 18.5 GB) in scratchpad.
-    let logits_output_tid: Option<TensorId> = graph.ops.iter().rev()
-        .find_map(|op| {
-            // The logits producer is the last QuantGemm or Gemm op whose output
-            // feeds into Argmax/WriteLogits/StoreToken downstream.
-            if op.op_is_quant_gemm(graph) || op.op_is_gemm_like(graph) {
-                op.outputs.first().copied()
-            } else {
-                None
+    // BCE-20260728-LOGITS-CHAIN-ALLOC: 从 Argmax/WriteLogits 反向遍历生产者链，
+    // 穿过 LogitSoftcap/TemperatureScale 等 output-preserving post-op，到 GEMM producer。
+    // 整条 logits 链由 mega-kernel output_ptr (logits_scratch_offset) 管理，不进 intermediate alloc。
+    let mut logits_chain_tids: HashSet<TensorId> = HashSet::new();
+    for sink_op in &graph.ops {
+        let is_sink = matches!(sink_op.op_resolved(graph),
+            Some(crate::compiler::graph::Op::Argmax { .. }) |
+            Some(crate::compiler::graph::Op::WriteLogits { .. }));
+        if !is_sink {
+            continue;
+        }
+        // Seed from the sink input, then walk each producer's inputs backwards.
+        let mut frontier: Vec<TensorId> = sink_op.inputs.iter().copied().collect();
+        while let Some(cur) = frontier.pop() {
+            if !logits_chain_tids.insert(cur) {
+                continue;
             }
-        })
-        .and_then(|tid| {
-            // Only exclude if this tensor is consumed by Argmax or WriteLogits
-            // (i.e. it IS the logits, not a regular GEMM output).
-            let consumer_is_logits_sink = graph.ops.iter().any(|op| {
-                op.inputs.contains(&tid) &&
-                    matches!(op.op_resolved(graph),
-                        Some(crate::compiler::graph::Op::Argmax { .. }) |
-                        Some(crate::compiler::graph::Op::WriteLogits { .. }))
-            });
-            if consumer_is_logits_sink { Some(tid) } else { None }
-        });
+            // Find the producer of this tensor.  Stop at the GEMM head: cur is
+            // already the logits output and has been recorded in the chain.
+            if let Some(producer) = graph.ops.iter().find(|op| op.outputs.contains(&cur)) {
+                if producer.op_is_quant_gemm(graph) || producer.op_is_gemm_like(graph) {
+                    continue;
+                }
+                // Non-GEMM post-op (LogitSoftcap/TemperatureScale, etc.):
+                // continue walking towards its producer.
+                for &inp in &producer.inputs {
+                    frontier.push(inp);
+                }
+            }
+        }
+    }
 
     let mut lifetimes = Vec::new();
     for tensor in &graph.tensors {
@@ -289,8 +295,8 @@ pub fn analyze_lifetimes(
         if alias_outputs.contains(&tensor.id) {
             continue;
         }
-        // §0.2.3: Logits tensor managed by mega-kernel output_ptr — skip
-        if logits_output_tid == Some(tensor.id) {
+        // §0.2.3: The complete logits chain is managed by mega-kernel output_ptr.
+        if logits_chain_tids.contains(&tensor.id) {
             continue;
         }
         // R2: 跳过虚拟 tensor — 已被 DataFlowOptimizer 消除，不需要物理 buffer
