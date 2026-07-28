@@ -300,9 +300,13 @@ pub fn analyze_lifetimes(
             // ARCH-DTYPE-JIT-TYPED: elem_bytes 始终从 tensor.dtype 推断，禁止硬编码 F32。
             // 中间张量的 dtype 由 dtype 传播链在图构建时设置，已反映真实计算精度。
             let elem_bytes = tensor.dtype.size_bytes();
-            // ARCH-SYMDIM: buffer 分配用 graph.max_seq_len 作为 Symbolic 维度上界
+            // ARCH-SYMDIM: buffer 分配用 graph.max_seq_len 作为 Symbolic 维度上界。
+            // BCE-20260728-SCRATCHPAD-MISMATCH: 限制编译期分配上界避免 PLE 等
+            // per-layer intermediate 膨胀（Gemma4 E2B max_seq_len=131072 → 278GB OOM）。
+            // 实际推理 seq_len 远小于 max_position_embeddings；8192 覆盖绝大多数场景。
+            let alloc_max_seq_len = graph.max_seq_len.min(8192);
             let numel: usize = tensor.shape.iter()
-                .map(|d| d.max_for_allocation(graph.max_seq_len))
+                .map(|d| d.max_for_allocation(alloc_max_seq_len))
                 .product::<usize>()
                 .max(1);
             let size_bytes = numel * elem_bytes;
