@@ -384,11 +384,7 @@ impl IsaProfile {
     /// 最优 SIMD 宽度
     pub fn optimal_simd_width(&self) -> super::instr::SimdWidth {
         match &self.platform {
-            // BCE-20260728-W512-HEAP-CORRUPTION: 强制 AVX-512 用 W256 而非 W512。
-            // 5070Ti (9950X3D) W512 路径的 zmm store 导致 glibc 堆损坏
-            // (corrupted size vs prev_size)。W256 (ymm) 在 AVX-512 CPU 上完全正确，
-            // 只是少一半 SIMD 宽度。根因待深挖（zmm spill slot 对齐或宽度不匹配）。
-            Platform::X86_64 { has_avx512: true, .. } => super::instr::SimdWidth::W256,
+            Platform::X86_64 { has_avx512: true, .. } => super::instr::SimdWidth::W512,
             Platform::X86_64 { has_avx10_2: true, .. } => super::instr::SimdWidth::W256,
             Platform::X86_64 { .. } => super::instr::SimdWidth::W256,
             Platform::AArch64 { has_sve: true, .. } => super::instr::SimdWidth::Scalable,
@@ -447,10 +443,7 @@ impl IsaProfile {
 
         // 向量寄存器 (ARCH-ISA-SCRATCH-VEC: 末六个保留为 Lower scratch)
         // 见 IsaProfile.scratch_vec_regs 文档说明拆分原因。
-        // BCE-20260728-AVX512-CODEGEN-DIFF: AVX-512 的 vec_count=32 产生和 AVX2 完全不同的
-        // regalloc 决策（26 vs 10 allocatable Vec）→ 不同机器码 → 5070Ti SIGSEGV。
-        // 强制 vec_count=16（完全 AVX2 配置），消除 AVX-512 特有 codegen 路径。
-        let vec_count: u8 = 16;
+        let vec_count: u8 = if kc.use_avx512 { 32 } else { 16 };
         // BCE-20260702-REGALLOC-AVX2-OOB: 内部 scratch (0..3) 用于 SSE scalar 指令
         // (vmovss/vmovsd/vmovd — scratch_xmm → lower_scalar_load_x86 / xmm_const_i32)
         // 以及 HReduce/broadcast。iced_x86 的 code_asm vmovss 仅接受 xmm0..15 (VEX
@@ -461,15 +454,13 @@ impl IsaProfile {
         // AVX2  (vec_count=16): [15,14,13, 12,11,10]   (全部 ≤15, 与原设计一致)
         // AVX512(vec_count=32): [15,14,13, 31,30,29]   (内部 ≤15, spill 高位)
         let scratch_vec_regs: Vec<PhysVec> = if kc.use_avx512 {
-            // BCE-20260728-EVEX-OOB: 所有 Vec 寄存器限制 ≤15（iced 1.21 code_asm
-            // 不正确编码 ymm16-31 的 EVEX 指令）。spill scratch 也用 ≤15。
             vec![
-                PhysVec(15), // ymm15 — 内部 scratch 0 (HReduce/FWHT, SSE scalar 安全)
-                PhysVec(14), // ymm14 — 内部 scratch 1 (FWHT, SSE scalar 安全)
-                PhysVec(13), // ymm13 — 内部 scratch 2 (broadcast/Sigmoid/ScalarLoad, SSE scalar 安全)
-                PhysVec(12), // ymm12 — spill scratch A (输入 a)
-                PhysVec(11), // ymm11 — spill scratch B (输入 b)
-                PhysVec(10), // ymm10 — spill scratch C (acc/dst 中转)
+                PhysVec(15), // zmm15 — 内部 scratch 0 (HReduce/FWHT, SSE scalar 安全)
+                PhysVec(14), // zmm14 — 内部 scratch 1 (FWHT, SSE scalar 安全)
+                PhysVec(13), // zmm13 — 内部 scratch 2 (broadcast/Sigmoid/ScalarLoad, SSE scalar 安全)
+                PhysVec(31), // zmm31 — spill scratch A (vmovups, 支持 16..31)
+                PhysVec(30), // zmm30 — spill scratch B (vmovups, 支持 16..31)
+                PhysVec(29), // zmm29 — spill scratch C (vmovups, 支持 16..31)
             ]
         } else {
             vec![
@@ -483,12 +474,6 @@ impl IsaProfile {
         };
         let vec_regs: Vec<PhysVec> = (0..vec_count)
             .filter(|&r| !scratch_vec_regs.iter().any(|s| s.0 == r))
-            // BCE-20260728-EVEX-OOB: 限制 allocatable Vec 到 ≤15。iced 1.21 的 code_asm
-            // 对 vaddps/vmulps 等算术指令在 assemble 时走 VEX 编码，不支持 ymm16-31
-            // （需 EVEX 前缀但 BlockEncoder 不自动选择 EVEX）。只有 vmovups（spill
-            // scratch 用）支持 0-31。因此 regalloc 只分配 0-12（去 scratch 后），
-            // 16-31 仅留给 spill scratch 的 vmovups。
-            .filter(|&r| r < 16)
             .map(PhysVec)
             .collect();
 
