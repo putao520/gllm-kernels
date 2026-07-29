@@ -55,7 +55,17 @@ impl OpImpl<GemmOpLayout> for GemmFmaBlis {
         let lanes = ctx.width.f32_lanes().max(1);
         // can_blis 判定 (原 gemm_emit.rs:175): 只有 BLIS 条件满足时才走 BLIS, 否则 naive。
         // trans_b 路径在 emit_gemm_inline_with_epilogue 内部自动路由到 emit_gemm_trans_b_inline。
-        let can_blis = !lo.trans_b && lo.m >= lo.mr && lo.n >= lo.nr * lanes && lo.k >= 16;
+        // A symbolic/runtime M bound must stay inside the VM loop.  `lo.m` is
+        // the allocation upper bound for symbolic dimensions, not an
+        // instruction-emission extent; using it for BLIS's Rust loops expands
+        // Gemma's max_seq_len-sized template into hundreds of millions of
+        // instructions.  BLIS is valid only when the bound is compile-time
+        // constant.
+        let can_blis = matches!(lo.m_bound, super::instr::BoundExpr::Const(_))
+            && !lo.trans_b
+            && lo.m >= lo.mr
+            && lo.n >= lo.nr * lanes
+            && lo.k >= 16;
         if can_blis {
             emit_gemm_blis_inline(
                 ctx.prog, lo.m, lo.n, lo.k, ctx.width,
