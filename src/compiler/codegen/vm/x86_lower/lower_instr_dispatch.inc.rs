@@ -3717,7 +3717,15 @@ impl X86Lower {
                 //   if j<4: sc=scales[j]&0x3F; else: sc=(scales[j+4]&0xF)|((scales[j-4]>>6)<<4)
                 // Min (is_min=true):
                 //   if j<4: m=scales[j+4]&0x3F; else: m=(scales[j+4]>>4)|((scales[j]>>6)<<4)
-                let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
+                // W512 broadcast must target ZMM (16 lanes); YMM leaves lanes 8..15 undefined.
+                let is_w512 = matches!(*width, SimdWidth::W512) && self.use_avx512;
+                let dst_xmm = if is_w512 {
+                    let (z, _) = self.resolve_zmm_or_spill_write(*dst, alloc, 2)?;
+                    Self::ymm_to_xmm(Self::zmm_to_ymm(z))
+                } else {
+                    let (y, _) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
+                    Self::ymm_to_xmm(y)
+                };
                 let scales_reg = self.resolve_gpr_read(*scales_base, alloc, 2)?;
                 let idx_reg = self.resolve_gpr_read(*sub_block_idx, alloc, 0)?;
 
@@ -3772,13 +3780,20 @@ impl X86Lower {
 
                 // ── Common ──
                 self.asm.set_label(&mut done_label).map_err(Self::err)?;
-                let dst_xmm = Self::ymm_to_xmm(dst_ymm);
                 self.asm.vmovd(dst_xmm, eax).map_err(Self::err)?;
-                self.asm.vpbroadcastd(dst_ymm, dst_xmm).map_err(Self::err)?;
-                self.asm.vcvtdq2ps(dst_ymm, dst_ymm).map_err(Self::err)?;
+                if is_w512 {
+                    let (dst_zmm, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 2)?;
+                    self.asm.vpbroadcastd(dst_zmm, dst_xmm).map_err(Self::err)?;
+                    self.asm.vcvtdq2ps(dst_zmm, dst_zmm).map_err(Self::err)?;
+                    if dst_spilled { self.spill_store_zmm(*dst, alloc, 2)?; }
+                } else {
+                    let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
+                    self.asm.vpbroadcastd(dst_ymm, dst_xmm).map_err(Self::err)?;
+                    self.asm.vcvtdq2ps(dst_ymm, dst_ymm).map_err(Self::err)?;
+                    if dst_spilled { self.spill_store_ymm(*dst, alloc, 2)?; }
+                }
 
                 let _ = (scales_count, is_q3k_extended, width.f32_lanes());
-                if dst_spilled { self.spill_store_ymm(*dst, alloc, 2)?; }
                 Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
@@ -3804,10 +3819,11 @@ impl X86Lower {
 
     fn lower_quant_scalar_cvt_load_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::QuantScalarCvtLoad { dst, base, offset, src_dtype, .. } => {
-                let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
+            VmInstr::QuantScalarCvtLoad { dst, base, offset, src_dtype, width } => {
+                // W512 needs a ZMM broadcast so all 16 lanes hold the scalar; the old
+                // YMM path left lanes 8..15 undefined, producing NaN in downstream FMA.
+                // (BCE-20260729-QUANT-W512-HALFLANE-NAN)
                 let base_reg = self.resolve_gpr_read(*base, alloc, 0)?;
-                let dst_xmm = Self::ymm_to_xmm(dst_ymm);
                 let addr = if *offset == 0 {
                     base_reg
                 } else if *offset > 0 {
@@ -3817,30 +3833,66 @@ impl X86Lower {
                     self.asm.lea(rax, dword_ptr(base_reg - ((-*offset) as i32))).map_err(Self::err)?;
                     rax
                 };
+                // Resolve the destination at the correct vector width so the broadcast
+                // fills every active lane (YMM=8 for W256, ZMM=16 for W512). The old path
+                // always resolved a YMM, leaving lanes 8..15 undefined for W512 → NaN.
+                let is_w512 = matches!(width, SimdWidth::W512) && self.use_avx512;
                 match src_dtype {
                     ScalarCvtSource::F16 => {
-                        // Load 16-bit, convert f16→f32, broadcast to YMM
                         self.asm.movzx(eax, word_ptr(addr)).map_err(Self::err)?;
-                        self.asm.vmovd(dst_xmm, eax).map_err(Self::err)?;
-                        self.asm.vcvtph2ps(dst_xmm, dst_xmm).map_err(Self::err)?;
-                        self.asm.vbroadcastss(dst_ymm, dst_xmm).map_err(Self::err)?;
+                        if is_w512 {
+                            let (dst_zmm, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 2)?;
+                            let dst_xmm = Self::ymm_to_xmm(Self::zmm_to_ymm(dst_zmm));
+                            self.asm.vmovd(dst_xmm, eax).map_err(Self::err)?;
+                            self.asm.vcvtph2ps(dst_xmm, dst_xmm).map_err(Self::err)?;
+                            self.asm.vbroadcastss(Self::zmm_to_ymm(dst_zmm), dst_xmm).map_err(Self::err)?;
+                            if dst_spilled { self.spill_store_zmm(*dst, alloc, 2)?; }
+                        } else {
+                            let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
+                            let dst_xmm = Self::ymm_to_xmm(dst_ymm);
+                            self.asm.vmovd(dst_xmm, eax).map_err(Self::err)?;
+                            self.asm.vcvtph2ps(dst_xmm, dst_xmm).map_err(Self::err)?;
+                            self.asm.vbroadcastss(dst_ymm, dst_xmm).map_err(Self::err)?;
+                            if dst_spilled { self.spill_store_ymm(*dst, alloc, 2)?; }
+                        }
                     }
                     ScalarCvtSource::I8 => {
-                        // Load signed byte, sign-extend to i32, convert to f32, broadcast
                         self.asm.movsx(eax, byte_ptr(addr)).map_err(Self::err)?;
-                        self.asm.vmovd(dst_xmm, eax).map_err(Self::err)?;
-                        self.asm.vcvtdq2ps(dst_xmm, dst_xmm).map_err(Self::err)?;
-                        self.asm.vbroadcastss(dst_ymm, dst_xmm).map_err(Self::err)?;
+                        if is_w512 {
+                            let (dst_zmm, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 2)?;
+                            let dst_xmm = Self::ymm_to_xmm(Self::zmm_to_ymm(dst_zmm));
+                            self.asm.vmovd(dst_xmm, eax).map_err(Self::err)?;
+                            self.asm.vcvtdq2ps(dst_xmm, dst_xmm).map_err(Self::err)?;
+                            self.asm.vbroadcastss(Self::zmm_to_ymm(dst_zmm), dst_xmm).map_err(Self::err)?;
+                            if dst_spilled { self.spill_store_zmm(*dst, alloc, 2)?; }
+                        } else {
+                            let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
+                            let dst_xmm = Self::ymm_to_xmm(dst_ymm);
+                            self.asm.vmovd(dst_xmm, eax).map_err(Self::err)?;
+                            self.asm.vcvtdq2ps(dst_xmm, dst_xmm).map_err(Self::err)?;
+                            self.asm.vbroadcastss(dst_ymm, dst_xmm).map_err(Self::err)?;
+                            if dst_spilled { self.spill_store_ymm(*dst, alloc, 2)?; }
+                        }
                     }
                     ScalarCvtSource::U8 => {
-                        // Load unsigned byte, zero-extend to i32, convert to f32, broadcast
                         self.asm.movzx(eax, byte_ptr(addr)).map_err(Self::err)?;
-                        self.asm.vmovd(dst_xmm, eax).map_err(Self::err)?;
-                        self.asm.vcvtdq2ps(dst_xmm, dst_xmm).map_err(Self::err)?;
-                        self.asm.vbroadcastss(dst_ymm, dst_xmm).map_err(Self::err)?;
+                        if is_w512 {
+                            let (dst_zmm, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 2)?;
+                            let dst_xmm = Self::ymm_to_xmm(Self::zmm_to_ymm(dst_zmm));
+                            self.asm.vmovd(dst_xmm, eax).map_err(Self::err)?;
+                            self.asm.vcvtdq2ps(dst_xmm, dst_xmm).map_err(Self::err)?;
+                            self.asm.vbroadcastss(Self::zmm_to_ymm(dst_zmm), dst_xmm).map_err(Self::err)?;
+                            if dst_spilled { self.spill_store_zmm(*dst, alloc, 2)?; }
+                        } else {
+                            let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
+                            let dst_xmm = Self::ymm_to_xmm(dst_ymm);
+                            self.asm.vmovd(dst_xmm, eax).map_err(Self::err)?;
+                            self.asm.vcvtdq2ps(dst_xmm, dst_xmm).map_err(Self::err)?;
+                            self.asm.vbroadcastss(dst_ymm, dst_xmm).map_err(Self::err)?;
+                            if dst_spilled { self.spill_store_ymm(*dst, alloc, 2)?; }
+                        }
                     }
                 }
-                if dst_spilled { self.spill_store_ymm(*dst, alloc, 2)?; }
                 Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
