@@ -936,6 +936,42 @@ mod tests {
         assert!(code.len() > 10, "code too short: {} bytes", code.len());
     }
 
+    /// BCE-20260729-EMBED-Q4K-NAN: QuantGather emits W512 byte loads for Q4_K
+    /// (16 qs bytes → 16 integer lanes). Verify the x86 lowerer uses the ZMM
+    /// widening form instead of the old 8-byte YMM form that left lanes 8..15
+    /// undefined before the W512 IntToFloat/store sequence.
+    #[test]
+    fn bce_embed_q4k_w512_byte_load_initializes_all_lanes() {
+        let mut prog = VmProgram::new();
+        let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W512);
+        prog.emit(VmInstr::QuantLoadBytesVec {
+            dst,
+            base,
+            offset: 16,
+            count: 16,
+            signed: false,
+            width: SimdWidth::W512,
+        });
+
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
+        let frame = super::super::stack_frame::StackFrame::compute(&alloc, &profile, 0);
+        let mut lower = X86Lower::with_avx512(true);
+        lower.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            lower.lower_instr(instr, &alloc).unwrap();
+        }
+        lower.emit_epilogue(&frame, &alloc).unwrap();
+        let code = lower.finalize().unwrap();
+        let disasm = disasm_lower(&code);
+        assert!(disasm.contains("vpmovzxbd") && disasm.contains("zmm"),
+            "W512 byte load must widen all 16 bytes into ZMM lanes; got:\n{disasm}");
+        assert!(!disasm.contains("vmovq"),
+            "W512 byte load must not use the old 8-byte vmovq path; got:\n{disasm}");
+    }
+
     // ── BCE-20260703-AVX512-HALF-LANES 回归测试 ──
     //
     // 静态回归: 验证 7 处 AVX-512 "半 lanes" BUG 修复后, use_avx512=true 走 ZMM 16-lane

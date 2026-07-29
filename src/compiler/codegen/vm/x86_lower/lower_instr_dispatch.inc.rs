@@ -3850,20 +3850,22 @@ impl X86Lower {
 
     fn lower_quant_load_bytes_vec_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::QuantLoadBytesVec { dst, base, offset, count, signed, .. } => {
+            VmInstr::QuantLoadBytesVec { dst, base, offset, count, signed, width } => {
                 // Load `count` bytes from [base + offset], sign/zero-extend each to i32.
                 // signed=true: vpmovsxbd (sign-extend); signed=false: vpmovzxbd (zero-extend)
                 // Result is integer (NO float conversion) — caller does AND/Shift/IntToFloat.
-                // IMPORTANT: Use reg-to-reg vpmovzxbd to avoid alignment issues.
-                // Quantized block data (e.g., Q4_0 nibbles at offset 2) is not 4-byte aligned,
-                // and vpmovzxbd dword_ptr requires 4-byte aligned addresses or risks page-boundary SIGSEGV.
-                let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
+                // IMPORTANT: Use register or byte-vector loads rather than an aligned dword
+                // memory operand. Quantized block data (for example Q4_K qs at +16) need not
+                // be naturally aligned.
+                //
+                // W512 is a real 16-lane value. The old implementation always resolved a
+                // YMM and loaded only 8 bytes, leaving the upper half of a ZMM undefined. A
+                // subsequent IntToFloat/VecStore W512 then consumed those bytes; QuantGather
+                // consequently wrote NaNs for Q4_K embeddings. Keep the width and destination
+                // register width aligned, and reject unsupported byte counts rather than
+                // silently leaving lanes uninitialized.
                 // ARCH-ISA-SCRATCH: base → slot 2 (r11), NOT slot 0 (rax).
-                // We compute the effective address into rax below; using slot 0 for base
-                // creates `mov rax, rax` NOP when base is Spilled (loaded into rax),
-                // and conflicts with eval_offset_to_rax which also uses slot 0.
                 let base_reg = self.resolve_gpr_read(*base, alloc, 2)?;
-                let dst_xmm = Self::ymm_to_xmm(dst_ymm);
 
                 // Compute effective address: base + offset → rax
                 if *offset == 0 {
@@ -3874,29 +3876,72 @@ impl X86Lower {
                     self.asm.lea(rax, dword_ptr(base_reg - ((-*offset) as i32))).map_err(Self::err)?;
                 }
 
-                if *count <= 4 {
-                    // Load 4 bytes via GPR (unaligned-safe) → vmovd to xmm → vpmovzxbd reg-to-reg
-                    self.asm.mov(eax, dword_ptr(rax)).map_err(Self::err)?;
-                    self.asm.vmovd(dst_xmm, eax).map_err(Self::err)?;
-                    if *signed {
-                        self.asm.vpmovsxbd(dst_xmm, dst_xmm).map_err(Self::err)?;
-                    } else {
-                        self.asm.vpmovzxbd(dst_xmm, dst_xmm).map_err(Self::err)?;
+                match width {
+                    SimdWidth::W512 => {
+                        if !self.use_avx512 {
+                            return Err(CompilerError::CodegenViolation(
+                                "QuantLoadBytesVec W512 requires use_avx512".into(),
+                            ));
+                        }
+                        let (dst_zmm, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 2)?;
+                        match *count {
+                            16 => {
+                                // vpmov[sz]xbd zmm, m128: load all 16 bytes → 16 i32 lanes.
+                                if *signed {
+                                    self.asm.vpmovsxbd(dst_zmm, xmmword_ptr(rax)).map_err(Self::err)?;
+                                } else {
+                                    self.asm.vpmovzxbd(dst_zmm, xmmword_ptr(rax)).map_err(Self::err)?;
+                                }
+                            }
+                            8 => {
+                                // Q5/Q6 high-bit paths load 8 bytes for a W512 trace. Clear
+                                // the full destination first so lanes 8..15 are deterministic.
+                                // iced 1.21 has no vpxor zmm form — use vpxord (dword variant).
+                                self.asm.vpxord(dst_zmm, dst_zmm, dst_zmm).map_err(Self::err)?;
+                                let dst_ymm = Self::zmm_to_ymm(dst_zmm);
+                                if *signed {
+                                    self.asm.vpmovsxbd(dst_ymm, qword_ptr(rax)).map_err(Self::err)?;
+                                } else {
+                                    self.asm.vpmovzxbd(dst_ymm, qword_ptr(rax)).map_err(Self::err)?;
+                                }
+                            }
+                            other => {
+                                return Err(CompilerError::CodegenViolation(format!(
+                                    "QuantLoadBytesVec W512: unsupported count {other} (expected 8 or 16)"
+                                )));
+                            }
+                        }
+                        if dst_spilled { self.spill_store_zmm(*dst, alloc, 2)?; }
                     }
-                    // Extend xmm to ymm (sign/zero)
-                    let zero_ymm = if dst_ymm != ymm15 { ymm15 } else { ymm14 };
-                    self.asm.vpxor(zero_ymm, zero_ymm, zero_ymm).map_err(Self::err)?;
-                    self.asm.vinserti128(dst_ymm, dst_ymm, Self::ymm_to_xmm(zero_ymm), 1).map_err(Self::err)?;
-                } else {
-                    // Load 8 bytes via vmovq (unaligned-safe for AVX) → vpmovzxbd reg-to-reg
-                    self.asm.vmovq(dst_xmm, qword_ptr(rax)).map_err(Self::err)?;
-                    if *signed {
-                        self.asm.vpmovsxbd(dst_ymm, dst_xmm).map_err(Self::err)?;
-                    } else {
-                        self.asm.vpmovzxbd(dst_ymm, dst_xmm).map_err(Self::err)?;
+                    _ => {
+                        let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
+                        let dst_xmm = Self::ymm_to_xmm(dst_ymm);
+                        if *count <= 4 {
+                            // Load 4 bytes via GPR (unaligned-safe) → vmovd to xmm →
+                            // vpmov[sz]xbd reg-to-reg.
+                            self.asm.mov(eax, dword_ptr(rax)).map_err(Self::err)?;
+                            self.asm.vmovd(dst_xmm, eax).map_err(Self::err)?;
+                            if *signed {
+                                self.asm.vpmovsxbd(dst_xmm, dst_xmm).map_err(Self::err)?;
+                            } else {
+                                self.asm.vpmovzxbd(dst_xmm, dst_xmm).map_err(Self::err)?;
+                            }
+                            // Extend xmm to ymm (sign/zero).
+                            let zero_ymm = if dst_ymm != ymm15 { ymm15 } else { ymm14 };
+                            self.asm.vpxor(zero_ymm, zero_ymm, zero_ymm).map_err(Self::err)?;
+                            self.asm.vinserti128(dst_ymm, dst_ymm, Self::ymm_to_xmm(zero_ymm), 1).map_err(Self::err)?;
+                        } else {
+                            // Load 8 bytes via vmovq (unaligned-safe for AVX) → vpmov[sz]xbd.
+                            self.asm.vmovq(dst_xmm, qword_ptr(rax)).map_err(Self::err)?;
+                            if *signed {
+                                self.asm.vpmovsxbd(dst_ymm, dst_xmm).map_err(Self::err)?;
+                            } else {
+                                self.asm.vpmovzxbd(dst_ymm, dst_xmm).map_err(Self::err)?;
+                            }
+                        }
+                        if dst_spilled { self.spill_store_ymm(*dst, alloc, 2)?; }
                     }
                 }
-                if dst_spilled { self.spill_store_ymm(*dst, alloc, 2)?; }
                 Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
