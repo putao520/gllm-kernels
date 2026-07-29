@@ -4017,58 +4017,79 @@ impl X86Lower {
         match instr {
             VmInstr::QuantCodebookLookup { dst, indices, codebook_data, bits_per_entry, width, .. } => {
                 // Embed codebook as scalar gather: for each lane i, dst[i] = (f32)codebook[indices[i]].
-                // x86 AVX2 scalar-loop gather (safe, no hardware gather dependency):
-                //   for i in 0..lanes: dst[i] = (float)codebook[(int)indices[i] & mask]
+                // W512 must materialize all 16 lanes before its ZMM consumer reads the result.
                 let lanes = width.f32_lanes().max(1);
                 let mask_val = ((1u32 << bits_per_entry) - 1) as i32;
-                let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
-                let (idx_ymm, _) = self.resolve_ymm_or_spill(*indices, alloc, 1)?;
-                let dst_xmm = Self::ymm_to_xmm(dst_ymm);
-                let idx_xmm = Self::ymm_to_xmm(idx_ymm);
-
-                // Load codebook pointer into r10 (scratch slot 1)
                 let codebook_ptr = codebook_data.as_ptr() as u64;
                 self.asm.mov(r10, codebook_ptr).map_err(Self::err)?;
 
-                // Scratch for high 128 bits
-                let scratch_ymm = if dst_ymm != ymm15 { ymm15 } else { ymm14 };
-                let scratch_xmm = Self::ymm_to_xmm(scratch_ymm);
-                let tmp_xmm = if dst_ymm != ymm13 && scratch_ymm != ymm13 { Self::ymm_to_xmm(ymm13) }
-                              else { Self::ymm_to_xmm(ymm12) };
-
-                // Zero dst
-                self.asm.vpxor(dst_ymm, dst_ymm, dst_ymm).map_err(Self::err)?;
-                if lanes > 4 {
-                    self.asm.vpxor(scratch_ymm, scratch_ymm, scratch_ymm).map_err(Self::err)?;
-                }
-
-                for lane in 0..lanes.min(8) {
-                    // Extract integer index from idx_ymm lane i
-                    if lane < 4 {
-                        self.asm.vpextrd(eax, idx_xmm, lane as u32).map_err(Self::err)?;
-                    } else {
-                        let idx_hi_xmm = if dst_ymm != ymm5 && scratch_ymm != ymm5 { Self::ymm_to_xmm(ymm5) }
-                                         else { Self::ymm_to_xmm(ymm6) };
-                        self.safe_vextractf128(idx_hi_xmm, idx_ymm, 1)?;
-                        self.asm.vpextrd(eax, idx_hi_xmm, (lane - 4) as u32).map_err(Self::err)?;
+                if matches!(width, SimdWidth::W512) {
+                    if !self.use_avx512 {
+                        return Err(CompilerError::CodegenViolation(
+                            "QuantCodebookLookup W512 requires use_avx512".into(),
+                        ));
                     }
-                    // Apply mask to get valid codebook index
-                    self.asm.and(eax, mask_val).map_err(Self::err)?;
-                    // Load i8 codebook[eax] via base-index addressing: r10 + rax*1
-                    self.asm.movsx(eax, byte_ptr(r10 + rax)).map_err(Self::err)?;
-                    // Convert i32 → f32 in tmp_xmm
-                    self.asm.vcvtsi2ss(tmp_xmm, tmp_xmm, eax).map_err(Self::err)?;
-                    // Insert f32 into result at lane position
-                    if lane < 4 {
-                        self.asm.vinsertps(dst_xmm, dst_xmm, tmp_xmm, (lane as u32) << 4).map_err(Self::err)?;
-                    } else {
-                        self.asm.vinsertps(scratch_xmm, scratch_xmm, tmp_xmm, ((lane - 4) as u32) << 4).map_err(Self::err)?;
+                    let (dst_zmm, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 2)?;
+                    let (idx_zmm, _) = self.resolve_zmm_or_spill(*indices, alloc, 1)?;
+                    let idx_lo_xmm = Self::ymm_to_xmm(Self::zmm_to_ymm(idx_zmm));
+                    let idx_chunk_xmm = self.scratch_xmm(1);
+                    let tmp_xmm = self.scratch_xmm(0);
+                    // Build all 16 scalar results in a temporary stack row, then load
+                    // one complete ZMM. This avoids leaving any upper lane undefined.
+                    self.asm.sub(rsp, 64i32).map_err(Self::err)?;
+                    for lane in 0..16usize {
+                        let chunk = (lane / 4) as u32;
+                        if chunk == 0 {
+                            self.asm.vpextrd(eax, idx_lo_xmm, (lane % 4) as u32).map_err(Self::err)?;
+                        } else {
+                            self.asm.vextracti32x4(idx_chunk_xmm, idx_zmm, chunk as i32).map_err(Self::err)?;
+                            self.asm.vpextrd(eax, idx_chunk_xmm, (lane % 4) as u32).map_err(Self::err)?;
+                        }
+                        self.asm.and(eax, mask_val).map_err(Self::err)?;
+                        self.asm.movsx(eax, byte_ptr(r10 + rax)).map_err(Self::err)?;
+                        self.asm.vcvtsi2ss(tmp_xmm, tmp_xmm, eax).map_err(Self::err)?;
+                        self.asm.vmovss(dword_ptr(rsp + (lane * 4) as i32), tmp_xmm).map_err(Self::err)?;
                     }
+                    self.asm.vmovups(dst_zmm, zmmword_ptr(rsp)).map_err(Self::err)?;
+                    self.asm.add(rsp, 64i32).map_err(Self::err)?;
+                    if dst_spilled { self.spill_store_zmm(*dst, alloc, 2)?; }
+                } else {
+                    // AVX2 scalar-loop gather (safe, no hardware gather dependency).
+                    let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
+                    let (idx_ymm, _) = self.resolve_ymm_or_spill(*indices, alloc, 1)?;
+                    let dst_xmm = Self::ymm_to_xmm(dst_ymm);
+                    let idx_xmm = Self::ymm_to_xmm(idx_ymm);
+                    let scratch_ymm = if dst_ymm != ymm15 { ymm15 } else { ymm14 };
+                    let scratch_xmm = Self::ymm_to_xmm(scratch_ymm);
+                    let tmp_xmm = if dst_ymm != ymm13 && scratch_ymm != ymm13 { Self::ymm_to_xmm(ymm13) }
+                                  else { Self::ymm_to_xmm(ymm12) };
+                    self.asm.vpxor(dst_ymm, dst_ymm, dst_ymm).map_err(Self::err)?;
+                    if lanes > 4 {
+                        self.asm.vpxor(scratch_ymm, scratch_ymm, scratch_ymm).map_err(Self::err)?;
+                    }
+                    for lane in 0..lanes.min(8) {
+                        if lane < 4 {
+                            self.asm.vpextrd(eax, idx_xmm, lane as u32).map_err(Self::err)?;
+                        } else {
+                            let idx_hi_xmm = if dst_ymm != ymm5 && scratch_ymm != ymm5 { Self::ymm_to_xmm(ymm5) }
+                                             else { Self::ymm_to_xmm(ymm6) };
+                            self.safe_vextractf128(idx_hi_xmm, idx_ymm, 1)?;
+                            self.asm.vpextrd(eax, idx_hi_xmm, (lane - 4) as u32).map_err(Self::err)?;
+                        }
+                        self.asm.and(eax, mask_val).map_err(Self::err)?;
+                        self.asm.movsx(eax, byte_ptr(r10 + rax)).map_err(Self::err)?;
+                        self.asm.vcvtsi2ss(tmp_xmm, tmp_xmm, eax).map_err(Self::err)?;
+                        if lane < 4 {
+                            self.asm.vinsertps(dst_xmm, dst_xmm, tmp_xmm, (lane as u32) << 4).map_err(Self::err)?;
+                        } else {
+                            self.asm.vinsertps(scratch_xmm, scratch_xmm, tmp_xmm, ((lane - 4) as u32) << 4).map_err(Self::err)?;
+                        }
+                    }
+                    if lanes > 4 {
+                        self.asm.vinsertf128(dst_ymm, dst_ymm, scratch_xmm, 1).map_err(Self::err)?;
+                    }
+                    if dst_spilled { self.spill_store_ymm(*dst, alloc, 2)?; }
                 }
-                if lanes > 4 {
-                    self.asm.vinsertf128(dst_ymm, dst_ymm, scratch_xmm, 1).map_err(Self::err)?;
-                }
-                if dst_spilled { self.spill_store_ymm(*dst, alloc, 2)?; }
                 Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
@@ -4078,22 +4099,37 @@ impl X86Lower {
 
     fn lower_quant_extract_bits_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::QuantExtractBits { dst, src, bit_offset, bit_width, .. } => {
-                // dst = (src >> bit_offset) & ((1 << bit_width) - 1)
-                // vpsrld dst_ymm, src_ymm, bit_offset ; vpand dst_ymm, dst_ymm, mask_ymm
-                let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
-                let (src_ymm, _) = self.resolve_ymm_or_spill(*src, alloc, 1)?;
-                let mask_ymm = if dst_ymm != ymm15 { ymm15 } else { ymm14 };
-                let mask_xmm = Self::ymm_to_xmm(mask_ymm);
-                // shift right by bit_offset
-                self.asm.vpsrld(dst_ymm, src_ymm, *bit_offset as i32).map_err(Self::err)?;
-                // AND with mask
+            VmInstr::QuantExtractBits { dst, src, bit_offset, bit_width, width } => {
+                // dst = (src >> bit_offset) & ((1 << bit_width) - 1).
+                // W512 consumers require all 16 integer lanes to be defined.
                 let mask_val = ((1u32 << bit_width) - 1) as i64;
                 self.asm.mov(rax, mask_val as u64).map_err(Self::err)?;
-                self.asm.vmovd(mask_xmm, eax).map_err(Self::err)?;
-                self.asm.vpbroadcastd(mask_ymm, mask_xmm).map_err(Self::err)?;
-                self.asm.vpand(dst_ymm, dst_ymm, mask_ymm).map_err(Self::err)?;
-                if dst_spilled { self.spill_store_ymm(*dst, alloc, 0)?; }
+                if matches!(width, SimdWidth::W512) {
+                    if !self.use_avx512 {
+                        return Err(CompilerError::CodegenViolation(
+                            "QuantExtractBits W512 requires use_avx512".into(),
+                        ));
+                    }
+                    let (dst_zmm, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 0)?;
+                    let (src_zmm, _) = self.resolve_zmm_or_spill(*src, alloc, 1)?;
+                    let mask_zmm = if dst_zmm != zmm15 { zmm15 } else { zmm14 };
+                    let mask_xmm = Self::ymm_to_xmm(Self::zmm_to_ymm(mask_zmm));
+                    self.asm.vpsrld(dst_zmm, src_zmm, *bit_offset as i32).map_err(Self::err)?;
+                    self.asm.vmovd(mask_xmm, eax).map_err(Self::err)?;
+                    self.asm.vpbroadcastd(mask_zmm, mask_xmm).map_err(Self::err)?;
+                    self.asm.vpandd(dst_zmm, dst_zmm, mask_zmm).map_err(Self::err)?;
+                    if dst_spilled { self.spill_store_zmm(*dst, alloc, 0)?; }
+                } else {
+                    let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
+                    let (src_ymm, _) = self.resolve_ymm_or_spill(*src, alloc, 1)?;
+                    let mask_ymm = if dst_ymm != ymm15 { ymm15 } else { ymm14 };
+                    let mask_xmm = Self::ymm_to_xmm(mask_ymm);
+                    self.asm.vpsrld(dst_ymm, src_ymm, *bit_offset as i32).map_err(Self::err)?;
+                    self.asm.vmovd(mask_xmm, eax).map_err(Self::err)?;
+                    self.asm.vpbroadcastd(mask_ymm, mask_xmm).map_err(Self::err)?;
+                    self.asm.vpand(dst_ymm, dst_ymm, mask_ymm).map_err(Self::err)?;
+                    if dst_spilled { self.spill_store_ymm(*dst, alloc, 0)?; }
+                }
                 Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
@@ -4123,22 +4159,42 @@ impl X86Lower {
 
     fn lower_quant_interleave_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::QuantInterleave { dst, lo, hi, .. } => {
-                // Full 8-dword interleave: [lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], lo[3], hi[3]]
-                // vpunpckldq only interleaves dwords 0,1 per 128-bit lane → misses dwords 2,3.
-                // Fix: vpunpckldq for dwords 0,1 + vpunpckhdq for dwords 2,3 + vinserti128 merge.
-                let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
-                let (lo_ymm, _) = self.resolve_ymm_or_spill(*lo, alloc, 1)?;
-                let (hi_ymm, _) = self.resolve_ymm_or_spill(*hi, alloc, 2)?;
-                // dst = [lo0, hi0, lo1, hi1, lo4, hi4, lo5, hi5] (vpunpckldq per lane)
-                self.asm.vpunpckldq(dst_ymm, lo_ymm, hi_ymm).map_err(Self::err)?;
-                // scratch = [lo2, hi2, lo3, hi3, lo6, hi6, lo7, hi7] (vpunpckhdq per lane)
-                let scratch = if dst_ymm != ymm14 { ymm14 } else { ymm13 };
-                self.asm.vpunpckhdq(scratch, lo_ymm, hi_ymm).map_err(Self::err)?;
-                // Merge: dst low 128 = vpunpckldq result, dst high 128 = vpunpckhdq low 128
-                let scratch_xmm = Self::ymm_to_xmm(scratch);
-                self.asm.vinserti128(dst_ymm, dst_ymm, scratch_xmm, 1).map_err(Self::err)?;
-                if dst_spilled { self.spill_store_ymm(*dst, alloc, 0)?; }
+            VmInstr::QuantInterleave { dst, lo, hi, width } => {
+                if matches!(width, SimdWidth::W512) {
+                    if !self.use_avx512 {
+                        return Err(CompilerError::CodegenViolation(
+                            "QuantInterleave W512 requires use_avx512".into(),
+                        ));
+                    }
+                    // W512 output is [lo0,hi0,lo1,hi1,...,lo7,hi7].  The
+                    // low/high unpack instructions operate independently on each
+                    // 128-bit lane, so merge the low 256 bits of the high-unpack
+                    // result into the upper half with VINSERTI32X8.
+                    let (dst_zmm, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 0)?;
+                    let (lo_zmm, _) = self.resolve_zmm_or_spill(*lo, alloc, 1)?;
+                    let (hi_zmm, _) = self.resolve_zmm_or_spill(*hi, alloc, 2)?;
+                    self.asm.vpunpckldq(dst_zmm, lo_zmm, hi_zmm).map_err(Self::err)?;
+                    let scratch_zmm = if dst_zmm != zmm14 { zmm14 } else { zmm13 };
+                    self.asm.vpunpckhdq(scratch_zmm, lo_zmm, hi_zmm).map_err(Self::err)?;
+                    self.asm.vinserti32x8(
+                        dst_zmm,
+                        dst_zmm,
+                        Self::zmm_to_ymm(scratch_zmm),
+                        1i32,
+                    ).map_err(Self::err)?;
+                    if dst_spilled { self.spill_store_zmm(*dst, alloc, 0)?; }
+                } else {
+                    // W256: preserve the established 8-lane implementation.
+                    let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
+                    let (lo_ymm, _) = self.resolve_ymm_or_spill(*lo, alloc, 1)?;
+                    let (hi_ymm, _) = self.resolve_ymm_or_spill(*hi, alloc, 2)?;
+                    self.asm.vpunpckldq(dst_ymm, lo_ymm, hi_ymm).map_err(Self::err)?;
+                    let scratch = if dst_ymm != ymm14 { ymm14 } else { ymm13 };
+                    self.asm.vpunpckhdq(scratch, lo_ymm, hi_ymm).map_err(Self::err)?;
+                    let scratch_xmm = Self::ymm_to_xmm(scratch);
+                    self.asm.vinserti128(dst_ymm, dst_ymm, scratch_xmm, 1).map_err(Self::err)?;
+                    if dst_spilled { self.spill_store_ymm(*dst, alloc, 0)?; }
+                }
                 Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
@@ -4148,21 +4204,40 @@ impl X86Lower {
 
     fn lower_quant_concat_seq_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::QuantConcatSeq { dst, lo, hi, .. } => {
-                // Sequential concatenation: dst = [lo[0..3], hi[0..3]]
-                // lo is low 128 bits, hi goes to high 128 bits.
-                // vinserti128: copy hi's low 128 into dst's upper 128, keep lo in lower 128.
-                let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
-                let (lo_ymm, _) = self.resolve_ymm_or_spill(*lo, alloc, 1)?;
-                let (hi_ymm, _) = self.resolve_ymm_or_spill(*hi, alloc, 2)?;
-                // dst = lo (full YMM copy)
-                if dst_ymm != lo_ymm {
-                    self.asm.vmovdqa(dst_ymm, lo_ymm).map_err(Self::err)?;
+            VmInstr::QuantConcatSeq { dst, lo, hi, width } => {
+                if matches!(width, SimdWidth::W512) {
+                    if !self.use_avx512 {
+                        return Err(CompilerError::CodegenViolation(
+                            "QuantConcatSeq W512 requires use_avx512".into(),
+                        ));
+                    }
+                    // W512 output is [lo0..7, hi0..7].  Copy the complete low
+                    // half then replace the high half with hi's low YMM.
+                    let (dst_zmm, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 0)?;
+                    let (lo_zmm, _) = self.resolve_zmm_or_spill(*lo, alloc, 1)?;
+                    let (hi_zmm, _) = self.resolve_zmm_or_spill(*hi, alloc, 2)?;
+                    if dst_zmm != lo_zmm {
+                        self.asm.vmovdqa32(dst_zmm, lo_zmm).map_err(Self::err)?;
+                    }
+                    self.asm.vinserti32x8(
+                        dst_zmm,
+                        dst_zmm,
+                        Self::zmm_to_ymm(hi_zmm),
+                        1i32,
+                    ).map_err(Self::err)?;
+                    if dst_spilled { self.spill_store_zmm(*dst, alloc, 0)?; }
+                } else {
+                    // W256: preserve the established 8-lane implementation.
+                    let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
+                    let (lo_ymm, _) = self.resolve_ymm_or_spill(*lo, alloc, 1)?;
+                    let (hi_ymm, _) = self.resolve_ymm_or_spill(*hi, alloc, 2)?;
+                    if dst_ymm != lo_ymm {
+                        self.asm.vmovdqa(dst_ymm, lo_ymm).map_err(Self::err)?;
+                    }
+                    let hi_xmm = Self::ymm_to_xmm(hi_ymm);
+                    self.asm.vinserti128(dst_ymm, dst_ymm, hi_xmm, 1).map_err(Self::err)?;
+                    if dst_spilled { self.spill_store_ymm(*dst, alloc, 0)?; }
                 }
-                // dst upper 128 = hi lower 128
-                let hi_xmm = Self::ymm_to_xmm(hi_ymm);
-                self.asm.vinserti128(dst_ymm, dst_ymm, hi_xmm, 1).map_err(Self::err)?;
-                if dst_spilled { self.spill_store_ymm(*dst, alloc, 0)?; }
                 Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
@@ -4173,14 +4248,26 @@ impl X86Lower {
     fn lower_q3_k_decode_step_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
             VmInstr::Q3KDecodeStep { dst, block_base, lane_offset, d_vreg: _, qs_offset, hmask_offset, lanes, width } => {
+                let is_w512 = matches!(width, SimdWidth::W512);
+                if is_w512 && !self.use_avx512 {
+                    return Err(CompilerError::CodegenViolation(
+                        "Q3KDecodeStep W512 requires use_avx512".into(),
+                    ));
+                }
                 // ── Assisted path: call native helper function ──
                 // Helper signature (System V ABI):
                 //   fn(block: *const u8, lane_offset: u64, d_f32: f32,
                 //      qs_offset: u64, hmask_offset: u64, lanes: u64, out: *mut f32)
                 // ABI: RDI=block, RSI=lane_offset, XMM0=d_f32, RDX=qs_offset, RCX=hmask_offset, R8=lanes, R9=out_ptr
 
-                // Resolve dst for write — we need to know which physical YMM it maps to
-                let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
+                // Resolve dst at the requested width. W512 output must load all 16
+                // f32 lanes into a ZMM; resolving a YMM here leaves lanes 8..15 stale.
+                let (dst_ymm, dst_spilled) = if is_w512 {
+                    let (dst_zmm, spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 0)?;
+                    (Self::zmm_to_ymm(dst_zmm), spilled)
+                } else {
+                    self.resolve_ymm_or_spill_write(*dst, alloc, 0)?
+                };
 
                 // Build YMM save list EXCLUDING dst_ymm — we write the result into dst_ymm
                 // after the call, and restore_all must NOT overwrite it.
@@ -4236,7 +4323,8 @@ impl X86Lower {
                         self.asm.vmovups(dst_ymm, ymmword_ptr(rsp)).map_err(Self::err)?;
                     }
                     SimdWidth::W512 => {
-                        self.asm.vmovups(dst_ymm, ymmword_ptr(rsp)).map_err(Self::err)?;
+                        let (dst_zmm, _) = self.resolve_zmm_or_spill_write(*dst, alloc, 0)?;
+                        self.asm.vmovups(dst_zmm, zmmword_ptr(rsp)).map_err(Self::err)?;
                     }
                     SimdWidth::Scalar => {
                         let dst_xmm = Self::ymm_to_xmm(dst_ymm);
@@ -4258,7 +4346,13 @@ impl X86Lower {
                     frame.restore_all(&save_gprs, &save_ymms)?;
                 }
 
-                if dst_spilled { self.spill_store_ymm(*dst, alloc, 0)?; }
+                if dst_spilled {
+                    if is_w512 {
+                        self.spill_store_zmm(*dst, alloc, 0)?;
+                    } else {
+                        self.spill_store_ymm(*dst, alloc, 0)?;
+                    }
+                }
 
                 Ok(())
             }
@@ -4273,7 +4367,18 @@ impl X86Lower {
     fn lower_q6_k_decode_step_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
             VmInstr::Q6KDecodeStep { dst, block_base, lane_offset, d_vreg: _, qs_offset, qh_offset, lanes, width } => {
-                let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
+                let is_w512 = matches!(width, SimdWidth::W512);
+                if is_w512 && !self.use_avx512 {
+                    return Err(CompilerError::CodegenViolation(
+                        "Q6KDecodeStep W512 requires use_avx512".into(),
+                    ));
+                }
+                let (dst_ymm, dst_spilled) = if is_w512 {
+                    let (dst_zmm, spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 0)?;
+                    (Self::zmm_to_ymm(dst_zmm), spilled)
+                } else {
+                    self.resolve_ymm_or_spill_write(*dst, alloc, 0)?
+                };
 
                 #[rustfmt::skip]
                 let all_ymms: [AsmRegisterYmm; 16] = [ymm0, ymm1, ymm2, ymm3, ymm4, ymm5, ymm6, ymm7, ymm8, ymm9, ymm10, ymm11, ymm12, ymm13, ymm14, ymm15];
@@ -4324,7 +4429,8 @@ impl X86Lower {
                         self.asm.vmovups(dst_ymm, ymmword_ptr(rsp)).map_err(Self::err)?;
                     }
                     SimdWidth::W512 => {
-                        self.asm.vmovups(dst_ymm, ymmword_ptr(rsp)).map_err(Self::err)?;
+                        let (dst_zmm, _) = self.resolve_zmm_or_spill_write(*dst, alloc, 0)?;
+                        self.asm.vmovups(dst_zmm, zmmword_ptr(rsp)).map_err(Self::err)?;
                     }
                     SimdWidth::Scalar => {
                         let dst_xmm = Self::ymm_to_xmm(dst_ymm);
@@ -4344,7 +4450,13 @@ impl X86Lower {
                     frame.restore_all(&save_gprs, &save_ymms)?;
                 }
 
-                if dst_spilled { self.spill_store_ymm(*dst, alloc, 0)?; }
+                if dst_spilled {
+                    if is_w512 {
+                        self.spill_store_zmm(*dst, alloc, 0)?;
+                    } else {
+                        self.spill_store_ymm(*dst, alloc, 0)?;
+                    }
+                }
 
                 Ok(())
             }
@@ -4358,7 +4470,18 @@ impl X86Lower {
     fn lower_q5_decode_step_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
             VmInstr::Q5DecodeStep { dst, block_base, lane_offset, d_vreg: _, qs_offset, qh_offset, has_min, lanes, width } => {
-                let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
+                let is_w512 = matches!(width, SimdWidth::W512);
+                if is_w512 && !self.use_avx512 {
+                    return Err(CompilerError::CodegenViolation(
+                        "Q5DecodeStep W512 requires use_avx512".into(),
+                    ));
+                }
+                let (dst_ymm, dst_spilled) = if is_w512 {
+                    let (dst_zmm, spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 0)?;
+                    (Self::zmm_to_ymm(dst_zmm), spilled)
+                } else {
+                    self.resolve_ymm_or_spill_write(*dst, alloc, 0)?
+                };
 
                 #[rustfmt::skip]
                 let all_ymms: [AsmRegisterYmm; 16] = [ymm0, ymm1, ymm2, ymm3, ymm4, ymm5, ymm6, ymm7, ymm8, ymm9, ymm10, ymm11, ymm12, ymm13, ymm14, ymm15];
@@ -4407,7 +4530,8 @@ impl X86Lower {
                         self.asm.vmovups(dst_ymm, ymmword_ptr(rsp)).map_err(Self::err)?;
                     }
                     SimdWidth::W512 => {
-                        self.asm.vmovups(dst_ymm, ymmword_ptr(rsp)).map_err(Self::err)?;
+                        let (dst_zmm, _) = self.resolve_zmm_or_spill_write(*dst, alloc, 0)?;
+                        self.asm.vmovups(dst_zmm, zmmword_ptr(rsp)).map_err(Self::err)?;
                     }
                     SimdWidth::Scalar => {
                         let dst_xmm = Self::ymm_to_xmm(dst_ymm);
@@ -4427,7 +4551,13 @@ impl X86Lower {
                     frame.restore_all(&save_gprs, &save_ymms)?;
                 }
 
-                if dst_spilled { self.spill_store_ymm(*dst, alloc, 0)?; }
+                if dst_spilled {
+                    if is_w512 {
+                        self.spill_store_zmm(*dst, alloc, 0)?;
+                    } else {
+                        self.spill_store_ymm(*dst, alloc, 0)?;
+                    }
+                }
 
                 Ok(())
             }
@@ -4441,7 +4571,18 @@ impl X86Lower {
     fn lower_q5k_decode_step_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
             VmInstr::Q5KDecodeStep { dst, block_base, lane_offset, d_vreg: _, qs_offset, qh_offset, lanes, width } => {
-                let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
+                let is_w512 = matches!(width, SimdWidth::W512);
+                if is_w512 && !self.use_avx512 {
+                    return Err(CompilerError::CodegenViolation(
+                        "Q5KDecodeStep W512 requires use_avx512".into(),
+                    ));
+                }
+                let (dst_ymm, dst_spilled) = if is_w512 {
+                    let (dst_zmm, spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 0)?;
+                    (Self::zmm_to_ymm(dst_zmm), spilled)
+                } else {
+                    self.resolve_ymm_or_spill_write(*dst, alloc, 0)?
+                };
 
                 #[rustfmt::skip]
                 let all_ymms: [AsmRegisterYmm; 16] = [ymm0, ymm1, ymm2, ymm3, ymm4, ymm5, ymm6, ymm7, ymm8, ymm9, ymm10, ymm11, ymm12, ymm13, ymm14, ymm15];
@@ -4486,7 +4627,8 @@ impl X86Lower {
                         self.asm.vmovups(dst_ymm, ymmword_ptr(rsp)).map_err(Self::err)?;
                     }
                     SimdWidth::W512 => {
-                        self.asm.vmovups(dst_ymm, ymmword_ptr(rsp)).map_err(Self::err)?;
+                        let (dst_zmm, _) = self.resolve_zmm_or_spill_write(*dst, alloc, 0)?;
+                        self.asm.vmovups(dst_zmm, zmmword_ptr(rsp)).map_err(Self::err)?;
                     }
                     SimdWidth::Scalar => {
                         let dst_xmm = Self::ymm_to_xmm(dst_ymm);
@@ -4506,7 +4648,13 @@ impl X86Lower {
                     frame.restore_all(&save_gprs, &save_ymms)?;
                 }
 
-                if dst_spilled { self.spill_store_ymm(*dst, alloc, 0)?; }
+                if dst_spilled {
+                    if is_w512 {
+                        self.spill_store_zmm(*dst, alloc, 0)?;
+                    } else {
+                        self.spill_store_ymm(*dst, alloc, 0)?;
+                    }
+                }
 
                 Ok(())
             }
