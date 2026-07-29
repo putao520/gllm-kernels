@@ -3803,13 +3803,25 @@ impl X86Lower {
 
     fn lower_quant_broadcast_int_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::QuantBroadcastInt { dst, value, .. } => {
-                let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
-                let dst_xmm = Self::ymm_to_xmm(dst_ymm);
-                self.asm.mov(rax, *value).map_err(Self::err)?;
-                self.asm.vmovd(dst_xmm, eax).map_err(Self::err)?;
-                self.asm.vpbroadcastd(dst_ymm, dst_xmm).map_err(Self::err)?;
-                if dst_spilled { self.spill_store_ymm(*dst, alloc, 2)?; }
+            VmInstr::QuantBroadcastInt { dst, value, width } => {
+                // W512 must broadcast to ZMM (16 lanes); YMM leaves lanes 8..15 undefined.
+                // (BCE-20260729-QUANT-W512-HALFLANE-NAN)
+                let is_w512 = matches!(width, SimdWidth::W512) && self.use_avx512;
+                if is_w512 {
+                    let (dst_zmm, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 2)?;
+                    let dst_xmm = Self::ymm_to_xmm(Self::zmm_to_ymm(dst_zmm));
+                    self.asm.mov(rax, *value).map_err(Self::err)?;
+                    self.asm.vmovd(dst_xmm, eax).map_err(Self::err)?;
+                    self.asm.vpbroadcastd(dst_zmm, dst_xmm).map_err(Self::err)?;
+                    if dst_spilled { self.spill_store_zmm(*dst, alloc, 2)?; }
+                } else {
+                    let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
+                    let dst_xmm = Self::ymm_to_xmm(dst_ymm);
+                    self.asm.mov(rax, *value).map_err(Self::err)?;
+                    self.asm.vmovd(dst_xmm, eax).map_err(Self::err)?;
+                    self.asm.vpbroadcastd(dst_ymm, dst_xmm).map_err(Self::err)?;
+                    if dst_spilled { self.spill_store_ymm(*dst, alloc, 2)?; }
+                }
                 Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
