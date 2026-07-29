@@ -4168,20 +4168,24 @@ impl X86Lower {
                     }
                     // W512 output is [lo0,hi0,lo1,hi1,...,lo7,hi7].  The
                     // low/high unpack instructions operate independently on each
-                    // 128-bit lane, so merge the low 256 bits of the high-unpack
-                    // result into the upper half with VINSERTI32X8.
+                    // 128-bit lane. Select A0/B0/A1/B1 explicitly so the source
+                    // lanes remain in contiguous order (A=low-unpack, B=high-unpack).
                     let (dst_zmm, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 0)?;
                     let (lo_zmm, _) = self.resolve_zmm_or_spill(*lo, alloc, 1)?;
                     let (hi_zmm, _) = self.resolve_zmm_or_spill(*hi, alloc, 2)?;
                     self.asm.vpunpckldq(dst_zmm, lo_zmm, hi_zmm).map_err(Self::err)?;
                     let scratch_zmm = if dst_zmm != zmm14 { zmm14 } else { zmm13 };
+                    let preserve_zmm = if dst_zmm != zmm15 && scratch_zmm != zmm15 { zmm15 } else { zmm13 };
                     self.asm.vpunpckhdq(scratch_zmm, lo_zmm, hi_zmm).map_err(Self::err)?;
-                    self.asm.vinserti32x8(
-                        dst_zmm,
-                        dst_zmm,
-                        Self::zmm_to_ymm(scratch_zmm),
-                        1i32,
-                    ).map_err(Self::err)?;
+                    // Preserve A1 before replacing destination chunks with B0/B1.
+                    self.asm.vmovdqa32(preserve_zmm, dst_zmm).map_err(Self::err)?;
+                    let scratch_xmm = Self::ymm_to_xmm(Self::zmm_to_ymm(scratch_zmm));
+                    self.asm.vextracti32x4(scratch_xmm, scratch_zmm, 0i32).map_err(Self::err)?;
+                    self.asm.vinserti32x4(dst_zmm, dst_zmm, scratch_xmm, 1i32).map_err(Self::err)?;
+                    self.asm.vextracti32x4(scratch_xmm, preserve_zmm, 1i32).map_err(Self::err)?;
+                    self.asm.vinserti32x4(dst_zmm, dst_zmm, scratch_xmm, 2i32).map_err(Self::err)?;
+                    self.asm.vextracti32x4(scratch_xmm, scratch_zmm, 1i32).map_err(Self::err)?;
+                    self.asm.vinserti32x4(dst_zmm, dst_zmm, scratch_xmm, 3i32).map_err(Self::err)?;
                     if dst_spilled { self.spill_store_zmm(*dst, alloc, 0)?; }
                 } else {
                     // W256: preserve the established 8-lane implementation.
