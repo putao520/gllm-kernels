@@ -3845,7 +3845,7 @@ impl X86Lower {
                             let dst_xmm = Self::ymm_to_xmm(Self::zmm_to_ymm(dst_zmm));
                             self.asm.vmovd(dst_xmm, eax).map_err(Self::err)?;
                             self.asm.vcvtph2ps(dst_xmm, dst_xmm).map_err(Self::err)?;
-                            self.asm.vbroadcastss(Self::zmm_to_ymm(dst_zmm), dst_xmm).map_err(Self::err)?;
+                            self.asm.vbroadcastss(dst_zmm, dst_xmm).map_err(Self::err)?;
                             if dst_spilled { self.spill_store_zmm(*dst, alloc, 2)?; }
                         } else {
                             let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
@@ -3863,7 +3863,7 @@ impl X86Lower {
                             let dst_xmm = Self::ymm_to_xmm(Self::zmm_to_ymm(dst_zmm));
                             self.asm.vmovd(dst_xmm, eax).map_err(Self::err)?;
                             self.asm.vcvtdq2ps(dst_xmm, dst_xmm).map_err(Self::err)?;
-                            self.asm.vbroadcastss(Self::zmm_to_ymm(dst_zmm), dst_xmm).map_err(Self::err)?;
+                            self.asm.vbroadcastss(dst_zmm, dst_xmm).map_err(Self::err)?;
                             if dst_spilled { self.spill_store_zmm(*dst, alloc, 2)?; }
                         } else {
                             let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
@@ -3881,7 +3881,7 @@ impl X86Lower {
                             let dst_xmm = Self::ymm_to_xmm(Self::zmm_to_ymm(dst_zmm));
                             self.asm.vmovd(dst_xmm, eax).map_err(Self::err)?;
                             self.asm.vcvtdq2ps(dst_xmm, dst_xmm).map_err(Self::err)?;
-                            self.asm.vbroadcastss(Self::zmm_to_ymm(dst_zmm), dst_xmm).map_err(Self::err)?;
+                            self.asm.vbroadcastss(dst_zmm, dst_xmm).map_err(Self::err)?;
                             if dst_spilled { self.spill_store_zmm(*dst, alloc, 2)?; }
                         } else {
                             let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
