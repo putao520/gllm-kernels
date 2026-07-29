@@ -865,7 +865,7 @@ mod tests {
     fn test_fallback_op_class_opaque_variants() {
         // Arrange & Act & Assert — key opaque OpKinds
         assert_eq!(
-            invoke_fallback(&Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 8, head_dim: 128 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(128)  })),
+            invoke_fallback(&Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 8, head_dim: 128 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(128), kv_cache_layer: 0, kv_write: false  })),
             OpClass::Opaque
         );
         assert_eq!(

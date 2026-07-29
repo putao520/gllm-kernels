@@ -15,6 +15,7 @@ impl CompilerGraph {
             quant_weight_bytes: HashMap::new(),
             max_seq_len: 2048,
             kv_load_mode: None,
+            kv_donor_map: Vec::new(),
             next_tensor_id: 0,
             next_op_id: 0,
         }
@@ -610,7 +611,7 @@ impl CompilerGraph {
 
         // Multi-head attention (no RoPE for encoder, bidirectional)
         let attn_out = g.add_tensor_concrete("attn_out", &[seq, q_dim], dt);
-        g.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: ir.num_heads, num_kv_heads: ir.num_heads, head_dim: ir.head_dim }, mask: if false { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: crate::compiler::graph::KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(seq)  }),
+        g.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: ir.num_heads, num_kv_heads: ir.num_heads, head_dim: ir.head_dim }, mask: if false { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: crate::compiler::graph::KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(seq), kv_cache_layer: 0, kv_write: false  }),
             vec![q_out, k_out, v_out],
             vec![attn_out],
             "mha",

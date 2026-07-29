@@ -272,6 +272,11 @@ pub struct CompilerGraph {
     /// specified precision tier (e.g., KiviDequantLoad for KIVI4/KIVI2).
     /// None = Direct (standard VecLoad, default).
     pub kv_load_mode: Option<crate::compiler::codegen::vm::instr::KvLoadMode>,
+    /// SharedKvRef logical-layer → physical donor-layer map. The vector is
+    /// complete (one entry per logical layer) and is the SSOT shared by the
+    /// graph builder, KV buffer layout, and JIT lowering. Identity entries mean
+    /// the logical layer owns its KV slot.
+    pub kv_donor_map: Vec<usize>,
     next_tensor_id: u32,
     next_op_id: u32,
 }

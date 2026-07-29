@@ -889,7 +889,7 @@ mod tests {
         let mha_out = g.add_tensor_concrete("mha_o", &[1, 256], DType::F32);
 
         let o_proj = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w], vec![gemm_out], "o_proj");
-        g.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 4, num_kv_heads: 2, head_dim: 64 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1)  }), vec![gemm_out], vec![mha_out], "mha");
+        g.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 4, num_kv_heads: 2, head_dim: 64 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), kv_cache_layer: 0, kv_write: false  }), vec![gemm_out], vec![mha_out], "mha");
 
         // Act
         let role = classify_gemm_role(o_proj, &g, &[o_proj]);

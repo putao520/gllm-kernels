@@ -52,6 +52,11 @@ pub enum SinksSpec {
     Learnable,
 }
 
+/// Logical layer index used by cache-bearing attention specs. For a
+/// single-template layer loop this remains the template anchor (0); runtime
+/// layer_loop_counter plus CompilerGraph::kv_donor_map selects the physical slot.
+pub type LayerIndex = usize;
+
 /// MultiHeadAttention 完整自描述 spec。
 // @trace REQ-FATOP-004 [entity:AttentionSpec] AttentionSpec kv_source 自描述
 // @trace REQ-FATOP-005 [entity:AttentionSpec] AttentionSpec sinks 配置
@@ -62,6 +67,14 @@ pub struct AttentionSpec {
     pub kv_source: KvSource,
     pub sinks: SinksSpec,
     pub seq_len: SymDim,
+    /// KV-cache layer address metadata. The graph builder supplies the donor map
+    /// on `CompilerGraph`; this field identifies the attention's logical layer
+    /// without adding a runtime ABI parameter.
+    pub kv_cache_layer: LayerIndex,
+    /// Whether this attention template is allowed to populate K/V cache.
+    /// SharedKvRef lowering additionally predicates writes with the graph's
+    /// donor map, so one layer template remains valid for every layer index.
+    pub kv_write: bool,
     // BCE-PHASE2 v2 D2: dtype 字段已删 (原硬编码 F32 违宪).
     // kv_row_stride 改从 K 张量 TensorMeta.dtype 派生 (K1, lower_op.inc.rs:1488).
 }

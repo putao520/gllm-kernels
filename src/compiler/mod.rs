@@ -1169,6 +1169,10 @@ impl InferenceCompiler {
             }
         }
 
+        // SharedKvRef donor map is part of the immutable graph metadata and must
+        // participate in the JIT cache key. A changed donor map changes KV loads.
+        graph.kv_donor_map.hash(&mut hasher);
+
         // Tensor shapes and dtypes
         for t in &graph.tensors {
             t.id.0.hash(&mut hasher);
