@@ -439,6 +439,31 @@ impl ScalarOpRegistry {
             );
         }
 
+        // ── ScaleConst: x * value (value is compile-time constant) ──
+        // Unary elementwise; the constant is a placeholder in the trace, rewritten
+        // to the op's `value` field by parameterized trace rewrite at dispatch.
+        {
+            let scale_sig = ScalarFnSignature {
+                fn_ptr: scalar_vec_mul as *const u8, // closest binary op (a*b); value baked at dispatch
+                params: vec![ScalarParam::InputPtr, ScalarParam::OutputPtr, ScalarParam::Dim(0)],
+            };
+            let value_placeholder = 1.0f64;
+            reg.register_with_symexec_fallback(
+                OpKindKey::ScaleConst,
+                scale_sig.clone(),
+                OpTrace {
+                    pattern: ComputePattern::Elementwise {
+                        body: vec![
+                            TraceOp::Input(0),                 // [0] x
+                            TraceOp::Const(value_placeholder), // [1] value (placeholder)
+                            TraceOp::Mul(ValueId(0), ValueId(1)), // [2] x * value
+                        ],
+                    },
+                    signature: scale_sig,
+                },
+            );
+        }
+
         // ── Softmax ──
         // SymExec auto-extraction verified: 3-pass Reduction (max → exp-sum → normalize).
         // Select pattern detection (W2.2) enables Max reduction from conditional branches.
