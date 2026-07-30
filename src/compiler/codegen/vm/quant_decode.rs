@@ -62,8 +62,11 @@ enum ZeroResult {
     StaticBias(i32),
     /// AWQ4/GPTQ4: `value = (unpacked - zero) × scale`.  Zero subtracted BEFORE scale.
     PreScaleSubtract(ValueId),
-    /// Q4_K/Q5_K: `value = (unpacked - bias) × scale + min`.  Min added AFTER scale.
+    /// Q4_1/Q5_1 (BlockMin): `value = d × quantized + m`.  Min added AFTER scale.
     PostScaleAdd(ValueId),
+    /// Q4_K/Q5_K/Q2_K (Hierarchical): `value = d*sc*q - dmin*m`.  Min SUBTRACTED AFTER scale.
+    /// (BCE-20260730-Q4K-MIN-SIGN: llama.cpp uses subtraction, not addition.)
+    PostScaleSubtract(ValueId),
     /// No correction needed.
     None,
 }
@@ -750,7 +753,10 @@ impl<'a> DecodeTraceBuilder<'a> {
 
                 // min = dmin * sub_m
                 let min_slot = push_op(trace, TraceOp::Mul(dmin_f32, sub_m_f32));
-                ZeroResult::PostScaleAdd(min_slot)
+                // BCE-20260730-Q4K-MIN-SIGN: Q4_K/Q5_K/Q2_K use SUBTRACTION (value = d*sc*q - dmin*m),
+                // not addition. llama.cpp ggml-quants.c dequantize_row_q4_K:1546:
+                //   *y++ = d1 * (q[l] & 0xF) - m1;  (m1 = dmin * m)
+                ZeroResult::PostScaleSubtract(min_slot)
             }
         }
     }
@@ -977,14 +983,24 @@ impl<'a> DecodeTraceBuilder<'a> {
             TraceOp::QuantDequantFma { acc: zero_acc, a: biased_slot, b: scale_broadcast },
         );
 
-        // 4. Post-scale addition (Q4_K/Q5_K dmin × sub_m)
+        // 4. Post-scale zero-point correction
         match zero {
             ZeroResult::PostScaleAdd(min_slot) => {
+                // Q4_1/Q5_1 (BlockMin): value = d*quantized + m
                 let min_broadcast = push_op(
                     trace,
                     TraceOp::QuantBroadcast { src: min_slot, lanes: self.output_lanes },
                 );
                 push_op(trace, TraceOp::Add(scaled_slot, min_broadcast))
+            }
+            ZeroResult::PostScaleSubtract(min_slot) => {
+                // Q4_K/Q5_K/Q2_K (Hierarchical): value = d*sc*q - dmin*m
+                // (BCE-20260730-Q4K-MIN-SIGN: llama.cpp uses subtraction)
+                let min_broadcast = push_op(
+                    trace,
+                    TraceOp::QuantBroadcast { src: min_slot, lanes: self.output_lanes },
+                );
+                push_op(trace, TraceOp::Sub(scaled_slot, min_broadcast))
             }
             _ => scaled_slot,
         }
@@ -2672,10 +2688,11 @@ mod tests {
     }
 
     // @trace TEST-QD-38 [req:REQ-QCG] [level:unit]
-    // Q2K hierarchical zero: verifies PostScaleAdd path with dmin × sub_m.
-    // Q2K uses Hierarchical zero layout → Add appears after FMA (post-scale min addition).
+    // Q2K hierarchical zero: verifies PostScaleSubtract path with dmin × sub_m.
+    // Q2K uses Hierarchical zero layout → Sub appears after FMA (post-scale min SUBTRACTION).
+    // (BCE-20260730-Q4K-MIN-SIGN: llama.cpp uses subtraction, not addition)
     #[test]
-    fn test_q2k_post_scale_add_ordering() {
+    fn test_q2k_post_scale_subtract_ordering() {
         // Arrange
         let r = registry();
         let desc = r.get(&QuantType::Q2K).expect("Q2_K must be registered");
@@ -2684,15 +2701,21 @@ mod tests {
         let mut trace = Vec::new();
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
-        // Assert: Q2K has Add for post-scale min addition
-        let add_pos = trace.iter().position(|op| matches!(op, TraceOp::Add(_, _)));
+        // Assert: Q2K has Sub for post-scale min SUBTRACTION
+        let sub_pos = trace.iter().position(|op| matches!(op, TraceOp::Sub(_, _)));
         let fma_pos = trace.iter().position(|op| matches!(op, TraceOp::QuantDequantFma { .. }));
-        assert!(add_pos.is_some(), "Q2_K should have Add for post-scale min");
+        assert!(sub_pos.is_some(), "Q2_K should have Sub for post-scale min subtraction");
         assert!(fma_pos.is_some(), "Q2_K should have QuantDequantFma");
         assert!(
-            add_pos.unwrap() > fma_pos.unwrap(),
-            "Q2_K Add (slot {}) must appear after QuantDequantFma (slot {})",
-            add_pos.unwrap(), fma_pos.unwrap()
+            sub_pos.unwrap() > fma_pos.unwrap(),
+            "Q2_K Sub (slot {}) must appear after QuantDequantFma (slot {})",
+            sub_pos.unwrap(), fma_pos.unwrap()
+        );
+        // Assert NO Add (the old buggy behavior)
+        let add_pos = trace.iter().position(|op| matches!(op, TraceOp::Add(_, _)));
+        assert!(
+            add_pos.is_none(),
+            "Q2_K should NOT have Add (Hierarchical min is subtracted, not added)"
         );
     }
 

@@ -655,6 +655,175 @@ mod quant_gemv_tests {
         assert!(pass, "Q4_0 QuantGather x86 oracle 数值不匹配 (actual vs expected 见 eprintln)");
     }
 
+    // ── Q4_K QuantGather x86 real-execution oracle ────────────────────────
+    //
+    // BCE-20260730-Q4K-MIN-SIGN: Q4_K 解码 value = d*sc*q - dmin*m (llama.cpp:1546),
+    // JIT 误用 Add (+ dmin*m) 致 embed NaN/garbage。本 oracle 构造已知 Q4_K block，
+    // emit QuantGather，编译后真实执行，对比手算参考验证 SUBTRACTION 符号正确。
+    //
+    // Q4_K block (block_size=256, block_bytes=144): d(f16) + dmin(f16) + scales[12] + qs[128]
+    // 4 groups × 64 elem, 每 group 2 mini-blocks (32 elem each), scale pair (sc, m) via get_scale_min_k4.
+    // SPLIT nibble: lo nibble → elem[0..32], hi nibble → elem[32..64] (per mini-block).
+    //
+    // 简化构造: d=1.0, dmin=1.0, scales 使 sc=1 m=1 for all 8 pairs.
+    //   get_scale_min_k4(0, scales): sc=scales[0]&63, m=scales[4]&63 → set scales[0]=1, scales[4]=1
+    //   get_scale_min_k4(1, scales): sc=scales[1]&63, m=scales[5]&63 → set scales[1]=1, scales[5]=1
+    //   (pairs 2-7 同理, scales[2,3]=1, scales[6,7]=1; pairs 4-7 use j>=4 path)
+    //
+    // qs: 128 bytes. Group 0 starts at qs[0], 32 bytes per group (64 nibbles).
+    //   Mini-block 0 (elem 0..31): qs[0..31] lo nibbles. elem[l] = qs[l] & 0xF
+    //   Mini-block 1 (elem 32..63): qs[0..31] hi nibbles. elem[32+l] = qs[l] >> 4
+    //
+    // 期望: value = d*sc*q - dmin*m = 1*1*q - 1*1 = q - 1
+    //   设 qs[0]=0x32: lo=2 → elem[0]=2-1=1.0; hi=3 → elem[32]=3-1=2.0
+    //   设 qs[1..31]=0x11: lo=1 → elem[1..31]=1-1=0.0; hi=1 → elem[33..63]=1-1=0.0
+    #[test]
+    fn test_q4_k_quant_gather_x86_oracle() {
+        let hidden_dim: usize = 256; // 1 super-block
+        let vocab: usize = 2;
+        let block_bytes: usize = 144; // Q4_K block_bytes
+
+        // ── 构造已知 Q4_K embed weight buffer ──
+        let d_f16 = f16::from_f32(1.0);
+        let dmin_f16 = f16::from_f32(1.0);
+        let d_bits = d_f16.to_bits();
+        let dmin_bits = dmin_f16.to_bits();
+
+        let mut weight = vec![0u8; vocab * block_bytes];
+        // token 0 block at offset 0 (144 bytes)
+        // d at [0..2], dmin at [2..4], scales at [4..16], qs at [16..144]
+        weight[0] = (d_bits & 0xFF) as u8;
+        weight[1] = ((d_bits >> 8) & 0xFF) as u8;
+        weight[2] = (dmin_bits & 0xFF) as u8;
+        weight[3] = ((dmin_bits >> 8) & 0xFF) as u8;
+        // scales[12]: set sc=1, m=1 for all 8 (sc,m) pairs
+        // pairs 0-3: sc=scales[0..3]&63=1, m=scales[4..7]&63=1
+        for i in 0..4 {
+            weight[4 + i] = 1; // scales[0..3] = 1 (sc)
+            weight[8 + i] = 1; // scales[4..7] = 1 (m)
+        }
+        // pairs 4-7 (j>=4 path): sc=(scales[j+4]&0xF)|((scales[j-4]>>6)<<4), m=(scales[j+4]>>4)|((scales[j]>>6)<<4)
+        // j=4: sc=(scales[8]&0xF)|((scales[0]>>6)<<4)=1|0=1, m=(scales[8]>>4)|((scales[4]>>6)<<4)=0|0=0
+        //   → m=0 for pair 4! Need scales[8]>>4 != 0 to get m=1. Set scales[8]=0x11 → m=1, sc=1
+        // j=5: sc=(scales[9]&0xF)|((scales[1]>>6)<<4)=1, m=(scales[9]>>4)|((scales[5]>>6)<<4)=1
+        // j=6: sc=(scales[10]&0xF)|((scales[2]>>6)<<4)=1, m=(scales[10]>>4)|((scales[6]>>6)<<4)=1
+        // j=7: sc=(scales[11]&0xF)|((scales[3]>>6)<<4)=1, m=(scales[11]>>4)|((scales[7]>>6)<<4)=1
+        weight[12] = 0x11; // scales[8]: sc=1 (low nibble), m=1 (high nibble)
+        weight[13] = 0x11; // scales[9]
+        weight[14] = 0x11; // scales[10]
+        weight[15] = 0x11; // scales[11]
+
+        // qs[128] at offset 16..144
+        // qs[0]=0x32: lo=2→elem[0], hi=3→elem[32]
+        weight[16] = 0x32;
+        // qs[1..31]=0x11: lo=1→elem[1..31], hi=1→elem[33..63]
+        for j in 1..32 {
+            weight[16 + j] = 0x11;
+        }
+        // qs[32..64] (group 1): all 0x11 → elem[64..128] = 0
+        for j in 32..64 {
+            weight[16 + j] = 0x11;
+        }
+        // qs[64..128] (groups 2,3): all 0x11 → elem[128..256] = 0
+        for j in 64..128 {
+            weight[16 + j] = 0x11;
+        }
+
+        // token 1 block at offset 144: all zero-point (qs=0x11, sc=1, m=1 → elem=0)
+        weight[144] = (d_bits & 0xFF) as u8;
+        weight[145] = ((d_bits >> 8) & 0xFF) as u8;
+        weight[146] = (dmin_bits & 0xFF) as u8;
+        weight[147] = ((dmin_bits >> 8) & 0xFF) as u8;
+        for i in 0..4 {
+            weight[148 + i] = 1;
+            weight[152 + i] = 1;
+        }
+        weight[156] = 0x11; weight[157] = 0x11; weight[158] = 0x11; weight[159] = 0x11;
+        for j in 0..128 {
+            weight[160 + j] = 0x11;
+        }
+
+        // ── indices: [0u32] (查 token 0, seq_len=1) ──
+        let indices: [u32; 1] = [0u32];
+
+        // ── output buffer: 1 * 256 * 4 bytes (F32) ──
+        let mut output = vec![0u8; 1 * hidden_dim * std::mem::size_of::<f32>()];
+
+        // ── emit VmProgram ──
+        let mut prog = VmProgram::new();
+        let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadPtr { dst: input_ptr, src: PtrExpr::AbiArg(0) });
+        prog.emit(VmInstr::LoadPtr { dst: weight_ptr, src: PtrExpr::AbiArg(1) });
+        prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: PtrExpr::StackArg(24) });
+
+        emit_quant_gather_inline(
+            &mut prog,
+            BoundExpr::Const(1),
+            vocab,
+            hidden_dim,
+            QuantType::Q4K,
+            SimdWidth::W256,
+            input_ptr, weight_ptr, output_ptr,
+            QuantPrecision::F32,
+            None,
+        ).expect("Q4_K QuantGather emit should succeed");
+
+        let code = compile_vm_prog(&prog);
+        eprintln!("[Q4_K-ORACLE] JIT code {} bytes, {} instrs", code.len(), prog.instrs.len());
+
+        let (exec_ptr, exec_len) = make_exec_buffer(&code);
+        type GatherFn = unsafe extern "C" fn(
+            *const u8, *const u8, usize, usize, usize, usize, usize, *mut u8,
+        ) -> usize;
+        let f: GatherFn = unsafe { std::mem::transmute(exec_ptr) };
+        let _ret = unsafe {
+            f(
+                indices.as_ptr() as *const u8,
+                weight.as_ptr() as *const u8,
+                0, 0, 0, 0, 0,
+                output.as_mut_ptr() as *mut u8,
+            )
+        };
+
+        let out_f32: &[f32] = unsafe {
+            std::slice::from_raw_parts(output.as_ptr() as *const f32, hidden_dim)
+        };
+        eprintln!("[Q4_K-ORACLE] out[0..8]    = {:?}", &out_f32[0..8]);
+        eprintln!("[Q4_K-ORACLE] out[128..136] = {:?}", &out_f32[128..136]);
+        eprintln!("[Q4_K-ORACLE] want: out[0]=1.0 (2-1), out[128]=2.0 (3-1, SPLIT hi pass), 其余=0.0 (1-1)");
+
+        // 期望 (SPLIT output layout): value = d*sc*q - dmin*m = 1*1*q - 1*1 = q - 1
+        // QuantGather two-phase SPLIT: lo pass → out[0..128], hi pass → out[128..256]
+        //   qs[0]=0x32: lo=2→out[0]=2-1=1.0; hi=3→out[128]=3-1=2.0
+        //   qs[1..31]=0x11: lo=1→out[1..31]=0.0; hi=1→out[129..159]=0.0
+        let mut pass = true;
+        if (out_f32[0] - 1.0).abs() >= 1e-5 {
+            eprintln!("[Q4_K-ORACLE] FAIL elem[0]: got {} want 1.0 (2-1)", out_f32[0]);
+            pass = false;
+        }
+        if (out_f32[128] - 2.0).abs() >= 1e-5 {
+            eprintln!("[Q4_K-ORACLE] FAIL elem[128]: got {} want 2.0 (3-1, SPLIT hi pass)", out_f32[128]);
+            pass = false;
+        }
+        for i in 0..hidden_dim {
+            if i != 0 && i != 128 && out_f32[i].abs() >= 1e-5 {
+                eprintln!("[Q4_K-ORACLE] FAIL elem[{}]: got {} want 0.0 (1-1)", i, out_f32[i]);
+                pass = false;
+            }
+        }
+
+        unsafe { libc::munmap(exec_ptr as *mut _, exec_len); }
+
+        if pass {
+            eprintln!("[Q4_K-ORACLE] PASS — Q4_K min SUBTRACTION sign correct (d*sc*q - dmin*m)");
+        } else {
+            eprintln!("[Q4_K-ORACLE] FAIL — min sign still wrong (+ dmin*m) or other decode bug");
+        }
+        assert!(pass, "Q4_K QuantGather x86 oracle 数值不匹配 (actual vs expected 见 eprintln)");
+    }
+
     /// 诊断变体：多字节非平凡 nibble，区分「4-byte 组内 INTERLEAVED」vs 其他模式。
     ///
     /// 构造：d=f16(1.0)，byte0=0x90 (lo=0, hi=9)，byte1=0xA0 (lo=0, hi=10)，

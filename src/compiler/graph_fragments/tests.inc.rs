@@ -360,9 +360,7 @@ mod tests {
             mask: AttentionMask::Causal,
             kv_source: KvSource::FromCache,
             sinks: SinksSpec::None,
-            seq_len: SymDim::Concrete(1),,
-            kv_cache_layer: 0,
-            kv_write: false,
+            seq_len: SymDim::Concrete(1),
             kv_cache_layer: 0,
             kv_write: false,
         });
