@@ -1275,16 +1275,11 @@ fn norm_feeds_single_gemm_consumer(
     }
     // The consumer must be a plain GEMM kind (not MoEGate, which shares Gemm
     // class but does not participate in Norm-prefix fusion).
-    // BCE-20260730-FUSION-QGEMM: QuantGemm must NOT enter NormIntoGemm fusion.
-    // emit_gemm_inline_with_hook (the NormIntoGemm emit path) assumes F32 Gemm
-    // and reads weight bytes as F32 — for Q4_0/Q4_1 quantized weights this
-    // reads raw nibble bytes as F32 → garbage → overflow. QuantGemm stays
-    // standalone so emit_quant_gemm_inline (DequantFma + QuantLoadBytesVec)
-    // handles weight dequantization correctly.
     matches!(
         graph.op(consumer_id).map(|o| &o.op),
         Some(Op::Gemm(_))
             | Some(Op::GemmBias(_))
+            | Some(Op::QuantGemm(_))
     )
 }
 
@@ -2165,11 +2160,8 @@ mod tests {
     // ── Test: norm_feeds_single_gemm_consumer accepts QuantGemm consumer ──
 
     #[test]
-    fn norm_feeds_single_gemm_rejects_quant_gemm_consumer() {
-        // Arrange: RmsNorm → QuantGemm (single consumer, Gemm class).
-        // BCE-20260730-FUSION-QGEMM: QuantGemm must NOT fuse into NormIntoGemm —
-        // emit_gemm_inline_with_hook assumes F32 and would read Q4_0 bytes as F32.
-        // QuantGemm stays standalone for DequantFma (QuantLoadBytesVec) emit.
+    fn norm_feeds_single_gemm_accepts_quant_gemm_consumer() {
+        // Arrange: RmsNorm → QuantGemm (single consumer, Gemm class)
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 4], DType::F32);
         let mid = g.add_tensor_concrete("mid", &[1, 4], DType::F32);
@@ -2189,8 +2181,8 @@ mod tests {
         // Act
         let result = norm_feeds_single_gemm_consumer(&g, norm_op, &dag);
 
-        // Assert: QuantGemm is rejected — must stay standalone for DequantFma emit
-        assert!(!result, "QuantGemm must not enter NormIntoGemm fusion (F32 emit reads quantized bytes as F32 → overflow)");
+        // Assert: QuantGemm is a valid Gemm-class consumer
+        assert!(result);
     }
 
     // ── Test: try_collect_reduction_epilogue accepts L2Normalize via OpKind match ──
