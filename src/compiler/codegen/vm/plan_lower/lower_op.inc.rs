@@ -171,6 +171,7 @@ fn lower_op_normlike(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGrap
 }
 
 fn lower_op_gemm(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, ctx: &LoweringContext, resolver: &TensorPtrResolver, abi: &AbiPtrs, op_resolved: &Op) -> Result<Option<bool>, CompilerError> {
+    eprintln!("[LOWER-OP-GEMM] entered op={:?}", op_resolved);
     // Clone to preserve by-value match semantics (struct fields bind by value, matching original lower_op).
     let op_resolved = op_resolved.clone();
     match op_resolved {
