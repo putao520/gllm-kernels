@@ -563,6 +563,129 @@ mod tests {
         assert_eq!(template.abi_map.input_ptr.0, 0); // first allocated VReg
     }
 
+    /// QuantGemm must bypass the generic trace-based elementwise dispatcher.
+    ///
+    /// Q4_0 weights are packed bytes, so routing this op through the generic F32
+    /// GEMM trace would interpret the weight blob with the wrong layout.  The
+    /// dedicated lower_op_gemm path must instead emit the quantized byte load
+    /// used by DequantFma.
+    #[test]
+    fn test_quant_gemm_routes_to_lower_op_not_auto_dispatch() {
+        let mut graph = CompilerGraph::new();
+        let input = graph.add_tensor_concrete("input", &[1, 32], DType::F32);
+        let weight = graph.add_tensor_concrete("q4_0_weight", &[8, 32], DType::U8);
+        let output = graph.add_tensor_concrete("output", &[1, 8], DType::F32);
+        graph.inputs = vec![input, weight];
+        graph.outputs = vec![output];
+        let op_id = graph.add_op(
+            Op::QuantGemm(QuantGemmSpec {
+                m: SymDim::Concrete(1),
+                n: 8,
+                // Q4_0 has 32 elements per quantization block.
+                k: 32,
+                quant_type: crate::quant::QuantType::Q4_0,
+            }),
+            vec![input, weight],
+            vec![output],
+            "q4_0_qgemm",
+        );
+        let op = graph.op(op_id).expect("QuantGemm must be in graph");
+
+        let alloc = BufferAllocation::default();
+        let topology = super::super::topology::GraphTopologyAnalysis::analyze(&graph);
+        let resolver = TensorPtrResolver::build(&graph, &alloc, &topology);
+        let profile = IsaProfile::from_device_profile(&DeviceProfile::detect());
+        let hook = super::super::isa_hook::select_hook(&profile);
+        let registry = ScalarOpRegistry::with_defaults();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
+        let session = CompileSession {
+            width: profile.optimal_simd_width(),
+            sym_map: &sym_map,
+            registry: Some(&registry),
+            hook: Some(hook.as_ref()),
+            feature_set: profile.feature_set(),
+            budget: Some(super::super::isa_hook::ResourceBudget::from_isa_profile(&profile)),
+            page_size: 0,
+            // Force the software dequant path so this test is independent of
+            // the host's native dot-product capability.
+            dot_cap: DotProductCap::None,
+            kv_elem_bytes: 4,
+            debug_jit: false,
+            virtual_activation: None,
+            virtual_tensor_map: None,
+            layout: None,
+            batch_ctx_ptr: None,
+        };
+        let ctx = LoweringContext {
+            session: &session,
+            accum_dtype: QuantPrecision::F32,
+            rope_req: None,
+            ple_req: None,
+            dwc_req: None,
+            exec_pattern: None,
+            bottleneck_map: None,
+            parallelism: None,
+        };
+        let abi = AbiPtrs {
+            input_ptr: VRegId(0),
+            weight_ptr: Some(VRegId(1)),
+            output_ptr: VRegId(2),
+            scratch_ptr: Some(VRegId(3)),
+            gen_loop_counter: None,
+            layer_loop_counter: None,
+            layer_loop_counter_fresh: None,
+            mega_decode_seq_len: None,
+            hook_ctx_ptr: None,
+            sg_detect_scratch_offset: None,
+            sg_knowledge_scratch_offset: None,
+            callback_table_ptr: None,
+            page_table_ptr: None,
+            kv_load_mode: None,
+            kv_cache_ptr: None,
+            activation_ping_ptr: None,
+            activation_pong_ptr: None,
+        };
+        let mut program = VmProgram::new();
+
+        emit_standalone_op(
+            &mut program,
+            op,
+            &graph,
+            &ctx,
+            abi.input_ptr,
+            abi.weight_ptr.expect("weight ABI pointer"),
+            abi.output_ptr,
+            None,
+            &resolver,
+            &abi,
+        )
+        .expect("QuantGemm lower_op path must succeed");
+
+        let has_quant_load = program
+            .instrs
+            .iter()
+            .any(|instr| matches!(instr, VmInstr::QuantLoadBytesVec { .. }));
+        assert!(
+            has_quant_load,
+            "Q4_0 QuantGemm must emit QuantLoadBytesVec via DequantFma, got: {:?}",
+            program.instrs
+        );
+        let has_f32_weight_load = program.instrs.iter().any(|instr| {
+            matches!(
+                instr,
+                VmInstr::VecLoad {
+                    base,
+                    dtype: QuantPrecision::F32,
+                    ..
+                } if *base == abi.weight_ptr.expect("weight ABI pointer")
+            )
+        });
+        assert!(
+            !has_f32_weight_load,
+            "QuantGemm must not read packed Q4_0 weights as F32 VecLoad"
+        );
+    }
+
     // ══════════════════════════════════════════════════════════════════
     //  Edge-case tests: empty plan, single-op, multi-group order,
     //  dtype propagation, symbolic seq_len, graph_dtype, diamond deps,

@@ -572,8 +572,6 @@ fn try_auto_dispatch_elementwise(
             | Some(Op::MeanPool { .. })
             | Some(Op::Argmax { .. })
             | Some(Op::MtpDraft { .. })
-            | Some(Op::Gemm(_))
-            | Some(Op::GemmBias(_))
             | Some(Op::QuantGemm(_))
     ) {
         return Ok(false);
