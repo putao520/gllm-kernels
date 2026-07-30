@@ -545,13 +545,6 @@ fn try_auto_dispatch_elementwise(
     // - Structural ops: Injective traces are skeletal, need dedicated lowering
     // - NormLike/Reduction ops: dedicated lower_op paths with
     //   specialized weight/bias handling not supported by generic emission
-    // - GEMM ops (Gemm/GemmBias/QuantGemm): dedicated lower_op_gemm path with
-    //   specialized dtype/quant handling. BCE-20260731-QGEMM-AUTODISPATCH:
-    //   register_with_symexec_fallback's Level 1/2 structured+linear symexec
-    //   may misclassify scalar_quant_gemm's loop structure as Reduction/Elementwise,
-    //   causing try_auto_dispatch_elementwise to emit F32 GEMM (reading Q4_0
-    //   weight bytes as F32 → garbage → overflow). Exclude all GEMM ops so they
-    //   route to lower_op_gemm → emit_quant_gemm_inline (DequantFma).
     if matches!(
         op.op_resolved(graph),
         Some(Op::ColumnSlice { .. })
@@ -572,9 +565,6 @@ fn try_auto_dispatch_elementwise(
             | Some(Op::MeanPool { .. })
             | Some(Op::Argmax { .. })
             | Some(Op::MtpDraft { .. })
-            | Some(Op::Gemm(_))
-            | Some(Op::GemmBias(_))
-            | Some(Op::QuantGemm(_))
     ) {
         return Ok(false);
     }
