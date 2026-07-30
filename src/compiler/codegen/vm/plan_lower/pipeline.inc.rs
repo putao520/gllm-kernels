@@ -1314,8 +1314,22 @@ fn emit_group_guard_and_body(
                 .and_then(|&tid| resolver.materialize(prog, tid, current_abi))
                 .unwrap_or(weight_ptr);
 
-            // Emit single GEMM for this op
-            if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(op, graph) {
+            // QuantGemm must stay on the quantized lowering path.  This per-op
+            // branch exists for QkvSharedInput groups with mixed layer guards; the
+            // regular group dispatcher has the same guard in
+            // `emit_fusion_group_by_mode`, but this branch used to route every op
+            // through the generic F32 GEMM emitter.  That reinterpreted raw Q4_0
+            // bytes as F32 (and dropped the DecodeTraceBuilder QuantLoadBytesVec).
+            if matches!(&op.op, crate::compiler::graph::Op::QuantGemm(_)) {
+                let out_ptr = load_op_scratch_ptr(prog, scratch_base, op, alloc, resolver, current_abi)?;
+                prog.emit_scope(|p| {
+                    emit_standalone_op(
+                        p, op, graph, ctx,
+                        op_input_ptr, op_weight_ptr, out_ptr,
+                        fctx.rope_cache_offset, resolver, current_abi,
+                    )
+                })?;
+            } else if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(op, graph) {
                 let out_ptr = load_op_scratch_ptr(prog, scratch_base, op, alloc, resolver, current_abi)?;
                 let pm = ctx.pack_map_for_gemm(op.inputs.get(1).copied());
                 // Op 必填，直接读 trans_b。
