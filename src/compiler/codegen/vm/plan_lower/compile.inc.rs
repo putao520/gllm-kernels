@@ -797,9 +797,6 @@ pub(crate) fn try_dispatch_reduction(
             normalize,
             ..
         } => {
-            eprintln!(
-                identity, combine, normalize
-            );
             (*identity, combine.clone(), normalize.clone())
         }
         _ => return Ok(false),

@@ -3397,4 +3397,53 @@ mod tests {
         assert!(!is_integer_only(mnemonic), "Vmovsd should not be integer-only");
         assert!(!is_xor_ps_pd(mnemonic), "Vmovsd should not be xor_ps/pd");
     }
+
+    // @trace TEST-CG-QUANT-GEMM-PATTERN [req:REQ-CG] [level:unit]
+    #[test]
+    fn test_analyze_quant_gemm_pattern_misclassification() {
+        use crate::compiler::trace::ComputePattern;
+        use gllm_scalar_ops::blas::scalar_quant_gemm;
+
+        let fn_ptr = scalar_quant_gemm as *const u8;
+        let sig = ScalarFnSignature {
+            fn_ptr,
+            params: vec![
+                ScalarParam::InputPtr,
+                ScalarParam::InputPtr,
+                ScalarParam::WeightPtr,
+                ScalarParam::OutputPtr,
+                ScalarParam::Dim(0),
+                ScalarParam::Dim(0),
+                ScalarParam::Dim(0),
+                ScalarParam::Dim(0),
+            ],
+        };
+
+        let result = unsafe { analyze_scalar_fn_structured(fn_ptr, &sig) };
+        match result {
+            Ok(Some(analysis)) => {
+                let pattern = &analysis.pattern;
+                eprintln!(
+                    "[QGEMM-PATTERN] structured analysis result: {:?}",
+                    pattern
+                );
+                if !matches!(pattern, ComputePattern::Gemm) {
+                    eprintln!(
+                        "[QGEMM-PATTERN] MISCLASSIFIED: expected Gemm, got {:?}",
+                        pattern
+                    );
+                }
+            }
+            Ok(None) => {
+                eprintln!(
+                    "[QGEMM-PATTERN] structured analysis result: None (no multi-loop pattern)"
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "[QGEMM-PATTERN] structured analysis failed: {error}"
+                );
+            }
+        }
+    }
 }
