@@ -1130,6 +1130,7 @@ pub(super) fn emit_standalone_op(
     // 仍 F32，行为等价；B2-ready）。详见 LoweringContext::for_op。
     let op_ctx = ctx.for_op(op, graph);
     let ctx = &op_ctx;
+    eprintln!("[STANDALONE-OP] op={:?} kind={:?}", op.id, op.op);
     let width = ctx.session.width;
     let sym_map = ctx.session.sym_map;
     let registry = ctx.session.registry;
