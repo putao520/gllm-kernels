@@ -56,31 +56,6 @@ pub fn compile_layer_type_body(
         activation_pong_ptr: None,
     };
 
-    // BCE-20260731-HETERO-PINGPONG: activation_ping/pong must be set so the
-    // resolver can materialize inter-layer residual tensors (TensorPtrSource::
-    // ActivationPing/Pong) for Norm op inputs. Without this, every hetero
-    // template fails with "Norm op 输入 tensor 无法 materialize", the 4 templates
-    // produce no VmInstr, and the mega kernel falls back to an F32 GEMM path
-    // that reads Q4_0 weight bytes as F32 → garbage → overflow → logits=30.
-    // Mirrors pipeline.inc.rs:297-312 (main-prog ping/pong setup).
-    let mut tpl_abi = tpl_abi;
-    if graph.hetero_layer_loop_config.is_some() {
-        let ping_offset = alloc.slots.iter()
-            .find(|s| s.tensor_id.0 == 0xFFFF_FF00)
-            .map(|s| s.offset);
-        let pong_offset = alloc.slots.iter()
-            .find(|s| s.tensor_id.0 == 0xFFFF_FF01)
-            .map(|s| s.offset);
-        if let (Some(ping_off), Some(pong_off)) = (ping_offset, pong_offset) {
-            let ping_ptr = template_prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            let pong_ptr = template_prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            template_prog.emit(VmInstr::AddPtr { dst: ping_ptr, base: tpl_scratch, offset: ping_off });
-            template_prog.emit(VmInstr::AddPtr { dst: pong_ptr, base: tpl_scratch, offset: pong_off });
-            tpl_abi.activation_ping_ptr = Some(ping_ptr);
-            tpl_abi.activation_pong_ptr = Some(pong_ptr);
-        }
-    }
-
     let rope_cache_offset = ctx.rope_req.map(|r| r.cache_offset);
     let seq_bound_override: Option<BoundExpr> = None;
 
