@@ -294,19 +294,26 @@ pub(super) fn emit_fusion_group_by_mode(
         eprintln!("[DTYPE-003] group {} has {} dtype cast points", group.id, dtype_cast_count);
     }
 
-    // QuantGemm anchor ops can only be lowered via emit_standalone_op (which
-    // dispatches to emit_quant_gemm_inline).  Fusion modes like NormIntoGemm,
-    // QkvSharedInput, EpilogueInjection, etc. call emit_gemm_inline_with_hook
-    // which assumes F32 Gemm.  When the anchor is QuantGemm, break the group
-    // into per-op standalone lowering.
-    if anchor_op.op_is_quant_gemm(graph)
+    // QuantGemm ops can only be lowered via emit_standalone_op (which
+    // dispatches to emit_quant_gemm_inline → DequantFma with QuantLoadBytesVec).
+    // Fusion modes like NormIntoGemm, QkvSharedInput, EpilogueInjection, etc.
+    // call emit_gemm_inline_with_hook which assumes F32 Gemm — when ANY op in
+    // the group (anchor, member, or epilogue) is QuantGemm, emit_gemm_inline_with_hook
+    // would read quantized weight bytes as F32 → garbage → overflow.
+    // Fix (BCE-20260730-FUSION-QGEMM): detect QuantGemm in ANY group position,
+    // not just anchor. Break the whole group into per-op standalone lowering.
+    let all_ops_preview: Vec<_> = group.ops.iter().chain(group.epilogue.iter()).copied().collect();
+    let any_quant_gemm = all_ops_preview.iter()
+        .filter_map(|&oid| graph.op(oid))
+        .any(|o| o.op_is_quant_gemm(graph));
+    if any_quant_gemm
         && !matches!(group.mode, FusionMode::Standalone | FusionMode::LoopFusion)
     {
-        eprintln!("[QGEM-FALLBACK] anchor='{}' mode={:?} ops_count={} epilogue={:?} abi.wp={:?}",
-            anchor_op.label, group.mode, group.ops.len(),
+        eprintln!("[QGEM-FALLBACK] mode={:?} ops_count={} epilogue={:?} abi.wp={:?}",
+            group.mode, group.ops.len(),
             group.epilogue.iter().filter_map(|&oid| graph.op(oid).map(|o| o.label.clone())).collect::<Vec<_>>(),
             abi.weight_ptr);
-        let all_ops: Vec<_> = group.ops.iter().chain(group.epilogue.iter()).copied().collect();
+        let all_ops: Vec<_> = all_ops_preview;
         for &op_id in &all_ops {
             let op = graph.op(op_id).ok_or_else(|| CompilerError::CodegenViolation(
                 format!("QuantGemm fallback: op {:?} not found", op_id)))?;
