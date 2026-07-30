@@ -171,7 +171,6 @@ fn lower_op_normlike(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGrap
 }
 
 fn lower_op_gemm(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, ctx: &LoweringContext, resolver: &TensorPtrResolver, abi: &AbiPtrs, op_resolved: &Op) -> Result<Option<bool>, CompilerError> {
-    eprintln!("[LOWER-OP-GEMM] entered op={:?}", op_resolved);
     // Clone to preserve by-value match semantics (struct fields bind by value, matching original lower_op).
     let op_resolved = op_resolved.clone();
     match op_resolved {
@@ -179,7 +178,6 @@ fn lower_op_gemm(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, c
             Ok(Some(lower_gemm_v2(prog, op, graph, ctx, resolver, abi, spec)?))
         }
         Op::QuantGemm(ref spec) => {
-            eprintln!("[LOWER-QGEMM] op={:?} n={} k={} qt={:?}", op.id, spec.n, spec.k, spec.quant_type);
             let m_bound = if abi.mega_decode_seq_len.is_some() {
                 BoundExpr::Const(1)
             } else {
