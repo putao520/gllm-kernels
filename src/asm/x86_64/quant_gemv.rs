@@ -2112,6 +2112,56 @@ pub unsafe extern "C" fn q5k_decode_step_native(
     }
 }
 
+/// Q4_K 单步解码 (BCE-20260731-Q4K-MONOLITHIC-DECODE).
+///
+/// Q4_K layout: d/f16 at 0, dmin/f16 at 2, packed scales/mins at 4,
+/// and qs[128] at 16. Each 64-element group contains 32 low-nibble
+/// values followed by 32 high-nibble values. The scale/min pair is
+/// selected by the 32-element sub-block index.
+/// ABI: (block, lane_offset, _d, qs_offset, lanes, out).
+pub unsafe extern "C" fn q4k_decode_step_native(
+    block: *const u8,
+    lane_offset: u64,
+    _d_f32: f32,
+    _qs_offset: u64,
+    lanes: u64,
+    out: *mut f32,
+) {
+    if block.is_null() {
+        return;
+    }
+    let d_bits = (*block.add(0) as u16) | ((*block.add(1) as u16) << 8);
+    let d = half::f16::from_bits(d_bits).to_f32();
+    let dmin_bits = (*block.add(2) as u16) | ((*block.add(3) as u16) << 8);
+    let dmin = half::f16::from_bits(dmin_bits).to_f32();
+    let scales = block.add(4);
+    let qs = block.add(_qs_offset as usize);
+
+    for i in 0..lanes as usize {
+        let global_elem = lane_offset as usize + i;
+        debug_assert!(global_elem < 256);
+        let mini = global_elem / 32;
+        let local = global_elem % 32;
+        let group = mini / 2;
+        let half = mini % 2;
+        let packed = *qs.add(group * 32 + local);
+        let q = if half == 0 { packed & 0x0F } else { packed >> 4 };
+        let (sc, m) = if mini < 4 {
+            (
+                (*scales.add(mini) & 0x3F) as f32,
+                (*scales.add(mini + 4) & 0x3F) as f32,
+            )
+        } else {
+            let sc = ((*scales.add(mini + 4) & 0x0F)
+                | ((*scales.add(mini - 4) >> 6) << 4)) as f32;
+            let m = ((*scales.add(mini + 4) >> 4)
+                | ((*scales.add(mini) >> 6) << 4)) as f32;
+            (sc, m)
+        };
+        *out.add(i) = d * sc * q as f32 - dmin * m;
+    }
+}
+
 /// Q5_0 单步解码 (BCE-20260710-Q5_0-HIGHBITS 同类横扫).
 ///
 /// Q5_0: d(f16) + qh[4](32 high bits, bit-index plane) + qs[16](SPLIT low 4bit) = 22B.

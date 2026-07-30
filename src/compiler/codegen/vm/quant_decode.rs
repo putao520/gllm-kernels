@@ -229,8 +229,14 @@ impl<'a> DecodeTraceBuilder<'a> {
             return self.build_q5k_decode(trace, block_base_slot, lane_offset_slot);
         }
 
+        // Q4_K (Hierarchical + PackedNibbles): monolithic per-64-group decode.
+        // (BCE-20260731-Q4K-MONOLITHIC-DECODE: generic two-phase SPLIT is not Q4_K layout.)
+        if self.is_q4k_format() {
+            return self.build_q4k_decode(trace, block_base_slot, lane_offset_slot);
+        }
+
         // Input(3): high_bits_ptr for NibbleWithHighBits (only for non-monolithic paths).
-        // Q6_K/Q5_0/Q5_1/Q5_K 走单片 build_q*_decode (early return above), 不需 Input(3).
+        // Q6_K/Q5_0/Q5_1/Q5_K/Q4_K 走单片 build_q*_decode (early return above), 不需 Input(3).
         // When unused, alias block_base_slot.
         let high_bits_ptr_slot = if self.needs_high_bits_ptr() {
             push_op(trace, TraceOp::Input(3))
@@ -277,6 +283,16 @@ impl<'a> DecodeTraceBuilder<'a> {
     fn is_q5k_format(&self) -> bool {
         matches!(self.desc.quant_type, crate::quant::QuantType::Q5K)
             && matches!(&self.desc.data_layout, DataLayout::NibbleWithHighBits { high_bits_per_elem: 1, .. })
+    }
+
+    /// Whether this format uses Q4_K monolithic decode (BCE-20260731-Q4K-MONOLITHIC-DECODE).
+    /// Q4_K packs four groups of 32 low nibbles followed by 32 high nibbles;
+    /// generic PackedNibbles two-phase decoding incorrectly treats the whole
+    /// 256-element block as one split plane.
+    fn is_q4k_format(&self) -> bool {
+        matches!(self.desc.quant_type, crate::quant::QuantType::Q4K)
+            && matches!(&self.desc.data_layout, DataLayout::PackedNibbles { .. })
+            && matches!(&self.desc.scale_layout, ScaleLayout::Hierarchical { .. })
     }
 
     /// Q3_K combined decode: loads d (f16), delegates to QuantQ3KDecode TraceOp
@@ -411,6 +427,36 @@ impl<'a> DecodeTraceBuilder<'a> {
             d_slot,
             qs_offset,
             qh_offset,
+        })
+    }
+
+    /// Q4_K combined decode (BCE-20260731-Q4K-MONOLITHIC-DECODE).
+    /// Emits a single layout-aware TraceOp so the four per-64-element groups
+    /// retain their low/high nibble and scale/min pairing.
+    fn build_q4k_decode(
+        &self,
+        trace: &mut Vec<TraceOp>,
+        block_base_slot: ValueId,
+        lane_offset_slot: ValueId,
+    ) -> ValueId {
+        let qs_offset = match &self.desc.data_layout {
+            DataLayout::PackedNibbles { offset, .. } => *offset,
+            _ => unreachable!("is_q4k_format guarantees PackedNibbles"),
+        };
+        let d_offset = match &self.desc.scale_layout {
+            ScaleLayout::Hierarchical { block_d_offset, .. } => *block_d_offset,
+            _ => unreachable!("is_q4k_format guarantees Hierarchical scale layout"),
+        };
+        let d_ptr = push_op(trace, TraceOp::QuantPtrAddOffset {
+            base: block_base_slot,
+            offset_bytes: d_offset as i64,
+        });
+        let d_slot = push_op(trace, TraceOp::QuantLoadF16toF32 { ptr: d_ptr, offset_bytes: 0 });
+        push_op(trace, TraceOp::QuantQ4KDecode {
+            block_base: block_base_slot,
+            lane_offset: lane_offset_slot,
+            d_slot,
+            qs_offset,
         })
     }
 
@@ -3248,8 +3294,8 @@ mod tests {
     }
 
     // @trace TEST-QD-57 [req:REQ-QCG] [level:unit]
-    // Q4K hierarchical scale: verifies Q4_K has both QuantLoadF16toF32 for block_d
-    // and QuantKQuantPackedScaleLookup for sub-scale decoding, followed by Mul.
+    // Q4K monolithic decode: verifies the descriptor metadata remains hierarchical
+    // while trace lowering uses the layout-aware Q4_K decode operation.
     #[test]
     fn test_q4k_hierarchical_scale_structure() {
         // Arrange
@@ -3277,16 +3323,12 @@ mod tests {
         let has_f16_load = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
         assert!(has_f16_load, "Q4_K should load block_d via QuantLoadF16toF32");
 
-        // Assert: sub-scale lookup via QuantKQuantPackedScaleLookup
-        let has_packed = trace.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantKQuantPackedScaleLookup { scale_algo: PackedScaleAlgorithm::KQuant6Bit, selector: ScaleSelector::Scale, .. }
-        ));
-        assert!(has_packed, "Q4_K should have QuantKQuantPackedScaleLookup for sub-scale");
-
-        // Assert: Mul combines block_d * sub_scale
-        let has_mul = trace.iter().any(|op| matches!(op, TraceOp::Mul(_, _)));
-        assert!(has_mul, "Q4_K should have Mul for block_d * sub_scale");
+        // Assert: BCE-20260731-Q4K-MONOLITHIC-DECODE — layout-aware decode
+        // replaces the generic two-phase PackedNibbles trace.
+        let has_q4k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ4KDecode { .. }));
+        assert!(has_q4k_decode, "Q4_K should emit QuantQ4KDecode");
+        let has_packed = trace.iter().any(|op| matches!(op, TraceOp::QuantKQuantPackedScaleLookup { .. }));
+        assert!(!has_packed, "Q4_K monolithic decode must not emit generic packed-scale lookup");
     }
 
     // @trace TEST-QD-58 [req:REQ-QCG] [level:unit]

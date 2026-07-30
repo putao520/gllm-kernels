@@ -1098,6 +1098,13 @@ impl<'a> RegAllocator<'a> {
                 d_vreg,
                 ..
             } => vec![*dst, *block_base, *lane_offset, *d_vreg],
+            VmInstr::Q4KDecodeStep {
+                dst,
+                block_base,
+                lane_offset,
+                d_vreg,
+                ..
+            } => vec![*dst, *block_base, *lane_offset, *d_vreg],
             VmInstr::BitwiseGemm {
                 dst,
                 sign_bits,
@@ -2573,6 +2580,13 @@ fn validate_spill_is_pure_write_quantb(instr: &VmInstr, vreg: VRegId) -> bool {
             ..
         } => *dst == vreg && *block_base != vreg && *lane_offset != vreg && *d_vreg != vreg,
         VmInstr::Q5KDecodeStep {
+            dst,
+            block_base,
+            lane_offset,
+            d_vreg,
+            ..
+        } => *dst == vreg && *block_base != vreg && *lane_offset != vreg && *d_vreg != vreg,
+        VmInstr::Q4KDecodeStep {
             dst,
             block_base,
             lane_offset,

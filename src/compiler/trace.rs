@@ -716,6 +716,16 @@ pub enum TraceOp {
         qh_offset: usize,
     },
 
+    /// Q4_K combined decode (BCE-20260731-Q4K-MONOLITHIC-DECODE).
+    /// Q4_K uses four groups of 32 low nibbles followed by 32 high nibbles;
+    /// each half has its own packed 6-bit scale/min pair.
+    QuantQ4KDecode {
+        block_base: ValueId,
+        lane_offset: ValueId,
+        d_slot: ValueId,
+        qs_offset: usize,
+    },
+
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // SPEC 24-QUANT-PIPELINE-JIT §1.3: QuantGather/QuantGemm structural trace ops
     // Marker ops in the trace — auto_select expands to full emit_*_inline logic.
@@ -1381,6 +1391,7 @@ pub fn infer_result_dtype(op: &TraceOp, slots: &[TypedSlot]) -> QuantPrecision {
         TraceOp::QuantQ6KDecode { .. } => QuantPrecision::F32,
         TraceOp::QuantQ5Decode { .. } => QuantPrecision::F32,
         TraceOp::QuantQ5KDecode { .. } => QuantPrecision::F32,
+        TraceOp::QuantQ4KDecode { .. } => QuantPrecision::F32,
         // ── SPEC 24-QUANT-PIPELINE-JIT §1.3: QuantGather/QuantGemm structural ──
         TraceOp::QuantGather { .. } => QuantPrecision::F32,
         TraceOp::QuantGemm { .. } => QuantPrecision::F32,
@@ -1466,6 +1477,9 @@ impl TraceOp {
                 f(*a); f(*b); f(*c);
             }
             TraceOp::QuantQ5KDecode { block_base: a, lane_offset: b, d_slot: c, .. } => {
+                f(*a); f(*b); f(*c);
+            }
+            TraceOp::QuantQ4KDecode { block_base: a, lane_offset: b, d_slot: c, .. } => {
                 f(*a); f(*b); f(*c);
             }
 
@@ -1665,6 +1679,8 @@ impl TraceOp {
                 TraceOp::QuantQ5Decode { block_base: m(block_base), lane_offset: m(lane_offset), d_slot: m(d_slot), qs_offset, qh_offset, has_min },
             TraceOp::QuantQ5KDecode { block_base, lane_offset, d_slot, qs_offset, qh_offset } =>
                 TraceOp::QuantQ5KDecode { block_base: m(block_base), lane_offset: m(lane_offset), d_slot: m(d_slot), qs_offset, qh_offset },
+            TraceOp::QuantQ4KDecode { block_base, lane_offset, d_slot, qs_offset } =>
+                TraceOp::QuantQ4KDecode { block_base: m(block_base), lane_offset: m(lane_offset), d_slot: m(d_slot), qs_offset },
             // SPEC 24 QuantGather/QuantGemm pipeline
             TraceOp::QuantScaleLoad { source, offset, dtype } =>
                 TraceOp::QuantScaleLoad { source: m(source), offset, dtype },

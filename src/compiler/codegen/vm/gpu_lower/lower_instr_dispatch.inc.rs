@@ -130,6 +130,7 @@ impl GpuLower {
             VmInstr::Q3KDecodeStep { .. } => self.lower_q3_k_decode_step_gpu(instr, alloc),
             VmInstr::Q6KDecodeStep { .. } => self.lower_q6_k_decode_step_gpu(instr, alloc),
             VmInstr::Q5DecodeStep { .. } => self.lower_q5_decode_step_gpu(instr, alloc),
+            VmInstr::Q4KDecodeStep { .. } => self.lower_q4_k_decode_step_gpu(instr, alloc),
             VmInstr::GgufSubScaleLoad { .. } | VmInstr::GgufKQuantScaleLoad { .. } => self.lower_gguf_sub_scale_load_gpu(instr, alloc),
             VmInstr::QuantBlockLoad { dst, base, offset, unpack, width } => self.lower_quant_block_load_gpu(instr, alloc),
             VmInstr::QuantBiPlaneLoad { dst, qs_base, extra_base, bias, mode, width } => self.lower_quant_bi_plane_load_gpu(instr, alloc),
@@ -4262,6 +4263,17 @@ Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_q5_decode_step_gpu: expected VmInstr::Q5DecodeStep, got {:?}", instr))),
+        }
+    }
+
+    fn lower_q4_k_decode_step_gpu(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
+        let _ = alloc;
+        match instr {
+            VmInstr::Q4KDecodeStep { .. } => Err(CompilerError::CodegenViolation(
+                "Q4KDecodeStep GPU: not yet implemented".into(),
+            )),
+            _ => Err(CompilerError::CodegenViolation(
+                format!("lower_q4_k_decode_step_gpu: expected VmInstr::Q4KDecodeStep, got {:?}", instr))),
         }
     }
 

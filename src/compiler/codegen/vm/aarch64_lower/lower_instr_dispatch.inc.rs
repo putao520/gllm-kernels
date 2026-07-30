@@ -138,6 +138,7 @@ impl AArch64Lower {
             VmInstr::Q3KDecodeStep { .. } => self.lower_q3_k_decode_step_aarch64(instr, alloc),
             VmInstr::Q6KDecodeStep { .. } => self.lower_q6_k_decode_step_aarch64(instr, alloc),
             VmInstr::Q5DecodeStep { .. } => self.lower_q5_decode_step_aarch64(instr, alloc),
+            VmInstr::Q4KDecodeStep { .. } => self.lower_q4_k_decode_step_aarch64(instr, alloc),
             VmInstr::BitwiseGemm { .. } => self.lower_bitwise_gemm_aarch64(instr, alloc),
             VmInstr::SparseGemm { .. } => self.lower_sparse_gemm_aarch64(instr, alloc),
             VmInstr::SparseFp8Gemm { .. } => self.lower_sparse_fp8_gemm_aarch64(instr, alloc),
@@ -3609,6 +3610,17 @@ Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_q5_decode_step_aarch64: expected VmInstr::Q5DecodeStep, got {:?}", instr))),
+        }
+    }
+
+    fn lower_q4_k_decode_step_aarch64(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
+        let _ = alloc;
+        match instr {
+            VmInstr::Q4KDecodeStep { .. } => Err(CompilerError::CodegenViolation(
+                "Q4KDecodeStep AArch64: not yet implemented".into(),
+            )),
+            _ => Err(CompilerError::CodegenViolation(
+                format!("lower_q4_k_decode_step_aarch64: expected VmInstr::Q4KDecodeStep, got {:?}", instr))),
         }
     }
 

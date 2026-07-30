@@ -1443,6 +1443,18 @@ pub enum VmInstr {
         width: SimdWidth,
     },
 
+    /// Q4_K 单步解码 (BCE-20260731-Q4K-MONOLITHIC-DECODE).
+    /// 委托 q4k_decode_step_native，保留每个 64 元素组的 lo/hi nibble 顺序。
+    Q4KDecodeStep {
+        dst: VRegId,
+        block_base: VRegId,
+        lane_offset: VRegId,
+        d_vreg: VRegId,
+        qs_offset: usize,
+        lanes: usize,
+        width: SimdWidth,
+    },
+
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // SPEC 23-QUANT-CODEGEN-ALGO §4.3: 原生 Dot-Product VmInstr
     // 硬件无关语义，ISA lowering 决定具体指令
