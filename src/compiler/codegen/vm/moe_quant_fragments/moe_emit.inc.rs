@@ -853,7 +853,6 @@ impl QuantGemmPlan {
                 GemmMode::General
             };
 
-            eprintln!("[GEMM-KERNEL] {:?} qt={:?} kernel={:?} mode={:?} dot_cap={:?} is_assisted={}", desc.name, desc.quant_type, kernel, mode, dot_cap, is_assisted);
             (kernel, mode)
         };
 
