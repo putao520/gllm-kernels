@@ -178,6 +178,7 @@ fn lower_op_gemm(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, c
             Ok(Some(lower_gemm_v2(prog, op, graph, ctx, resolver, abi, spec)?))
         }
         Op::QuantGemm(ref spec) => {
+            eprintln!("[LOWER-QGEMM] op={:?} n={} k={} qt={:?}", op.id, spec.n, spec.k, spec.quant_type);
             let m_bound = if abi.mega_decode_seq_len.is_some() {
                 BoundExpr::Const(1)
             } else {

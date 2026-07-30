@@ -846,7 +846,6 @@ impl QuantGemmPlan {
             } else {
                 GemmKernel::DequantFma
             };
-            eprintln!("[KSEL] qt={:?} dot_cap={:?} data_kind={:?} is_float={} is_int4={} is_flat_scale={} is_assisted={} => kernel={:?}", desc.quant_type, dot_cap, desc.data_kind, desc.data_kind.is_float(), is_int4, is_flat_scale, is_assisted, kernel);
 
             let mode = if matches!(m_bound, BoundExpr::Const(1) | BoundExpr::DynamicVReg(_)) {
                 GemmMode::Gemv

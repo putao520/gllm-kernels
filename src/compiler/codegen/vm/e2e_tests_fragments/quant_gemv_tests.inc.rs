@@ -1000,6 +1000,103 @@ mod quant_gemv_tests {
         assert!(pass, "Q4_0 QuantGemm x86 oracle: got {} want 3.0 (SPLIT act·weight)", out_f32[0]);
     }
 
+    // ── Q4_0 QuantGemm W512 real-execution oracle ────────────────────────
+    //
+    // W512 is the production width on AVX-512 hosts (including Gemma4's
+    // 5070Ti-side CPU workers).  Use different low/high activation values and
+    // different low/high nibbles so the two DequantFma SPLIT passes are both
+    // observable: the high pass must read activation[k + 16], not activation[k].
+    // On AVX2-only hosts this same known-answer oracle runs at W256; the W512
+    // machine-code path is exercised when the test runs on AVX-512 hardware.
+    #[test]
+    fn test_q4_0_quant_gemm_w512_oracle() {
+        use crate::compiler::codegen::vm::moe_quant_emit::emit_quant_gemm_inline;
+
+        let m: usize = 1;
+        let n: usize = 1;
+        let k: usize = 32;
+        let block_bytes: usize = 18;
+        let use_avx512 = std::is_x86_feature_detected!("avx512f");
+        let width = if use_avx512 { SimdWidth::W512 } else { SimdWidth::W256 };
+
+        // Q4_0 block: d=1 and SPLIT qs.  For byte j, low q=j and high
+        // q=15-j, so the dequantized halves are j-8 and 7-j respectively.
+        let d_bits = f16::from_f32(1.0).to_bits();
+        let mut weight = vec![0u8; block_bytes];
+        weight[0] = (d_bits & 0xff) as u8;
+        weight[1] = (d_bits >> 8) as u8;
+        for j in 0..16 {
+            weight[2 + j] = (j as u8) | (((15 - j) as u8) << 4);
+        }
+
+        // Distinct half activation values expose an incorrect high-pass
+        // pointer.  The expected dot is computed from the GGML formula and
+        // retained as a fixed known answer: 272 + 2*(-408) = -544.
+        let mut act = vec![0.0f32; k];
+        for j in 0..16 {
+            act[j] = (j + 1) as f32;
+            act[j + 16] = (2 * (j + 1)) as f32;
+        }
+        let expected = -544.0f32;
+        let mut output = vec![0.0f32; 1];
+
+        let mut prog = VmProgram::new();
+        let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadPtr { dst: input_ptr, src: PtrExpr::AbiArg(0) });
+        prog.emit(VmInstr::LoadPtr { dst: weight_ptr, src: PtrExpr::AbiArg(1) });
+        prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: PtrExpr::StackArg(24) });
+
+        emit_quant_gemm_inline(
+            &mut prog,
+            BoundExpr::Const(m),
+            n, k,
+            QuantType::Q4_0,
+            width,
+            input_ptr, weight_ptr, output_ptr,
+            QuantPrecision::F32,
+            DotProductCap::SimdAssisted,
+        ).expect("Q4_0 QuantGemm W512 oracle emit should succeed");
+
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        let alloc = RegAllocator::new(&profile)
+            .allocate(&prog)
+            .expect("Q4_0 QuantGemm W512 oracle register allocation should succeed");
+        let frame = StackFrame::compute(&alloc, &profile, 0);
+        let mut lower = X86Lower::with_avx512(use_avx512);
+        lower.emit_prologue(&frame, &alloc).expect("W512 oracle prologue");
+        for instr in &prog.instrs {
+            lower.lower_instr(instr, &alloc).expect("W512 oracle lowering");
+        }
+        lower.emit_epilogue(&frame, &alloc).expect("W512 oracle epilogue");
+        let code = lower.finalize().expect("W512 oracle finalization");
+        eprintln!("[Q4_0-GEMM-W512] width={width:?}, JIT code {} bytes, {} instrs", code.len(), prog.instrs.len());
+
+        let (exec_ptr, exec_len) = make_exec_buffer(&code);
+        type GemmFn = unsafe extern "C" fn(
+            *const u8, *const u8, usize, usize, usize, usize, usize, *mut u8,
+        ) -> usize;
+        let f: GemmFn = unsafe { std::mem::transmute(exec_ptr) };
+        let _ret = unsafe {
+            f(
+                act.as_ptr() as *const u8,
+                weight.as_ptr() as *const u8,
+                0, 0, 0, 0, 0,
+                output.as_mut_ptr() as *mut u8,
+            )
+        };
+        let actual = output[0];
+        eprintln!("[Q4_0-GEMM-W512] actual={actual}, expected={expected}");
+        unsafe { libc::munmap(exec_ptr as *mut _, exec_len); }
+
+        assert!(
+            (actual - expected).abs() < 1e-3,
+            "Q4_0 QuantGemm W512 oracle: got {actual} want {expected}"
+        );
+    }
+
     // ── Q4_0 QuantGemm x86 oracle — BF16 accum_dtype (真实推理配置) ───────
     //
     // 真实 Qwen3 Q4_0: geometry.dtype=BF16, compute_dtype=BF16 → accum_dtype=BF16.
