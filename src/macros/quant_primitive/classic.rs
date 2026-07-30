@@ -8,19 +8,21 @@ macro_rules! quant_primitive_classic {
     // ========================================================================
     // Q4_0: d(f16) + qs[16] packed 4-bit, zero_point = 8
     // out[i] = d * (nibble - 8)
+    // SPLIT layout (llama.cpp ggml-quants.c dequantize_row_q4_0):
+    //   byte j: lo nibble → elem[j], hi nibble → elem[j+16] (j=0..15)
     // ========================================================================
 
     (scalar, q4_0, decode, $block_ptr:expr, $out_ptr:expr) => {
         {
             let block = unsafe { &*$block_ptr };
             let d: f32 = block.d.to_f32();
-            for i in 0..16 {
-                let b = block.qs[i];
+            for j in 0..16 {
+                let b = block.qs[j];
                 let lo = (b & 0x0F) as f32;
                 let hi = (b >> 4) as f32;
                 unsafe {
-                    *$out_ptr.add(i * 2) = d * (lo - 8.0);
-                    *$out_ptr.add(i * 2 + 1) = d * (hi - 8.0);
+                    *$out_ptr.add(j) = d * (lo - 8.0);
+                    *$out_ptr.add(j + 16) = d * (hi - 8.0);
                 }
             }
         }
@@ -32,13 +34,13 @@ macro_rules! quant_primitive_classic {
             let d: f32 = block.d.to_f32();
             let other = $other_ptr;
             let mut sum = 0.0f32;
-            for i in 0..16 {
-                let b = block.qs[i];
+            for j in 0..16 {
+                let b = block.qs[j];
                 let lo = (b & 0x0F) as f32;
                 let hi = (b >> 4) as f32;
                 unsafe {
-                    sum += d * (lo - 8.0) * *other.add(i * 2);
-                    sum += d * (hi - 8.0) * *other.add(i * 2 + 1);
+                    sum += d * (lo - 8.0) * *other.add(j);
+                    sum += d * (hi - 8.0) * *other.add(j + 16);
                 }
             }
             sum
@@ -306,13 +308,13 @@ macro_rules! quant_primitive_classic {
             let block = unsafe { &*$block_ptr };
             let d: f32 = block.d.to_f32();
             let m: f32 = block.m.to_f32();
-            for i in 0..16 {
-                let b = block.qs[i];
+            for j in 0..16 {
+                let b = block.qs[j];
                 let lo = (b & 0x0F) as f32;
                 let hi = (b >> 4) as f32;
                 unsafe {
-                    *$out_ptr.add(i * 2) = d * lo + m;
-                    *$out_ptr.add(i * 2 + 1) = d * hi + m;
+                    *$out_ptr.add(j) = d * lo + m;
+                    *$out_ptr.add(j + 16) = d * hi + m;
                 }
             }
         }
@@ -325,13 +327,13 @@ macro_rules! quant_primitive_classic {
             let m: f32 = block.m.to_f32();
             let other = $other_ptr;
             let mut sum = 0.0f32;
-            for i in 0..16 {
-                let b = block.qs[i];
+            for j in 0..16 {
+                let b = block.qs[j];
                 let lo = (b & 0x0F) as f32;
                 let hi = (b >> 4) as f32;
                 unsafe {
-                    sum += (d * lo + m) * *other.add(i * 2);
-                    sum += (d * hi + m) * *other.add(i * 2 + 1);
+                    sum += (d * lo + m) * *other.add(j);
+                    sum += (d * hi + m) * *other.add(j + 16);
                 }
             }
             sum
@@ -494,11 +496,20 @@ macro_rules! quant_primitive_classic {
         {
             let block = unsafe { &*$block_ptr };
             let d: f32 = block.d.to_f32();
-            for i in 0..32 {
-                let lo = (block.qs[i / 2] >> ((i % 2) * 4)) & 0xF;
-                let hi = (block.qh[i / 8] >> (i % 8)) & 1;
-                let q = (hi << 4) | lo;
-                unsafe { *$out_ptr.add(i) = d * (q as f32 - 16.0); }
+            // SPLIT layout (llama.cpp dequantize_row_q5_0):
+            //   byte j (j=0..15): lo nibble → elem[j] (5th bit from qh bit j),
+            //   hi nibble → elem[j+16] (5th bit from qh bit j+16)
+            let qh: u32 = u32::from_le_bytes([block.qh[0], block.qh[1], block.qh[2], block.qh[3]]);
+            for j in 0..16 {
+                let b = block.qs[j];
+                let lo = (b & 0x0F) as u32;
+                let hi = (b >> 4) as u32;
+                let bit_lo = ((qh >> j) & 1) << 4;
+                let bit_hi = ((qh >> (j + 16)) & 1) << 4;
+                unsafe {
+                    *$out_ptr.add(j) = d * ((lo | bit_lo) as f32 - 16.0);
+                    *$out_ptr.add(j + 16) = d * ((hi | bit_hi) as f32 - 16.0);
+                }
             }
         }
     };
@@ -509,11 +520,18 @@ macro_rules! quant_primitive_classic {
             let d: f32 = block.d.to_f32();
             let other = $other_ptr;
             let mut sum = 0.0f32;
-            for i in 0..32 {
-                let lo = (block.qs[i / 2] >> ((i % 2) * 4)) & 0xF;
-                let hi = (block.qh[i / 8] >> (i % 8)) & 1;
-                let q = (hi << 4) | lo;
-                unsafe { sum += d * (q as f32 - 16.0) * *other.add(i); }
+            // SPLIT: byte j lo → elem[j], hi → elem[j+16]
+            let qh: u32 = u32::from_le_bytes([block.qh[0], block.qh[1], block.qh[2], block.qh[3]]);
+            for j in 0..16 {
+                let b = block.qs[j];
+                let lo = (b & 0x0F) as u32;
+                let hi = (b >> 4) as u32;
+                let bit_lo = ((qh >> j) & 1) << 4;
+                let bit_hi = ((qh >> (j + 16)) & 1) << 4;
+                unsafe {
+                    sum += d * ((lo | bit_lo) as f32 - 16.0) * *other.add(j);
+                    sum += d * ((hi | bit_hi) as f32 - 16.0) * *other.add(j + 16);
+                }
             }
             sum
         }
@@ -656,11 +674,20 @@ macro_rules! quant_primitive_classic {
             let block = unsafe { &*$block_ptr };
             let d: f32 = block.d.to_f32();
             let m: f32 = block.m.to_f32();
-            for i in 0..32 {
-                let lo = (block.qs[i / 2] >> ((i % 2) * 4)) & 0xF;
-                let hi = (block.qh[i / 8] >> (i % 8)) & 1;
-                let q = ((hi << 4) | lo) as f32;
-                unsafe { *$out_ptr.add(i) = d * q + m; }
+            // SPLIT layout (llama.cpp dequantize_row_q5_1):
+            //   byte j (j=0..15): lo nibble → elem[j] (5th bit from qh bit j),
+            //   hi nibble → elem[j+16] (5th bit from qh bit j+16)
+            let qh: u32 = u32::from_le_bytes([block.qh[0], block.qh[1], block.qh[2], block.qh[3]]);
+            for j in 0..16 {
+                let b = block.qs[j];
+                let lo = (b & 0x0F) as u32;
+                let hi = (b >> 4) as u32;
+                let bit_lo = ((qh >> j) & 1) << 4;
+                let bit_hi = ((qh >> (j + 16)) & 1) << 4;
+                unsafe {
+                    *$out_ptr.add(j) = d * (lo | bit_lo) as f32 + m;
+                    *$out_ptr.add(j + 16) = d * (hi | bit_hi) as f32 + m;
+                }
             }
         }
     };
@@ -672,11 +699,18 @@ macro_rules! quant_primitive_classic {
             let m: f32 = block.m.to_f32();
             let other = $other_ptr;
             let mut sum = 0.0f32;
-            for i in 0..32 {
-                let lo = (block.qs[i / 2] >> ((i % 2) * 4)) & 0xF;
-                let hi = (block.qh[i / 8] >> (i % 8)) & 1;
-                let q = ((hi << 4) | lo) as f32;
-                unsafe { sum += (d * q + m) * *other.add(i); }
+            // SPLIT: byte j lo → elem[j], hi → elem[j+16]
+            let qh: u32 = u32::from_le_bytes([block.qh[0], block.qh[1], block.qh[2], block.qh[3]]);
+            for j in 0..16 {
+                let b = block.qs[j];
+                let lo = (b & 0x0F) as u32;
+                let hi = (b >> 4) as u32;
+                let bit_lo = ((qh >> j) & 1) << 4;
+                let bit_hi = ((qh >> (j + 16)) & 1) << 4;
+                unsafe {
+                    sum += (d * (lo | bit_lo) as f32 + m) * *other.add(j);
+                    sum += (d * (hi | bit_hi) as f32 + m) * *other.add(j + 16);
+                }
             }
             sum
         }
