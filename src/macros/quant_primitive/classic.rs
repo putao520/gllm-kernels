@@ -72,19 +72,12 @@ macro_rules! quant_primitive_classic {
                 let rl1 = $crate::simd_primitive!(avx2, f32, fma, vd, il1, v_off);
                 let rh0 = $crate::simd_primitive!(avx2, f32, fma, vd, ih0, v_off);
                 let rh1 = $crate::simd_primitive!(avx2, f32, fma, vd, ih1, v_off);
-                // Interleave [l0,h0,l1,h1,...]
-                let t0 = _mm256_unpacklo_ps(rl0, rh0);
-                let t1 = _mm256_unpackhi_ps(rl0, rh0);
-                let t2 = _mm256_unpacklo_ps(rl1, rh1);
-                let t3 = _mm256_unpackhi_ps(rl1, rh1);
-                let f0 = _mm256_permute2f128_ps(t0, t1, 0x20);
-                let f1 = _mm256_permute2f128_ps(t0, t1, 0x31);
-                let f2 = _mm256_permute2f128_ps(t2, t3, 0x20);
-                let f3 = _mm256_permute2f128_ps(t2, t3, 0x31);
-                $crate::simd_primitive!(avx2, f32, store, out_ptr.add(0), f0);
-                $crate::simd_primitive!(avx2, f32, store, out_ptr.add(8), f1);
-                $crate::simd_primitive!(avx2, f32, store, out_ptr.add(16), f2);
-                $crate::simd_primitive!(avx2, f32, store, out_ptr.add(24), f3);
+                // SPLIT layout (llama.cpp): low nibbles → elem[0..15], high → elem[16..31].
+                // rl0=elem[0..7], rl1=elem[8..15], rh0=elem[16..23], rh1=elem[24..31].
+                $crate::simd_primitive!(avx2, f32, store, out_ptr.add(0), rl0);
+                $crate::simd_primitive!(avx2, f32, store, out_ptr.add(8), rl1);
+                $crate::simd_primitive!(avx2, f32, store, out_ptr.add(16), rh0);
+                $crate::simd_primitive!(avx2, f32, store, out_ptr.add(24), rh1);
             }
         }
     };
@@ -151,10 +144,10 @@ macro_rules! quant_primitive_classic {
                 let fh = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(high_bytes));
                 let rl = $crate::simd_primitive!(avx512, f32, fma, vd, fl, v_off);
                 let rh = $crate::simd_primitive!(avx512, f32, fma, vd, fh, v_off);
-                let lo = _mm512_unpacklo_ps(rl, rh);
-                let hi = _mm512_unpackhi_ps(rl, rh);
-                $crate::simd_primitive!(avx512, f32, store, out_ptr.add(0), lo);
-                $crate::simd_primitive!(avx512, f32, store, out_ptr.add(16), hi);
+                // SPLIT layout (llama.cpp): low nibbles → elem[0..15], high nibbles → elem[16..31].
+                // No interleave — store rl then rh contiguously.
+                $crate::simd_primitive!(avx512, f32, store, out_ptr.add(0), rl);
+                $crate::simd_primitive!(avx512, f32, store, out_ptr.add(16), rh);
             }
         }
     };
@@ -364,14 +357,11 @@ macro_rules! quant_primitive_classic {
                 let rl1 = $crate::simd_primitive!(avx2, f32, fma, vd, il1, vm);
                 let rh0 = $crate::simd_primitive!(avx2, f32, fma, vd, ih0, vm);
                 let rh1 = $crate::simd_primitive!(avx2, f32, fma, vd, ih1, vm);
-                let t0 = _mm256_unpacklo_ps(rl0, rh0);
-                let t1 = _mm256_unpackhi_ps(rl0, rh0);
-                let t2 = _mm256_unpacklo_ps(rl1, rh1);
-                let t3 = _mm256_unpackhi_ps(rl1, rh1);
-                $crate::simd_primitive!(avx2, f32, store, out_ptr.add(0), _mm256_permute2f128_ps(t0, t1, 0x20));
-                $crate::simd_primitive!(avx2, f32, store, out_ptr.add(8), _mm256_permute2f128_ps(t0, t1, 0x31));
-                $crate::simd_primitive!(avx2, f32, store, out_ptr.add(16), _mm256_permute2f128_ps(t2, t3, 0x20));
-                $crate::simd_primitive!(avx2, f32, store, out_ptr.add(24), _mm256_permute2f128_ps(t2, t3, 0x31));
+                // SPLIT: low→elem[0..15], high→elem[16..31]
+                $crate::simd_primitive!(avx2, f32, store, out_ptr.add(0), rl0);
+                $crate::simd_primitive!(avx2, f32, store, out_ptr.add(8), rl1);
+                $crate::simd_primitive!(avx2, f32, store, out_ptr.add(16), rh0);
+                $crate::simd_primitive!(avx2, f32, store, out_ptr.add(24), rh1);
             }
         }
     };
@@ -438,10 +428,9 @@ macro_rules! quant_primitive_classic {
                 let fh = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(high_bytes));
                 let rl = $crate::simd_primitive!(avx512, f32, fma, vd, fl, vm);
                 let rh = $crate::simd_primitive!(avx512, f32, fma, vd, fh, vm);
-                let lo = _mm512_unpacklo_ps(rl, rh);
-                let hi = _mm512_unpackhi_ps(rl, rh);
-                $crate::simd_primitive!(avx512, f32, store, out_ptr.add(0), lo);
-                $crate::simd_primitive!(avx512, f32, store, out_ptr.add(16), hi);
+                // SPLIT layout: low nibbles → elem[0..15], high → elem[16..31].
+                $crate::simd_primitive!(avx512, f32, store, out_ptr.add(0), rl);
+                $crate::simd_primitive!(avx512, f32, store, out_ptr.add(16), rh);
             }
         }
     };
@@ -547,19 +536,42 @@ macro_rules! quant_primitive_classic {
                 let vd = $crate::simd_primitive!(avx2, f32, splat, d);
                 let v_off = $crate::simd_primitive!(avx2, f32, splat, -d * 16.0);
                 let out_ptr = $out_ptr;
-                // Extract 32 x 5-bit values into i32 array, then SIMD convert
-                for i in 0..4 {
-                    let base = i * 8;
+                let qh: u32 = u32::from_le_bytes([block.qh[0], block.qh[1], block.qh[2], block.qh[3]]);
+                // SPLIT: byte j (j=0..15): lo→elem[j], hi→elem[j+16].
+                for half in 0..2 {
                     let mut vals = [0i32; 8];
                     for j in 0..8 {
-                        let idx = base + j;
-                        let lo = (block.qs[idx / 2] >> ((idx % 2) * 4)) & 0xF;
-                        let hi = (block.qh[idx / 8] >> (idx % 8)) & 1;
-                        vals[j] = ((hi << 4) | lo) as i32;
+                        let bj = half * 8 + j;
+                        let b = block.qs[bj];
+                        let lo = (b & 0x0F) as u32;
+                        let hi = (b >> 4) as u32;
+                        let bit_lo = ((qh >> bj) & 1) << 4;
+                        let bit_hi = ((qh >> (bj + 16)) & 1) << 4;
+                        // half=0 → low nibbles (elem 0..7), half=1 → high nibbles (elem 16..23)
+                        vals[j] = if half == 0 { (lo | bit_lo) as i32 } else { (hi | bit_hi) as i32 };
                     }
                     let vi = _mm256_loadu_si256(vals.as_ptr() as *const _);
                     let vf = _mm256_cvtepi32_ps(vi);
                     let res = $crate::simd_primitive!(avx2, f32, fma, vd, vf, v_off);
+                    let base = if half == 0 { 0 } else { 16 };
+                    $crate::simd_primitive!(avx2, f32, store, out_ptr.add(base), res);
+                }
+                // Process j=8..15 (second half of low/high)
+                for half in 0..2 {
+                    let mut vals = [0i32; 8];
+                    for j in 0..8 {
+                        let bj = 8 + j;
+                        let b = block.qs[bj];
+                        let lo = (b & 0x0F) as u32;
+                        let hi = (b >> 4) as u32;
+                        let bit_lo = ((qh >> bj) & 1) << 4;
+                        let bit_hi = ((qh >> (bj + 16)) & 1) << 4;
+                        vals[j] = if half == 0 { (lo | bit_lo) as i32 } else { (hi | bit_hi) as i32 };
+                    }
+                    let vi = _mm256_loadu_si256(vals.as_ptr() as *const _);
+                    let vf = _mm256_cvtepi32_ps(vi);
+                    let res = $crate::simd_primitive!(avx2, f32, fma, vd, vf, v_off);
+                    let base = if half == 0 { 8 } else { 24 };
                     $crate::simd_primitive!(avx2, f32, store, out_ptr.add(base), res);
                 }
             }
@@ -607,20 +619,26 @@ macro_rules! quant_primitive_classic {
                 let vd = $crate::simd_primitive!(avx512, f32, splat, d);
                 let v_off = $crate::simd_primitive!(avx512, f32, splat, -d * 16.0);
                 let out_ptr = $out_ptr;
-                for i in 0..2 {
-                    let base = i * 16;
-                    let mut vals = [0i32; 16];
-                    for j in 0..16 {
-                        let idx = base + j;
-                        let lo = (block.qs[idx / 2] >> ((idx % 2) * 4)) & 0xF;
-                        let hi = (block.qh[idx / 8] >> (idx % 8)) & 1;
-                        vals[j] = ((hi << 4) | lo) as i32;
-                    }
-                    let vi = _mm512_loadu_si512(vals.as_ptr() as *const _);
-                    let vf = _mm512_cvtepi32_ps(vi);
-                    let res = $crate::simd_primitive!(avx512, f32, fma, vd, vf, v_off);
-                    $crate::simd_primitive!(avx512, f32, store, out_ptr.add(base), res);
+                let qh: u32 = u32::from_le_bytes([block.qh[0], block.qh[1], block.qh[2], block.qh[3]]);
+                // SPLIT: byte j (j=0..15): lo nibble → elem[j], hi nibble → elem[j+16].
+                // 5th bit: qh bit j → elem[j], bit j+16 → elem[j+16].
+                let mut vals_lo = [0i32; 16];
+                let mut vals_hi = [0i32; 16];
+                for j in 0..16 {
+                    let b = block.qs[j];
+                    let lo = (b & 0x0F) as u32;
+                    let hi = (b >> 4) as u32;
+                    let bit_lo = ((qh >> j) & 1) << 4;
+                    let bit_hi = ((qh >> (j + 16)) & 1) << 4;
+                    vals_lo[j] = (lo | bit_lo) as i32;
+                    vals_hi[j] = (hi | bit_hi) as i32;
                 }
+                let vf_lo = _mm512_cvtepi32_ps(_mm512_loadu_si512(vals_lo.as_ptr() as *const _));
+                let vf_hi = _mm512_cvtepi32_ps(_mm512_loadu_si512(vals_hi.as_ptr() as *const _));
+                let rl = $crate::simd_primitive!(avx512, f32, fma, vd, vf_lo, v_off);
+                let rh = $crate::simd_primitive!(avx512, f32, fma, vd, vf_hi, v_off);
+                $crate::simd_primitive!(avx512, f32, store, out_ptr.add(0), rl);
+                $crate::simd_primitive!(avx512, f32, store, out_ptr.add(16), rh);
             }
         }
     };
@@ -727,18 +745,40 @@ macro_rules! quant_primitive_classic {
                 let vd = $crate::simd_primitive!(avx2, f32, splat, d);
                 let vm = $crate::simd_primitive!(avx2, f32, splat, m);
                 let out_ptr = $out_ptr;
-                for i in 0..4 {
-                    let base = i * 8;
+                let qh: u32 = u32::from_le_bytes([block.qh[0], block.qh[1], block.qh[2], block.qh[3]]);
+                // SPLIT: byte j (j=0..15): lo→elem[j], hi→elem[j+16].
+                for half in 0..2 {
                     let mut vals = [0i32; 8];
                     for j in 0..8 {
-                        let idx = base + j;
-                        let lo = (block.qs[idx / 2] >> ((idx % 2) * 4)) & 0xF;
-                        let hi = (block.qh[idx / 8] >> (idx % 8)) & 1;
-                        vals[j] = ((hi << 4) | lo) as i32;
+                        let bj = half * 8 + j;
+                        let b = block.qs[bj];
+                        let lo = (b & 0x0F) as u32;
+                        let hi = (b >> 4) as u32;
+                        let bit_lo = ((qh >> bj) & 1) << 4;
+                        let bit_hi = ((qh >> (bj + 16)) & 1) << 4;
+                        vals[j] = if half == 0 { (lo | bit_lo) as i32 } else { (hi | bit_hi) as i32 };
                     }
                     let vi = _mm256_loadu_si256(vals.as_ptr() as *const _);
                     let vf = _mm256_cvtepi32_ps(vi);
                     let res = $crate::simd_primitive!(avx2, f32, fma, vd, vf, vm);
+                    let base = if half == 0 { 0 } else { 16 };
+                    $crate::simd_primitive!(avx2, f32, store, out_ptr.add(base), res);
+                }
+                for half in 0..2 {
+                    let mut vals = [0i32; 8];
+                    for j in 0..8 {
+                        let bj = 8 + j;
+                        let b = block.qs[bj];
+                        let lo = (b & 0x0F) as u32;
+                        let hi = (b >> 4) as u32;
+                        let bit_lo = ((qh >> bj) & 1) << 4;
+                        let bit_hi = ((qh >> (bj + 16)) & 1) << 4;
+                        vals[j] = if half == 0 { (lo | bit_lo) as i32 } else { (hi | bit_hi) as i32 };
+                    }
+                    let vi = _mm256_loadu_si256(vals.as_ptr() as *const _);
+                    let vf = _mm256_cvtepi32_ps(vi);
+                    let res = $crate::simd_primitive!(avx2, f32, fma, vd, vf, vm);
+                    let base = if half == 0 { 8 } else { 24 };
                     $crate::simd_primitive!(avx2, f32, store, out_ptr.add(base), res);
                 }
             }
@@ -788,20 +828,25 @@ macro_rules! quant_primitive_classic {
                 let vd = $crate::simd_primitive!(avx512, f32, splat, d);
                 let vm = $crate::simd_primitive!(avx512, f32, splat, m);
                 let out_ptr = $out_ptr;
-                for i in 0..2 {
-                    let base = i * 16;
-                    let mut vals = [0i32; 16];
-                    for j in 0..16 {
-                        let idx = base + j;
-                        let lo = (block.qs[idx / 2] >> ((idx % 2) * 4)) & 0xF;
-                        let hi = (block.qh[idx / 8] >> (idx % 8)) & 1;
-                        vals[j] = ((hi << 4) | lo) as i32;
-                    }
-                    let vi = _mm512_loadu_si512(vals.as_ptr() as *const _);
-                    let vf = _mm512_cvtepi32_ps(vi);
-                    let res = $crate::simd_primitive!(avx512, f32, fma, vd, vf, vm);
-                    $crate::simd_primitive!(avx512, f32, store, out_ptr.add(base), res);
+                let qh: u32 = u32::from_le_bytes([block.qh[0], block.qh[1], block.qh[2], block.qh[3]]);
+                // SPLIT: byte j (j=0..15): lo nibble → elem[j], hi nibble → elem[j+16].
+                let mut vals_lo = [0i32; 16];
+                let mut vals_hi = [0i32; 16];
+                for j in 0..16 {
+                    let b = block.qs[j];
+                    let lo = (b & 0x0F) as u32;
+                    let hi = (b >> 4) as u32;
+                    let bit_lo = ((qh >> j) & 1) << 4;
+                    let bit_hi = ((qh >> (j + 16)) & 1) << 4;
+                    vals_lo[j] = (lo | bit_lo) as i32;
+                    vals_hi[j] = (hi | bit_hi) as i32;
                 }
+                let vf_lo = _mm512_cvtepi32_ps(_mm512_loadu_si512(vals_lo.as_ptr() as *const _));
+                let vf_hi = _mm512_cvtepi32_ps(_mm512_loadu_si512(vals_hi.as_ptr() as *const _));
+                let rl = $crate::simd_primitive!(avx512, f32, fma, vd, vf_lo, vm);
+                let rh = $crate::simd_primitive!(avx512, f32, fma, vd, vf_hi, vm);
+                $crate::simd_primitive!(avx512, f32, store, out_ptr.add(0), rl);
+                $crate::simd_primitive!(avx512, f32, store, out_ptr.add(16), rh);
             }
         }
     };
