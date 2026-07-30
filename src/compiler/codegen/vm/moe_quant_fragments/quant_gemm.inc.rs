@@ -832,8 +832,39 @@ pub(crate) fn emit_gemm_dequant_from_plan(
     let needs_lane_off = builder.needs_lane_offset();
     let needs_high_bits = builder.needs_high_bits_ptr();
     let high_bits_stride_val = builder.high_bits_stride();
+
+    // BCE-20260730-Q4_0-GEMM-SPLIT: PackedNibbles (Q4_0/Q4_1) uses SPLIT layout —
+    // byte j: lo nibble → elem[j], hi nibble → elem[j+block_size/2].
+    // DequantFma must do TWO passes (lo + hi) per block, like QuantGather.
+    // Without this, only lo nibbles are decoded → half the weights missing → overflow.
+    let needs_two_phase = super::quant_decode::DecodeTraceBuilder::new(desc, lanes)
+        .needs_two_phase_split();
+
     let mut decode_trace: Vec<TraceOp> = Vec::new();
-    let decode_final_slot = builder.build(&mut decode_trace);
+    let decode_final_slot = if needs_two_phase {
+        super::quant_decode::DecodeTraceBuilder::new(desc, lanes)
+            .with_nibble_phase(super::quant_decode::NibblePhase::Lo)
+            .build(&mut decode_trace)
+    } else {
+        builder.build(&mut decode_trace)
+    };
+
+    // Hi pass trace (only for PackedNibbles two-phase SPLIT)
+    let mut hi_decode_trace: Vec<TraceOp> = Vec::new();
+    let hi_decode_final_slot = if needs_two_phase {
+        Some(super::quant_decode::DecodeTraceBuilder::new(desc, lanes)
+            .with_nibble_phase(super::quant_decode::NibblePhase::Hi)
+            .build(&mut hi_decode_trace))
+    } else {
+        None
+    };
+
+    // Hi pass trace ref (for Gemv/General two-phase SPLIT)
+    let hi_decode_trace_opt: Option<&Vec<TraceOp>> = if needs_two_phase {
+        Some(&hi_decode_trace)
+    } else {
+        None
+    };
 
     let lane_offset_gpr = if needs_lane_off {
         let gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
@@ -900,7 +931,17 @@ pub(crate) fn emit_gemm_dequant_from_plan(
                             None
                         };
 
-                        prog.emit_loop_try(BoundExpr::Const(iters_per_block), lanes * elem,
+                        // BCE-20260730-Q4_0-GEMM-SPLIT: PackedNibbles needs lo+hi two passes.
+                        // Each pass processes iters_per_block/2 iterations.
+                        // Lo pass: decode lo nibbles, act offset = k_act_base + ei_off.
+                        // Hi pass: decode hi nibbles (same bytes, >> 4), act offset = k_act_base + half_block + ei_off.
+                        let (lo_iters, half_block_act) = if needs_two_phase {
+                            (iters_per_block / 2, (block_size / 2) * elem)
+                        } else {
+                            (iters_per_block, 0)
+                        };
+
+                        prog.emit_loop_try(BoundExpr::Const(lo_iters), lanes * elem,
                             |prog, _ei_ctr, ei_off| -> Result<(), CompilerError> {
                                 let mut decode_inputs: Vec<VRegId> = if let Some(lo) = lane_offset_gpr {
                                     vec![blk_ptr, data_ptr, lo]
@@ -934,6 +975,61 @@ pub(crate) fn emit_gemm_dequant_from_plan(
                                 Ok(())
                             },
                         )?;
+
+                        // Hi pass (only for PackedNibbles two-phase SPLIT):
+                        // Reset data_ptr to block start (re-read same bytes for hi nibble),
+                        // use hi_decode_trace, act offset shifts by half_block.
+                        if needs_two_phase {
+                            // Reset data_ptr to block start
+                            prog.emit(VmInstr::GprBinOp { dst: data_ptr, a: blk_ptr, b: GprOperand::VReg(zero_gpr), op: GprOp::Add });
+                            if let Some(lo) = lane_offset_gpr {
+                                prog.emit(VmInstr::GprLoadImm { dst: lo, value: 0 });
+                            }
+                            if let Some(hbp) = high_bits_ptr {
+                                prog.emit(VmInstr::AddPtr { dst: hbp, base: blk_ptr, offset: high_offset_val });
+                            }
+
+                            let hi_trace = hi_decode_trace_opt.as_ref().expect("two_phase requires hi_trace");
+                            let hi_final = hi_decode_final_slot.expect("two_phase requires hi_final_slot");
+                            prog.emit_loop_try(BoundExpr::Const(lo_iters), lanes * elem,
+                                |prog, _ei_ctr, ei_off| -> Result<(), CompilerError> {
+                                    let mut decode_inputs: Vec<VRegId> = if let Some(lo) = lane_offset_gpr {
+                                        vec![blk_ptr, data_ptr, lo]
+                                    } else {
+                                        vec![blk_ptr, data_ptr]
+                                    };
+                                    if let Some(hbp) = high_bits_ptr {
+                                        decode_inputs.push(hbp);
+                                    }
+                                    let decode_slots = super::auto_select::auto_lower_trace_raw(
+                                        prog, hi_trace, &decode_inputs, width, dtype)?;
+                                    let b_decoded = decode_slots[hi_final.0 as usize];
+
+                                    // Hi pass act offset: k_act_base + half_block + ei_off
+                                    let act_off = OffsetExpr::Add(
+                                        Box::new(OffsetExpr::Add(
+                                            Box::new(OffsetExpr::ScalarVReg(k_act_base)),
+                                            Box::new(OffsetExpr::Const(half_block_act)),
+                                        )),
+                                        Box::new(OffsetExpr::LoopOffset(ei_off)),
+                                    );
+                                    prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: act_off, width, dtype , predicate: None });
+
+                                    super::auto_select::auto_lower_trace_into(
+                                        prog, &fma_trace, &[a_val, b_decoded, acc], acc, width, dtype,
+                                    )?;
+
+                                    prog.emit(VmInstr::GprBinOp { dst: data_ptr, a: data_ptr, b: GprOperand::VReg(data_stride_reg ), op: GprOp::Add });
+                                    if let (Some(lo), Some(lg)) = (lane_offset_gpr, lanes_gpr) {
+                                        prog.emit(VmInstr::GprBinOp { dst: lo, a: lo, b: GprOperand::VReg(lg ), op: GprOp::Add });
+                                    }
+                                    if let (Some(hbp), Some(hbs)) = (high_bits_ptr, high_bits_stride_gpr) {
+                                        prog.emit(VmInstr::GprBinOp { dst: hbp, a: hbp, b: GprOperand::VReg(hbs ), op: GprOp::Add });
+                                    }
+                                    Ok(())
+                                },
+                            )?;
+                        }
 
                         prog.emit(VmInstr::GprBinOp { dst: k_act_base, a: k_act_base, b: GprOperand::VReg(act_stride_reg ), op: GprOp::Add });
                         prog.emit(VmInstr::GprBinOp { dst: blk_ptr, a: blk_ptr, b: GprOperand::VReg(blk_ptr_stride ), op: GprOp::Add });
@@ -978,7 +1074,14 @@ pub(crate) fn emit_gemm_dequant_from_plan(
                                 None
                             };
 
-                            prog.emit_loop_try(BoundExpr::Const(iters_per_block), lanes * elem,
+                            // BCE-20260730-Q4_0-GEMM-SPLIT: two-phase for PackedNibbles
+                            let (lo_iters_g, half_block_act_g) = if needs_two_phase {
+                                (iters_per_block / 2, (block_size / 2) * elem)
+                            } else {
+                                (iters_per_block, 0)
+                            };
+
+                            prog.emit_loop_try(BoundExpr::Const(lo_iters_g), lanes * elem,
                                 |prog, _ei_ctr, ei_off| -> Result<(), CompilerError> {
                                     let mut decode_inputs: Vec<VRegId> = if let Some(lo) = lane_offset_gpr {
                                         vec![blk_ptr, data_ptr, lo]
@@ -1018,6 +1121,63 @@ pub(crate) fn emit_gemm_dequant_from_plan(
                                     Ok(())
                                 },
                             )?;
+
+                            // Hi pass for PackedNibbles SPLIT
+                            if needs_two_phase {
+                                prog.emit(VmInstr::GprBinOp { dst: data_ptr, a: blk_ptr, b: GprOperand::VReg(zero_gpr), op: GprOp::Add });
+                                if let Some(lo) = lane_offset_gpr {
+                                    prog.emit(VmInstr::GprLoadImm { dst: lo, value: 0 });
+                                }
+                                if let Some(hbp) = high_bits_ptr {
+                                    prog.emit(VmInstr::AddPtr { dst: hbp, base: blk_ptr, offset: high_offset_val });
+                                }
+
+                                let hi_trace_g = hi_decode_trace_opt.as_ref().expect("two_phase requires hi_trace");
+                                let hi_final_g = hi_decode_final_slot.expect("two_phase requires hi_final");
+                                prog.emit_loop_try(BoundExpr::Const(lo_iters_g), lanes * elem,
+                                    |prog, _ei_ctr, ei_off| -> Result<(), CompilerError> {
+                                        let mut decode_inputs: Vec<VRegId> = if let Some(lo) = lane_offset_gpr {
+                                            vec![blk_ptr, data_ptr, lo]
+                                        } else {
+                                            vec![blk_ptr, data_ptr]
+                                        };
+                                        if let Some(hbp) = high_bits_ptr {
+                                            decode_inputs.push(hbp);
+                                        }
+                                        let decode_slots = super::auto_select::auto_lower_trace_raw(
+                                            prog, hi_trace_g, &decode_inputs, width, dtype)?;
+                                        let b_decoded = decode_slots[hi_final_g.0 as usize];
+
+                                        let act_off = OffsetExpr::Add(
+                                            Box::new(OffsetExpr::Add(
+                                                Box::new(OffsetExpr::Mul(
+                                                    Box::new(OffsetExpr::LoopOffset(i_cnt)),
+                                                    a_row_stride,
+                                                )),
+                                                Box::new(OffsetExpr::Add(
+                                                    Box::new(OffsetExpr::ScalarVReg(k_act_base)),
+                                                    Box::new(OffsetExpr::Const(half_block_act_g)),
+                                                )),
+                                            )),
+                                            Box::new(OffsetExpr::LoopOffset(ei_off)),
+                                        );
+                                        prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: act_off, width, dtype , predicate: None });
+
+                                        super::auto_select::auto_lower_trace_into(
+                                            prog, &fma_trace, &[a_val, b_decoded, acc], acc, width, dtype,
+                                        )?;
+
+                                        prog.emit(VmInstr::GprBinOp { dst: data_ptr, a: data_ptr, b: GprOperand::VReg(data_stride_reg ), op: GprOp::Add });
+                                        if let (Some(lo), Some(lg)) = (lane_offset_gpr, lanes_gpr) {
+                                            prog.emit(VmInstr::GprBinOp { dst: lo, a: lo, b: GprOperand::VReg(lg ), op: GprOp::Add });
+                                        }
+                                        if let (Some(hbp), Some(hbs)) = (high_bits_ptr, high_bits_stride_gpr) {
+                                            prog.emit(VmInstr::GprBinOp { dst: hbp, a: hbp, b: GprOperand::VReg(hbs), op: GprOp::Add });
+                                        }
+                                        Ok(())
+                                    },
+                                )?;
+                            }
 
                             prog.emit(VmInstr::GprBinOp { dst: k_act_base, a: k_act_base, b: GprOperand::VReg(act_stride_reg ), op: GprOp::Add });
                             prog.emit(VmInstr::GprBinOp { dst: blk_ptr, a: blk_ptr, b: GprOperand::VReg(blk_ptr_stride ), op: GprOp::Add });

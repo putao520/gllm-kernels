@@ -255,48 +255,51 @@ mod tests {
         use crate::quant::BlockQ4_0;
         let kernels = CpuKernels::<f32>::new();
         // d=0.5, qs[0] = 0x12 -> lo nibble=2, hi nibble=1
-        // out[0] = 0.5*(2-8) = -3.0, out[1] = 0.5*(1-8) = -3.5
+        // SPLIT layout: out[0] = 0.5*(2-8) = -3.0, out[16] = 0.5*(1-8) = -3.5
         let mut block = BlockQ4_0 {
             d: f16::from_f32(0.5),
-            qs: [0x88; 16], // default zero-point
+            qs: [0x88; 16], // default zero-point (8-8=0)
         };
-        block.qs[0] = 0x12;
-        block.qs[1] = 0xFA; // lo=0xA=10, hi=0xF=15 -> out[2]=0.5*(10-8)=1.0, out[3]=0.5*(15-8)=3.5
+        block.qs[0] = 0x12; // lo=2 -> out[0]=-3.0, hi=1 -> out[16]=-3.5
+        block.qs[1] = 0xFA; // lo=0xA=10 -> out[1]=0.5*(10-8)=1.0, hi=0xF=15 -> out[17]=0.5*(15-8)=3.5
 
         let mut out = vec![0.0f32; 32];
         kernels.dequant_q4_0(as_u8_slice(&block), &mut out);
         assert!((out[0] - (-3.0)).abs() < 1e-3, "q4_0: out[0]={}", out[0]);
-        assert!((out[1] - (-3.5)).abs() < 1e-3, "q4_0: out[1]={}", out[1]);
-        assert!((out[2] - 1.0).abs() < 1e-3, "q4_0: out[2]={}", out[2]);
-        assert!((out[3] - 3.5).abs() < 1e-3, "q4_0: out[3]={}", out[3]);
+        assert!((out[1] - 1.0).abs() < 1e-3, "q4_0: out[1]={}", out[1]);
+        assert!((out[16] - (-3.5)).abs() < 1e-3, "q4_0: out[16]={}", out[16]);
+        assert!((out[17] - 3.5).abs() < 1e-3, "q4_0: out[17]={}", out[17]);
+        // Remaining zero-point elements
+        for i in [2,3,4,5,6,7,8,9,10,11,12,13,14,15,18,19,20,21,22,23,24,25,26,27,28,29,30,31] {
+            assert!((out[i]).abs() < 1e-3, "q4_0: out[{}]={} (should be 0)", i, out[i]);
+        }
     }
 
     #[test]
     fn test_dequant_q4_0_full_range() {
         use crate::quant::BlockQ4_0;
         let kernels = CpuKernels::<f32>::new();
-        // d=2.0, fill qs with ramp pattern to test all nibble values
+        // SPLIT layout: byte j: lo→elem[j], hi→elem[j+16]
+        // qs[j] = lo nibble + hi nibble, both 0..15
+        // Use qs[j] = j | ((15-j) << 4) → lo=j, hi=15-j
         let mut block = BlockQ4_0 {
             d: f16::from_f32(2.0),
             qs: [0; 16],
         };
-        // qs[i] = (i*2+1) << 4 | (i*2) for i=0..8 -> covers nibbles 0..15
-        for i in 0..8 {
-            let lo = (i * 2) as u8;
-            let hi = (i * 2 + 1) as u8;
-            block.qs[i] = lo | (hi << 4);
+        for j in 0..16 {
+            let lo = j as u8;
+            let hi = (15 - j) as u8;
+            block.qs[j] = lo | (hi << 4);
         }
         let mut out = vec![0.0f32; 32];
         kernels.dequant_q4_0(as_u8_slice(&block), &mut out);
-        for i in 0..8 {
-            let lo = (i * 2) as f32;
-            let hi = (i * 2 + 1) as f32;
-            let expected_lo = 2.0 * (lo - 8.0);
-            let expected_hi = 2.0 * (hi - 8.0);
-            assert!((out[i * 2] - expected_lo).abs() < 1e-3,
-                "q4_0 full: out[{}]={}, expected {}", i * 2, out[i * 2], expected_lo);
-            assert!((out[i * 2 + 1] - expected_hi).abs() < 1e-3,
-                "q4_0 full: out[{}]={}, expected {}", i * 2 + 1, out[i * 2 + 1], expected_hi);
+        for j in 0..16 {
+            let expected_lo = 2.0 * (j as f32 - 8.0);
+            let expected_hi = 2.0 * ((15 - j) as f32 - 8.0);
+            assert!((out[j] - expected_lo).abs() < 1e-3,
+                "q4_0 full: out[{}]={}, expected {}", j, out[j], expected_lo);
+            assert!((out[j + 16] - expected_hi).abs() < 1e-3,
+                "q4_0 full: out[{}]={}, expected {}", j + 16, out[j + 16], expected_hi);
         }
     }
 
@@ -305,21 +308,21 @@ mod tests {
         use crate::quant::BlockQ4_1;
         let kernels = CpuKernels::<f32>::new();
         // d=0.5, m=1.0, qs[0]=0x23 -> lo=3, hi=2
-        // out[0] = 0.5*3 + 1.0 = 2.5, out[1] = 0.5*2 + 1.0 = 2.0
+        // SPLIT: out[0] = 0.5*3 + 1.0 = 2.5, out[16] = 0.5*2 + 1.0 = 2.0
         let mut block = BlockQ4_1 {
             d: f16::from_f32(0.5),
             m: f16::from_f32(1.0),
             qs: [0; 16],
         };
-        block.qs[0] = 0x23;
-        block.qs[1] = 0x0F; // lo=15, hi=0 -> out[2]=0.5*15+1=8.5, out[3]=0.5*0+1=1.0
+        block.qs[0] = 0x23; // lo=3 -> out[0]=2.5, hi=2 -> out[16]=2.0
+        block.qs[1] = 0x0F; // lo=15 -> out[1]=8.5, hi=0 -> out[17]=1.0
 
         let mut out = vec![0.0f32; 32];
         kernels.dequant_q4_1(as_u8_slice(&block), &mut out);
         assert!((out[0] - 2.5).abs() < 1e-3, "q4_1: out[0]={}", out[0]);
-        assert!((out[1] - 2.0).abs() < 1e-3, "q4_1: out[1]={}", out[1]);
-        assert!((out[2] - 8.5).abs() < 1e-3, "q4_1: out[2]={}", out[2]);
-        assert!((out[3] - 1.0).abs() < 1e-3, "q4_1: out[3]={}", out[3]);
+        assert!((out[1] - 8.5).abs() < 1e-3, "q4_1: out[1]={}", out[1]);
+        assert!((out[16] - 2.0).abs() < 1e-3, "q4_1: out[16]={}", out[16]);
+        assert!((out[17] - 1.0).abs() < 1e-3, "q4_1: out[17]={}", out[17]);
     }
 
     #[test]
@@ -344,38 +347,36 @@ mod tests {
         use crate::quant::BlockQ5_0;
         let kernels = CpuKernels::<f32>::new();
         // d=1.0, zero_point=16
-        // Element 0: lo nibble from qs[0] low = 0xF=15, hi bit from qh[0] bit0 = 1
-        //   q = (1<<4)|15 = 31, val = 1.0*(31-16) = 15.0
-        // Element 1: hi nibble from qs[0] high = 0x0=0, hi bit from qh[0] bit1 = 0
-        //   q = (0<<4)|0 = 0, val = 1.0*(0-16) = -16.0
+        // SPLIT: byte 0: lo nibble → elem[0], hi nibble → elem[16]
+        // Element 0: qs[0] lo = 0xF=15, qh bit0 = 1 → q=31, val=1.0*(31-16)=15.0
+        // Element 16: qs[0] hi = 0x0=0, qh bit16 = 0 → q=0, val=1.0*(0-16)=-16.0
         let mut block = BlockQ5_0 {
             d: f16::from_f32(1.0),
             qh: [0; 4],
             qs: [0; 16],
         };
-        block.qs[0] = 0x0F; // lo nibble=15, hi nibble=0
-        block.qh[0] = 0x01; // bit 0 set (element 0 hi bit = 1)
+        block.qs[0] = 0x0F; // lo=15, hi=0
+        block.qh[0] = 0x01; // bit 0 set → elem[0] hi bit = 1
 
         let mut out = vec![0.0f32; 32];
         kernels.dequant_q5_0(as_u8_slice(&block), &mut out);
         assert!((out[0] - 15.0).abs() < 1e-3, "q5_0: out[0]={}", out[0]);
-        assert!((out[1] - (-16.0)).abs() < 1e-3, "q5_0: out[1]={}", out[1]);
+        assert!((out[16] - (-16.0)).abs() < 1e-3, "q5_0: out[16]={}", out[16]);
     }
 
     #[test]
     fn test_dequant_q5_0_all_bits() {
         use crate::quant::BlockQ5_0;
         let kernels = CpuKernels::<f32>::new();
-        // d=0.5, test element 8: qs[4] lo nibble, qh[1] bit 0
+        // d=0.5, SPLIT: elem[8] = qs[8] lo nibble + qh bit8
         let mut block = BlockQ5_0 {
             d: f16::from_f32(0.5),
             qh: [0; 4],
             qs: [0; 16],
         };
-        // Element 8: qs[4] lo nibble = 7, qh[1] bit 0 = 1
-        // q = (1<<4)|7 = 23, val = 0.5*(23-16) = 3.5
-        block.qs[4] = 0x07;
-        block.qh[1] = 0x01;
+        // Element 8: qs[8] lo=7, qh bit8=1 → q=(1<<4)|7=23, val=0.5*(23-16)=3.5
+        block.qs[8] = 0x07;
+        block.qh[1] = 0x01; // qh[1] bit0 = bit8 of 32-bit qh
 
         let mut out = vec![0.0f32; 32];
         kernels.dequant_q5_0(as_u8_slice(&block), &mut out);
@@ -387,23 +388,24 @@ mod tests {
         use crate::quant::BlockQ5_1;
         let kernels = CpuKernels::<f32>::new();
         // d=0.5, m=2.0
-        // Element 0: qs[0] lo=0xA=10, qh[0] bit0=1 -> q=(1<<4)|10=26
-        //   val = 0.5*26 + 2.0 = 15.0
-        // Element 1: qs[0] hi=0x3=3, qh[0] bit1=0 -> q=(0<<4)|3=3
-        //   val = 0.5*3 + 2.0 = 3.5
+        // SPLIT: elem[0] = qs[0] lo + qh bit0, elem[16] = qs[0] hi + qh bit16
+        // Element 0: qs[0] lo=0xA=10, qh bit0=1 → q=26, val=0.5*26+2=15.0
+        // Element 16: qs[0] hi=0x3=3, qh bit16=0 → q=3, val=0.5*3+2=3.5
         let mut block = BlockQ5_1 {
             d: f16::from_f32(0.5),
             m: f16::from_f32(2.0),
             qh: [0; 4],
             qs: [0; 16],
         };
-        block.qs[0] = 0x3A; // lo=0xA, hi=0x3
-        block.qh[0] = 0x01; // bit 0 set
+        block.qs[0] = 0x3A; // lo=0xA=10, hi=0x3=3
+        block.qh[0] = 0x01; // bit 0 set → elem[0] hi bit = 1
 
         let mut out = vec![0.0f32; 32];
         kernels.dequant_q5_1(as_u8_slice(&block), &mut out);
+        // SPLIT: elem[0] = lo=10 + qh bit0=1 → q=26, val=0.5*26+2=15.0
+        //        elem[16] = hi=3 + qh bit16=0 → q=3, val=0.5*3+2=3.5
         assert!((out[0] - 15.0).abs() < 1e-3, "q5_1: out[0]={}", out[0]);
-        assert!((out[1] - 3.5).abs() < 1e-3, "q5_1: out[1]={}", out[1]);
+        assert!((out[16] - 3.5).abs() < 1e-3, "q5_1: out[16]={}", out[16]);
     }
 
     #[test]
