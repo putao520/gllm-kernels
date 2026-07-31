@@ -785,6 +785,7 @@ mod tests {
             kv_load_mode: None,
             kv_cache_ptr: None,
             activation_ping_ptr: None,
+            kv_page_header_ptr: None,
             activation_pong_ptr: None,
         }
     }

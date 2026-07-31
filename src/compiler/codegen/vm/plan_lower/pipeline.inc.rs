@@ -171,6 +171,7 @@ pub(crate) fn lower_fusion_plan_inner_with_sym_map(
         kv_load_mode: graph.kv_load_mode,
         kv_cache_ptr: None,
         activation_ping_ptr: None,
+        kv_page_header_ptr: None,
         activation_pong_ptr: None,
     };
 

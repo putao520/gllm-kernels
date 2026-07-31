@@ -76,7 +76,8 @@ impl CompiledLayer {
     ///
     /// # Safety
     /// The caller must ensure the compiled code was emitted by `emit_mega_kernel_x86()`
-    /// and follows the MegaKernelFn ABI (22 params → usize return).
+    /// and follows the MegaKernelFn ABI (23 params → usize return).
+    // @trace REQ-UMK-27
     #[inline]
     pub unsafe fn entry_point_as_mega_kernel(&self) -> super::MegaKernelFn {
         let ptr = self.code.ptr.add(self.entry_offset);
@@ -96,7 +97,7 @@ impl CompiledLayer {
         unsafe { std::slice::from_raw_parts(self.code.ptr, self.code.len) }
     }
 
-    /// Execute via MegaKernelFn ABI (22-param). All graphs now use the unified
+    /// Execute via MegaKernelFn ABI (23-param). All graphs now use the unified
     /// `compile_mega_kernel_vm` entry point (SPEC/39).
     ///
     /// # Safety
@@ -137,6 +138,7 @@ impl CompiledLayer {
             std::ptr::null(),      // arg 19: callback_table_ptr
             std::ptr::null(),      // arg 20: page_table_ptr
             std::ptr::null(),      // arg 21: batch_ctx_ptr
+            std::ptr::null(),      // arg 22: kv_page_header_ptr
         );
         // Post-execution: copy output from scratchpad logits region to caller's output buffer.
         // All graphs write their output tensor to scratchpad[logits_scratch_offset].

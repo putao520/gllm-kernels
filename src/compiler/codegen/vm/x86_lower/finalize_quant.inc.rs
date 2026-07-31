@@ -512,8 +512,10 @@ impl X86Lower {
             }
         };
 
-        // Load scale (f32 bits), 全程不变
-        self.asm.mov(r8d, dword_ptr(scale_gpr)).map_err(Self::err)?;
+        // Scale is page-local f16 and is per-channel.  Widen one half to f32
+        // on every packed pair; the scale pointer advances by one f16.
+        // F16C converts the low half of the XMM scratch to an F32 lane.
+        let scale_xmm = self.scratch_xmm(1);
 
         // r11 = rbp + tmp_rbp (循环不变的 tmp 基址)
         self.asm.lea(r11, qword_ptr(rbp + tmp_rbp)).map_err(Self::err)?;
@@ -529,6 +531,14 @@ impl X86Lower {
         self.asm.set_label(&mut unpack_loop).map_err(Self::err)?;
         self.asm.cmp(ecx, num_pairs as u32).map_err(Self::err)?;
         self.asm.jae(unpack_done).map_err(Self::err)?;
+
+        // Load the per-channel f16 scale and widen it to f32 bits.
+        self.asm.movzx(eax, word_ptr(scale_gpr)).map_err(Self::err)?;
+        self.asm.vmovd(scale_xmm, eax).map_err(Self::err)?;
+        let scale_wide = self.scratch_ymm(1);
+        self.asm.vcvtph2ps(scale_wide, scale_xmm).map_err(Self::err)?;
+        self.asm.vmovd(r8d, Self::ymm_to_xmm(scale_wide)).map_err(Self::err)?;
+        self.asm.add(scale_gpr, 2).map_err(Self::err)?;
 
         // Load packed byte
         self.asm.movzx(eax, byte_ptr(rdx)).map_err(Self::err)?;

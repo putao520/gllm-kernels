@@ -1678,7 +1678,7 @@ fn lower_attention_v2(
         ctx.session.width,
         q_ptr, k_attn_ptr, v_attn_ptr, output_ptr,
         ctx.session.hook, causal, sinks_ptr, dtype,
-        abi.page_table_ptr, ctx.session.page_size,
+        abi.page_table_ptr, abi.kv_page_header_ptr, ctx.session.page_size,
         abi.kv_load_mode.unwrap_or_default(), None,
         ctx.session.batch_ctx_ptr, abi.kv_cache_ptr,
         use_tma, use_tmem,

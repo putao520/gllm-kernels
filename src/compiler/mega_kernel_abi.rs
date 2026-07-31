@@ -152,8 +152,10 @@ impl Default for BusinessConfig {
 ///    aux_ptr, batch_size,    ← register params (rdi..r9)
 ///    prompt_len, scratchpad_ptr, output_tokens_ptr,
 ///    temperature_u32, top_k, top_p_u32, max_new_tokens, eos_token_id,
-///    hook_ctx_ptr, telemetry_ptr)
-///    ← stack params ([rbp+16]..[rbp+88])
+///    hook_ctx_ptr, telemetry_ptr, session_position, fused_hidden_ptr,
+///    num_mm_tokens, callback_table_ptr, page_table_ptr, batch_ctx_ptr,
+///    kv_page_header_ptr)
+///    ← stack params ([rbp+16]..[rbp+144])
 ///    → rax: generated token count (generate) | 0 (classify/encode)
 /// ```
 pub type MegaKernelFn = unsafe extern "C" fn(
@@ -180,6 +182,7 @@ pub type MegaKernelFn = unsafe extern "C" fn(
     *const u8,    // arg 19: callback_table_ptr    → [rbp+120] (NULL = no callbacks, C-style fn_ptr array)
     *const u32,   // arg 20: page_table_ptr        → [rbp+128] (NULL = contiguous KV, u32[] = paged KV)
     *const u8,    // arg 21: batch_ctx_ptr         → [rbp+136] (NULL = single-seq legacy, non-NULL = batch mode)
+    *const u8,    // arg 22: kv_page_header_ptr    → [rbp+144] (NULL = no page headers; KIVI4 needs valid)
 ) -> usize;      // → rax: generated token count (generate) | 0 (classify/encode)
 
 /// ABI parameter names in order. Used by SymDimSlotMap to resolve
@@ -207,6 +210,7 @@ pub const MEGA_KERNEL_PARAMS: &[&str] = &[
     "callback_table_ptr",   // arg 19 → [rbp+120] (NULL = no callbacks)
     "page_table_ptr",       // arg 20 → [rbp+128] (NULL = contiguous KV, u32[] = paged KV)
     "batch_ctx_ptr",        // arg 21 → [rbp+136] (NULL = single-seq legacy mode, non-NULL = batch mode)
+    "kv_page_header_ptr",   // arg 22 → [rbp+144] (NULL = no page headers; KIVI4 needs valid)
 ];
 
 /// Stack parameter byte offsets (relative to [rbp+16] after standard prologue).
@@ -229,6 +233,7 @@ pub const MEGA_KERNEL_STACK_OFFSETS: &[i32] = &[
     120, // callback_table_ptr     → [rbp+120]
     128, // page_table_ptr         → [rbp+128]
     136, // batch_ctx_ptr          → [rbp+136]
+    144, // kv_page_header_ptr     → [rbp+144]
 ];
 
 // ── Model geometry config ──────────────────────────────────────────
@@ -936,7 +941,7 @@ mod tests {
 
     #[test]
     fn mega_kernel_params_count() {
-        assert_eq!(MEGA_KERNEL_PARAMS.len(), 22);
+        assert_eq!(MEGA_KERNEL_PARAMS.len(), 23);
     }
 
     #[test]
@@ -957,11 +962,12 @@ mod tests {
     #[test]
     fn mega_kernel_params_last() {
         assert_eq!(MEGA_KERNEL_PARAMS[21], "batch_ctx_ptr");
+        assert_eq!(MEGA_KERNEL_PARAMS[22], "kv_page_header_ptr");
     }
 
     #[test]
     fn mega_kernel_stack_offsets_count() {
-        assert_eq!(MEGA_KERNEL_STACK_OFFSETS.len(), 16);
+        assert_eq!(MEGA_KERNEL_STACK_OFFSETS.len(), 17);
     }
 
     #[test]

@@ -123,7 +123,7 @@ impl VmState {
         }
     }
 
-    /// 从 MegaKernelFn ABI 初始化 (22 参数: 6 寄存器 + 16 栈参数)。
+    /// 从 MegaKernelFn ABI 初始化 (23 参数: 6 寄存器 + 17 栈参数)。
     ///
     /// 栈参数严格 8 字节对齐 (SysV ABI: 每个参数占一个 eightbyte 槽位)。
     /// f32 已改为 u32 传递 (避免 SSE 寄存器传参导致 JIT 无法从栈读取)。
@@ -151,6 +151,7 @@ impl VmState {
             "callback_table_ptr",   // arg 19 → StackArg(120)
             "page_table_ptr",       // arg 20 → StackArg(128)
             "batch_ctx_ptr",        // arg 21 → StackArg(136) (NULL = single-seq legacy, non-NULL = batch mode)
+            "kv_page_header_ptr",   // arg 22 → StackArg(144) (NULL = no page headers)
         ];
 
         let num_reg_args: usize = 6;
@@ -175,14 +176,14 @@ impl VmState {
         }
     }
 
-    /// 从 MegaKernelFn GPU ABI 初始化 (22 参数全部通过 `.param` 传递, 无栈参数).
+    /// 从 MegaKernelFn GPU ABI 初始化 (23 参数全部通过 `.param` 传递, 无栈参数).
     ///
-    /// ARCH-GPU-ABI: GPU (PTX/HIP/Metal) mega-kernel 与 CPU MegaKernelFn 共享同一 22-param
+    /// ARCH-GPU-ABI: GPU (PTX/HIP/Metal) mega-kernel 与 CPU MegaKernelFn 共享同一 23-param
     /// 语义顺序 (mega_kernel_abi.rs:MEGA_KERNEL_PARAMS), 但物理传递方式不同: GPU 全部走
     /// `.param`/`__global__` arg/`[[buffer(N)]]` 槽位, 无 x86 SysV 的寄存器+栈划分.
     ///
-    /// BCE-20260703-GPU-MEGA-KERNEL-ABI: 22 个参数按声明顺序映射到 `Register(0..21)`,
-    /// 对应 GpuLower prologue 的 `abi_param_names` (prologue.inc.rs:485-492).
+    /// BCE-20260703-GPU-MEGA-KERNEL-ABI: 23 个参数按声明顺序映射到 `Register(0..22)`,
+    /// 对应 GpuLower prologue 的 `abi_param_names` (prologue.inc.rs:489-496).
     /// `arg_ptr_expr()` 返回 `AbiArg(N)`, GPU LoadPtr 降低为 `ld.param.u64 dst,[param_name];`.
     pub fn init_mega_kernel_gpu() -> Self {
         let param_names: &[&str] = &[
@@ -208,6 +209,7 @@ impl VmState {
             "callback_table_ptr",   // .param 19 → AbiArg(19)
             "page_table_ptr",       // .param 20 → AbiArg(20)
             "batch_ctx_ptr",        // .param 21 → AbiArg(21)
+            "kv_page_header_ptr",   // .param 22 → AbiArg(22)
         ];
 
         let mut arg_locations = HashMap::new();
@@ -347,8 +349,10 @@ pub struct AbiPtrs {
     pub sg_knowledge_scratch_offset: Option<usize>,
     /// Mega-kernel callback table pointer (ABI arg 20).
     pub callback_table_ptr: Option<super::instr::VRegId>,
-    /// Mega-kernel page_table_ptr (ABI arg 21). NULL = contiguous KV, u32[] = paged KV.
+    /// Mega-kernel page_table_ptr (ABI arg 20). NULL = contiguous KV, u32[] = paged KV.
     pub page_table_ptr: Option<super::instr::VRegId>,
+    /// Mega-kernel KV page-header array base (ABI arg 22). NULL = no page headers.
+    pub kv_page_header_ptr: Option<super::instr::VRegId>,
     /// KV cache load mode for attention variant (KV-OPT-009).
     /// None = Direct (default). Some(mode) = use specified variant for K/V load.
     pub kv_load_mode: Option<super::instr::KvLoadMode>,
@@ -489,7 +493,7 @@ mod tests {
     }
 
     /// @trace TEST-VMS-08 [req:REQ-VR] [level:unit]
-    /// init_mega_kernel_x86 maps 22 params: first 6 Register, rest StackArg.
+    /// init_mega_kernel_x86 maps 23 params: first 6 Register, rest StackArg.
     #[test]
     fn test_init_mega_kernel_x86_register_and_first_stack_args() {
         // Arrange
@@ -511,7 +515,8 @@ mod tests {
 
     /// @trace TEST-VMS-09 [req:REQ-VR] [level:unit]
     /// init_mega_kernel_x86 last stack args at correct offsets, including
-    /// page_table_ptr at arg 20 → StackArg(128) and batch_ctx_ptr at arg 21 → StackArg(136).
+    /// page_table_ptr at arg 20 → StackArg(128), batch_ctx_ptr at arg 21 → StackArg(136),
+    /// and kv_page_header_ptr at arg 22 → StackArg(144).
     #[test]
     fn test_init_mega_kernel_x86_last_stack_args() {
         // Arrange
@@ -531,18 +536,19 @@ mod tests {
         assert_eq!(state.arg_ptr_expr("callback_table_ptr").unwrap(), PtrExpr::StackArg(120));
         assert_eq!(state.arg_ptr_expr("page_table_ptr").unwrap(), PtrExpr::StackArg(128));
         assert_eq!(state.arg_ptr_expr("batch_ctx_ptr").unwrap(), PtrExpr::StackArg(136));
+        assert_eq!(state.arg_ptr_expr("kv_page_header_ptr").unwrap(), PtrExpr::StackArg(144));
     }
 
     /// @trace TEST-VMS-GPU-MEGA-KERNEL-ABI [req:REQ-UMK-27] [level:unit]
-    /// BCE-20260703-GPU-MEGA-KERNEL-ABI 回归测试: GPU mega-kernel ABI 必须把全部 22 个
-    /// 参数映射到 `AbiArg(0..21)`, 禁止出现 `StackArg` (GPU 无栈参数概念, 会被
+    /// BCE-20260703-GPU-MEGA-KERNEL-ABI 回归测试: GPU mega-kernel ABI 必须把全部 23 个
+    /// 参数映射到 `AbiArg(0..22)`, 禁止出现 `StackArg` (GPU 无栈参数概念, 会被
     /// gpu_lower/lower_instr_dispatch.inc.rs 拒绝). 与 CPU `init_mega_kernel_x86` 的
-    /// 6 reg + 16 stack 划分形成对照 — 同一语义名, 不同物理位置.
+    /// 6 reg + 17 stack 划分形成对照 — 同一语义名, 不同物理位置.
     #[test]
     fn test_init_mega_kernel_gpu_all_params_are_abi_arg() {
         let state = VmState::init_mega_kernel_gpu();
 
-        // 全部 22 个参数必须解析为 AbiArg(N), 顺序与 GPU prologue abi_param_names 一致
+        // 全部 23 个参数必须解析为 AbiArg(N), 顺序与 GPU prologue abi_param_names 一致
         let expected: &[(&str, u8)] = &[
             ("input_ids_ptr", 0), ("weight_blob_ptr", 1), ("kv_cache_ptr", 2),
             ("positions_ptr", 3), ("aux_ptr", 4), ("batch_size", 5),
@@ -552,6 +558,7 @@ mod tests {
             ("telemetry_ptr", 15), ("session_position", 16), ("fused_hidden_ptr", 17),
             ("num_mm_tokens", 18), ("callback_table_ptr", 19),
             ("page_table_ptr", 20), ("batch_ctx_ptr", 21),
+            ("kv_page_header_ptr", 22),
         ];
         for &(name, idx) in expected {
             match state.arg_ptr_expr(name).unwrap() {

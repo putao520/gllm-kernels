@@ -643,6 +643,7 @@ mod tests {
             kv_load_mode: None,
             kv_cache_ptr: None,
             activation_ping_ptr: None,
+            kv_page_header_ptr: None,
             activation_pong_ptr: None,
         };
         let mut program = VmProgram::new();
@@ -960,9 +961,9 @@ mod tests {
             PtrExpr::AbiArg(7) => {}
             other => panic!("GPU scratchpad_ptr must be AbiArg(7), got {:?}", other),
         }
-        // GPU 全部 22 参数必须为 AbiArg, 禁止 StackArg
+        // GPU 全部 23 参数必须为 AbiArg, 禁止 StackArg
         for name in ["scratchpad_ptr", "prompt_len", "output_tokens_ptr",
-            "batch_ctx_ptr", "temperature_u32", "hook_ctx_ptr", "page_table_ptr"] {
+            "batch_ctx_ptr", "kv_page_header_ptr", "temperature_u32", "hook_ctx_ptr", "page_table_ptr"] {
             match gpu_map.resolve(name).expect("GPU ABI must resolve param") {
                 PtrExpr::AbiArg(_) => {}
                 other => panic!("GPU param '{}' must be AbiArg, got {:?}", name, other),

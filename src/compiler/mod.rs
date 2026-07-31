@@ -2133,7 +2133,7 @@ mod tests {
         // Assert: well-known first and last param names
         assert_eq!(mega_kernel_abi::MEGA_KERNEL_PARAMS[0], "input_ids_ptr");
         assert_eq!(mega_kernel_abi::MEGA_KERNEL_PARAMS[5], "batch_size");
-        assert_eq!(mega_kernel_abi::MEGA_KERNEL_PARAMS[param_count - 1], "batch_ctx_ptr");
+        assert_eq!(mega_kernel_abi::MEGA_KERNEL_PARAMS[param_count - 1], "kv_page_header_ptr");
 
         // Assert: stack offsets are strictly increasing by 8
         for w in mega_kernel_abi::MEGA_KERNEL_STACK_OFFSETS.windows(2) {

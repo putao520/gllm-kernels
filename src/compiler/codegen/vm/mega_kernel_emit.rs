@@ -1070,7 +1070,7 @@ pub fn compile_mega_kernel_vm(
     let _ = resource_plan;
     let width = profile.optimal_simd_width();
     // BCE-20260703-GPU-MEGA-KERNEL-ABI: 按 compile target 选 ABI SymDimSlotMap.
-    // GPU (Cuda/Hip/Metal) 全部 22 参数走 `.param` (AbiArg), x86 保持 6 reg + 16 stack.
+    // GPU (Cuda/Hip/Metal) 全部 23 参数走 `.param` (AbiArg), x86 保持 6 reg + 17 stack.
     // 防止 GPU codegen 收到 StackArg(N) 被拒 (gpu_lower/lower_instr_dispatch.inc.rs:421).
     let sym_map = SymDimSlotMap::mega_kernel_abi_for_target(&profile.platform);
     let mut prog = VmProgram::new();
@@ -1367,6 +1367,18 @@ pub fn compile_mega_kernel_vm(
             }
         },
         kv_load_mode: graph.kv_load_mode,
+        kv_page_header_ptr: {
+            if topology.kv_cache_source != KvCacheSource::NoCache {
+                let header_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                prog.emit(VmInstr::LoadPtr {
+                    dst: header_ptr,
+                    src: sym_map.resolve("kv_page_header_ptr").expect("ABI: kv_page_header_ptr").clone(),
+                });
+                Some(header_ptr)
+            } else {
+                None
+            }
+        },
         kv_cache_ptr: {
             // 拓扑驱动: 图有 MHA ops → 加载 kv_cache_ptr。
             // 无 Argmax 的图（EncodeToLayer/Classify*）有 MHA 也需要 KV cache
@@ -1977,6 +1989,7 @@ fn emit_batch_mode_path(
             callback_table_ptr: batch_cb_ptr,
             page_table_ptr: batch_pt_ptr,
             kv_load_mode: mk.graph.kv_load_mode,
+        kv_page_header_ptr: None,
         kv_cache_ptr: batch_kv_ptr,
         activation_ping_ptr: None,
         activation_pong_ptr: None,
@@ -2712,6 +2725,7 @@ fn emit_batch_decode_step_loop(
             callback_table_ptr: batch_cb_ptr,
             page_table_ptr: batch_pt_ptr,
             kv_load_mode: mk.graph.kv_load_mode,
+            kv_page_header_ptr: None,
             kv_cache_ptr: batch_kv_ptr,
             activation_ping_ptr: None,
             activation_pong_ptr: None,
@@ -5453,13 +5467,13 @@ mod tests {
 
         // Assert: slot 0 must be 16 (prompt_len at [rbp+16])
         assert_eq!(MEGA_KERNEL_STACK_OFFSETS[0], 16, "slot 0 must be prompt_len at [rbp+16]");
-        // Assert: last slot must be batch_ctx_ptr at [rbp+136]
+        // Assert: last slot must be kv_page_header_ptr at [rbp+144]
         assert_eq!(
-            *MEGA_KERNEL_STACK_OFFSETS.last().unwrap(), 136,
-            "last slot must be batch_ctx_ptr at [rbp+136]"
+            *MEGA_KERNEL_STACK_OFFSETS.last().unwrap(), 144,
+            "last slot must be kv_page_header_ptr at [rbp+144]"
         );
-        // Assert: total of 16 stack parameters (6 register + 16 stack = 22 total params)
-        assert_eq!(MEGA_KERNEL_STACK_OFFSETS.len(), 16, "must have exactly 16 stack parameters");
+        // Assert: total of 17 stack parameters (6 register + 17 stack = 23 total params)
+        assert_eq!(MEGA_KERNEL_STACK_OFFSETS.len(), 17, "must have exactly 17 stack parameters");
     }
 
     // ── Test 86: emit_mtp_draft_inline depth loop phase ordering — GEMV before Argmax before ScalarStore ──
@@ -5861,8 +5875,8 @@ mod tests {
         // Arrange
         use crate::compiler::mega_kernel_abi::{MEGA_KERNEL_PARAMS, MEGA_KERNEL_STACK_OFFSETS};
 
-        // Assert: total ABI params must be 22 (6 register + 16 stack)
-        assert_eq!(MEGA_KERNEL_PARAMS.len(), 22, "MEGA_KERNEL_PARAMS must have exactly 22 entries (6 register + 16 stack)");
+        // Assert: total ABI params must be 23 (6 register + 17 stack)
+        assert_eq!(MEGA_KERNEL_PARAMS.len(), 23, "MEGA_KERNEL_PARAMS must have exactly 23 entries (6 register + 17 stack)");
 
         // Assert: first 6 params are register params (names must contain pointer/usize semantics)
         let register_names = &MEGA_KERNEL_PARAMS[0..6];
@@ -5873,6 +5887,9 @@ mod tests {
         // Assert: stack param count must match stack offsets count
         let stack_params = &MEGA_KERNEL_PARAMS[6..];
         assert_eq!(stack_params.len(), MEGA_KERNEL_STACK_OFFSETS.len(), "stack param names must match stack offset count");
+
+        // Assert: kv_page_header_ptr is the new final stack parameter.
+        assert_eq!(stack_params.last().copied(), Some("kv_page_header_ptr"));
 
         // Assert: stack param names must match offsets by index
         for (i, &name) in stack_params.iter().enumerate() {

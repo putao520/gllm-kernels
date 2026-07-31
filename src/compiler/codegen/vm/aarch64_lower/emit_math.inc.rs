@@ -1511,9 +1511,13 @@ impl AArch64Lower {
         self.emit32(0x3940000E | ((9u32 & 0x1F) << 5)); // LDRB w14, [x9]
         self.emit32(self.enc_add_imm(9, 9, 1)); // src_ptr++
 
-        // LDR s2, [x10] — load scale
-        self.emit32(0xBD400000 | ((10u32 & 0x1F) << 5) | (2u32 & 0x1F)); // LDR s2, [x10]
-        self.emit32(self.enc_add_imm(10, 10, 4)); // scale_ptr += 4
+        // LDRH W8, [x10] + FCVT S2, H2 — load one page-local f16 scale
+        // and widen it to f32.  KIVI scales are per-channel, so advance one
+        // half (2 bytes) per packed pair rather than one f32 per pair.
+        self.emit32(0x79400000 | ((10u32 & 0x1F) << 5) | 8u32); // LDRH W8, [x10]
+        self.emit32(self.enc_fmov_s_from_w(2, 8)); // FMOV S2, W8
+        self.emit32(0x1EE20000 | ((2u32 & 0x1F) << 5) | 2u32); // FCVT S2, H2
+        self.emit32(self.enc_add_imm(10, 10, 2)); // scale_ptr += sizeof(f16)
 
         // Unpack low nibble: w3 = w14 & 0xF
         self.emit32(0x121F01CE); // AND w14, w14, #0xF — actually we need two temps

@@ -50,6 +50,94 @@ fn sum_update_trace() -> Vec<TraceOp> {
 /// Values: FP16=0, FP8=1, KIVI4=2, KIVI2=3, Sparse=4, Dictionary=5, Evicted=6.
 /// See gllm/src/kv_cache/mod.rs for the canonical layout.
 const PAGE_HEADER_PRECISION_TIER_OFFSET: usize = 28;
+const PAGE_HEADER_K_SCALE_OFFSET: usize = 0x1C;
+
+/// Page-local KIVI scale layout known at graph-build time.
+#[derive(Debug, Clone, Copy)]
+struct KiviScaleLayout {
+    k_scales_len: usize,
+    v_packed_len: usize,
+}
+
+impl KiviScaleLayout {
+    fn for_bits(num_kv_heads: usize, page_size: usize, head_dim: usize, bits: u8) -> Self {
+        let elements = num_kv_heads
+            .checked_mul(page_size)
+            .and_then(|v| v.checked_mul(head_dim))
+            .expect("KIVI page element count overflow");
+        let packed_bytes = match bits {
+            2 => elements.div_ceil(4),
+            4 => elements.div_ceil(2),
+            _ => unreachable!("KIVI scale layout requires 2-bit or 4-bit data"),
+        };
+        Self {
+            k_scales_len: head_dim.checked_mul(2).expect("KIVI scale length overflow"),
+            v_packed_len: packed_bytes,
+        }
+    }
+}
+
+/// Emit a pointer to page-local K or V f16 scales.
+///
+/// The header stores the little-endian u16 K-scale offset at 0x1c. VmInstr
+/// exposes byte loads, so both bytes are loaded and combined before pointer
+/// arithmetic. V scales follow the K scales and packed V data.
+// @trace REQ-KV-OPT-004
+fn emit_kivi_scale_ptr(
+    prog: &mut VmProgram,
+    page_header_ptr: VRegId,
+    layout: KiviScaleLayout,
+    v_scales: bool,
+) -> VRegId {
+    let offset_lo = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+    let offset_hi = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+    prog.emit(VmInstr::ScalarByteLoad {
+        dst: offset_lo,
+        base: page_header_ptr,
+        offset: OffsetExpr::Const(PAGE_HEADER_K_SCALE_OFFSET),
+    });
+    prog.emit(VmInstr::ScalarByteLoad {
+        dst: offset_hi,
+        base: page_header_ptr,
+        offset: OffsetExpr::Const(PAGE_HEADER_K_SCALE_OFFSET + 1),
+    });
+    let offset_hi_shifted = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+    prog.emit(VmInstr::GprBinOp {
+        dst: offset_hi_shifted,
+        a: offset_hi,
+        b: GprOperand::Imm(8),
+        op: GprOp::Shl,
+    });
+    let k_scale_offset = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+    prog.emit(VmInstr::GprBinOp {
+        dst: k_scale_offset,
+        a: offset_hi_shifted,
+        b: GprOperand::VReg(offset_lo),
+        op: GprOp::Or,
+    });
+    let extra = if v_scales {
+        layout
+            .k_scales_len
+            .checked_add(layout.v_packed_len)
+            .expect("KIVI V scale offset overflow")
+    } else {
+        0
+    };
+    let offset = if extra == 0 {
+        OffsetExpr::ScalarVReg(k_scale_offset)
+    } else {
+        OffsetExpr::Add(
+            Box::new(OffsetExpr::ScalarVReg(k_scale_offset)),
+            Box::new(OffsetExpr::Const(extra)),
+        )
+    };
+    let scale_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+    prog.emit(VmInstr::LoadPtr {
+        dst: scale_ptr,
+        src: PtrExpr::VRegPlusOff(page_header_ptr, offset),
+    });
+    scale_ptr
+}
 
 /// Emit a K-load with runtime tier dispatch (KvLoadMode::Auto).
 ///
@@ -74,6 +162,7 @@ fn emit_tier_dispatch_k_load(
     sparse_bitmap_val: Option<VRegId>,
     channel_group: usize,
     page_header_ptr: VRegId,
+    layout: KiviScaleLayout,
 ) {
     // 1. Load precision_tier byte from page header + 28
     let tier_gpr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -132,7 +221,7 @@ fn emit_tier_dispatch_k_load(
     prog.emit(VmInstr::MarkLabel { label_id: kivi2_label });
     prog.emit(VmInstr::MarkLabel { label_id: kivi3_label });
     {
-        let sc = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let sc = emit_kivi_scale_ptr(prog, page_header_ptr, layout, false);
         prog.emit(VmInstr::KiviDequantLoad { dst, src_ptr: k_row, scale_ptr: sc, num_elems: lanes, width });
     }
     // fall through to done_label
@@ -153,6 +242,7 @@ fn emit_tier_dispatch_v_load(
     sparse_bitmap_val: Option<VRegId>,
     channel_group: usize,
     page_header_ptr: VRegId,
+    layout: KiviScaleLayout,
 ) {
     let tier_gpr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     prog.emit(VmInstr::ScalarByteLoad {
@@ -200,7 +290,7 @@ fn emit_tier_dispatch_v_load(
     prog.emit(VmInstr::MarkLabel { label_id: kivi2_label });
     prog.emit(VmInstr::MarkLabel { label_id: kivi3_label });
     {
-        let sc = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let sc = emit_kivi_scale_ptr(prog, page_header_ptr, layout, true);
         prog.emit(VmInstr::KiviDequantLoad { dst, src_ptr: v_row, scale_ptr: sc, num_elems: lanes, width });
     }
 
@@ -379,6 +469,7 @@ fn emit_score_dot_cpu(
     scale_vec: VRegId, lanes: usize, kv_load_mode: KvLoadMode,
     sparse_bitmap_val: Option<VRegId>,
     page_header_ptr: Option<VRegId>,
+    layout: KiviScaleLayout,
 ) -> VRegId {
     let dot_acc = prog.alloc_vreg(VRegKind::Vec, width);
     // BCE-20260630-MIXED-P3: dot_acc/HReduce/scale 是 accumulate 位置，用 dtype.accumulator_dtype()
@@ -412,7 +503,7 @@ fn emit_score_dot_cpu(
                 prog.emit(VmInstr::VecLoad { dst: q_vec, base: q_row, offset: OffsetExpr::Const(d_off), width, dtype , predicate: None });
                 emit_tier_dispatch_k_load(
                     prog, k_vec, k_row, OffsetExpr::Const(d_off),
-                    width, dtype, lanes, sparse_bitmap_val, d, ph,
+                    width, dtype, lanes, sparse_bitmap_val, d, ph, layout,
                 );
                 super::auto_select::auto_lower_trace_into(prog, &dot_body, &[q_vec, k_vec, dot_acc], dot_acc, width, acc_dtype)
                     .expect("MHA dot FMA auto_lower failed");
@@ -424,7 +515,8 @@ fn emit_score_dot_cpu(
                 prog.emit(VmInstr::VecLoad { dst: q_vec, base: q_row, offset: OffsetExpr::LoopOffset(d_off), width, dtype , predicate: None });
                 match kv_load_mode {
                     KvLoadMode::Kivi4 | KvLoadMode::Kivi2 => {
-                        let sc = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                        let ph = page_header_ptr.expect("explicit KIVI attention requires page_header_ptr");
+                        let sc = emit_kivi_scale_ptr(prog, ph, layout, false);
                         prog.emit(VmInstr::KiviDequantLoad { dst: k_vec, src_ptr: k_row, scale_ptr: sc, num_elems: lanes, width });
                     }
                     KvLoadMode::Sparse => { unreachable!("Sparse handled above") }
@@ -458,6 +550,7 @@ fn emit_v_accumulate_cpu(
     kv_load_mode: KvLoadMode, lanes: usize,
     sparse_bitmap_val: Option<VRegId>,
     page_header_ptr: Option<VRegId>,
+    layout: KiviScaleLayout,
 ) {
     // BCE-20260630-MIXED-P3: o_acc 是 accumulate 位置，dtype.accumulator_dtype() 显式标注。
     let acc_dtype = dtype.accumulator_dtype();
@@ -466,7 +559,8 @@ fn emit_v_accumulate_cpu(
         let v_vec = prog.alloc_vreg(VRegKind::Vec, width);
         match kv_load_mode {
             KvLoadMode::Kivi4 | KvLoadMode::Kivi2 => {
-                let sc = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                let ph = page_header_ptr.expect("explicit KIVI attention requires page_header_ptr");
+                let sc = emit_kivi_scale_ptr(prog, ph, layout, true);
                 prog.emit(VmInstr::KiviDequantLoad { dst: v_vec, src_ptr: v_row, scale_ptr: sc, num_elems: lanes, width });
             }
             KvLoadMode::Sparse => {
@@ -479,7 +573,7 @@ fn emit_v_accumulate_cpu(
                 let ph = page_header_ptr.unwrap();
                 emit_tier_dispatch_v_load(
                     prog, v_vec, v_row, OffsetExpr::Const(d_off),
-                    width, dtype, lanes, sparse_bitmap_val, d, ph,
+                    width, dtype, lanes, sparse_bitmap_val, d, ph, layout,
                 );
             }
             KvLoadMode::Auto => {
@@ -535,6 +629,7 @@ fn emit_smem_stage_row(
     kv_load_mode: KvLoadMode, use_async: bool, width: SimdWidth, dtype: QuantPrecision, lanes: usize,
     sparse_bitmap_val: Option<VRegId>,
     page_header_ptr: Option<VRegId>,
+    layout: KiviScaleLayout,
 ) {
     for d in 0..hd_vecs {
         let d_off = d * vec_step;
@@ -545,7 +640,8 @@ fn emit_smem_stage_row(
         let k_vec = prog.alloc_vreg(VRegKind::Vec, width);
         match kv_load_mode {
             KvLoadMode::Kivi4 | KvLoadMode::Kivi2 => {
-                let sc = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                let ph = page_header_ptr.expect("explicit KIVI attention requires page_header_ptr");
+                let sc = emit_kivi_scale_ptr(prog, ph, layout, false);
                 prog.emit(VmInstr::KiviDequantLoad { dst: k_vec, src_ptr: k_row, scale_ptr: sc, num_elems: lanes, width });
             }
             KvLoadMode::Sparse => {
@@ -558,7 +654,7 @@ fn emit_smem_stage_row(
                 let ph = page_header_ptr.unwrap();
                 emit_tier_dispatch_k_load(
                     prog, k_vec, k_row, OffsetExpr::Const(d_off),
-                    width, dtype, lanes, sparse_bitmap_val, d, ph,
+                    width, dtype, lanes, sparse_bitmap_val, d, ph, layout,
                 );
             }
             KvLoadMode::Auto => {
@@ -577,7 +673,8 @@ fn emit_smem_stage_row(
         let v_vec = prog.alloc_vreg(VRegKind::Vec, width);
         match kv_load_mode {
             KvLoadMode::Kivi4 | KvLoadMode::Kivi2 => {
-                let sc = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                let ph = page_header_ptr.expect("explicit KIVI attention requires page_header_ptr");
+                let sc = emit_kivi_scale_ptr(prog, ph, layout, true);
                 prog.emit(VmInstr::KiviDequantLoad { dst: v_vec, src_ptr: v_row, scale_ptr: sc, num_elems: lanes, width });
             }
             KvLoadMode::Sparse => {
@@ -590,7 +687,7 @@ fn emit_smem_stage_row(
                 let ph = page_header_ptr.unwrap();
                 emit_tier_dispatch_v_load(
                     prog, v_vec, v_row, OffsetExpr::Const(d_off),
-                    width, dtype, lanes, sparse_bitmap_val, d, ph,
+                    width, dtype, lanes, sparse_bitmap_val, d, ph, layout,
                 );
             }
             KvLoadMode::Auto => {
@@ -619,7 +716,7 @@ pub(crate) fn emit_tiled_attention_inline(
     q_ptr: VRegId, k_ptr: VRegId, v_ptr: VRegId, output_ptr: VRegId,
     hook: Option<&dyn super::isa_hook::IsaHook>,
     causal: bool, sinks_ptr: Option<VRegId>, dtype: QuantPrecision,
-    page_table_ptr: Option<VRegId>, page_size: usize, kv_load_mode: KvLoadMode,
+    page_table_ptr: Option<VRegId>, kv_page_header_ptr: Option<VRegId>, page_size: usize, kv_load_mode: KvLoadMode,
     sparse_bitmap_ptr: Option<VRegId>, _batch_ctx_ptr: Option<VRegId>, _kv_cache_ptr: Option<VRegId>,
     use_tma: bool,
     use_tmem: bool,
@@ -675,6 +772,15 @@ pub(crate) fn emit_tiled_attention_inline(
     let accumulate_body = accumulate_trace();
     let sum_body = sum_update_trace();
     let gqa_ratio = num_heads / num_kv_heads;
+    let kivi_layout = KiviScaleLayout::for_bits(num_kv_heads, page_size, head_dim, 4);
+    if matches!(kv_load_mode, KvLoadMode::Kivi4 | KvLoadMode::Kivi2)
+        && kv_page_header_ptr.is_none()
+        && (page_table_ptr.is_none() || page_size == 0)
+    {
+        return Err(CompilerError::CodegenViolation(
+            "explicit KIVI attention requires page_header_ptr".into(),
+        ));
+    }
 
     // TMA prologue (SM90+): one-time descriptor + barrier initialization.
     // K/V descriptors describe the global tensor layout per KV head:
@@ -785,12 +891,24 @@ pub(crate) fn emit_tiled_attention_inline(
             let ki_bound = if causal && !decode_mode { BoundExpr::DynamicVRegPlusOne(qi_ctr) } else { kv_bound.clone() };
             let pt_ptr = page_table_ptr;
             let pgs = page_size;
-            // For Auto mode with paged KV, allocate a VReg to hold the page header pointer.
-            // This is populated by emit_kv_row_ptrs and consumed by the tier dispatch helpers.
-            let page_header_ptr = if kv_load_mode == KvLoadMode::Auto && pt_ptr.is_some() && pgs > 0 {
-                Some(prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar))
-            } else {
+            // Continuous KV uses the ABI-provided page-header array directly. Paged KV
+            // resolves each physical page header through PageTableAddr below.
+            let page_header_ptr = kv_page_header_ptr.or_else(|| {
+                if matches!(kv_load_mode, KvLoadMode::Auto | KvLoadMode::Kivi4 | KvLoadMode::Kivi2)
+                    && pt_ptr.is_some() && pgs > 0
+                {
+                    Some(prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar))
+                } else {
+                    None
+                }
+            });
+            // Only the paged fallback is populated by emit_kv_row_ptrs. The
+            // ABI header pointer is already the scale-header source and must
+            // not be overwritten by a per-row PageTableAddr result.
+            let page_header_dst = if kv_page_header_ptr.is_some() {
                 None
+            } else {
+                page_header_ptr
             };
 
             if use_flash_decoding_gpu {
@@ -800,10 +918,10 @@ pub(crate) fn emit_tiled_attention_inline(
                 prog.emit_loop(ki_bound, chunk_kv * k_stride, |prog, _chunk_ctr, chunk_off| {
                     prog.emit_loop(BoundExpr::Const(chunk_kv), k_stride, |prog, _ki_ctr, ki_off| {
                         let combined = OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(chunk_off)), Box::new(OffsetExpr::ScalarVReg(ki_off)));
-                        emit_kv_row_ptrs(prog, k_row, v_row, k_head, v_head, combined, pt_ptr, pgs, kv_h, head_bytes, k_stride, k_ptr, v_ptr, seq_pt_offset, None, ph);
-                        let score = emit_score_dot_cpu(prog, q_row, k_row, hd_vecs, vec_step, width, dtype, scale_vec, lanes, kv_load_mode, sparse_bmp_for_loads, ph);
+                        emit_kv_row_ptrs(prog, k_row, v_row, k_head, v_head, combined, pt_ptr, pgs, kv_h, head_bytes, k_stride, k_ptr, v_ptr, seq_pt_offset, None, page_header_dst);
+                        let score = emit_score_dot_cpu(prog, q_row, k_row, hd_vecs, vec_step, width, dtype, scale_vec, lanes, kv_load_mode, sparse_bmp_for_loads, ph, kivi_layout);
                         let (_, correction, weight) = emit_softmax_update(prog, running_max, score, running_sum, &softmax_body, &sum_body, width);
-                        emit_v_accumulate_cpu(prog, v_row, hd_vecs, vec_step, &o_acc, correction, weight, width, dtype, &accumulate_body, kv_load_mode, lanes, sparse_bmp_for_loads, ph);
+                        emit_v_accumulate_cpu(prog, v_row, hd_vecs, vec_step, &o_acc, correction, weight, width, dtype, &accumulate_body, kv_load_mode, lanes, sparse_bmp_for_loads, ph, kivi_layout);
                     });
                 });
                 let global_max = prog.alloc_vreg(VRegKind::Vec, width);
@@ -865,8 +983,8 @@ pub(crate) fn emit_tiled_attention_inline(
                         // ── SM80 path: per-row VecLoad + SharedMemAsyncStore ──
                         for t in 0..tile_kv {
                             let ptr_off = OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(tile_off)), Box::new(OffsetExpr::Const(t * k_stride)));
-                            emit_kv_row_ptrs(prog, k_row, v_row, k_head, v_head, ptr_off, pt_ptr, pgs, kv_h, head_bytes, k_stride, k_ptr, v_ptr, seq_pt_offset, None, ph);
-                            emit_smem_stage_row(prog, k_row, v_row, &smem_k, &smem_v, write_buf, t, head_bytes, hd_vecs, vec_step, kv_load_mode, use_async, width, dtype, lanes, sparse_bmp_for_loads, ph);
+                            emit_kv_row_ptrs(prog, k_row, v_row, k_head, v_head, ptr_off, pt_ptr, pgs, kv_h, head_bytes, k_stride, k_ptr, v_ptr, seq_pt_offset, None, page_header_dst);
+                            emit_smem_stage_row(prog, k_row, v_row, &smem_k, &smem_v, write_buf, t, head_bytes, hd_vecs, vec_step, kv_load_mode, use_async, width, dtype, lanes, sparse_bmp_for_loads, ph, kivi_layout);
                         }
                     }
                     // Wait for async load completion
@@ -950,15 +1068,15 @@ pub(crate) fn emit_tiled_attention_inline(
                 let prefetch_distance = if tile_kv > 0 && seq_len > tile_kv { Some(tile_kv * k_stride) } else { None };
                 let ph = page_header_ptr;
                 prog.emit_loop(ki_bound, k_stride, |prog, _ki_ctr, ki_off| {
-                    emit_kv_row_ptrs(prog, k_row, v_row, k_head, v_head, OffsetExpr::ScalarVReg(ki_off), pt_ptr, pgs, kv_h, head_bytes, k_stride, k_ptr, v_ptr, seq_pt_offset, None, ph);
+                    emit_kv_row_ptrs(prog, k_row, v_row, k_head, v_head, OffsetExpr::ScalarVReg(ki_off), pt_ptr, pgs, kv_h, head_bytes, k_stride, k_ptr, v_ptr, seq_pt_offset, None, page_header_dst);
                     if let Some(dist) = prefetch_distance {
                         use super::isa_hook::PrefetchHint;
                         prog.emit(VmInstr::Prefetch { base: k_ptr, offset: OffsetExpr::ScalarVReg(ki_off), distance: dist, hint: PrefetchHint::T1 });
                         prog.emit(VmInstr::Prefetch { base: v_ptr, offset: OffsetExpr::ScalarVReg(ki_off), distance: dist, hint: PrefetchHint::T1 });
                     }
-                    let score = emit_score_dot_cpu(prog, q_row, k_row, hd_vecs, vec_step, width, dtype, scale_vec, lanes, kv_load_mode, sparse_bmp_for_loads, ph);
+                    let score = emit_score_dot_cpu(prog, q_row, k_row, hd_vecs, vec_step, width, dtype, scale_vec, lanes, kv_load_mode, sparse_bmp_for_loads, ph, kivi_layout);
                     let (_, correction, weight) = emit_softmax_update(prog, running_max, score, running_sum, &softmax_body, &sum_body, width);
-                    emit_v_accumulate_cpu(prog, v_row, hd_vecs, vec_step, &o_acc, correction, weight, width, dtype, &accumulate_body, kv_load_mode, lanes, sparse_bmp_for_loads, ph);
+                    emit_v_accumulate_cpu(prog, v_row, hd_vecs, vec_step, &o_acc, correction, weight, width, dtype, &accumulate_body, kv_load_mode, lanes, sparse_bmp_for_loads, ph, kivi_layout);
                 });
             }
             emit_normalize_store(prog, o_row, &o_acc, running_sum, hd_vecs, vec_step, width, dtype);
@@ -1117,7 +1235,7 @@ mod tests {
             q_ptr, k_ptr, v_ptr, out_ptr,
             Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Sparse,
+            None, None, 0, KvLoadMode::Sparse,
             Some(sparse_bmp), None, None,
             false, false,
         );
@@ -1152,6 +1270,7 @@ mod tests {
             &mut prog, dst, k_row, OffsetExpr::Const(0),
             SimdWidth::W256, QuantPrecision::F32, 8,
             None, 0, page_hdr,
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
 
         // Must contain ScalarByteLoad to read precision_tier from offset 28
@@ -1217,7 +1336,7 @@ mod tests {
             q_ptr, k_ptr, v_ptr, out_ptr,
             Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Auto,
+            None, None, 0, KvLoadMode::Auto,
             None, None, None,
             false, false,
         );
@@ -1270,7 +1389,7 @@ mod tests {
             q_ptr, k_ptr, v_ptr, out_ptr,
             Some(&TestHook),
             false, None, QuantPrecision::F32,
-            Some(pt_ptr), 16, KvLoadMode::Auto,  // paged KV with page_size=16
+            Some(pt_ptr), None, 16, KvLoadMode::Auto,  // paged KV with page_size=16
             None, None, None,
             false, false,
         );
@@ -1416,7 +1535,7 @@ mod tests {
             q_ptr, k_ptr, v_ptr, out_ptr,
             Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct,
+            None, None, 0, KvLoadMode::Direct,
             None, None, None,
             false, false,
         );
@@ -1470,7 +1589,7 @@ mod tests {
             q_ptr, k_ptr, v_ptr, out_ptr,
             Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct,
+            None, None, 0, KvLoadMode::Direct,
             None, None, None,
             false, false,
         );
@@ -1500,7 +1619,7 @@ mod tests {
             q_ptr, k_ptr, v_ptr, out_ptr,
             None,  // no hook
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct,
+            None, None, 0, KvLoadMode::Direct,
             None, None, None,
             false, false,
         );
@@ -1526,6 +1645,7 @@ mod tests {
             &mut prog, dst, v_row, OffsetExpr::Const(64),
             SimdWidth::W256, QuantPrecision::F32, 8,
             None, 0, page_hdr,
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
 
         // Must contain ScalarByteLoad at offset 28
@@ -1680,7 +1800,7 @@ mod tests {
             q_ptr, k_ptr, v_ptr, out_ptr,
             Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct,
+            None, None, 0, KvLoadMode::Direct,
             None, None, None,
             false, false,
         );
@@ -1829,6 +1949,8 @@ mod tests {
         let k_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let v_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let out_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let page_table_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let page_header_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         let result = emit_tiled_attention_inline(
             &mut prog,
@@ -1838,7 +1960,7 @@ mod tests {
             q_ptr, k_ptr, v_ptr, out_ptr,
             Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Kivi4,
+            Some(page_table_ptr), Some(page_header_ptr), 16, KvLoadMode::Kivi4,
             None, None, None,
             false, false,
         );
@@ -1882,6 +2004,8 @@ mod tests {
         let k_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let v_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let out_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let page_table_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let page_header_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         let result = emit_tiled_attention_inline(
             &mut prog,
@@ -1891,7 +2015,7 @@ mod tests {
             q_ptr, k_ptr, v_ptr, out_ptr,
             Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Kivi2,
+            Some(page_table_ptr), Some(page_header_ptr), 16, KvLoadMode::Kivi2,
             None, None, None,
             false, false,
         );
@@ -1944,7 +2068,7 @@ mod tests {
             q_ptr, k_ptr, v_ptr, out_ptr,
             Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct,
+            None, None, 0, KvLoadMode::Direct,
             None, None, None,
             false, false,
         );
@@ -1995,7 +2119,7 @@ mod tests {
             q_ptr, k_ptr, v_ptr, out_ptr,
             Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct,
+            None, None, 0, KvLoadMode::Direct,
             None, None, None,
             false, false,
         );
@@ -2048,7 +2172,7 @@ mod tests {
             q_ptr, k_ptr, v_ptr, out_ptr,
             Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct,
+            None, None, 0, KvLoadMode::Direct,
             None, None, None,
             false, false,
         );
@@ -2110,7 +2234,7 @@ mod tests {
             q_ptr, k_ptr, v_ptr, out_ptr,
             Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct,
+            None, None, 0, KvLoadMode::Direct,
             None, None, None,
             false, false,
         );
@@ -2339,7 +2463,7 @@ mod tests {
             Some(&TestHook),
             true,  // causal = true
             None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct,
+            None, None, 0, KvLoadMode::Direct,
             None, None, None,
             false, false,
         );
@@ -2403,7 +2527,7 @@ mod tests {
             q_ptr, k_ptr, v_ptr, out_ptr,
             Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct,
+            None, None, 0, KvLoadMode::Direct,
             None, None, None,
             false, false,
         );
@@ -2510,7 +2634,7 @@ mod tests {
             q_ptr, k_ptr, v_ptr, out_ptr,
             Some(&TestHook),
             false, Some(sinks), QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct,
+            None, None, 0, KvLoadMode::Direct,
             None, None, None,
             false, false,
         );
@@ -2647,7 +2771,7 @@ mod tests {
             q_ptr, k_ptr, v_ptr, out_ptr,
             Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct,
+            None, None, 0, KvLoadMode::Direct,
             None, None, None,
             false, false,
         );
@@ -2699,6 +2823,7 @@ mod tests {
             &mut prog, dst, k_row, OffsetExpr::Const(0),
             SimdWidth::W256, QuantPrecision::F32, 8,
             None, 0, page_hdr,
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
 
         // Should contain at least 2 UnconditionalBranch:
@@ -2821,7 +2946,7 @@ mod tests {
             q_ptr, k_ptr, v_ptr, out_ptr,
             Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct,
+            None, None, 0, KvLoadMode::Direct,
             None, None, None,
             false, false,
         );
@@ -2893,6 +3018,7 @@ mod tests {
             SimdWidth::W256, QuantPrecision::F32,
             scale_vec, 8, KvLoadMode::Direct,
             None, None,
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
 
         let new_instrs = &prog.instrs[before_count..];
@@ -2930,13 +3056,15 @@ mod tests {
         let q_row = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let k_row = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let scale_vec = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
+        let page_hdr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         emit_score_dot_cpu(
             &mut prog, q_row, k_row,
             1, 32,
             SimdWidth::W256, QuantPrecision::F32,
             scale_vec, 8, KvLoadMode::Kivi4,
-            None, None,
+            None, Some(page_hdr),
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
 
         let has_kivi = prog.instrs.iter().any(|i| matches!(i, VmInstr::KiviDequantLoad { .. }));
@@ -2962,6 +3090,7 @@ mod tests {
             &[o_acc0, o_acc1], correction, weight,
             SimdWidth::W256, QuantPrecision::F32, &accumulate_body,
             KvLoadMode::Direct, 8, None, None,
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
 
         let new_instrs = &prog.instrs[before_count..];
@@ -2997,11 +3126,13 @@ mod tests {
         let accumulate_body = accumulate_trace();
 
         let before_count = prog.instrs.len();
+        let page_hdr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         emit_v_accumulate_cpu(
             &mut prog, v_row, 1, 32,
             &[o_acc0], correction, weight,
             SimdWidth::W256, QuantPrecision::F32, &accumulate_body,
-            KvLoadMode::Kivi2, 8, None, None,
+            KvLoadMode::Kivi2, 8, None, Some(page_hdr),
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
 
         let new_instrs = &prog.instrs[before_count..];
@@ -3107,6 +3238,7 @@ mod tests {
             KvLoadMode::Direct, true,  // use_async=true
             SimdWidth::W256, QuantPrecision::F32, 8,
             None, None,
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
 
         let new_instrs = &prog.instrs[before_count..];
@@ -3143,6 +3275,7 @@ mod tests {
             KvLoadMode::Direct, false,  // use_async=false
             SimdWidth::W256, QuantPrecision::F32, 8,
             None, None,
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
 
         let new_instrs = &prog.instrs[before_count..];
@@ -3208,6 +3341,7 @@ mod tests {
             &[o_acc0, o_acc1], correction, weight,
             SimdWidth::W256, QuantPrecision::F32, &accumulate_body,
             KvLoadMode::Sparse, 8, Some(bmp), None,
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
         let new_instrs = &prog.instrs[before_count..];
 
@@ -3249,6 +3383,7 @@ mod tests {
             &[o_acc0], correction, weight,
             SimdWidth::W256, QuantPrecision::F32, &accumulate_body,
             KvLoadMode::Auto, 8, None, Some(page_hdr),
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
         let new_instrs = &prog.instrs[before_count..];
 
@@ -3285,6 +3420,7 @@ mod tests {
             2, 32, SimdWidth::W256, QuantPrecision::F32,
             scale_vec, 8, KvLoadMode::Sparse,
             Some(bmp), None,
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
         let new_instrs = &prog.instrs[before_count..];
 
@@ -3320,6 +3456,7 @@ mod tests {
             1, 32, SimdWidth::W256, QuantPrecision::F32,
             scale_vec, 8, KvLoadMode::Auto,
             None, Some(page_hdr),
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
         let new_instrs = &prog.instrs[before_count..];
 
@@ -3354,6 +3491,7 @@ mod tests {
             SimdWidth::W256, QuantPrecision::F32,
             scale_vec, 8, KvLoadMode::Direct,
             None, None,
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
         let new_instrs = &prog.instrs[before_count..];
 
@@ -3395,13 +3533,15 @@ mod tests {
 
         // Act
         let before_count = prog.instrs.len();
+        let page_hdr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         emit_smem_stage_row(
             &mut prog, k_row, v_row,
             "smem_k", "smem_v", write_buf,
             0, 256, 1, 32,
             KvLoadMode::Kivi4, false,
             SimdWidth::W256, QuantPrecision::F32, 8,
-            None, None,
+            None, Some(page_hdr),
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
         let new_instrs = &prog.instrs[before_count..];
 
@@ -3438,6 +3578,7 @@ mod tests {
             KvLoadMode::Direct, false,
             SimdWidth::W256, QuantPrecision::F32, 8,
             None, None,
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
         let new_instrs = &prog.instrs[before_count..];
 
@@ -3575,7 +3716,7 @@ mod tests {
             q_ptr, k_ptr, v_ptr, out_ptr,
             Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct,
+            None, None, 0, KvLoadMode::Direct,
             None, None, None,
             false, false,
         );
@@ -3602,11 +3743,13 @@ mod tests {
         let scale_vec = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
         // Act
+        let page_hdr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         emit_score_dot_cpu(
             &mut prog, q_row, k_row,
             1, 32, SimdWidth::W256, QuantPrecision::F32,
             scale_vec, 8, KvLoadMode::Kivi2,
-            None, None,
+            None, Some(page_hdr),
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
 
         // Assert
@@ -3633,6 +3776,7 @@ mod tests {
             &mut prog, v_row, 1, 32, &[o_acc], correction, weight,
             SimdWidth::W256, QuantPrecision::F32, &body,
             KvLoadMode::Auto, 8, None, None,
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
         let added = &prog.instrs[before..];
 
@@ -3665,6 +3809,7 @@ mod tests {
             0, 256, 1, 32, KvLoadMode::Sparse, false,
             SimdWidth::W256, QuantPrecision::F32, 8,
             Some(bmp), None,
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
         let added = &prog.instrs[before..];
 
@@ -3694,6 +3839,7 @@ mod tests {
                 t, 256, 1, 32, KvLoadMode::Direct, false,
                 SimdWidth::W256, QuantPrecision::F32, 8,
                 None, None,
+                KiviScaleLayout::for_bits(1, 16, 64, 4),
             );
             prog.instrs[before..].iter().filter(|i| !i.is_meta()).count()
         };
@@ -3740,6 +3886,7 @@ mod tests {
             &mut prog, dst, k_row, OffsetExpr::Const(0),
             SimdWidth::W256, QuantPrecision::F32, 8,
             Some(bmp), 3, page_hdr,
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
 
         // Assert: Sparse path should contain BitClear for channel_group=3
@@ -3766,6 +3913,7 @@ mod tests {
             &mut prog, dst, v_row, OffsetExpr::Const(0),
             SimdWidth::W256, QuantPrecision::F32, 8,
             Some(bmp), 5, page_hdr,
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
 
         // Assert: Sparse path should contain BitClear for channel_group=5
@@ -3854,6 +4002,7 @@ mod tests {
             0, 256, 1, 32, KvLoadMode::Auto, false,
             SimdWidth::W256, QuantPrecision::F32, 8,
             None, Some(page_hdr),
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
         let added = &prog.instrs[before..];
 
@@ -3912,7 +4061,7 @@ mod tests {
             q_ptr, k_ptr, v_ptr, out_ptr,
             Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct,
+            None, None, 0, KvLoadMode::Direct,
             None, None, None,
             false, false,
         );
@@ -3968,7 +4117,7 @@ mod tests {
             q_ptr, k_ptr, v_ptr, out_ptr,
             Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct,
+            None, None, 0, KvLoadMode::Direct,
             None, None, None,
             false, false,
         );
@@ -4024,7 +4173,7 @@ mod tests {
             q_ptr, k_ptr, v_ptr, out_ptr,
             Some(&SlidingHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct,
+            None, None, 0, KvLoadMode::Direct,
             None, None, None,
             false, false,
         );
@@ -4080,7 +4229,7 @@ mod tests {
             q_ptr, k_ptr, v_ptr, out_ptr,
             Some(&TestHook),
             false, None, QuantPrecision::F32,
-            Some(pt_ptr), 1, KvLoadMode::Direct,  // page_size=1
+            Some(pt_ptr), None, 1, KvLoadMode::Direct,  // page_size=1
             None, None, None,
             false, false,
         );
@@ -4141,7 +4290,7 @@ mod tests {
             q_ptr, k_ptr, v_ptr, out_ptr,
             Some(&TestHook),
             true, None, QuantPrecision::F32,  // causal=true
-            None, 0, KvLoadMode::Direct,
+            None, None, 0, KvLoadMode::Direct,
             None, None, None,
             false, false,
         );
@@ -4212,6 +4361,7 @@ mod tests {
             0, 4, SimdWidth::W256, QuantPrecision::F32,
             scale_vec, 8, KvLoadMode::Direct,
             None, None,
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
         let added = &prog.instrs[before..];
 
@@ -4325,7 +4475,7 @@ mod tests {
             q_ptr, k_ptr, v_ptr, out_ptr,
             Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct,
+            None, None, 0, KvLoadMode::Direct,
             None, None, None,
             false, false,
         );
@@ -4378,7 +4528,7 @@ mod tests {
             2, 2, 64, SimdWidth::W128,
             q, k, v, o, Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct, None, None, None, false, false,
+            None, None, 0, KvLoadMode::Direct, None, None, None, false, false,
         );
         assert!(r128.is_ok(), "W128 should compile: {:?}", r128);
         let stores_128 = prog128.instrs.iter().filter(|i| matches!(i, VmInstr::VecStore { .. })).count();
@@ -4394,7 +4544,7 @@ mod tests {
             2, 2, 64, SimdWidth::W256,
             q2, k2, v2, o2, Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct, None, None, None, false, false,
+            None, None, 0, KvLoadMode::Direct, None, None, None, false, false,
         );
         assert!(r256.is_ok(), "W256 should compile: {:?}", r256);
         let stores_256 = prog256.instrs.iter().filter(|i| matches!(i, VmInstr::VecStore { .. })).count();
@@ -4444,7 +4594,7 @@ mod tests {
             2, 2, 64, SimdWidth::W512,
             q, k, v, o, Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct, None, None, None, false, false,
+            None, None, 0, KvLoadMode::Direct, None, None, None, false, false,
         );
         assert!(r512.is_ok(), "W512 should compile: {:?}", r512);
         let stores_512 = prog512.instrs.iter().filter(|i| matches!(i, VmInstr::VecStore { .. })).count();
@@ -4460,7 +4610,7 @@ mod tests {
             2, 2, 64, SimdWidth::W256,
             q2, k2, v2, o2, Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct, None, None, None, false, false,
+            None, None, 0, KvLoadMode::Direct, None, None, None, false, false,
         );
         assert!(r256.is_ok(), "W256 should compile: {:?}", r256);
         let stores_256 = prog256.instrs.iter().filter(|i| matches!(i, VmInstr::VecStore { .. })).count();
@@ -4512,7 +4662,7 @@ mod tests {
             2, 2, 64, SimdWidth::W256,
             q_ptr, k_ptr, v_ptr, out_ptr, Some(&TestHook),
             false, None, QuantPrecision::BF16,
-            None, 0, KvLoadMode::Direct, None, None, None, false, false,
+            None, None, 0, KvLoadMode::Direct, None, None, None, false, false,
         );
 
         // Assert: compiles without error
@@ -4571,7 +4721,7 @@ mod tests {
             2, 2, 64, SimdWidth::W256,
             q1, k1, v1, o1, Some(&TestHook),
             false, None, QuantPrecision::BF16,
-            None, 0, KvLoadMode::Direct, None, None, None, false, false,
+            None, None, 0, KvLoadMode::Direct, None, None, None, false, false,
         );
         assert!(r1.is_ok(), "BF16 should compile: {:?}", r1);
         let count_bf16 = prog_bf16.instrs.len();
@@ -4587,7 +4737,7 @@ mod tests {
             2, 2, 64, SimdWidth::W256,
             q2, k2, v2, o2, Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct, None, None, None, false, false,
+            None, None, 0, KvLoadMode::Direct, None, None, None, false, false,
         );
         assert!(r2.is_ok(), "F32 should compile: {:?}", r2);
         let count_f32 = prog_f32.instrs.len();
@@ -4639,7 +4789,7 @@ mod tests {
             2, 2, 16, SimdWidth::W256,
             q1, k1, v1, o1, Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct, None, None, None, false, false,
+            None, None, 0, KvLoadMode::Direct, None, None, None, false, false,
         );
         assert!(r1.is_ok(), "aligned head_dim=16 should compile: {:?}", r1);
         let stores_aligned = prog_aligned.instrs.iter()
@@ -4656,7 +4806,7 @@ mod tests {
             2, 2, 12, SimdWidth::W256,
             q2, k2, v2, o2, Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct, None, None, None, false, false,
+            None, None, 0, KvLoadMode::Direct, None, None, None, false, false,
         );
 
         // Assert: unaligned head_dim still compiles (integer division truncation)
@@ -4766,7 +4916,7 @@ mod tests {
             2, 2, 64, SimdWidth::W256,
             q_ptr, k_ptr, v_ptr, out_ptr, Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct, None, None, None, false, false,
+            None, None, 0, KvLoadMode::Direct, None, None, None, false, false,
         );
 
         // Assert
@@ -4791,6 +4941,7 @@ mod tests {
             &mut prog512, q512, k512,
             4, 64, SimdWidth::W512, QuantPrecision::F32,
             sc512, 16, KvLoadMode::Direct, None, None,
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
         let loads_512 = prog512.instrs.iter()
             .filter(|i| matches!(i, VmInstr::VecLoad { .. })).count();
@@ -4804,6 +4955,7 @@ mod tests {
             &mut prog256, q256, k256,
             8, 32, SimdWidth::W256, QuantPrecision::F32,
             sc256, 8, KvLoadMode::Direct, None, None,
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
         let loads_256 = prog256.instrs.iter()
             .filter(|i| matches!(i, VmInstr::VecLoad { .. })).count();
@@ -4832,6 +4984,7 @@ mod tests {
             &mut prog, v_row, 1, 16, &[o_acc], correction, weight,
             SimdWidth::W256, QuantPrecision::BF16, &body,
             KvLoadMode::Direct, 8, None, None,
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
         let added = &prog.instrs[before..];
 
@@ -4887,7 +5040,7 @@ mod tests {
             1, 2, 64, SimdWidth::W256,
             q_ptr, k_ptr, v_ptr, out_ptr, Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct, None, None, None, false, false,
+            None, None, 0, KvLoadMode::Direct, None, None, None, false, false,
         );
 
         // Assert: should fail with divisibility error
@@ -5020,7 +5173,7 @@ mod tests {
             2, 2, 64, SimdWidth::W256,
             q_ptr, k_ptr, v_ptr, out_ptr, Some(&TestHook),
             false, None, QuantPrecision::F32,
-            Some(pt_ptr), 16, KvLoadMode::Direct,
+            Some(pt_ptr), None, 16, KvLoadMode::Direct,
             None, None, None, false, false,
         );
 
@@ -5114,7 +5267,7 @@ mod tests {
             16, 4, 64, SimdWidth::W256,
             q16, k16, v16, o16, Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct, None, None, None, false, false,
+            None, None, 0, KvLoadMode::Direct, None, None, None, false, false,
         );
         assert!(r16.is_ok(), "16-head should compile: {:?}", r16);
         let stores_16 = prog16.instrs.iter()
@@ -5131,7 +5284,7 @@ mod tests {
             2, 2, 64, SimdWidth::W256,
             q2, k2, v2, o2, Some(&TestHook),
             false, None, QuantPrecision::F32,
-            None, 0, KvLoadMode::Direct, None, None, None, false, false,
+            None, None, 0, KvLoadMode::Direct, None, None, None, false, false,
         );
         assert!(r2.is_ok(), "2-head should compile: {:?}", r2);
         let stores_2 = prog2.instrs.iter()
@@ -5159,6 +5312,7 @@ mod tests {
             &mut prog, dst, v_row, OffsetExpr::Const(0),
             SimdWidth::W256, QuantPrecision::F32, 8,
             None, 0, page_hdr,
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
 
         // Assert: should emit MarkLabel instructions for branching targets
@@ -5207,12 +5361,14 @@ mod tests {
 
         // Act
         let before = prog.instrs.len();
+        let page_hdr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         emit_smem_stage_row(
             &mut prog, k_row, v_row, "smem_k", "smem_v", write_buf,
             0, 256, 1, 32,
             KvLoadMode::Kivi2, false,
             SimdWidth::W256, QuantPrecision::F32, 8,
-            None, None,
+            None, Some(page_hdr),
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
         let added = &prog.instrs[before..];
 
@@ -5249,6 +5405,7 @@ mod tests {
             2, 32, SimdWidth::W256, QuantPrecision::F32,
             scale_vec, 8, KvLoadMode::Auto,
             None, None,  // no page_header_ptr
+            KiviScaleLayout::for_bits(1, 16, 64, 4),
         );
         let added = &prog.instrs[before..];
 

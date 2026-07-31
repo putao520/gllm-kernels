@@ -835,7 +835,7 @@ impl SymDimSlotMap {
         // 与 mega_kernel_abi_gpu() 保持键集对齐 (CPU=StackArg, GPU=AbiArg).
         for name in [
             "output_tokens_ptr", "max_new_tokens", "eos_token_id", "prompt_len",
-            "page_table_ptr", "batch_ctx_ptr", "input_ids_ptr", "weight_blob_ptr",
+            "page_table_ptr", "batch_ctx_ptr", "kv_page_header_ptr", "input_ids_ptr", "weight_blob_ptr",
             "kv_cache_ptr", "positions_ptr", "aux_ptr", "batch_size",
             "scratchpad_ptr", "telemetry_ptr", "hook_ctx_ptr", "callback_table_ptr",
             "temperature_u32", "top_k", "top_p_u32", "session_position",
@@ -856,10 +856,10 @@ impl SymDimSlotMap {
         Self { slots }
     }
 
-    /// MegaKernelFn GPU ABI SymDimSlotMap（22 `.param` 槽位）。
+    /// MegaKernelFn GPU ABI SymDimSlotMap（23 `.param` 槽位）。
     ///
     /// ARCH-GPU-ABI (BCE-20260703-GPU-MEGA-KERNEL-ABI): GPU mega-kernel 与 CPU MegaKernelFn
-    /// 共享同一 22-param 语义顺序, 但物理位置全部为 `AbiArg(0..21)` (对应 PTX `.param` /
+    /// 共享同一 23-param 语义顺序, 但物理位置全部为 `AbiArg(0..22)` (对应 PTX `.param` /
     /// HIP `__global__` arg / Metal `[[buffer(N)]]`), 无 x86 SysV 的栈参数划分。
     ///
     /// 用途: `compile_mega_kernel_vm` 在 `IsaProfile.platform` 为 Cuda/Hip/Metal 时选用,
@@ -869,7 +869,7 @@ impl SymDimSlotMap {
         let state = super::vm_state::VmState::init_mega_kernel_gpu();
         let mut slots = HashMap::new();
 
-        // 22 个 `.param` 参数 — 全部从 GPU VmState 解析为 AbiArg(N)
+        // 23 个 `.param` 参数 — 全部从 GPU VmState 解析为 AbiArg(N)
         slots.insert("input".into(), state.arg_ptr_expr("input_ids_ptr").unwrap());
         slots.insert("weights".into(), state.arg_ptr_expr("weight_blob_ptr").unwrap());
         slots.insert("kv_cache".into(), state.arg_ptr_expr("kv_cache_ptr").unwrap());
@@ -897,7 +897,7 @@ impl SymDimSlotMap {
             "input_ids_ptr", "weight_blob_ptr", "positions_ptr", "aux_ptr",
             "temperature_u32", "top_k", "top_p_u32", "max_new_tokens", "eos_token_id",
             "session_position", "fused_hidden_ptr", "num_mm_tokens",
-            "page_table_ptr", "batch_ctx_ptr",
+            "page_table_ptr", "batch_ctx_ptr", "kv_page_header_ptr",
         ] {
             if let Ok(expr) = state.arg_ptr_expr(name) {
                 slots.insert(name.into(), expr);
@@ -917,14 +917,14 @@ impl SymDimSlotMap {
     /// MegaKernelFn ABI SymDimSlotMap — 按 compile target 分支。
     ///
     /// BCE-20260703-GPU-MEGA-KERNEL-ABI: GPU (Cuda/Hip/Metal) 全部参数走 `.param` 槽位
-    /// (`AbiArg(0..21)`), CPU (x86/AArch64) 保持 6 寄存器 + 16 栈参数 (`init_mega_kernel_x86`).
+    /// (`AbiArg(0..22)`), CPU (x86/AArch64) 保持 6 寄存器 + 17 栈参数 (`init_mega_kernel_x86`).
     /// 防止 GPU codegen 收到 `StackArg(24)` 被拒 (gpu_lower/lower_instr_dispatch.inc.rs:421).
     pub fn mega_kernel_abi_for_target(platform: &super::isa_profile::Platform) -> Self {
         match platform {
             super::isa_profile::Platform::Cuda { .. }
             | super::isa_profile::Platform::Hip { .. }
             | super::isa_profile::Platform::Metal { .. } => Self::mega_kernel_abi_gpu(),
-            // x86_64 / AArch64 / 其他: 保留 x86 SysV ABI (6 reg + 16 stack)
+            // x86_64 / AArch64 / 其他: 保留 x86 SysV ABI (6 reg + 17 stack)
             _ => Self::mega_kernel_abi(),
         }
     }

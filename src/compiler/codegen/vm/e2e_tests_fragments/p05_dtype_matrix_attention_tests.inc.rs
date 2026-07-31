@@ -86,7 +86,7 @@ fn dtype_matrix_attention_bf16_qkv_load_uses_dtype_param() {
         q_ptr, k_ptr, v_ptr, out_ptr,
         Some(&CpuTestHook),
         false, None, QuantPrecision::BF16,
-        None, 0, KvLoadMode::Direct,
+        None, None, 0, KvLoadMode::Direct,
         None, None, None,
         false, false,
     );
@@ -113,7 +113,7 @@ fn dtype_matrix_attention_bf16_accumulator_is_f32() {
         q_ptr, k_ptr, v_ptr, out_ptr,
         Some(&CpuTestHook),
         false, None, QuantPrecision::BF16,
-        None, 0, KvLoadMode::Direct,
+        None, None, 0, KvLoadMode::Direct,
         None, None, None,
         false, false,
     );
@@ -140,7 +140,7 @@ fn dtype_matrix_attention_f32_load_uses_dtype_param() {
         q_ptr, k_ptr, v_ptr, out_ptr,
         Some(&CpuTestHook),
         false, None, QuantPrecision::F32,
-        None, 0, KvLoadMode::Direct,
+        None, None, 0, KvLoadMode::Direct,
         None, None, None,
         false, false,
     );

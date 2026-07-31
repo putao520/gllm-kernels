@@ -640,3 +640,21 @@ fixTemplate:
 - **确认**: cargo test --lib 全过 (7040 passed, 0 failed; 3x gpu_lower 无 flaky)。residual=0。commit 10eaa3b1。
 - **重要备注**: 此修复虽正确 (类型错配是真的 BUG), 但**不是 SmolLM2-Q4_0 GPU E2E fail 的根因** — 5070Ti 重验后 logits 完全不变 (sum=273279.8351 一字不差), 说明 SmolLM2-Q4_0 的 GPU 路径未走 DotProduct(Int8) (可能走别的 GEMM 路径或 graph build 选了不同 kernel)。SmolLM2 GPU 真根因待另行排查 (疑似 embedding/attention 层, 非 GEMM)。
 - **SPEC criterion**: ARCH-DTYPE-MIXED-PRECISION — GPU DotProduct 整数变体的操作数寄存器类型必须与上游 QuantBlockLoad/VecLoad 输出 dtype 一致 (f32 累加器用 fma.rn.f32, 非 s32 mul); PTX 路径必须用合法 PTX 指令 (ld.global + cvt), 禁止 CUDA C 语法。
+
+## KIVI4-SCALE-MODELING-INCOMPLETE — KIVI4 scale 建模缺口
+
+- **patternId**: KIVI4-SCALE-MODELING-INCOMPLETE
+- **title**: KIVI4 graph emits uninitialized scale_ptr because the KV page scale layout is not modeled
+- **layer**: 架构/契约缺口（预存问题，待架构决策）
+- **发现时间**: 2026-08-01
+- **现象**: `attention_emit.rs` 的全部 `KiviDequantLoad` emit 点都只 `alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar)` 取得 `scale_ptr`，没有任何 `LoadPtr`/地址计算写入。SmolLM2 dump `/tmp/smollm2_mega_kernel_vm.txt` line 461 声明 `VReg222`，line 462 直接将其作为 `scale_ptr` 使用；对照 line 451 的 `VReg204`（`src_ptr`）已有 `LoadPtr` 初始化。
+- **根因**: 这不是可以安全补一条 `LoadPtr` 的单点 lowering bug。SPEC 19 §2.2-§2.3 要求 KIVI4 page 物理布局为 `[K_data: 4bit packed | K_scales: f16[num_channels] | V_data: 4bit packed | V_scales: f16[page_size]]`，但当前 graph/KV cache 路径仍用 plain row stride（`lower_op.inc.rs` 以 `2 * max_seq * kv_row_stride` 计算层跨度），没有 scale tensor/source，也没有 K_data/V_data 分区和 scale offset 元数据贯穿到 attention lowering。因此任意就地补 `LoadPtr` 都会指向不存在或错误的 scale 地址。
+- **影响**: KIVI4/KIVI2 variant 的 native lowering 会在 `finalize_quant.inc.rs:516` 执行 `mov r8d, dword_ptr(scale_gpr)`，运行时读取未定义指针并可能越界；当前 `executor_core.inc.rs` 还以 `TEMP: disable KIVI4 compilation for GGUF models` 注释说明该路径未完整启用。Direct graph 的通用 codegen crash 与本条目无关。
+- **证据位置**:
+  - `src/compiler/codegen/vm/attention_emit.rs:136,204,428,470,549,581`：6 个 `KiviDequantLoad` emit 点，均缺少 `LoadPtr`/scale 地址来源。
+  - `src/compiler/codegen/vm/plan_lower/lower_op.inc.rs:1499-1685`：FromCache KV 仍按 plain `kv_row_stride` 建立 K/V 基址和复制布局，无 KIVI4 scale source。
+  - `src/compiler/codegen/vm/x86_lower/finalize_quant.inc.rs:494-516`：native dequant 读取 `scale_ptr` 指向的 f32 scale。
+  - `/tmp/smollm2_mega_kernel_vm.txt:451-462`：`src_ptr` 已初始化而 `VReg222` 未初始化的实证 dump。
+- **处理状态**: blocked — 暂停 scale_ptr 修复；需先完成 KIVI4 scale 建模/页布局设计，再实现 graph→VmInstr 的完整地址传播。未修改代码，未提交 commit。
+- **残留**: N/A（功能设计缺口，非本轮单点修复）；待架构决策后重新评估。
+- **SPEC criterion**: SPEC/19-KV-CACHE-OPTIMIZATION §2.2-§2.3、REQ-KV-OPT-004/009。

@@ -1332,10 +1332,10 @@ mod tests {
     }
 
     #[test]
-    fn test_ptx_mega_kernel_prologue_22_params() {
-        // Arrange: Mega-kernel prologue should declare 22 ABI parameters,
-        // aligned to the CPU MegaKernelFn 22-param SSOT (mega_kernel_abi.rs:159).
-        // BCE-20260702-GPU-ABI: 三层 arity 漂移根治 (PTX 20→22).
+    fn test_ptx_mega_kernel_prologue_23_params() {
+        // Arrange: Mega-kernel prologue should declare 23 ABI parameters,
+        // aligned to the CPU MegaKernelFn 23-param SSOT (mega_kernel_abi.rs:159).
+        // BCE-20260702-GPU-ABI: 三层 arity 漂移根治 (PTX 20→23).
         let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 80 });
         let frame = empty_frame();
         let alloc = empty_alloc();
@@ -1343,7 +1343,7 @@ mod tests {
         l.emit_mega_kernel_prologue(&frame, &alloc, Default::default()).unwrap();
         l.emit_epilogue(&frame, &alloc).unwrap();
         let ir = l.finalize().unwrap();
-        // Assert: all 22 parameters should be declared
+        // Assert: all 23 parameters should be declared
         assert!(ir.contains(".visible .entry mega_kernel("), "Should declare mega_kernel entry: {ir}");
         assert!(ir.contains("input_ids_ptr"), "Should have input_ids_ptr param: {ir}");
         assert!(ir.contains("weight_blob_ptr"), "Should have weight_blob_ptr param: {ir}");
@@ -1351,6 +1351,8 @@ mod tests {
         assert!(ir.contains("callback_table_ptr"), "Should have callback_table_ptr param: {ir}");
         assert!(ir.contains("page_table_ptr"), "Should have page_table_ptr param (21st): {ir}");
         assert!(ir.contains("batch_ctx_ptr"), "Should have batch_ctx_ptr param (22nd): {ir}");
+        assert!(ir.contains("kv_page_header_ptr"), "Should have kv_page_header_ptr param (23rd): {ir}");
+        assert!(ir.contains("ld.param.u64 %rd_kvpagehdr"), "Should load kv_page_header_ptr into register: {ir}");
         assert!(ir.contains("ld.param.u64 %rd_input"), "Should load input_ids into register: {ir}");
         assert!(ir.contains("ld.param.u64 %rd_cb"), "Should load callback_table_ptr into register: {ir}");
         assert!(ir.contains("ld.param.u64 %rd_pagetable"), "Should load page_table_ptr into register: {ir}");
@@ -1358,8 +1360,8 @@ mod tests {
     }
 
     #[test]
-    fn test_hip_mega_kernel_prologue_22_params() {
-        // Arrange: HIP mega-kernel prologue should emit full C++ signature (22 params)
+    fn test_hip_mega_kernel_prologue_23_params() {
+        // Arrange: HIP mega-kernel prologue should emit full C++ signature (23 params)
         let mut l = GpuLower::new(GpuDialect::Hip { gfx_arch: 950, wave_size: 64 });
         let frame = empty_frame();
         let alloc = empty_alloc();
@@ -1374,6 +1376,7 @@ mod tests {
         assert!(ir.contains("callback_table_ptr"), "HIP mega should have callback_table_ptr: {ir}");
         assert!(ir.contains("page_table_ptr"), "HIP mega should have page_table_ptr: {ir}");
         assert!(ir.contains("batch_ctx_ptr"), "HIP mega should have batch_ctx_ptr: {ir}");
+        assert!(ir.contains("kv_page_header_ptr"), "HIP mega should have kv_page_header_ptr: {ir}");
     }
 
     #[test]
