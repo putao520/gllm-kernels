@@ -4370,7 +4370,10 @@ impl X86Lower {
                 // Align rsp, then allocate space for output.
                 // lanes * 4 bytes, rounded up to 16-byte multiple.
                 let aligned_out_bytes = ((*lanes as i32 + 3) & !3) * 4;
-                self.asm.mov(r10, rsp).map_err(Self::err)?;
+                // r10 is caller-saved and may be clobbered by the native helper.
+                // Keep the pre-alignment stack pointer in r15 (callee-saved); the
+                // frame already preserves/restores its incoming value.
+                self.asm.mov(r15, rsp).map_err(Self::err)?;
                 self.asm.and(rsp, -16i32).map_err(Self::err)?;
                 self.asm.sub(rsp, aligned_out_bytes).map_err(Self::err)?;
                 self.asm.lea(r9, qword_ptr(rsp)).map_err(Self::err)?;
@@ -4404,7 +4407,7 @@ impl X86Lower {
                 }
 
                 // Restore rsp from r10 (undo dynamic alignment)
-                self.asm.mov(rsp, r10).map_err(Self::err)?;
+                self.asm.mov(rsp, r15).map_err(Self::err)?;
 
                 self.restore_decode_native_call_frame(&save_gprs, dst_ymm, dst_zmm)?;
 
@@ -4464,7 +4467,10 @@ impl X86Lower {
                 self.asm.mov(r8, *lanes as u64).map_err(Self::err)?;
 
                 let aligned_out_bytes = ((*lanes as i32 + 3) & !3) * 4;
-                self.asm.mov(r10, rsp).map_err(Self::err)?;
+                // r10 is caller-saved and may be clobbered by the native helper.
+                // Keep the pre-alignment stack pointer in r15 (callee-saved); the
+                // frame already preserves/restores its incoming value.
+                self.asm.mov(r15, rsp).map_err(Self::err)?;
                 self.asm.and(rsp, -16i32).map_err(Self::err)?;
                 self.asm.sub(rsp, aligned_out_bytes).map_err(Self::err)?;
                 self.asm.lea(r9, qword_ptr(rsp)).map_err(Self::err)?;
@@ -4495,7 +4501,7 @@ impl X86Lower {
                     }
                 }
 
-                self.asm.mov(rsp, r10).map_err(Self::err)?;
+                self.asm.mov(rsp, r15).map_err(Self::err)?;
                 self.restore_decode_native_call_frame(&save_gprs, dst_ymm, dst_zmm)?;
 
                 if dst_spilled {
@@ -4547,7 +4553,10 @@ impl X86Lower {
                 self.asm.mov(r8, *lanes as u64).map_err(Self::err)?;
 
                 let aligned_out_bytes = ((*lanes as i32 + 3) & !3) * 4;
-                self.asm.mov(r10, rsp).map_err(Self::err)?;
+                // r10 is caller-saved and may be clobbered by the native helper.
+                // Keep the pre-alignment stack pointer in r15 (callee-saved); the
+                // frame already preserves/restores its incoming value.
+                self.asm.mov(r15, rsp).map_err(Self::err)?;
                 self.asm.and(rsp, -16i32).map_err(Self::err)?;
                 self.asm.sub(rsp, aligned_out_bytes).map_err(Self::err)?;
                 self.asm.lea(r9, qword_ptr(rsp)).map_err(Self::err)?;
@@ -4582,7 +4591,7 @@ impl X86Lower {
                     }
                 }
 
-                self.asm.mov(rsp, r10).map_err(Self::err)?;
+                self.asm.mov(rsp, r15).map_err(Self::err)?;
                 self.restore_decode_native_call_frame(&save_gprs, dst_ymm, dst_zmm)?;
 
                 if dst_spilled {
@@ -4634,7 +4643,10 @@ impl X86Lower {
                 self.asm.mov(r8, *lanes as u64).map_err(Self::err)?;
 
                 let aligned_out_bytes = ((*lanes as i32 + 3) & !3) * 4;
-                self.asm.mov(r10, rsp).map_err(Self::err)?;
+                // r10 is caller-saved and may be clobbered by the native helper.
+                // Keep the pre-alignment stack pointer in r15 (callee-saved); the
+                // frame already preserves/restores its incoming value.
+                self.asm.mov(r15, rsp).map_err(Self::err)?;
                 self.asm.and(rsp, -16i32).map_err(Self::err)?;
                 self.asm.sub(rsp, aligned_out_bytes).map_err(Self::err)?;
                 self.asm.lea(r9, qword_ptr(rsp)).map_err(Self::err)?;
@@ -4665,7 +4677,7 @@ impl X86Lower {
                     }
                 }
 
-                self.asm.mov(rsp, r10).map_err(Self::err)?;
+                self.asm.mov(rsp, r15).map_err(Self::err)?;
                 self.restore_decode_native_call_frame(&save_gprs, dst_ymm, dst_zmm)?;
 
                 if dst_spilled {
@@ -4722,7 +4734,10 @@ impl X86Lower {
                 self.asm.mov(rdx, *qs_offset as u64).map_err(Self::err)?;  // qs_offset
                 self.asm.mov(rcx, *lanes as u64).map_err(Self::err)?;     // lanes
                 let aligned_out_bytes = ((*lanes as i32 + 3) & !3) * 4;
-                self.asm.mov(r10, rsp).map_err(Self::err)?;
+                // r10 is caller-saved and may be clobbered by the native helper.
+                // Keep the pre-alignment stack pointer in r15 (callee-saved); the
+                // frame already preserves/restores its incoming value.
+                self.asm.mov(r15, rsp).map_err(Self::err)?;
                 self.asm.and(rsp, -16i32).map_err(Self::err)?;
                 self.asm.sub(rsp, aligned_out_bytes).map_err(Self::err)?;
                 self.asm.lea(r8, qword_ptr(rsp)).map_err(Self::err)?;  // out
@@ -4746,7 +4761,7 @@ impl X86Lower {
                         ));
                     }
                 }
-                self.asm.mov(rsp, r10).map_err(Self::err)?;
+                self.asm.mov(rsp, r15).map_err(Self::err)?;
                 self.restore_decode_native_call_frame(&save_gprs, dst_ymm, dst_zmm)?;
                 if dst_spilled {
                     if is_w512 {
