@@ -4701,22 +4701,24 @@ impl X86Lower {
                 self.asm.mov(rdi, bb_gpr).map_err(Self::err)?;
                 self.asm.mov(rsi, lo_gpr).map_err(Self::err)?;
                 self.asm.vxorps(xmm0, xmm0, xmm0).map_err(Self::err)?;
-                // SysV ABI: rdx=_d_f32(unused), rcx=qs_offset(USED by native: qs = block.add(qs_offset)),
-                // r8=lanes, r9=out.
-                // BCE-20260731-Q4K-ARG-MISALIGN: previously rdx=qs_offset, rcx=lanes,
-                // r8=out — shifted every param by one slot, so native received
-                // lanes=out_ptr(huge) and out=garbage → loop ran billions of iters
-                // writing random memory → embed garbage → overflow → logits=30.
-                self.asm.xor(rdx, rdx).map_err(Self::err)?;  // _d_f32 = 0 (unused by native)
-                // BCE-20260731-Q4K-QS-OFFSET: native q4k_decode_step_native reads
-                // qs = block.add(qs_offset); pass the descriptor offset instead of 0.
-                self.asm.mov(rcx, *qs_offset as u64).map_err(Self::err)?;  // qs_offset
-                self.asm.mov(r8, *lanes as u64).map_err(Self::err)?;  // lanes
+                // SysV ABI integer slots (float _d_f32 goes to xmm0, does NOT consume
+                // an integer register slot — SysV tracks int/float counters in parallel):
+                //   rdi=block, rsi=lane_offset, xmm0=_d_f32(unused),
+                //   rdx=qs_offset(USED: native qs = block.add(qs_offset)),
+                //   rcx=lanes, r8=out.
+                // BCE-20260731-Q4K-XMM0-FLOAT-SLOT: ff62d58a wrongly assumed _d_f32 (f32)
+                // occupies rdx as an integer slot, shifting qs_offset/lanes/out by one
+                // slot (rdx=qs_off, rcx=lanes, r8=out, r9=unused). Native then read
+                // _d_f32=0 as qs_offset, qs_offset(16) as lanes, lanes(8) as out=0x8,
+                // stack as 7th arg → wrote out to address 0x8 → SIGSEGV. Fixed: _d_f32
+                // is float → xmm0 only; integer args start at rdx.
+                self.asm.mov(rdx, *qs_offset as u64).map_err(Self::err)?;  // qs_offset
+                self.asm.mov(rcx, *lanes as u64).map_err(Self::err)?;     // lanes
                 let aligned_out_bytes = ((*lanes as i32 + 3) & !3) * 4;
                 self.asm.mov(r10, rsp).map_err(Self::err)?;
                 self.asm.and(rsp, -16i32).map_err(Self::err)?;
                 self.asm.sub(rsp, aligned_out_bytes).map_err(Self::err)?;
-                self.asm.lea(r9, qword_ptr(rsp)).map_err(Self::err)?;  // out
+                self.asm.lea(r8, qword_ptr(rsp)).map_err(Self::err)?;  // out
                 let fn_ptr = crate::asm::x86_64::quant_gemv::q4k_decode_step_native as *const () as u64;
                 self.asm.mov(rax, fn_ptr).map_err(Self::err)?;
                 self.asm.call(rax).map_err(Self::err)?;
