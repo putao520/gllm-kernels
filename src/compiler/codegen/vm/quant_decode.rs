@@ -124,8 +124,17 @@ impl<'a> DecodeTraceBuilder<'a> {
 
     /// Whether this format uses PackedNibbles and needs two-phase SPLIT
     /// (lo pass + hi pass instead of single QuantConcatSeq concat).
+    ///
+    /// BCE-20260731-Q4K-MONOLITHIC: Q4_K has a dedicated monolithic decode path
+    /// (build_q4k_decode → Q4KDecodeStep) that handles the per-64-group lo/hi
+    /// layout internally via lane_offset. The generic two-phase SPLIT (which
+    /// assumes block-level 128-lo/128-hi) is WRONG for Q4_K and causes it to
+    /// decode only 2×lanes elements (e.g. 32 of 256), leaving the rest zero →
+    /// embed mostly zero/garbage → overflow → logits=30. Exclude Q4_K (and any
+    /// format with a dedicated monolithic path) from two-phase.
     pub fn needs_two_phase_split(&self) -> bool {
         matches!(&self.desc.data_layout, DataLayout::PackedNibbles { .. })
+            && !self.is_q4k_format()
     }
 
     /// Whether the trace requires a lane_offset input (inputs[2]).
