@@ -2238,3 +2238,99 @@ pub unsafe extern "C" fn q5_1_decode_step_native(
         *out.add(i) = d * (q as f32) + m;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::q4k_decode_step_native;
+    use half::f16;
+
+    fn llama_cpp_q4k_dequantize(block: &[u8; 144]) -> [f32; 256] {
+        let d = f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
+        let dmin = f16::from_bits(u16::from_le_bytes([block[2], block[3]])).to_f32();
+        let scales = &block[4..16];
+        let qs = &block[16..144];
+        let mut output = [0.0_f32; 256];
+
+        fn scale_min(scales: &[u8], index: usize) -> (f32, f32) {
+            if index < 4 {
+                (
+                    (scales[index] & 0x3f) as f32,
+                    (scales[index + 4] & 0x3f) as f32,
+                )
+            } else {
+                (
+                    ((scales[index + 4] & 0x0f)
+                        | ((scales[index - 4] >> 6) << 4)) as f32,
+                    ((scales[index + 4] >> 4)
+                        | ((scales[index] >> 6) << 4)) as f32,
+                )
+            }
+        }
+
+        for group in 0..4 {
+            let (sc_lo, m_lo) = scale_min(scales, group * 2);
+            let (sc_hi, m_hi) = scale_min(scales, group * 2 + 1);
+            let q = &qs[group * 32..(group + 1) * 32];
+            for local in 0..32 {
+                output[group * 64 + local] =
+                    d * sc_lo * (q[local] & 0x0f) as f32 - dmin * m_lo;
+                output[group * 64 + 32 + local] =
+                    d * sc_hi * (q[local] >> 4) as f32 - dmin * m_hi;
+            }
+        }
+        output
+    }
+
+    // @trace REQ-JIT-QUANT-001
+    #[test]
+    fn test_q4k_decode_step_native_vs_llamacpp() {
+        let mut block = [0_u8; 144];
+        block[..2].copy_from_slice(&f16::from_f32(1.0).to_bits().to_le_bytes());
+        block[2..4].copy_from_slice(&f16::from_f32(1.0).to_bits().to_le_bytes());
+
+        // llama.cpp's get_scale_min_k4 decodes all eight pairs as (sc, m)=(1, 1):
+        // the first four pairs use 6-bit fields, while the last four use the
+        // low/high nibbles in scales[8..12] plus the high bits of scales[0..7].
+        block[4..8].fill(1);
+        block[8..12].fill(1);
+        block[12..16].fill(0x11);
+
+        let qs = &mut block[16..144];
+        qs[0] = 0x32;
+        qs[1..32].fill(0x11);
+        qs[32..64].fill(0x22);
+        qs[64..96].fill(0x33);
+        qs[96..128].fill(0x44);
+
+        let expected = llama_cpp_q4k_dequantize(&block);
+        let mut got = [0.0_f32; 256];
+        for lane_offset in (0..256).step_by(16) {
+            // SAFETY: `block` has the 144-byte Q4_K layout, `lane_offset` is
+            // within the 256-element block, and `out` has 16 writable lanes.
+            unsafe {
+                q4k_decode_step_native(
+                    block.as_ptr(),
+                    lane_offset as u64,
+                    0.0,
+                    16,
+                    16,
+                    got[lane_offset..lane_offset + 16].as_mut_ptr(),
+                );
+            }
+        }
+
+        let mut mismatches = 0;
+        for (index, (&actual, &reference)) in got.iter().zip(expected.iter()).enumerate() {
+            if (actual - reference).abs() > 1e-5 {
+                let mini = index / 32;
+                let group = mini / 2;
+                let half = mini % 2;
+                eprintln!(
+                    "Q4_K mismatch elem={index} group={group} half={half} mini={mini}: got={actual:.8} want={reference:.8}"
+                );
+                mismatches += 1;
+            }
+        }
+        assert_eq!(mismatches, 0, "Q4_K native output differs from llama.cpp reference");
+    }
+}
