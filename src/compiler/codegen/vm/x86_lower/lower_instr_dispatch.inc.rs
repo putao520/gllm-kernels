@@ -4701,13 +4701,19 @@ impl X86Lower {
                 self.asm.mov(rdi, bb_gpr).map_err(Self::err)?;
                 self.asm.mov(rsi, lo_gpr).map_err(Self::err)?;
                 self.asm.vxorps(xmm0, xmm0, xmm0).map_err(Self::err)?;
-                self.asm.mov(rdx, *qs_offset as u64).map_err(Self::err)?;
-                self.asm.mov(rcx, *lanes as u64).map_err(Self::err)?;
+                // SysV ABI: rdx=_d_f32(unused), rcx=_qs_offset(unused), r8=lanes, r9=out.
+                // BCE-20260731-Q4K-ARG-MISALIGN: previously rdx=qs_offset, rcx=lanes,
+                // r8=out — shifted every param by one slot, so native received
+                // lanes=out_ptr(huge) and out=garbage → loop ran billions of iters
+                // writing random memory → embed garbage → overflow → logits=30.
+                self.asm.xor(rdx, rdx).map_err(Self::err)?;  // _d_f32 = 0 (unused)
+                self.asm.xor(rcx, rcx).map_err(Self::err)?;  // _qs_offset = 0 (unused)
+                self.asm.mov(r8, *lanes as u64).map_err(Self::err)?;  // lanes
                 let aligned_out_bytes = ((*lanes as i32 + 3) & !3) * 4;
                 self.asm.mov(r10, rsp).map_err(Self::err)?;
                 self.asm.and(rsp, -16i32).map_err(Self::err)?;
                 self.asm.sub(rsp, aligned_out_bytes).map_err(Self::err)?;
-                self.asm.lea(r8, qword_ptr(rsp)).map_err(Self::err)?;
+                self.asm.lea(r9, qword_ptr(rsp)).map_err(Self::err)?;  // out
                 let fn_ptr = crate::asm::x86_64::quant_gemv::q4k_decode_step_native as *const () as u64;
                 self.asm.mov(rax, fn_ptr).map_err(Self::err)?;
                 self.asm.call(rax).map_err(Self::err)?;
