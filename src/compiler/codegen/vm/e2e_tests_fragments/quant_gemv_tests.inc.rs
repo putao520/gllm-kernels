@@ -792,23 +792,26 @@ mod quant_gemv_tests {
         };
         eprintln!("[Q4_K-ORACLE] out[0..8]    = {:?}", &out_f32[0..8]);
         eprintln!("[Q4_K-ORACLE] out[128..136] = {:?}", &out_f32[128..136]);
-        eprintln!("[Q4_K-ORACLE] want: out[0]=1.0 (2-1), out[128]=2.0 (3-1, SPLIT hi pass), 其余=0.0 (1-1)");
+        eprintln!("[Q4_K-ORACLE] want: out[0]=1.0 (2-1), out[32]=2.0 (3-1, per-64-group hi), 其余=0.0 (1-1)");
 
-        // 期望 (SPLIT output layout): value = d*sc*q - dmin*m = 1*1*q - 1*1 = q - 1
-        // QuantGather two-phase SPLIT: lo pass → out[0..128], hi pass → out[128..256]
-        //   qs[0]=0x32: lo=2→out[0]=2-1=1.0; hi=3→out[128]=3-1=2.0
-        //   qs[1..31]=0x11: lo=1→out[1..31]=0.0; hi=1→out[129..159]=0.0
+        // 期望 (llama.cpp Q4_K per-64-group layout, 662e93d6 monolithic decode):
+        //   value = d*sc*q - dmin*m = 1*1*q - 1*1 = q - 1
+        //   Q4_K groups: each 64 elems = 32 lo(低 nibble) + 32 hi(高 nibble) from same 32 qs bytes.
+        //   qs[0]=0x32: lo=2→out[0]=2-1=1.0; hi=3→out[32]=3-1=2.0
+        //   qs[1..31]=0x11: lo=1→out[1..31]=0.0; hi=1→out[33..63]=0.0
+        // (旧 generic two-phase SPLIT 期望 out[128]=2.0 是错的；llama.cpp dequantize_row_q4_K
+        //  每 j+=64 组内 32 lo + 32 hi，非整个 block 128 lo + 128 hi)
         let mut pass = true;
         if (out_f32[0] - 1.0).abs() >= 1e-5 {
             eprintln!("[Q4_K-ORACLE] FAIL elem[0]: got {} want 1.0 (2-1)", out_f32[0]);
             pass = false;
         }
-        if (out_f32[128] - 2.0).abs() >= 1e-5 {
-            eprintln!("[Q4_K-ORACLE] FAIL elem[128]: got {} want 2.0 (3-1, SPLIT hi pass)", out_f32[128]);
+        if (out_f32[32] - 2.0).abs() >= 1e-5 {
+            eprintln!("[Q4_K-ORACLE] FAIL elem[32]: got {} want 2.0 (3-1, per-64-group hi nibble)", out_f32[32]);
             pass = false;
         }
         for i in 0..hidden_dim {
-            if i != 0 && i != 128 && out_f32[i].abs() >= 1e-5 {
+            if i != 0 && i != 32 && out_f32[i].abs() >= 1e-5 {
                 eprintln!("[Q4_K-ORACLE] FAIL elem[{}]: got {} want 0.0 (1-1)", i, out_f32[i]);
                 pass = false;
             }
