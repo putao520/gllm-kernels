@@ -118,6 +118,7 @@ fn emit_quant_gather_trace_driven(
         .needs_two_phase_split();
     // 两阶段: 每趟 sub_blocks = (block_size/2)/lanes = sub_blocks/2. 单阶段: sub_blocks.
     let sub_blocks_per_phase = if needs_two_phase { sub_blocks / 2 } else { sub_blocks };
+    eprintln!("[QG-DIAG] qt={:?} block_size={} lanes={} sub_blocks={} needs_two_phase={} sub_blocks_per_phase={}", quant_type, block_size, lanes, sub_blocks, needs_two_phase, sub_blocks_per_phase);
     // hi pass 输出偏移: 跳到 block 后半 (block_size/2 个 f32 = block_size/2 * compute_elem_bytes 字节).
     let half_block_output_bytes = if needs_two_phase { (block_size / 2) * compute_elem_bytes } else { 0 };
 
