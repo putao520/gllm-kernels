@@ -3,6 +3,7 @@
 // SymbolicSaveFrame — 符号化栈帧追踪, 自动计算对齐, 生成 save/restore 序列
 //
 // 替代手工 push/pop/sub/add 计算, 消除 NativeCall 对齐错误根源。
+// @trace REQ-VR-009 [req:VmInstr native-call ISA lowering] caller-saved vector context
 // ============================================================================
 
 /// 符号化地声明要保存的寄存器, 自动计算栈布局和对齐。
@@ -52,6 +53,25 @@ impl<'a> SymbolicSaveFrame<'a> {
         }
         self.total_adjustment += total;
         self.op_log.push("save_ymm");
+        Ok(())
+    }
+
+    /// 保存完整 ZMM 寄存器块。
+    ///
+    /// AVX-512 的 ZMM 高 256 bit 不是 YMM 的别名；`vmovups ymmword_ptr`
+    /// 只保存低半，native call 返回后会留下 caller-saved ZMM 的高半垃圾。
+    /// 该路径专门保存完整 64-byte ZMM，供 W512/native-call 边界使用。
+    pub fn save_zmm_block(&mut self, regs: &[AsmRegisterZmm]) -> Result<(), CompilerError> {
+        let stride: i32 = 64;
+        let total = (regs.len() as i32) * stride;
+        self.asm.sub(rsp, total).map_err(X86Lower::err)?;
+        for (i, &r) in regs.iter().enumerate() {
+            self.asm.vmovups(
+                zmmword_ptr(rsp + i as i32 * stride), r,
+            ).map_err(X86Lower::err)?;
+        }
+        self.total_adjustment += total;
+        self.op_log.push("save_zmm");
         Ok(())
     }
 
@@ -110,6 +130,28 @@ impl<'a> SymbolicSaveFrame<'a> {
             self.asm.add(rsp, (ymms.len() as i32) * stride).map_err(X86Lower::err)?;
         }
         // Restore RFLAGS + GPRs in reverse
+        self.asm.popfq().map_err(X86Lower::err)?;
+        for &r in gprs.iter().rev() {
+            self.asm.pop(r).map_err(X86Lower::err)?;
+        }
+        Ok(())
+    }
+
+    /// 自动生成完整 ZMM 恢复序列，再恢复 RFLAGS/GPRs。
+    pub fn restore_zmm_all(
+        &mut self,
+        gprs: &[AsmRegister64],
+        zmms: &[AsmRegisterZmm],
+    ) -> Result<(), CompilerError> {
+        if !zmms.is_empty() {
+            let stride: i32 = 64;
+            for (i, &r) in zmms.iter().enumerate() {
+                self.asm.vmovups(
+                    r, zmmword_ptr(rsp + i as i32 * stride),
+                ).map_err(X86Lower::err)?;
+            }
+            self.asm.add(rsp, (zmms.len() as i32) * stride).map_err(X86Lower::err)?;
+        }
         self.asm.popfq().map_err(X86Lower::err)?;
         for &r in gprs.iter().rev() {
             self.asm.pop(r).map_err(X86Lower::err)?;

@@ -4250,6 +4250,81 @@ impl X86Lower {
         }
     }
 
+    /// Save/restore the native decode-call vector context at the requested width.
+    ///
+    /// W512 uses the complete 32-register ZMM file. Saving only the low YMM view
+    /// both truncates each live value to 256 bits and misses ZMM16..ZMM31 entirely;
+    /// either leaves caller-saved ZMM state corrupted after the native helper returns.
+    fn save_decode_native_call_frame(
+        &mut self,
+        save_gprs: &[AsmRegister64],
+        dst_ymm: AsmRegisterYmm,
+        dst_zmm: Option<AsmRegisterZmm>,
+    ) -> Result<(), CompilerError> {
+        #[rustfmt::skip]
+        let all_ymms: [AsmRegisterYmm; 16] = [ymm0, ymm1, ymm2, ymm3, ymm4, ymm5, ymm6, ymm7, ymm8, ymm9, ymm10, ymm11, ymm12, ymm13, ymm14, ymm15];
+        #[rustfmt::skip]
+        let all_zmms: [AsmRegisterZmm; 32] = [
+            zmm0, zmm1, zmm2, zmm3, zmm4, zmm5, zmm6, zmm7,
+            zmm8, zmm9, zmm10, zmm11, zmm12, zmm13, zmm14, zmm15,
+            zmm16, zmm17, zmm18, zmm19, zmm20, zmm21, zmm22, zmm23,
+            zmm24, zmm25, zmm26, zmm27, zmm28, zmm29, zmm30, zmm31,
+        ];
+        let mut frame = SymbolicSaveFrame::new(&mut self.asm);
+        frame.push_gprs(save_gprs)?;
+        frame.pushfq()?;
+        if let Some(dst_zmm) = dst_zmm {
+            let save_zmms: Vec<AsmRegisterZmm> = all_zmms
+                .iter()
+                .copied()
+                .filter(|&r| r != dst_zmm)
+                .collect();
+            frame.save_zmm_block(&save_zmms)?;
+        } else {
+            let save_ymms: Vec<AsmRegisterYmm> = all_ymms
+                .iter()
+                .copied()
+                .filter(|&r| r != dst_ymm)
+                .collect();
+            frame.save_ymm_block(&save_ymms)?;
+        }
+        frame.verify_alignment()
+    }
+
+    fn restore_decode_native_call_frame(
+        &mut self,
+        save_gprs: &[AsmRegister64],
+        dst_ymm: AsmRegisterYmm,
+        dst_zmm: Option<AsmRegisterZmm>,
+    ) -> Result<(), CompilerError> {
+        #[rustfmt::skip]
+        let all_ymms: [AsmRegisterYmm; 16] = [ymm0, ymm1, ymm2, ymm3, ymm4, ymm5, ymm6, ymm7, ymm8, ymm9, ymm10, ymm11, ymm12, ymm13, ymm14, ymm15];
+        #[rustfmt::skip]
+        let all_zmms: [AsmRegisterZmm; 32] = [
+            zmm0, zmm1, zmm2, zmm3, zmm4, zmm5, zmm6, zmm7,
+            zmm8, zmm9, zmm10, zmm11, zmm12, zmm13, zmm14, zmm15,
+            zmm16, zmm17, zmm18, zmm19, zmm20, zmm21, zmm22, zmm23,
+            zmm24, zmm25, zmm26, zmm27, zmm28, zmm29, zmm30, zmm31,
+        ];
+        let mut frame = SymbolicSaveFrame::new(&mut self.asm);
+        if let Some(dst_zmm) = dst_zmm {
+            let save_zmms: Vec<AsmRegisterZmm> = all_zmms
+                .iter()
+                .copied()
+                .filter(|&r| r != dst_zmm)
+                .collect();
+            frame.restore_zmm_all(save_gprs, &save_zmms)?;
+        } else {
+            let save_ymms: Vec<AsmRegisterYmm> = all_ymms
+                .iter()
+                .copied()
+                .filter(|&r| r != dst_ymm)
+                .collect();
+            frame.restore_all(save_gprs, &save_ymms)?;
+        }
+        Ok(())
+    }
+
     fn lower_q3_k_decode_step_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
             VmInstr::Q3KDecodeStep { dst, block_base, lane_offset, d_vreg: _, qs_offset, hmask_offset, lanes, width } => {
@@ -4267,30 +4342,16 @@ impl X86Lower {
 
                 // Resolve dst at the requested width. W512 output must load all 16
                 // f32 lanes into a ZMM; resolving a YMM here leaves lanes 8..15 stale.
-                let (dst_ymm, dst_spilled) = if is_w512 {
+                let (dst_ymm, dst_zmm, dst_spilled) = if is_w512 {
                     let (dst_zmm, spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 0)?;
-                    (Self::zmm_to_ymm(dst_zmm), spilled)
+                    (Self::zmm_to_ymm(dst_zmm), Some(dst_zmm), spilled)
                 } else {
-                    self.resolve_ymm_or_spill_write(*dst, alloc, 0)?
+                    let (dst_ymm, spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
+                    (dst_ymm, None, spilled)
                 };
 
-                // Build YMM save list EXCLUDING dst_ymm — we write the result into dst_ymm
-                // after the call, and restore_all must NOT overwrite it.
-                #[rustfmt::skip]
-                let all_ymms: [AsmRegisterYmm; 16] = [ymm0, ymm1, ymm2, ymm3, ymm4, ymm5, ymm6, ymm7, ymm8, ymm9, ymm10, ymm11, ymm12, ymm13, ymm14, ymm15];
-                let save_ymms: Vec<AsmRegisterYmm> = all_ymms.iter().filter(|&&r| r != dst_ymm).copied().collect();
-
                 let save_gprs = [rax, rbx, rcx, rdx, rsi, rdi, r8, r9, r10, r11, r12, r13, r14, r15];
-
-                // Save all GPRs + pushfq + save YMMs (excluding dst)
-                {
-                    let mut frame = SymbolicSaveFrame::new(&mut self.asm);
-                    frame.push_gprs(&save_gprs)?;
-                    frame.pushfq()?;
-                    frame.save_ymm_block(&save_ymms)?;
-                    // Total: 14*8=112 + 8 + 15*32=480 = 600 → 600%16=8 ✓
-                    frame.verify_alignment()?;
-                }
+                self.save_decode_native_call_frame(&save_gprs, dst_ymm, dst_zmm)?;
 
                 // BCE-20260711-NATIVE-CALL-SAVE-ORDER: resolve_gpr_read 在 push_gprs 之后 (见 Q6K 注释).
                 let bb_gpr = self.resolve_gpr_read(*block_base, alloc, 0)?;
@@ -4345,11 +4406,7 @@ impl X86Lower {
                 // Restore rsp from r10 (undo dynamic alignment)
                 self.asm.mov(rsp, r10).map_err(Self::err)?;
 
-                // Restore YMMs (excluding dst_ymm), popfq, pop GPRs
-                {
-                    let mut frame = SymbolicSaveFrame::new(&mut self.asm);
-                    frame.restore_all(&save_gprs, &save_ymms)?;
-                }
+                self.restore_decode_native_call_frame(&save_gprs, dst_ymm, dst_zmm)?;
 
                 if dst_spilled {
                     if is_w512 {
@@ -4378,26 +4435,16 @@ impl X86Lower {
                         "Q6KDecodeStep W512 requires use_avx512".into(),
                     ));
                 }
-                let (dst_ymm, dst_spilled) = if is_w512 {
+                let (dst_ymm, dst_zmm, dst_spilled) = if is_w512 {
                     let (dst_zmm, spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 0)?;
-                    (Self::zmm_to_ymm(dst_zmm), spilled)
+                    (Self::zmm_to_ymm(dst_zmm), Some(dst_zmm), spilled)
                 } else {
-                    self.resolve_ymm_or_spill_write(*dst, alloc, 0)?
+                    let (dst_ymm, spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
+                    (dst_ymm, None, spilled)
                 };
 
-                #[rustfmt::skip]
-                let all_ymms: [AsmRegisterYmm; 16] = [ymm0, ymm1, ymm2, ymm3, ymm4, ymm5, ymm6, ymm7, ymm8, ymm9, ymm10, ymm11, ymm12, ymm13, ymm14, ymm15];
-                let save_ymms: Vec<AsmRegisterYmm> = all_ymms.iter().filter(|&&r| r != dst_ymm).copied().collect();
-
                 let save_gprs = [rax, rbx, rcx, rdx, rsi, rdi, r8, r9, r10, r11, r12, r13, r14, r15];
-
-                {
-                    let mut frame = SymbolicSaveFrame::new(&mut self.asm);
-                    frame.push_gprs(&save_gprs)?;
-                    frame.pushfq()?;
-                    frame.save_ymm_block(&save_ymms)?;
-                    frame.verify_alignment()?;
-                }
+                self.save_decode_native_call_frame(&save_gprs, dst_ymm, dst_zmm)?;
 
                 // BCE-20260711-NATIVE-CALL-SAVE-ORDER: resolve_gpr_read 必须在 push_gprs 之后.
                 // 旧序: resolve_gpr_read(block_base, slot=0=rax) 在 push_gprs 之前 → 若 block_base
@@ -4449,11 +4496,7 @@ impl X86Lower {
                 }
 
                 self.asm.mov(rsp, r10).map_err(Self::err)?;
-
-                {
-                    let mut frame = SymbolicSaveFrame::new(&mut self.asm);
-                    frame.restore_all(&save_gprs, &save_ymms)?;
-                }
+                self.restore_decode_native_call_frame(&save_gprs, dst_ymm, dst_zmm)?;
 
                 if dst_spilled {
                     if is_w512 {
@@ -4481,26 +4524,16 @@ impl X86Lower {
                         "Q5DecodeStep W512 requires use_avx512".into(),
                     ));
                 }
-                let (dst_ymm, dst_spilled) = if is_w512 {
+                let (dst_ymm, dst_zmm, dst_spilled) = if is_w512 {
                     let (dst_zmm, spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 0)?;
-                    (Self::zmm_to_ymm(dst_zmm), spilled)
+                    (Self::zmm_to_ymm(dst_zmm), Some(dst_zmm), spilled)
                 } else {
-                    self.resolve_ymm_or_spill_write(*dst, alloc, 0)?
+                    let (dst_ymm, spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
+                    (dst_ymm, None, spilled)
                 };
 
-                #[rustfmt::skip]
-                let all_ymms: [AsmRegisterYmm; 16] = [ymm0, ymm1, ymm2, ymm3, ymm4, ymm5, ymm6, ymm7, ymm8, ymm9, ymm10, ymm11, ymm12, ymm13, ymm14, ymm15];
-                let save_ymms: Vec<AsmRegisterYmm> = all_ymms.iter().filter(|&&r| r != dst_ymm).copied().collect();
-
                 let save_gprs = [rax, rbx, rcx, rdx, rsi, rdi, r8, r9, r10, r11, r12, r13, r14, r15];
-
-                {
-                    let mut frame = SymbolicSaveFrame::new(&mut self.asm);
-                    frame.push_gprs(&save_gprs)?;
-                    frame.pushfq()?;
-                    frame.save_ymm_block(&save_ymms)?;
-                    frame.verify_alignment()?;
-                }
+                self.save_decode_native_call_frame(&save_gprs, dst_ymm, dst_zmm)?;
 
                 // BCE-20260711-NATIVE-CALL-SAVE-ORDER: resolve_gpr_read 在 push_gprs 之后 (见 Q6K 注释).
                 let bb_gpr = self.resolve_gpr_read(*block_base, alloc, 0)?;
@@ -4550,11 +4583,7 @@ impl X86Lower {
                 }
 
                 self.asm.mov(rsp, r10).map_err(Self::err)?;
-
-                {
-                    let mut frame = SymbolicSaveFrame::new(&mut self.asm);
-                    frame.restore_all(&save_gprs, &save_ymms)?;
-                }
+                self.restore_decode_native_call_frame(&save_gprs, dst_ymm, dst_zmm)?;
 
                 if dst_spilled {
                     if is_w512 {
@@ -4582,26 +4611,16 @@ impl X86Lower {
                         "Q5KDecodeStep W512 requires use_avx512".into(),
                     ));
                 }
-                let (dst_ymm, dst_spilled) = if is_w512 {
+                let (dst_ymm, dst_zmm, dst_spilled) = if is_w512 {
                     let (dst_zmm, spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 0)?;
-                    (Self::zmm_to_ymm(dst_zmm), spilled)
+                    (Self::zmm_to_ymm(dst_zmm), Some(dst_zmm), spilled)
                 } else {
-                    self.resolve_ymm_or_spill_write(*dst, alloc, 0)?
+                    let (dst_ymm, spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
+                    (dst_ymm, None, spilled)
                 };
 
-                #[rustfmt::skip]
-                let all_ymms: [AsmRegisterYmm; 16] = [ymm0, ymm1, ymm2, ymm3, ymm4, ymm5, ymm6, ymm7, ymm8, ymm9, ymm10, ymm11, ymm12, ymm13, ymm14, ymm15];
-                let save_ymms: Vec<AsmRegisterYmm> = all_ymms.iter().filter(|&&r| r != dst_ymm).copied().collect();
-
                 let save_gprs = [rax, rbx, rcx, rdx, rsi, rdi, r8, r9, r10, r11, r12, r13, r14, r15];
-
-                {
-                    let mut frame = SymbolicSaveFrame::new(&mut self.asm);
-                    frame.push_gprs(&save_gprs)?;
-                    frame.pushfq()?;
-                    frame.save_ymm_block(&save_ymms)?;
-                    frame.verify_alignment()?;
-                }
+                self.save_decode_native_call_frame(&save_gprs, dst_ymm, dst_zmm)?;
 
                 // BCE-20260711-NATIVE-CALL-SAVE-ORDER: resolve_gpr_read 在 push_gprs 之后 (见 Q6K 注释).
                 let bb_gpr = self.resolve_gpr_read(*block_base, alloc, 0)?;
@@ -4647,11 +4666,7 @@ impl X86Lower {
                 }
 
                 self.asm.mov(rsp, r10).map_err(Self::err)?;
-
-                {
-                    let mut frame = SymbolicSaveFrame::new(&mut self.asm);
-                    frame.restore_all(&save_gprs, &save_ymms)?;
-                }
+                self.restore_decode_native_call_frame(&save_gprs, dst_ymm, dst_zmm)?;
 
                 if dst_spilled {
                     if is_w512 {
@@ -4679,23 +4694,15 @@ impl X86Lower {
                         "Q4KDecodeStep W512 requires use_avx512".into(),
                     ));
                 }
-                let (dst_ymm, dst_spilled) = if is_w512 {
+                let (dst_ymm, dst_zmm, dst_spilled) = if is_w512 {
                     let (dst_zmm, spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 0)?;
-                    (Self::zmm_to_ymm(dst_zmm), spilled)
+                    (Self::zmm_to_ymm(dst_zmm), Some(dst_zmm), spilled)
                 } else {
-                    self.resolve_ymm_or_spill_write(*dst, alloc, 0)?
+                    let (dst_ymm, spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
+                    (dst_ymm, None, spilled)
                 };
-                #[rustfmt::skip]
-                let all_ymms: [AsmRegisterYmm; 16] = [ymm0, ymm1, ymm2, ymm3, ymm4, ymm5, ymm6, ymm7, ymm8, ymm9, ymm10, ymm11, ymm12, ymm13, ymm14, ymm15];
-                let save_ymms: Vec<AsmRegisterYmm> = all_ymms.iter().filter(|&&r| r != dst_ymm).copied().collect();
                 let save_gprs = [rax, rbx, rcx, rdx, rsi, rdi, r8, r9, r10, r11, r12, r13, r14, r15];
-                {
-                    let mut frame = SymbolicSaveFrame::new(&mut self.asm);
-                    frame.push_gprs(&save_gprs)?;
-                    frame.pushfq()?;
-                    frame.save_ymm_block(&save_ymms)?;
-                    frame.verify_alignment()?;
-                }
+                self.save_decode_native_call_frame(&save_gprs, dst_ymm, dst_zmm)?;
                 let bb_gpr = self.resolve_gpr_read(*block_base, alloc, 0)?;
                 let lo_gpr = self.resolve_gpr_read(*lane_offset, alloc, 1)?;
                 self.asm.mov(rdi, bb_gpr).map_err(Self::err)?;
@@ -4740,10 +4747,7 @@ impl X86Lower {
                     }
                 }
                 self.asm.mov(rsp, r10).map_err(Self::err)?;
-                {
-                    let mut frame = SymbolicSaveFrame::new(&mut self.asm);
-                    frame.restore_all(&save_gprs, &save_ymms)?;
-                }
+                self.restore_decode_native_call_frame(&save_gprs, dst_ymm, dst_zmm)?;
                 if dst_spilled {
                     if is_w512 {
                         self.spill_store_zmm(*dst, alloc, 0)?;

@@ -972,6 +972,51 @@ mod tests {
             "W512 byte load must not use the old 8-byte vmovq path; got:\n{disasm}");
     }
 
+    /// BCE-20260731-NATIVE-CALL-ZMM-CLOBBER: W512 quant decode helpers are
+    /// native calls embedded in a larger VM program. The call frame must save
+    /// the complete ZMM file, including zmm16..zmm31 and each register's high
+    /// 256 bits; saving only YMM views loses live values across the call.
+    #[test]
+    fn bce_native_q4k_w512_saves_complete_zmm_context() {
+        let mut prog = VmProgram::new();
+        let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W512);
+        let block = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let lane_offset = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let d_vreg = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+        prog.emit(VmInstr::Q4KDecodeStep {
+            dst,
+            block_base: block,
+            lane_offset,
+            d_vreg,
+            qs_offset: 16,
+            lanes: 16,
+            width: SimdWidth::W512,
+        });
+
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        let is_avx512 = matches!(
+            profile.platform,
+            super::super::isa_profile::Platform::X86_64 { has_avx512: true, .. }
+        );
+        if !is_avx512 {
+            eprintln!("skip: host not AVX-512, native-call ZMM save invariant unchecked");
+            return;
+        }
+        let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
+        let frame = super::super::stack_frame::StackFrame::compute(&alloc, &profile, 0);
+        let mut lower = X86Lower::with_avx512(true);
+        lower.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            lower.lower_instr(instr, &alloc).unwrap();
+        }
+        lower.emit_epilogue(&frame, &alloc).unwrap();
+        let code = lower.finalize().unwrap();
+        let disasm = disasm_lower(&code);
+        assert!(disasm.contains("zmm16") && disasm.contains("zmm31"),
+            "W512 native decode call must save extended ZMM registers; got:\n{disasm}");
+    }
+
     // ── BCE-20260703-AVX512-HALF-LANES 回归测试 ──
     //
     // 静态回归: 验证 7 处 AVX-512 "半 lanes" BUG 修复后, use_avx512=true 走 ZMM 16-lane
