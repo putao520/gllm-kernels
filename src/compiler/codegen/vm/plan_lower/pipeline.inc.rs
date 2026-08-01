@@ -565,24 +565,12 @@ fn emit_one_fusion_group(
     }
 
     // ── Heterogeneous / mixed-quant / standard layer loop handling ──
-    let was_in_layer_loop = state.in_layer_loop;
     if fctx.graph.hetero_layer_loop_config.is_some() {
         handle_hetero_layer_loop(fctx, prog, state, group, locals)?;
     } else if fctx.graph.mixed_quant_layer_loop_config.is_some() {
         handle_mixed_quant_layer_loop(fctx, prog, state, group, locals)?;
     } else {
         handle_standard_layer_loop(fctx, prog, state, group, locals)?;
-    }
-
-    // BCE-KV-CACHE-PTR-SPILL: re-materialize the KV base after entering each
-    // layer-body group. This covers standard, heterogeneous, and mixed-quant
-    // loops through the shared dispatch point. The original mega-kernel ABI
-    // pointer may be spilled across the loop and its slot reused by another
-    // loop-carried value; all KV copy/read instructions must see this fresh VReg.
-    // If this group closes the layer loop, reload outside the loop as well so
-    // the body-local VReg cannot escape into following global groups.
-    if state.in_layer_loop || was_in_layer_loop {
-        reload_kv_cache_ptr(fctx, prog, state);
     }
 
     // Sync current_abi from state.abi — layer loop setup mutates state.abi.weight_ptr.
@@ -606,34 +594,6 @@ fn emit_one_fusion_group(
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // §emit_fusion_groups 子fn: 按层循环类型 (异构 / 同构) + guard/body 拆分
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-/// Reload the mega-kernel KV-cache base from its ABI source.
-///
-/// A KV pointer kept live across a layer loop can be spilled, and the spill slot
-/// may be reused by another loop-carried value. Layer-body KV copies must use a
-/// pointer materialized inside the loop, just like the per-iteration weight reload.
-/// Non-mega-kernel plans leave `kv_cache_ptr` unset and do not need a reload.
-fn reload_kv_cache_ptr(
-    fctx: &FusionEmitCtx,
-    prog: &mut VmProgram,
-    state: &mut EmitState,
-) {
-    if state.abi.kv_cache_ptr.is_none() {
-        return;
-    }
-    let fresh_kv_cache = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr {
-        dst: fresh_kv_cache,
-        src: fctx
-            .ctx
-            .session
-            .sym_map
-            .resolve("kv_cache_ptr")
-            .cloned()
-            .expect("ABI: kv_cache_ptr"),
-    });
-    state.abi.kv_cache_ptr = Some(fresh_kv_cache);
-}
 
 /// 处理异构层循环 (4-type: sliding/full × small/large FFN)。
 ///
