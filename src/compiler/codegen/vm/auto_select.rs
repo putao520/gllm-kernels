@@ -1150,9 +1150,11 @@ fn dispatch_injective(
             let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
             prog.emit(VmInstr::LoopBegin {
                 counter,
-                byte_offset: byte_off,
+                offsets: vec![LoopOffset {
+                    vreg: byte_off,
+                    stride: LoopStride::FixedBytes(*step_bytes),
+                }],
                 bound: bound.clone(),
-                step_bytes: *step_bytes,
             });
             // 递归处理 Loop body — body 内的 TraceOp 走同样的 dispatch
             for body_op in body.iter() {

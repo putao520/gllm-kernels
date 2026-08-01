@@ -114,10 +114,7 @@ mod tests {
         };
 
         lower.lower_instr(&VmInstr::LoopBegin {
-            counter: VRegId(0),
-            byte_offset: VRegId(1),
-            bound: BoundExpr::Const(16),
-            step_bytes: 16,
+            counter: VRegId(0), offsets: vec![LoopOffset { vreg: VRegId(1), stride: LoopStride::FixedBytes(16) }], bound: BoundExpr::Const(16),
         }, &alloc).unwrap();
 
         lower.lower_instr(&VmInstr::LoopEnd, &alloc).unwrap();
@@ -152,10 +149,7 @@ mod tests {
         };
 
         lower.lower_instr(&VmInstr::LoopBegin {
-            counter: VRegId(0),
-            byte_offset: VRegId(1),
-            bound: BoundExpr::Const(64),
-            step_bytes: 16,
+            counter: VRegId(0), offsets: vec![LoopOffset { vreg: VRegId(1), stride: LoopStride::FixedBytes(16) }], bound: BoundExpr::Const(64),
         }, &alloc).unwrap();
 
         lower.lower_instr(&VmInstr::LoopEnd, &alloc).unwrap();

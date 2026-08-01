@@ -90,6 +90,83 @@ impl GpuLower {
         self.ir.push('\n');
     }
 
+    /// Initialize every fixed-width PTX loop offset.
+    /// Scalable strides are rejected explicitly; GPU lowering has no runtime
+    /// vector-length source from which to derive their byte distance.
+    fn emit_gpu_loop_offset_init(
+        &mut self,
+        offsets: &[(String, LoopStride)],
+    ) -> Result<(), CompilerError> {
+        for (offset, stride) in offsets {
+            match stride {
+                LoopStride::FixedBytes(_) => {
+                    if matches!(self.dialect, GpuDialect::Ptx { .. }) {
+                        self.emit_line(&format!("mov.u32 {offset}, 0;"));
+                    }
+                }
+                LoopStride::ScalableElemBytes(_) => {
+                    return Err(CompilerError::CodegenViolation(
+                        "GPU LoopBegin does not support scalable offset strides".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Render declarations for C-like GPU loop headers.
+    fn gpu_loop_offset_decls(
+        &self,
+        offsets: &[(String, LoopStride)],
+    ) -> Result<String, CompilerError> {
+        offsets
+            .iter()
+            .map(|(offset, stride)| match stride {
+                LoopStride::FixedBytes(_) => Ok(format!("{offset} = 0")),
+                LoopStride::ScalableElemBytes(_) => Err(CompilerError::CodegenViolation(
+                    "GPU loop does not support scalable offset strides".into(),
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|decls| decls.join(", "))
+    }
+
+    /// Render the comma-separated C/HIP/Metal update clause for all offsets.
+    fn gpu_loop_offset_update_expr(
+        &self,
+        offsets: &[(String, LoopStride)],
+    ) -> Result<String, CompilerError> {
+        offsets
+            .iter()
+            .map(|(offset, stride)| match stride {
+                LoopStride::FixedBytes(bytes) => Ok(format!("{offset} += {bytes}")),
+                LoopStride::ScalableElemBytes(_) => Err(CompilerError::CodegenViolation(
+                    "GPU loop does not support scalable offset strides".into(),
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|updates| updates.join(", "))
+    }
+
+    /// Emit all fixed byte-offset updates at a GPU loop back edge.
+    fn emit_gpu_loop_offset_updates(
+        &mut self,
+        offsets: &[(String, LoopStride)],
+    ) -> Result<(), CompilerError> {
+        for (offset, stride) in offsets {
+            let bytes = match stride {
+                LoopStride::FixedBytes(bytes) => bytes,
+                LoopStride::ScalableElemBytes(_) => {
+                    return Err(CompilerError::CodegenViolation(
+                        "GPU LoopEnd does not support scalable offset strides".into(),
+                    ));
+                }
+            };
+            self.emit_line(&format!("add.u32 {offset}, {offset}, {bytes};"));
+        }
+        Ok(())
+    }
+
     fn next_loop_label(&mut self) -> u32 {
         let id = self.loop_label_counter;
         self.loop_label_counter += 1;

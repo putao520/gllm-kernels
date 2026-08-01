@@ -362,21 +362,18 @@ impl<'a> RegAllocator<'a> {
 
         // Pass 2: LoopBegin 的 counter/byte_offset 活跃到对应 LoopEnd
         // 这确保循环变量不会被分配到和 body 内 VReg 相同的物理寄存器
-        let mut loop_stack: Vec<(VRegId, VRegId)> = Vec::new(); // (counter, byte_offset)
+        let mut loop_stack: Vec<(VRegId, Vec<VRegId>)> = Vec::new(); // (counter, offsets)
         for (i, instr) in program.instrs.iter().enumerate() {
-            if let VmInstr::LoopBegin {
-                counter,
-                byte_offset,
-                ..
-            } = instr
-            {
-                loop_stack.push((*counter, *byte_offset));
+            if let VmInstr::LoopBegin { counter, offsets, .. } = instr {
+                loop_stack.push((*counter, offsets.iter().map(|offset| offset.vreg).collect()));
             }
             if matches!(instr, VmInstr::LoopEnd) {
-                if let Some((counter, byte_offset)) = loop_stack.pop() {
-                    // 延展 counter/byte_offset 的 last_use 到 LoopEnd
+                if let Some((counter, offsets)) = loop_stack.pop() {
+                    // Extend every loop-carried counter/offset through LoopEnd.
                     map.entry(counter).and_modify(|e| e.3 = e.3.max(i));
-                    map.entry(byte_offset).and_modify(|e| e.3 = e.3.max(i));
+                    for offset in offsets {
+                        map.entry(offset).and_modify(|e| e.3 = e.3.max(i));
+                    }
                 }
             }
         }
@@ -928,11 +925,11 @@ impl<'a> RegAllocator<'a> {
         match instr {
             VmInstr::LoopBegin {
                 counter,
-                byte_offset,
+                offsets,
                 bound,
-                ..
             } => {
-                let mut v = vec![*counter, *byte_offset];
+                let mut v = vec![*counter];
+                v.extend(offsets.iter().map(|offset| offset.vreg));
                 v.extend(Self::bound_vregs(bound));
                 v
             }
@@ -2527,11 +2524,9 @@ fn validate_spill_is_pure_write_arithb(instr: &VmInstr, vreg: VRegId) -> bool {
 fn validate_spill_is_pure_write_controla(instr: &VmInstr, vreg: VRegId) -> bool {
     // Control cluster a (1 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
     match instr {
-        VmInstr::LoopBegin {
-            counter,
-            byte_offset,
-            ..
-        } => *counter == vreg || *byte_offset == vreg,
+        VmInstr::LoopBegin { counter, offsets, .. } => {
+            *counter == vreg || offsets.iter().any(|offset| offset.vreg == vreg)
+        },
         _ => false,
     }
 }
@@ -3549,9 +3544,8 @@ mod tests {
         let vec1 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::LoopBegin {
             counter,
-            byte_offset: byte_off,
+            offsets: vec![LoopOffset { vreg: byte_off, stride: LoopStride::FixedBytes(4) }],
             bound: BoundExpr::Const(10),
-            step_bytes: 4,
         });
         prog.emit(VmInstr::VecLoad {
             dst: vec1,
@@ -3733,9 +3727,11 @@ mod tests {
     fn test_referenced_vregs_loop_begin() {
         let instr = VmInstr::LoopBegin {
             counter: VRegId(0),
-            byte_offset: VRegId(1),
+            offsets: vec![LoopOffset {
+                vreg: VRegId(1),
+                stride: LoopStride::FixedBytes(4),
+            }],
             bound: BoundExpr::DynamicVReg(VRegId(2)),
-            step_bytes: 4,
         };
         let vregs = RegAllocator::referenced_vregs(&instr);
         assert!(vregs.contains(&VRegId(0)));

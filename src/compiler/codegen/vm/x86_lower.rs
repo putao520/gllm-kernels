@@ -100,7 +100,13 @@ pub struct X86Lower {
     /// flushed after `ret` so they live at function end, unreachable by control
     /// flow. The label (forward reference) is bound in `finalize`.
     data_tables: Vec<(Vec<u8>, CodeLabel)>,
-    loop_stack: Vec<(CodeLabel, CodeLabel, AsmRegister64, Option<i32>, AsmRegister64, usize, Option<i32>)>,
+    loop_stack: Vec<(
+        CodeLabel,
+        CodeLabel,
+        AsmRegister64,
+        Option<i32>,
+        Vec<(AsmRegister64, usize, Option<i32>)>,
+    )>,
     scope_saves: Vec<Vec<AsmRegister64>>,
     skip_stack: Vec<(usize, CodeLabel)>,
     stack_layout: StackLayout,

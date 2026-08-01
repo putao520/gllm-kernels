@@ -2502,7 +2502,7 @@ mod tests {
 
         // Outer seq loop must have step_bytes = token_step_bytes
         let has_correct_step = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::LoopBegin { step_bytes, .. } if *step_bytes == expected_step)
+            matches!(i, VmInstr::LoopBegin { offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(expected_step))
         });
         assert!(has_correct_step,
             "RoPE seq loop step must be token_step_bytes = {expected_step}");

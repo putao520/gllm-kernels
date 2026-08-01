@@ -609,7 +609,9 @@ fn is_pure_write_to_arithb(instr: &VmInstr, vreg: VRegId) -> bool {
 fn is_pure_write_to_controla(instr: &VmInstr, vreg: VRegId) -> bool {
     // Control cluster a (1 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
     match instr {
-        VmInstr::LoopBegin { counter, byte_offset, .. } => *counter == vreg || *byte_offset == vreg,
+        VmInstr::LoopBegin { counter, offsets, .. } => {
+            *counter == vreg || offsets.iter().any(|offset| offset.vreg == vreg)
+        },
         _ => false,
     }
 }
@@ -1807,11 +1809,11 @@ fn verify_loop_offset_scope(prog: &VmProgram) -> Result<(), CompilerError> {
         match instr {
             VmInstr::LoopBegin {
                 counter,
-                byte_offset,
+                offsets,
                 ..
             } => {
                 active_loop_vregs.insert(*counter);
-                active_loop_vregs.insert(*byte_offset);
+                active_loop_vregs.extend(offsets.iter().map(|offset| offset.vreg));
             }
             VmInstr::LoopEnd => {
                 // 无法确定哪个 loop 结束（嵌套时），保守不清除
@@ -1975,9 +1977,11 @@ mod tests {
         let byte_offset = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         prog.emit(VmInstr::LoopBegin {
             counter,
-            byte_offset,
+            offsets: vec![LoopOffset {
+                vreg: byte_offset,
+                stride: LoopStride::FixedBytes(32),
+            }],
             bound: BoundExpr::Const(4),
-            step_bytes: 32,
         });
         // 没有 LoopEnd
         assert!(verify_loop_pairing(&prog).is_err());
@@ -2379,9 +2383,11 @@ mod tests {
 
         prog.emit(VmInstr::LoopBegin {
             counter,
-            byte_offset,
+            offsets: vec![LoopOffset {
+                vreg: byte_offset,
+                stride: LoopStride::FixedBytes(32),
+            }],
             bound: BoundExpr::Const(4),
-            step_bytes: 32,
         });
         // DeclareVReg inside loop so def_pos falls within loop body
         prog.emit(VmInstr::DeclareVReg { id: inner_val, kind: VRegKind::Vec, width: SimdWidth::W256 });
@@ -2912,7 +2918,7 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-        prog.emit(VmInstr::LoopBegin { counter, byte_offset: byte_off, bound: BoundExpr::Const(4), step_bytes: 32 });
+        prog.emit(VmInstr::LoopBegin { counter, offsets: vec![LoopOffset { vreg: byte_off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(4)});
         prog.emit(VmInstr::QuantBlockLoad {
             dst, base,
             offset: OffsetExpr::LoopOffset(byte_off),
@@ -3143,7 +3149,7 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-        prog.emit(VmInstr::LoopBegin { counter, byte_offset: byte_off, bound: BoundExpr::Const(4), step_bytes: 32 });
+        prog.emit(VmInstr::LoopBegin { counter, offsets: vec![LoopOffset { vreg: byte_off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(4)});
         prog.emit(VmInstr::QuantBlockLoad {
             dst, base,
             offset: OffsetExpr::LoopOffset(byte_off), // non-Const
@@ -3261,7 +3267,14 @@ mod tests {
         let wrong_loop_vreg = VRegId(88); // not a LoopBegin counter/byte_offset
         let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let byte_offset = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-        prog.emit(VmInstr::LoopBegin { counter, byte_offset, bound: BoundExpr::Const(4), step_bytes: 32 });
+        prog.emit(VmInstr::LoopBegin {
+            counter,
+            offsets: vec![LoopOffset {
+                vreg: byte_offset,
+                stride: LoopStride::FixedBytes(32),
+            }],
+            bound: BoundExpr::Const(4),
+        });
         prog.emit(VmInstr::VecLoad {
             dst, base,
             offset: OffsetExpr::LoopOffset(wrong_loop_vreg),
@@ -4056,9 +4069,11 @@ mod tests {
         let byte_offset = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         prog.emit(VmInstr::LoopBegin {
             counter,
-            byte_offset,
+            offsets: vec![LoopOffset {
+                vreg: byte_offset,
+                stride: LoopStride::FixedBytes(32),
+            }],
             bound: BoundExpr::Const(8),
-            step_bytes: 32,
         });
 
         // Act
@@ -4138,9 +4153,11 @@ mod tests {
 
         prog.emit(VmInstr::LoopBegin {
             counter,
-            byte_offset,
+            offsets: vec![LoopOffset {
+                vreg: byte_offset,
+                stride: LoopStride::FixedBytes(32),
+            }],
             bound: BoundExpr::Const(4),
-            step_bytes: 32,
         });
         prog.emit(VmInstr::DeclareVReg { id: inner_val, kind: VRegKind::Vec, width: SimdWidth::W256 });
         prog.emit(VmInstr::VecLoad {

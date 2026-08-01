@@ -2140,14 +2140,14 @@ mod tests {
         // Find the maximum step_bytes among inner vec loops (BoundExpr::Const(vec_count)) in each program.
         let max_step_256: usize = prog_256.instrs.iter()
             .filter_map(|i| match i {
-                VmInstr::LoopBegin { step_bytes, bound: BoundExpr::Const(n), .. } if *n > 1 => Some(*step_bytes),
+                VmInstr::LoopBegin { offsets, bound: BoundExpr::Const(n), .. } if *n > 1 => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
                 _ => None,
             })
             .max()
             .unwrap_or(0);
         let max_step_512: usize = prog_512.instrs.iter()
             .filter_map(|i| match i {
-                VmInstr::LoopBegin { step_bytes, bound: BoundExpr::Const(n), .. } if *n > 1 => Some(*step_bytes),
+                VmInstr::LoopBegin { offsets, bound: BoundExpr::Const(n), .. } if *n > 1 => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
                 _ => None,
             })
             .max()
@@ -2596,7 +2596,7 @@ mod tests {
         // Assert: count LoopBegin with row_bytes step (16 * 4 = 64 bytes)
         let row_bytes = 16usize * 4;
         let outer_loop_count = prog.instrs.iter().filter(|i| match i {
-            VmInstr::LoopBegin { step_bytes, bound: BoundExpr::Const(1), .. } if *step_bytes == row_bytes => true,
+            VmInstr::LoopBegin { offsets, bound: BoundExpr::Const(1), .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(row_bytes) => true,
             _ => false,
         }).count();
         assert!(outer_loop_count <= 1, "Should have at most 1 outer row loop with row_bytes step, found {outer_loop_count}");

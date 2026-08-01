@@ -1494,8 +1494,12 @@ mod tests {
         let scope_begin = VmInstr::ScopeBegin { scope_id: 1 };
         let scope_end = VmInstr::ScopeEnd { scope_id: 1 };
         let loop_begin = VmInstr::LoopBegin {
-            counter: VRegId(0), byte_offset: VRegId(1),
-            bound: BoundExpr::Const(10), step_bytes: 32,
+            counter: VRegId(0),
+            offsets: vec![LoopOffset {
+                vreg: VRegId(1),
+                stride: LoopStride::FixedBytes(32),
+            }],
+            bound: BoundExpr::Const(10),
         };
         let vec_load = VmInstr::VecLoad {
             dst: VRegId(2), base: VRegId(0),

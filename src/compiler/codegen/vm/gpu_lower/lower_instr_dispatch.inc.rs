@@ -74,7 +74,7 @@ impl GpuLower {
     /// ISA 不支持的变体 (类别错配) 返回 Err (NO_SILENT_FALLBACK, 非 catch-all NOP)。
     fn lower_control_gpu(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::LoopBegin { counter, byte_offset, bound, step_bytes } => self.lower_loop_begin_gpu(instr, alloc),
+            VmInstr::LoopBegin { .. } => self.lower_loop_begin_gpu(instr, alloc),
             VmInstr::LoopEnd => self.lower_loop_end_gpu(instr, alloc),
             VmInstr::ConditionalSkip { mask, skip_count } => self.lower_conditional_skip_gpu(instr, alloc),
             VmInstr::GprCondAction { cond, action } => self.lower_gpr_cond_action_gpu(instr, alloc),
@@ -2231,15 +2231,25 @@ Ok(())
     }
 
     // ── Control ──
+    // @trace REQ-VR-001 [req:VmInstr-LoopBegin-MultiOffset]
     fn lower_loop_begin_gpu(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::LoopBegin { counter, byte_offset, bound, step_bytes } => {
-
+            VmInstr::LoopBegin { counter, offsets, bound } => {
+                if offsets.is_empty() {
+                    return Err(CompilerError::CodegenViolation(
+                        "LoopBegin requires at least one offset".into(),
+                    ));
+                }
                 let c = self.reg_name_with_kind(*counter, alloc);
-                let off = self.reg_name_with_kind(*byte_offset, alloc);
+                let offset_regs: Vec<(String, LoopStride)> = offsets
+                    .iter()
+                    .map(|offset| (self.reg_name_with_kind(offset.vreg, alloc), offset.stride))
+                    .collect();
                 let label_id = self.next_loop_label();
-                // ARCH-GPU-LOOP-TRACKING: 保存完整状态到栈，LoopEnd 从栈读
-                self.loop_stack.push((label_id, c.clone(), off.clone(), *step_bytes));
+                // ARCH-GPU-LOOP-TRACKING: 保存完整状态到栈，LoopEnd 从栈读。
+                self.loop_stack.push((label_id, c.clone(), offset_regs.clone()));
+                let offset_updates = self.gpu_loop_offset_update_expr(&offset_regs)?;
+                self.emit_gpu_loop_offset_init(&offset_regs)?;
                 let ps0 = self.scratch_pred_names[0];
                 let rs_bound = self.scratch_gpr_names[2]; // %rs_bound
 
@@ -2247,13 +2257,13 @@ Ok(())
                     BoundExpr::Const(n) => match self.dialect {
                         GpuDialect::Ptx { .. } => {
                             self.emit_line(&format!("mov.u32 {c}, 0;"));
-                            self.emit_line(&format!("mov.u32 {off}, 0;"));
                             self.emit_line(&format!("LOOP_{label_id}:"));
                             self.emit_line(&format!("setp.ge.u32 {ps0}, {c}, {n};"));
                             self.emit_line(&format!("@{ps0} bra LOOP_END_{label_id};"));
                         }
                         _ => {
-                            self.emit_line(&format!("for (int {c} = 0, {off} = 0; {c} < {n}; {c}++, {off} += {step_bytes}) {{"));
+                            let offset_decls = self.gpu_loop_offset_decls(&offset_regs)?;
+                            self.emit_line(&format!("for (int {c} = 0, {offset_decls}; {c} < {n}; {c}++, {offset_updates}) {{"));
                             self.indent += 1;
                         }
                     },
@@ -2263,13 +2273,13 @@ Ok(())
                             GpuDialect::Ptx { .. } => {
                                 self.emit_line(&format!("ld.param.u32 {rs_bound}, [{param}];"));
                                 self.emit_line(&format!("mov.u32 {c}, 0;"));
-                                self.emit_line(&format!("mov.u32 {off}, 0;"));
                                 self.emit_line(&format!("LOOP_{label_id}:"));
                                 self.emit_line(&format!("setp.ge.u32 {ps0}, {c}, {rs_bound};"));
                                 self.emit_line(&format!("@{ps0} bra LOOP_END_{label_id};"));
                             }
                             _ => {
-                                self.emit_line(&format!("for (int {c} = 0, {off} = 0; {c} < {param}; {c}++, {off} += {step_bytes}) {{"));
+                                let offset_decls = self.gpu_loop_offset_decls(&offset_regs)?;
+                                self.emit_line(&format!("for (int {c} = 0, {offset_decls}; {c} < {param}; {c}++, {offset_updates}) {{"));
                                 self.indent += 1;
                             }
                         }
@@ -2293,13 +2303,13 @@ Ok(())
                             GpuDialect::Ptx { .. } => {
                                 self.emit_line(&format!("ld.param.u32 {rs_bound}, [{param}];"));
                                 self.emit_line(&format!("mov.u32 {c}, 0;"));
-                                self.emit_line(&format!("mov.u32 {off}, 0;"));
                                 self.emit_line(&format!("LOOP_{label_id}:"));
                                 self.emit_line(&format!("setp.ge.u32 {ps0}, {c}, {rs_bound};"));
                                 self.emit_line(&format!("@{ps0} bra LOOP_END_{label_id};"));
                             }
                             _ => {
-                                self.emit_line(&format!("for (int {c} = 0, {off} = 0; {c} < {param}; {c}++, {off} += {step_bytes}) {{"));
+                                let offset_decls = self.gpu_loop_offset_decls(&offset_regs)?;
+                                self.emit_line(&format!("for (int {c} = 0, {offset_decls}; {c} < {param}; {c}++, {offset_updates}) {{"));
                                 self.indent += 1;
                             }
                         }
@@ -2310,13 +2320,13 @@ Ok(())
                         match self.dialect {
                             GpuDialect::Ptx { .. } => {
                                 self.emit_line(&format!("mov.u32 {c}, 0;"));
-                                self.emit_line(&format!("mov.u32 {off}, 0;"));
                                 self.emit_line(&format!("LOOP_{label_id}:"));
                                 self.emit_line(&format!("setp.ge.u32 {ps0}, {c}, {bound_reg};"));
                                 self.emit_line(&format!("@{ps0} bra LOOP_END_{label_id};"));
                             }
                             _ => {
-                                self.emit_line(&format!("for (int {c} = 0, {off} = 0; {c} < {bound_reg}; {c}++, {off} += {step_bytes}) {{"));
+                                let offset_decls = self.gpu_loop_offset_decls(&offset_regs)?;
+                                self.emit_line(&format!("for (int {c} = 0, {offset_decls}; {c} < {bound_reg}; {c}++, {offset_updates}) {{"));
                                 self.indent += 1;
                             }
                         }
@@ -2329,13 +2339,13 @@ Ok(())
                                 // 临时用 rs_bound = bound_reg + 1
                                 self.emit_line(&format!("add.u32 {rs_bound}, {bound_reg}, 1;"));
                                 self.emit_line(&format!("mov.u32 {c}, 0;"));
-                                self.emit_line(&format!("mov.u32 {off}, 0;"));
                                 self.emit_line(&format!("LOOP_{label_id}:"));
                                 self.emit_line(&format!("setp.ge.u32 {ps0}, {c}, {rs_bound};"));
                                 self.emit_line(&format!("@{ps0} bra LOOP_END_{label_id};"));
                             }
                             _ => {
-                                self.emit_line(&format!("for (int {c} = 0, {off} = 0; {c} <= {bound_reg}; {c}++, {off} += {step_bytes}) {{"));
+                                let offset_decls = self.gpu_loop_offset_decls(&offset_regs)?;
+                                self.emit_line(&format!("for (int {c} = 0, {offset_decls}; {c} <= {bound_reg}; {c}++, {offset_updates}) {{"));
                                 self.indent += 1;
                             }
                         }
@@ -2360,14 +2370,14 @@ Ok(())
         match instr {
             VmInstr::LoopEnd => {
 
-                // ARCH-GPU-LOOP-TRACKING: 从栈读取真实 counter/offset 名字，禁止硬编码 %r0
-                let (label_id, c, off, step_bytes) = self.loop_stack.pop().ok_or_else(|| {
+                // ARCH-GPU-LOOP-TRACKING: 从栈读取真实 counter/offset 名字，禁止硬编码 %r0。
+                let (label_id, c, offsets) = self.loop_stack.pop().ok_or_else(|| {
                     CompilerError::CodegenViolation("LoopEnd without matching LoopBegin".into())
                 })?;
                 match self.dialect {
                     GpuDialect::Ptx { .. } => {
                         self.emit_line(&format!("add.u32 {c}, {c}, 1;"));
-                        self.emit_line(&format!("add.u32 {off}, {off}, {step_bytes};"));
+                        self.emit_gpu_loop_offset_updates(&offsets)?;
                         self.emit_line(&format!("bra LOOP_{label_id};"));
                         self.emit_line(&format!("LOOP_END_{label_id}:"));
                     }

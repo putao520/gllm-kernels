@@ -638,9 +638,11 @@ fn handle_hetero_layer_loop(
         let seg_byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         prog.emit(VmInstr::LoopBegin {
             counter: seg_counter,
-            byte_offset: seg_byte_off,
+            offsets: vec![LoopOffset {
+                vreg: seg_byte_off,
+                stride: LoopStride::FixedBytes(hcfg.small_segment_stride),
+            }],
             bound: BoundExpr::Const(num_small_segs),
-            step_bytes: hcfg.small_segment_stride,
         });
         let seg_wb = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         prog.emit(VmInstr::GprBinOp { dst: seg_wb, a: weight_ptr, b: GprOperand::VReg(seg_byte_off), op: GprOp::Add });
@@ -651,9 +653,12 @@ fn handle_hetero_layer_loop(
         let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let byte_offset = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         prog.emit(VmInstr::LoopBegin {
-            counter, byte_offset,
+            counter,
+            offsets: vec![LoopOffset {
+                vreg: byte_offset,
+                stride: LoopStride::FixedBytes(hcfg.sliding_small_stride),
+            }],
             bound: BoundExpr::Const(hcfg.sliding_per_segment),
-            step_bytes: hcfg.sliding_small_stride,
         });
         // Type 0: no correction needed (template base = lbb_off, rel correction = 0)
         let layer_weight_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -722,9 +727,11 @@ fn handle_hetero_layer_loop(
         let seg_byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         prog.emit(VmInstr::LoopBegin {
             counter: seg_counter,
-            byte_offset: seg_byte_off,
+            offsets: vec![LoopOffset {
+                vreg: seg_byte_off,
+                stride: LoopStride::FixedBytes(hcfg.large_segment_stride),
+            }],
             bound: BoundExpr::Const(num_large_segs),
-            step_bytes: hcfg.large_segment_stride,
         });
         // Large segments start after all small segments
         let large_base_start = num_small_segs * hcfg.small_segment_stride;
@@ -742,9 +749,12 @@ fn handle_hetero_layer_loop(
         let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let byte_offset = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         prog.emit(VmInstr::LoopBegin {
-            counter, byte_offset,
+            counter,
+            offsets: vec![LoopOffset {
+                vreg: byte_offset,
+                stride: LoopStride::FixedBytes(hcfg.sliding_large_stride),
+            }],
             bound: BoundExpr::Const(hcfg.sliding_per_segment),
-            step_bytes: hcfg.sliding_large_stride,
         });
         let layer_weight_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         prog.emit(VmInstr::GprBinOp { dst: layer_weight_base, a: seg_wb, b: GprOperand::VReg(byte_offset ), op: GprOp::Add });
@@ -897,9 +907,12 @@ fn handle_standard_layer_loop(
             }
 
             prog.emit(VmInstr::LoopBegin {
-                counter, byte_offset,
+                counter,
+                offsets: vec![LoopOffset {
+                    vreg: byte_offset,
+                    stride: LoopStride::FixedBytes(cfg.weight_stride),
+                }],
                 bound: layer_bound,
-                step_bytes: cfg.weight_stride,
             });
 
             // Reload weight_ptr from ABI stack slot on every iteration.
@@ -1077,9 +1090,12 @@ fn handle_mixed_quant_layer_loop(
         // step_bytes=0: no linear weight stride (per-layer dtype varies → non-linear).
         // weight offset is computed via LoadLayerWeightOffset(offset_table, layer_idx).
         prog.emit(VmInstr::LoopBegin {
-            counter, byte_offset,
+            counter,
+            offsets: vec![LoopOffset {
+                vreg: byte_offset,
+                stride: LoopStride::FixedBytes(0),
+            }],
             bound: layer_bound,
-            step_bytes: 0,
         });
 
         // Reload weight_ptr from ABI stack slot on every iteration (regalloc safety,

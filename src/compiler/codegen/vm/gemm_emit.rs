@@ -1302,6 +1302,7 @@ pub(crate) fn b_offset_expr_indexed(
 /// When trans_b=true, B is [N,K] row-major. B[j][p] and B[j][p+1] are contiguous
 /// (same row), but B[j][p] and B[j+1][p] are NOT contiguous (stride=K*elem).
 /// Standard J-dimension vectorization fails — we vectorize along K instead.
+// @trace GEMM-TRANS-B-MIXED-DTYPE [req:REQ-DTYPE-006] [level:unit]
 pub(crate) fn emit_gemm_trans_b_inline(
     prog: &mut VmProgram,
     m_dim: &SymDim, n: usize, k: usize,
@@ -1333,22 +1334,21 @@ pub(crate) fn emit_gemm_trans_b_inline(
     let a_row_stride = k * a_elem;
     let c_row_stride = n * c_elem;
     let b_row_stride = k * b_elem;
-    // trans_b: B[j][p] row-major, 行 stride = k * b_elem。j 循环按 c_elem 步进（输出列），
-    // 但 B 的行起始 = j * b_row_stride。j_off (c_elem 步进) → j = j_off / c_elem。
-    // 当 c_elem != b_elem 时 j * b_row_stride 无法从 j_off 直接算 — 但 j 循环迭代次数
-    // 是 n（输出列数），每次步进 c_elem 字节。B 行 j 起始 = j * k * b_elem。
-    // 用 j 索引 = j_off / c_elem：但 emit_loop 不暴露索引。改用 c_elem 步进保证
-    // j_off = j * c_elem，则 j = j_off/c_elem，j*k*b_elem = j_off * k * b_elem / c_elem。
-    // 暂按 c_elem 步进但 B offset 用 j_off * (b_row_stride / c_elem) — 需 c_elem 整除。
-    // SmolLM2: c=F32(4) b=BF16(2), b_row_stride=k*2=1152, c_elem=4 → 1152/4=288 (整除).
-    let j_b_stride_ratio = if c_elem > 0 { b_row_stride / c_elem } else { 0 };
-    let k_step = lanes * b_elem;
-    // BCE-20260706-MIXED-GEMM-STRIDE: 混合精度 trans_b GEMM (a_elem≠b_elem) 时,
-    // A 和 B 的 K维 byte offset 步长不同. p_off 以 k_step=lanes*b_elem 步进 (对 B 正确),
-    // 但 A (a_elem) 需 p_off * (a_elem/b_elem). a_b_ratio = a_elem/b_elem, 需 b_elem|a_elem.
-    // SmolLM2: a=F32(4) b=BF16(2) → ratio=2. A offset = p_off*2 (补回 F32 比 BF16 宽 2x).
-    // 不整除时回退 ratio=1 (同 dtype 路径, 行为不变).
-    let a_b_ratio = if b_elem > 0 && a_elem >= b_elem && a_elem % b_elem == 0 { a_elem / b_elem } else { 1 };
+    // trans_b uses independent byte offsets for each operand. The K-loop advances
+    // A and B by their own storage element widths, while the j-loop advances C
+    // and each transposed-B row independently.
+    let a_k_step = lanes.checked_mul(a_elem).ok_or_else(|| {
+        CompilerError::CodegenViolation(format!(
+            "trans_b A K-loop stride overflow: lanes={lanes}, elem_bytes={a_elem}"
+        ))
+    })?;
+    let b_k_step = lanes.checked_mul(b_elem).ok_or_else(|| {
+        CompilerError::CodegenViolation(format!(
+            "trans_b B K-loop stride overflow: lanes={lanes}, elem_bytes={b_elem}"
+        ))
+    })?;
+    let c_step = c_elem;
+    let b_row_step = b_row_stride;
 
     let acc_vec = prog.alloc_vreg(VRegKind::Vec, width);
     let a_vec = prog.alloc_vreg(VRegKind::Vec, width);
@@ -1358,50 +1358,47 @@ pub(crate) fn emit_gemm_trans_b_inline(
     let s_tail = prog.alloc_vreg(VRegKind::Vec, s_width);
 
 
-    // j loop uses emit_loop to avoid compile-time unrolling (n can be 576/1536).
-    let emit_j_loop = |prog: &mut VmProgram, m_off: OffsetExpr| {
-        prog.emit_loop(BoundExpr::Const(n), c_elem, |prog, _j_ctr, j_off| {
-            // j_off accumulates j_iter * c_elem bytes. B[j] row offset = j * b_row_stride
-            // = j * k * b_elem. j = j_off / c_elem, so j * b_row_stride = j_off * j_b_stride_ratio.
-            // (j_b_stride_ratio = b_row_stride / c_elem, computed outer; requires c_elem | b_row_stride.)
+    // j loop uses independent offsets to avoid compile-time unrolling (n can be 576/1536).
+    let emit_j_loop = |prog: &mut VmProgram, m_off: OffsetExpr| -> Result<(), CompilerError> {
+        prog.emit_loop_multi_try(BoundExpr::Const(n), &[c_step, b_row_step], |prog, _j_ctr, offsets| {
+            let c_off = offsets[0];
+            let b_row_off = offsets[1];
 
             prog.emit(VmInstr::Broadcast {
                 dst: acc_vec, src: ScalarExpr::Const(0.0), width, dtype: acc_dtype,
             });
 
             if k_vecs > 0 {
-                prog.emit_loop(BoundExpr::Const(k_vecs), k_step, |prog, _p_ctr, p_off| {
-                    // Load A[i][p*lanes .. (p+1)*lanes] — A 按 a_dtype (F32) 存储
-                    // BCE-20260706-MIXED-GEMM-STRIDE: A 的 K维 byte offset = p*lanes*a_elem,
-                    // 但 p_off 以 k_step=lanes*b_elem 步进. a_elem≠b_elem 时需 p_off * a_b_ratio.
-                    let a_p_off = OffsetExpr::Mul(
-                        Box::new(OffsetExpr::LoopOffset(p_off)),
-                        a_b_ratio,
-                    );
-                    prog.emit(VmInstr::VecLoad {
-                        dst: a_vec, base: a_ptr,
-                        offset: OffsetExpr::Add(
-                            Box::new(OffsetExpr::Mul(
-                                Box::new(m_off.clone()), a_row_stride,
-                            )),
-                            Box::new(a_p_off),
-                        ),
-                        width, dtype: a_dtype, predicate: None,
-                    });
-                    // Load B[j][p*lanes .. (p+1)*lanes] — B 按 b_dtype (BF16) 存储
-                    // B row offset = j * b_row_stride = j_off * j_b_stride_ratio
-                    // p_off 是 k_step (=lanes*b_elem) 步进 → p_off 字节 = p*lanes*b_elem ✓
-                    prog.emit(VmInstr::VecLoad {
-                        dst: b_vec, base: b_ptr,
-                        offset: OffsetExpr::Add(
-                            Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(j_off)), j_b_stride_ratio)),
-                            Box::new(OffsetExpr::LoopOffset(p_off)),
-                        ),
-                        width, dtype: b_dtype, predicate: None,
-                    });
-                    // Direct FMA: dst = acc + a * b (in-place accumulate). a/b 已 widen 到 F32.
-                    prog.emit(VmInstr::Fma { dst: acc_vec, acc: acc_vec, a: a_vec, b: b_vec, dtype: acc_dtype });
-                });
+                prog.emit_loop_multi_try(
+                    BoundExpr::Const(k_vecs),
+                    &[a_k_step, b_k_step],
+                    |prog, _p_ctr, offsets| {
+                        let a_off = offsets[0];
+                        let b_off = offsets[1];
+                        // Each operand uses its own storage stride in the K dimension.
+                        prog.emit(VmInstr::VecLoad {
+                            dst: a_vec, base: a_ptr,
+                            offset: OffsetExpr::Add(
+                                Box::new(OffsetExpr::Mul(
+                                    Box::new(m_off.clone()), a_row_stride,
+                                )),
+                                Box::new(OffsetExpr::LoopOffset(a_off)),
+                            ),
+                            width, dtype: a_dtype, predicate: None,
+                        });
+                        prog.emit(VmInstr::VecLoad {
+                            dst: b_vec, base: b_ptr,
+                            offset: OffsetExpr::Add(
+                                Box::new(OffsetExpr::LoopOffset(b_row_off)),
+                                Box::new(OffsetExpr::LoopOffset(b_off)),
+                            ),
+                            width, dtype: b_dtype, predicate: None,
+                        });
+                        // Direct FMA: dst = acc + a * b (in-place accumulate). a/b 已 widen 到 F32.
+                        prog.emit(VmInstr::Fma { dst: acc_vec, acc: acc_vec, a: a_vec, b: b_vec, dtype: acc_dtype });
+                        Ok::<(), CompilerError>(())
+                    },
+                )?;
             }
 
             if k_tail > 0 {
@@ -1425,7 +1422,7 @@ pub(crate) fn emit_gemm_trans_b_inline(
                     prog.emit(VmInstr::Broadcast {
                         dst: s_b,
                         src: ScalarExpr::MemLoad(b_ptr, OffsetExpr::Add(
-                            Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(j_off)), j_b_stride_ratio)),
+                            Box::new(OffsetExpr::LoopOffset(b_row_off)),
                             Box::new(OffsetExpr::Const(p_byte)),
                         )),
                         width: s_width, dtype: b_dtype,
@@ -1470,11 +1467,13 @@ pub(crate) fn emit_gemm_trans_b_inline(
                 base: c_ptr,
                 offset: OffsetExpr::Add(
                     Box::new(OffsetExpr::Mul(Box::new(m_off.clone()), c_row_stride)),
-                    Box::new(OffsetExpr::LoopOffset(j_off)),
+                    Box::new(OffsetExpr::LoopOffset(c_off)),
                 ),
                 src: store_src, width: s_width, dtype: c_dtype, predicate: None,
             });
-        });
+            Ok::<(), CompilerError>(())
+        })?;
+        Ok(())
     };
 
     // @trace BCE-20260629-001: seq_bound_override 无条件优先 (override 优先),
@@ -1490,9 +1489,9 @@ pub(crate) fn emit_gemm_trans_b_inline(
             BoundExpr::Const(m)
         }
     });
-    prog.emit_loop(m_bound, 1, |prog, _m_ctr, m_off| {
-        emit_j_loop(prog, OffsetExpr::LoopOffset(m_off));
-    });
+    prog.emit_loop_try(m_bound, 1, |prog, _m_ctr, m_off| {
+        emit_j_loop(prog, OffsetExpr::LoopOffset(m_off))
+    })?;
 
     Ok(())
 }
@@ -2839,9 +2838,9 @@ mod template_tests {
         assert!(result.is_ok(), "{:?}", result.err());
         for (i, instr) in prog.instrs.iter().enumerate() {
             match instr {
-                VmInstr::LoopBegin { counter, byte_offset, bound, step_bytes } => {
-                    eprintln!("[{}] LoopBegin counter=v{} byte_offset=v{} bound={:?} step={}",
-                        i, counter.0, byte_offset.0, bound, step_bytes);
+                VmInstr::LoopBegin { counter, offsets, bound } => {
+                    eprintln!("[{}] LoopBegin counter=v{} offsets={:?} bound={:?}",
+                        i, counter.0, offsets.iter().map(|offset| offset.vreg.0).collect::<Vec<_>>(), bound);
                 }
                 VmInstr::LoopEnd => { eprintln!("[{}] LoopEnd", i); }
                 VmInstr::VecStore { base, offset, src, width, dtype, .. } => {

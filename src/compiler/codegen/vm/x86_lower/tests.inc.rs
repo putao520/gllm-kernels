@@ -1525,9 +1525,12 @@ mod tests {
         let offset_table = vec![0usize, 11370496, 22740992, 34111488];
 
         prog.emit(VmInstr::LoopBegin {
-            counter, byte_offset,
+            counter,
+            offsets: vec![LoopOffset {
+                vreg: byte_offset,
+                stride: LoopStride::FixedBytes(0),
+            }],
             bound: BoundExpr::Const(4),
-            step_bytes: 0,
         });
         prog.emit(VmInstr::LoadLayerWeightOffset {
             dst, offset_table: offset_table.clone(), layer_idx_reg: counter,

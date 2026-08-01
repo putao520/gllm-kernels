@@ -32,8 +32,12 @@ impl StructuralOpBuilder {
         let ctr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         prog.emit(VmInstr::LoopBegin {
-            counter: ctr, byte_offset: byte_off,
-            bound: BoundExpr::Const(iterations), step_bytes: byte_step,
+            counter: ctr,
+            offsets: vec![LoopOffset {
+                vreg: byte_off,
+                stride: LoopStride::FixedBytes(byte_step),
+            }],
+            bound: BoundExpr::Const(iterations),
         });
         let vec = prog.alloc_vreg(VRegKind::Vec, width);
         prog.emit(VmInstr::VecLoad {
@@ -73,8 +77,12 @@ impl StructuralOpBuilder {
         let ctr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         prog.emit(VmInstr::LoopBegin {
-            counter: ctr, byte_offset: byte_off,
-            bound: BoundExpr::Const(iterations), step_bytes: byte_step,
+            counter: ctr,
+            offsets: vec![LoopOffset {
+                vreg: byte_off,
+                stride: LoopStride::FixedBytes(byte_step),
+            }],
+            bound: BoundExpr::Const(iterations),
         });
         // Load knowledge_vector
         let kv_vec = prog.alloc_vreg(VRegKind::Vec, width);
@@ -610,7 +618,7 @@ mod tests {
         ).unwrap();
 
         let step_bytes = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { step_bytes, .. } => Some(*step_bytes),
+            VmInstr::LoopBegin { offsets, .. } => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
             _ => None,
         }).expect("should have LoopBegin");
         assert_eq!(step_bytes, 64, "W512 step_bytes should be 64 (16 lanes * 4 bytes)");
@@ -828,7 +836,7 @@ mod tests {
         ).unwrap();
 
         let step_bytes = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { step_bytes, .. } => Some(*step_bytes),
+            VmInstr::LoopBegin { offsets, .. } => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
             _ => None,
         }).expect("should have LoopBegin with step_bytes");
 

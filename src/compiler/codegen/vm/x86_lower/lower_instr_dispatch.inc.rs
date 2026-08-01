@@ -81,7 +81,7 @@ impl X86Lower {
     /// ISA 不支持的变体 (类别错配) 返回 Err (NO_SILENT_FALLBACK, 非 catch-all NOP)。
     fn lower_control_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::LoopBegin { counter, byte_offset, bound, step_bytes } => self.lower_loop_begin_x86(instr, alloc),
+            VmInstr::LoopBegin { .. } => self.lower_loop_begin_x86(instr, alloc),
             VmInstr::LoopEnd => self.lower_loop_end_x86(instr, alloc),
             VmInstr::ScopeBegin { .. } => self.lower_scope_begin_x86(instr, alloc),
             VmInstr::ScopeEnd { .. } => self.lower_scope_end_x86(instr, alloc),
@@ -2701,9 +2701,28 @@ impl X86Lower {
         }
     }
 
+    // @trace REQ-VR-001 [req:VmInstr-LoopBegin-MultiOffset]
     fn lower_loop_begin_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::LoopBegin { counter, byte_offset, bound, step_bytes } => {
+            VmInstr::LoopBegin { counter, offsets, bound } => {
+                let offset_steps: Vec<(VRegId, usize)> = offsets
+                    .iter()
+                    .map(|offset| {
+                        offset
+                            .stride
+                            .as_fixed_bytes()
+                            .map(|stride| (offset.vreg, stride))
+                            .ok_or_else(|| CompilerError::CodegenViolation(
+                                "x86 LoopBegin requires FixedBytes stride".into(),
+                            ))
+                    })
+                    .collect::<Result<_, _>>()?;
+                if offset_steps.is_empty() {
+                    return Err(CompilerError::CodegenViolation(
+                        "LoopBegin requires at least one offset".into(),
+                    ));
+                }
+
                 // counter: handle spilled case (use rax as scratch for cmp)
                 let (counter_reg, counter_spill_rbp_off) = match alloc.get(*counter) {
                     Some(super::isa_profile::PhysReg::Gpr(g)) => {
@@ -2726,27 +2745,29 @@ impl X86Lower {
                         format!("counter v{} not allocated to GPR", counter.0))),
                 };
 
-                // byte_offset: initialize to 0 (either xor GPR or store 0 to spill slot)
-                let (offset_reg, offset_spill_rbp_off) = match alloc.get(*byte_offset) {
-                    Some(super::isa_profile::PhysReg::Gpr(g)) => {
-                        let reg = Self::gpr(g);
-                        self.asm.xor(reg, reg).map_err(Self::err)?;
-                        (reg, None)
-                    }
-                    Some(super::isa_profile::PhysReg::Spilled(slot_id)) => {
-                        let spill = alloc.spills.get(slot_id as usize)
-                            .ok_or_else(|| CompilerError::CodegenViolation(
-                                format!("LoopBegin: spill slot {} missing for byte_offset v{}", slot_id, byte_offset.0)
-                            ))?;
-                        let rbp_off = self.gpr_spill_rbp_offset(spill.offset);
-                        self.asm.mov(qword_ptr(rbp + rbp_off), 0i32).map_err(Self::err)?;
-                        // Use scratch r10 as the offset_reg for LoopEnd's add+store
-                        let scratch = self.scratch_gprs[1];
-                        (scratch, Some(rbp_off))
-                    }
-                    _ => return Err(CompilerError::CodegenViolation(
-                        format!("byte_offset v{} not allocated to GPR", byte_offset.0))),
-                };
+                // Initialize every independently maintained byte offset. Spilled offsets
+                // reuse scratch r10 at LoopEnd because their spill slot is the state.
+                let offset_states: Vec<(AsmRegister64, usize, Option<i32>)> = offset_steps
+                    .iter()
+                    .map(|(byte_offset, step_bytes)| match alloc.get(*byte_offset) {
+                        Some(super::isa_profile::PhysReg::Gpr(g)) => {
+                            let reg = Self::gpr(g);
+                            self.asm.xor(reg, reg).map_err(Self::err)?;
+                            Ok((reg, *step_bytes, None))
+                        }
+                        Some(super::isa_profile::PhysReg::Spilled(slot_id)) => {
+                            let spill = alloc.spills.get(slot_id as usize)
+                                .ok_or_else(|| CompilerError::CodegenViolation(
+                                    format!("LoopBegin: spill slot {} missing for byte_offset v{}", slot_id, byte_offset.0)
+                                ))?;
+                            let rbp_off = self.gpr_spill_rbp_offset(spill.offset);
+                            self.asm.mov(qword_ptr(rbp + rbp_off), 0i32).map_err(Self::err)?;
+                            Ok((self.scratch_gprs[1], *step_bytes, Some(rbp_off)))
+                        }
+                        _ => Err(CompilerError::CodegenViolation(
+                            format!("byte_offset v{} not allocated to GPR", byte_offset.0))),
+                    })
+                    .collect::<Result<_, CompilerError>>()?;
 
                 let mut loop_start = self.asm.create_label();
                 let loop_done = self.asm.create_label();
@@ -2797,7 +2818,7 @@ impl X86Lower {
                 }
                 self.asm.jge(loop_done).map_err(Self::err)?;
 
-                self.loop_stack.push((loop_start, loop_done, counter_reg, counter_spill_rbp_off, offset_reg, *step_bytes, offset_spill_rbp_off));
+                self.loop_stack.push((loop_start, loop_done, counter_reg, counter_spill_rbp_off, offset_states));
                 Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
@@ -2808,7 +2829,7 @@ impl X86Lower {
     fn lower_loop_end_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
             VmInstr::LoopEnd => {
-                let (loop_start, mut loop_done, counter_reg, counter_spill_rbp_off, offset_reg, step_bytes, offset_spill_rbp_off) =
+                let (loop_start, mut loop_done, counter_reg, counter_spill_rbp_off, offset_states) =
                     self.loop_stack.pop()
                     .ok_or_else(|| CompilerError::CodegenViolation("LoopEnd without LoopBegin".into()))?;
 
@@ -2825,17 +2846,19 @@ impl X86Lower {
                         self.asm.inc(counter_reg).map_err(Self::err)?;
                     }
                 }
-                // byte_offset += step_bytes
-                match offset_spill_rbp_off {
-                    Some(rbp_off) => {
-                        // Spilled: load → add → store back
-                        self.asm.mov(offset_reg, qword_ptr(rbp + rbp_off)).map_err(Self::err)?;
-                        self.asm.add(offset_reg, step_bytes as i32).map_err(Self::err)?;
-                        self.asm.mov(qword_ptr(rbp + rbp_off), offset_reg).map_err(Self::err)?;
-                    }
-                    None => {
-                        // In physical GPR: direct add
-                        self.asm.add(offset_reg, step_bytes as i32).map_err(Self::err)?;
+                // Advance every independently maintained byte offset by its own stride.
+                for (offset_reg, step_bytes, offset_spill_rbp_off) in offset_states {
+                    match offset_spill_rbp_off {
+                        Some(rbp_off) => {
+                            // Spilled: load → add → store back
+                            self.asm.mov(offset_reg, qword_ptr(rbp + rbp_off)).map_err(Self::err)?;
+                            self.asm.add(offset_reg, step_bytes as i32).map_err(Self::err)?;
+                            self.asm.mov(qword_ptr(rbp + rbp_off), offset_reg).map_err(Self::err)?;
+                        }
+                        None => {
+                            // In physical GPR: direct add
+                            self.asm.add(offset_reg, step_bytes as i32).map_err(Self::err)?;
+                        }
                     }
                 }
                 // jmp loop_start
@@ -5821,7 +5844,7 @@ impl X86Lower {
 
                 // token_id == eos_token_id → done
                 self.asm.cmp(id_val, eos_val).map_err(Self::err)?;
-                if let Some((_, done_label, _, _, _, _, _)) = self.loop_stack.last() {
+                if let Some((_, done_label, _, _, _)) = self.loop_stack.last() {
                     self.asm.je(*done_label).map_err(Self::err)?;
                 }
                 // Free eos slot, reuse for max_tokens
@@ -5832,7 +5855,7 @@ impl X86Lower {
 
                 // counter >= max_new_tokens → done
                 self.asm.cmp(ctr_reg, max_val).map_err(Self::err)?;
-                if let Some((_, done_label, _, _, _, _, _)) = self.loop_stack.last() {
+                if let Some((_, done_label, _, _, _)) = self.loop_stack.last() {
                     self.asm.jge(*done_label).map_err(Self::err)?;
                 }
                 let _ = ctr_slot;

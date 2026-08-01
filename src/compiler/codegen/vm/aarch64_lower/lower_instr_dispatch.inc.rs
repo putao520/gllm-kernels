@@ -79,7 +79,7 @@ impl AArch64Lower {
     /// ISA 不支持的变体 (类别错配) 返回 Err (NO_SILENT_FALLBACK, 非 catch-all NOP)。
     fn lower_control_aarch64(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::LoopBegin { counter, byte_offset, bound, step_bytes } => self.lower_loop_begin_aarch64(instr, alloc),
+            VmInstr::LoopBegin { .. } => self.lower_loop_begin_aarch64(instr, alloc),
             VmInstr::LoopEnd => self.lower_loop_end_aarch64(instr, alloc),
             VmInstr::BreakLoop { return_value } => self.lower_break_loop_aarch64(instr, alloc),
             VmInstr::ScopeBegin { .. } | VmInstr::ScopeEnd { .. } => self.lower_scope_begin_aarch64(instr, alloc),
@@ -2294,18 +2294,35 @@ impl AArch64Lower {
     }
 
     // ── Control ──
+    // @trace REQ-VR-001 [req:VmInstr-LoopBegin-MultiOffset]
     fn lower_loop_begin_aarch64(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::LoopBegin { counter, byte_offset, bound, step_bytes } => {
-
+            VmInstr::LoopBegin { counter, offsets, bound } => {
+                if offsets.is_empty() {
+                    return Err(CompilerError::CodegenViolation(
+                        "LoopBegin requires at least one offset".into(),
+                    ));
+                }
+                let offset_regs: Vec<(u8, LoopStride)> = offsets
+                    .iter()
+                    .map(|offset| Ok((self.resolve_gpr(offset.vreg, alloc)?, offset.stride)))
+                    .collect::<Result<_, CompilerError>>()?;
                 let xn = self.resolve_gpr(*counter, alloc)?;
-                let xoff = self.resolve_gpr(*byte_offset, alloc)?;
 
-                // Zero the counter and byte offset
-                // MOV Xn, XZR (=0)
+                // Zero the counter and every independently maintained byte offset.
                 self.emit32(self.enc_mov_x(xn, 31));
-                // MOV Xoff, XZR (=0)
-                self.emit32(self.enc_mov_x(xoff, 31));
+                for (offset_reg, _) in &offset_regs {
+                    self.emit32(self.enc_mov_x(*offset_reg, 31));
+                }
+                if !self.platform.has_sve {
+                    for (_, stride) in &offset_regs {
+                        if !matches!(stride, LoopStride::FixedBytes(_)) {
+                            return Err(CompilerError::CodegenViolation(
+                                "AArch64 NEON LoopBegin requires FixedBytes strides".into(),
+                            ));
+                        }
+                    }
+                }
 
                 if self.platform.has_sve {
                     // ── SVE predicated loop (SVE1: WHILELT/INCW/PTRUE) ──
@@ -2359,8 +2376,7 @@ impl AArch64Lower {
                         loop_top,
                         branch_placeholder,
                         counter_reg: xn,
-                        offset_reg: xoff,
-                        step: *step_bytes,
+                        offsets: offset_regs.clone(),
                         is_sve: true,
                         bound_reg: Some(bound_reg),
                         counter_spill_sp_off: None,
@@ -2403,8 +2419,7 @@ impl AArch64Lower {
                         loop_top,
                         branch_placeholder,
                         counter_reg: xn,
-                        offset_reg: xoff,
-                        step: *step_bytes,
+                        offsets: offset_regs,
                         is_sve: false,
                         bound_reg: None,
                         counter_spill_sp_off: None,
@@ -2435,11 +2450,11 @@ impl AArch64Lower {
                         // INCW Xn
                         self.emit32(self.enc_incw(ctx.counter_reg));
 
-                        // ADD offset by VL bytes: CNTW x16; LSL x16,x16,#2; ADD offset,offset,x16
-                        self.emit32(self.enc_cntw(16)); // x16 = VL/4 (num f32 elements)
-                        // LSL x16, x16, #2  => ADD x16, xzr, x16, LSL #2
-                        self.emit32(0xD37EF610); // UBFM x16, x16, #62, #61 → LSL x16,x16,#2
-                        self.emit32(self.enc_add_reg(ctx.offset_reg, ctx.offset_reg, 16));
+                        // Update every offset independently. FixedBytes is still
+                        // legal in SVE; scalable strides derive VL at runtime.
+                        for (offset_reg, stride) in &ctx.offsets {
+                            self.emit_loop_offset_step_aarch64(*offset_reg, *stride, true)?;
+                        }
 
                         // B loop_top
                         let curr = self.current_offset();
@@ -2460,8 +2475,11 @@ impl AArch64Lower {
 
                         // ADD Xn, Xn, #1
                         self.emit32(self.enc_add_imm(ctx.counter_reg, ctx.counter_reg, 1));
-                        // ADD Xoff, Xoff, #step
-                        self.emit32(self.enc_add_imm(ctx.offset_reg, ctx.offset_reg, ctx.step as u32));
+                        // Update all fixed-width offsets; scalable strides were
+                        // rejected before emitting the NEON loop prologue.
+                        for (offset_reg, stride) in &ctx.offsets {
+                            self.emit_loop_offset_step_aarch64(*offset_reg, *stride, false)?;
+                        }
                         // B loop_top
                         let curr = self.current_offset();
                         let delta = (ctx.loop_top as i32 - curr as i32) / 4;

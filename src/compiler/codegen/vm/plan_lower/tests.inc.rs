@@ -1208,7 +1208,7 @@ mod tests {
 
         // Assert: exactly one LoopBegin with step_bytes=0 (non-linear weight offset).
         let loop_begin_zero_step = prog.instrs.iter().any(|i| matches!(
-            i, VmInstr::LoopBegin { step_bytes: 0, .. }
+            i, VmInstr::LoopBegin { offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(0)
         ));
         assert!(loop_begin_zero_step, "mixed-quant must emit LoopBegin with step_bytes=0 (non-linear offset_table), got instrs: {:?}",
                 prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).collect::<Vec<_>>());

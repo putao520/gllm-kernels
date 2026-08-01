@@ -301,6 +301,63 @@ impl AArch64Lower {
         0x8B000000 | ((rm as u32 & 0x1F) << 16) | ((rn as u32 & 0x1F) << 5) | (rd as u32 & 0x1F)
     }
 
+    /// Emit one loop-carried byte-offset update.
+    ///
+    /// Fixed-width loops use the AArch64 ADD-immediate encoding. SVE scalable
+    /// offsets derive their byte distance from CNTW (VL/4 lanes) and the
+    /// per-lane element width. Scalable strides are rejected on NEON rather
+    /// than silently using the first fixed offset.
+    fn emit_loop_offset_step_aarch64(
+        &mut self,
+        offset_reg: u8,
+        stride: LoopStride,
+        allow_scalable: bool,
+    ) -> Result<(), CompilerError> {
+        match stride {
+            LoopStride::FixedBytes(bytes) => {
+                if bytes > 0xFFF {
+                    return Err(CompilerError::CodegenViolation(format!(
+                        "AArch64 loop offset step {} exceeds ADD immediate range",
+                        bytes,
+                    )));
+                }
+                self.emit32(self.enc_add_imm(offset_reg, offset_reg, bytes as u32));
+            }
+            LoopStride::ScalableElemBytes(elem_bytes) if allow_scalable => {
+                if elem_bytes == 0 {
+                    return Err(CompilerError::CodegenViolation(
+                        "SVE loop offset element width must be non-zero".into(),
+                    ));
+                }
+                // CNTW returns the number of 32-bit lanes in the current VL.
+                // Multiply by the declared bytes-per-lane to derive the byte
+                // stride at runtime; this remains valid for every SVE VL.
+                self.emit32(self.enc_cntw(16));
+                let width = elem_bytes as u64;
+                if width.is_power_of_two() && width.trailing_zeros() < 64 {
+                    let shift = width.trailing_zeros() as u8;
+                    if shift != 0 {
+                        self.emit32(self.enc_lsl_x_imm(16, 16, shift));
+                    }
+                } else {
+                    self.emit32(self.enc_movz_x(17, (width & 0xFFFF) as u16));
+                    self.emit32(self.enc_movk_x_lsl16(17, ((width >> 16) & 0xFFFF) as u16));
+                    self.emit32(self.enc_movk_x_lsl32(17, ((width >> 32) & 0xFFFF) as u16));
+                    self.emit32(self.enc_movk_x_lsl48(17, ((width >> 48) & 0xFFFF) as u16));
+                    // MUL X16, X16, X17.
+                    self.emit32(0x9B007C00 | (17u32 << 16) | (16u32 << 5) | 16u32);
+                }
+                self.emit32(self.enc_add_reg(offset_reg, offset_reg, 16));
+            }
+            LoopStride::ScalableElemBytes(_) => {
+                return Err(CompilerError::CodegenViolation(
+                    "NEON loop does not support scalable offset stride".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// CMP Xn, #imm12 (SUBS XZR, Xn, #imm12)
     fn enc_cmp_imm(&self, xn: u8, imm12: u32) -> u32 {
         0xF100001F | ((imm12 & 0xFFF) << 10) | ((xn as u32 & 0x1F) << 5)

@@ -107,12 +107,10 @@ mod tests {
         l.emit_prologue(&empty_frame(), &alloc, Default::default()).unwrap();
         // 两个嵌套循环
         l.lower_instr(&VmInstr::LoopBegin {
-            counter: VRegId(0), byte_offset: VRegId(1),
-            bound: BoundExpr::Const(16), step_bytes: 4,
+            counter: VRegId(0), offsets: vec![LoopOffset { vreg: VRegId(1), stride: LoopStride::FixedBytes(4) }], bound: BoundExpr::Const(16),
         }, &alloc).unwrap();
         l.lower_instr(&VmInstr::LoopBegin {
-            counter: VRegId(2), byte_offset: VRegId(3),
-            bound: BoundExpr::Const(8), step_bytes: 4,
+            counter: VRegId(2), offsets: vec![LoopOffset { vreg: VRegId(3), stride: LoopStride::FixedBytes(4) }], bound: BoundExpr::Const(8),
         }, &alloc).unwrap();
         l.lower_instr(&VmInstr::LoopEnd, &alloc).unwrap();
         l.lower_instr(&VmInstr::LoopEnd, &alloc).unwrap();

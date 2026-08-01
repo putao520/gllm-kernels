@@ -148,8 +148,7 @@ mod tests {
         let c = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         prog.emit(VmInstr::LoopBegin {
-            counter: c, byte_offset: off,
-            bound: BoundExpr::Const(10), step_bytes: 32,
+            counter: c, offsets: vec![LoopOffset { vreg: off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(10),
         });
         // 缺少 LoopEnd
         assert!(prog.validate_structure().is_err());

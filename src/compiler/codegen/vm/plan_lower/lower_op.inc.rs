@@ -996,8 +996,12 @@ fn lower_op_generation(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGr
             let ctr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
             let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
             prog.emit(VmInstr::LoopBegin {
-                counter: ctr, byte_offset: byte_off,
-                bound: BoundExpr::Const(iters), step_bytes: step,
+                counter: ctr,
+                offsets: vec![LoopOffset {
+                    vreg: byte_off,
+                    stride: LoopStride::FixedBytes(step),
+                }],
+                bound: BoundExpr::Const(iters),
             });
             let vec = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::VecLoad {
@@ -1176,7 +1180,7 @@ fn lower_op_hook(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, c
             let iters = (total_bytes + step - 1) / step;
             let ctr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
             let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoopBegin { counter: ctr, byte_offset: byte_off, bound: BoundExpr::Const(iters), step_bytes: step });
+            prog.emit(VmInstr::LoopBegin { counter: ctr, offsets: vec![LoopOffset { vreg: byte_off, stride: LoopStride::FixedBytes(step) }], bound: BoundExpr::Const(iters) });
             let src_vec = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::VecLoad { dst: src_vec, base: input_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.accum_dtype , predicate: None,});
             let mm_vec = prog.alloc_vreg(VRegKind::Vec, width);

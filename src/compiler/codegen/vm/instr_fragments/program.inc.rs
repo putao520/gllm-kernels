@@ -132,6 +132,17 @@ impl VmProgram {
         counts
     }
 
+    /// Validate the fixed-width loop API's offset-step contract.
+    fn validate_loop_offsets(offset_steps: &[usize]) -> Result<(), String> {
+        if offset_steps.is_empty() {
+            return Err("LoopBegin requires at least one offset step".into());
+        }
+        if offset_steps.iter().any(|step| *step == 0) {
+            return Err("LoopBegin offset steps must be non-zero".into());
+        }
+        Ok(())
+    }
+
     /// 发射一条指令。
     pub fn emit(&mut self, instr: VmInstr) {
         self.instrs.push(instr);
@@ -139,6 +150,9 @@ impl VmProgram {
 
     /// 发射循环: LoopBegin + body + LoopEnd。
     /// 自动分配 counter 和 byte_offset VReg。
+    ///
+    /// This legacy wrapper intentionally preserves the historical zero-step
+    /// semantics used by mixed-quant non-linear layer offsets.
     pub fn emit_loop(
         &mut self,
         bound: BoundExpr,
@@ -147,9 +161,54 @@ impl VmProgram {
     ) {
         let counter = self.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let byte_offset = self.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-        self.emit(VmInstr::LoopBegin { counter, byte_offset, bound, step_bytes });
+        self.emit(VmInstr::LoopBegin {
+            counter,
+            offsets: vec![LoopOffset {
+                vreg: byte_offset,
+                stride: LoopStride::FixedBytes(step_bytes),
+            }],
+            bound,
+        });
         body(self, counter, byte_offset);
         self.emit(VmInstr::LoopEnd);
+    }
+
+    /// Emit a loop with one independently stepped byte offset per operand.
+    ///
+    /// The returned offsets preserve the order of `offset_steps`. Unlike the
+    /// legacy wrapper, this API rejects an empty list and zero strides before
+    /// emitting any instruction.
+    /// @trace REQ-VR-001 [req:VmInstr-LoopBegin-MultiOffset]
+    pub fn emit_loop_multi(
+        &mut self,
+        bound: BoundExpr,
+        offset_steps: &[usize],
+        body: impl FnOnce(&mut Self, VRegId, &[VRegId]),
+    ) -> Result<(), String> {
+        Self::validate_loop_offsets(offset_steps)?;
+
+        let counter = self.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+        let offsets: Vec<VRegId> = offset_steps
+            .iter()
+            .map(|_| self.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar))
+            .collect();
+        let pairs: Vec<LoopOffset> = offsets
+            .iter()
+            .copied()
+            .zip(offset_steps.iter().copied())
+            .map(|(vreg, step_bytes)| LoopOffset {
+                vreg,
+                stride: LoopStride::FixedBytes(step_bytes),
+            })
+            .collect();
+        self.emit(VmInstr::LoopBegin {
+            counter,
+            offsets: pairs,
+            bound,
+        });
+        body(self, counter, &offsets);
+        self.emit(VmInstr::LoopEnd);
+        Ok(())
     }
 
     /// 发射作用域: ScopeBegin + body + ScopeEnd。
@@ -175,11 +234,47 @@ impl VmProgram {
         let byte_offset = self.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         self.emit(VmInstr::LoopBegin {
             counter,
-            byte_offset,
+            offsets: vec![LoopOffset {
+                vreg: byte_offset,
+                stride: LoopStride::FixedBytes(step_bytes),
+            }],
             bound,
-            step_bytes,
         });
         body(self, counter, byte_offset)?;
+        self.emit(VmInstr::LoopEnd);
+        Ok(())
+    }
+
+    /// Result-returning multi-offset loop emitter.
+    /// @trace REQ-VR-001 [req:VmInstr-LoopBegin-MultiOffset]
+    pub fn emit_loop_multi_try<E: From<String>>(
+        &mut self,
+        bound: BoundExpr,
+        offset_steps: &[usize],
+        body: impl FnOnce(&mut Self, VRegId, &[VRegId]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        Self::validate_loop_offsets(offset_steps)?;
+
+        let counter = self.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+        let offsets: Vec<VRegId> = offset_steps
+            .iter()
+            .map(|_| self.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar))
+            .collect();
+        let pairs: Vec<LoopOffset> = offsets
+            .iter()
+            .copied()
+            .zip(offset_steps.iter().copied())
+            .map(|(vreg, step_bytes)| LoopOffset {
+                vreg,
+                stride: LoopStride::FixedBytes(step_bytes),
+            })
+            .collect();
+        self.emit(VmInstr::LoopBegin {
+            counter,
+            offsets: pairs,
+            bound,
+        });
+        body(self, counter, &offsets)?;
         self.emit(VmInstr::LoopEnd);
         Ok(())
     }
@@ -401,7 +496,14 @@ impl VmProgram {
     fn remap_vreg_with_map_controla(instr: VmInstr, map: &mut std::collections::HashMap<VRegId, VRegId>, next_vreg: &mut u32, r: &impl Fn(VRegId, &mut std::collections::HashMap<VRegId, VRegId>, &mut u32) -> VRegId, remap_offset: &impl Fn(OffsetExpr, &mut std::collections::HashMap<VRegId, VRegId>, &mut u32) -> OffsetExpr, remap_scalar: &impl Fn(ScalarExpr, &mut std::collections::HashMap<VRegId, VRegId>, &mut u32) -> ScalarExpr, remap_ptr: &impl Fn(PtrExpr, &mut std::collections::HashMap<VRegId, VRegId>, &mut u32) -> PtrExpr) -> VmInstr {
         // Control cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
         match instr {
-            VmInstr::LoopBegin { counter, byte_offset, bound, step_bytes } => VmInstr::LoopBegin { counter: r(counter, map, next_vreg), byte_offset: r(byte_offset, map, next_vreg), bound, step_bytes },
+            VmInstr::LoopBegin { counter, offsets, bound } => VmInstr::LoopBegin {
+                counter: r(counter, map, next_vreg),
+                offsets: offsets
+                    .into_iter()
+                    .map(|offset| LoopOffset { vreg: r(offset.vreg, map, next_vreg), ..offset })
+                    .collect(),
+                bound,
+            },
             VmInstr::LoopEnd => VmInstr::LoopEnd,
             VmInstr::ScopeBegin { scope_id } => VmInstr::ScopeBegin { scope_id },
             VmInstr::ScopeEnd { scope_id } => VmInstr::ScopeEnd { scope_id },
@@ -819,7 +921,14 @@ impl VmProgram {
     fn remap_vreg_instr_controla(instr: VmInstr, r: &impl Fn(VRegId) -> VRegId, remap_offset: &impl Fn(OffsetExpr) -> OffsetExpr, remap_scalar: &impl Fn(ScalarExpr) -> ScalarExpr, remap_ptr: &impl Fn(PtrExpr) -> PtrExpr) -> VmInstr {
         // Control cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
         match instr {
-            VmInstr::LoopBegin { counter, byte_offset, bound, step_bytes } => VmInstr::LoopBegin { counter: r(counter), byte_offset: r(byte_offset), bound, step_bytes },
+            VmInstr::LoopBegin { counter, offsets, bound } => VmInstr::LoopBegin {
+                counter: r(counter),
+                offsets: offsets
+                    .into_iter()
+                    .map(|offset| LoopOffset { vreg: r(offset.vreg), ..offset })
+                    .collect(),
+                bound,
+            },
             VmInstr::LoopEnd => VmInstr::LoopEnd,
             VmInstr::ScopeBegin { scope_id } => VmInstr::ScopeBegin { scope_id },
             VmInstr::ScopeEnd { scope_id } => VmInstr::ScopeEnd { scope_id },
@@ -1210,9 +1319,22 @@ impl VmProgram {
         }
     }
 
+    fn bound_vregs(expr: &BoundExpr) -> Vec<VRegId> {
+        match expr {
+            BoundExpr::Const(_) | BoundExpr::Runtime(_) | BoundExpr::Symbolic(_) => vec![],
+            BoundExpr::DynamicVReg(v) | BoundExpr::DynamicVRegPlusOne(v) => vec![*v],
+        }
+    }
+
     fn referenced_vregs_controla(instr: &VmInstr) -> Vec<VRegId> {
         // Control cluster a (3 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
         match instr {
+            VmInstr::LoopBegin { counter, offsets, bound } => {
+                let mut v = vec![*counter];
+                v.extend(offsets.iter().map(|offset| offset.vreg));
+                v.extend(Self::bound_vregs(bound));
+                v
+            }
             VmInstr::BreakLoop { return_value } => match return_value {
                                 ReturnValue::Const(_) => vec![],
                                 ReturnValue::VReg(v) => vec![*v],
@@ -1407,7 +1529,11 @@ impl VmProgram {
                 VmInstr::Fma { dst, acc, a, b, .. } => format!("Fma dst=v{} acc=v{} a=v{} b=v{}", dst.0, acc.0, a.0, b.0),
                 VmInstr::LoadPtr { dst, .. } => format!("LoadPtr dst=v{}", dst.0),
                 VmInstr::Argmax { dst, logits_ptr, .. } => format!("Argmax dst=v{} logits_ptr=v{}", dst.0, logits_ptr.0),
-                VmInstr::LoopBegin { counter, byte_offset, .. } => format!("LoopBegin counter=v{} byte_offset=v{}", counter.0, byte_offset.0),
+                VmInstr::LoopBegin { counter, offsets, .. } => format!(
+                    "LoopBegin counter=v{} offsets={:?}",
+                    counter.0,
+                    offsets.iter().map(|offset| offset.vreg.0).collect::<Vec<_>>(),
+                ),
                 VmInstr::AddPtr { dst, base, .. } => format!("AddPtr dst=v{} base=v{}", dst.0, base.0),
                 VmInstr::IndexToScalar { dst, src } => format!("IndexToScalar dst=v{} src=v{}", dst.0, src.0),
                 VmInstr::IntMulStride { dst, src, .. } => format!("IntMulStride dst=v{} src=v{}", dst.0, src.0),
@@ -1623,7 +1749,7 @@ impl VmProgram {
     fn validate_type_consistency_controla(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, check: &impl Fn(VRegId, bool, &str) -> Option<String>) -> Result<(), String> {
         // Control cluster a (1 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
         match instr {
-            VmInstr::LoopBegin { counter, byte_offset, .. } => { 
+            VmInstr::LoopBegin { counter, offsets, .. } => {
                                     match kinds.get(counter) {
                                         Some(VRegKind::Counter) => {}
                                         Some(k) => return Err(format!(
@@ -1631,12 +1757,14 @@ impl VmProgram {
                                             counter.0, k)),
                                         None => {}
                                     }
-                                    match kinds.get(byte_offset) {
-                                        Some(VRegKind::ByteOffset) => {}
-                                        Some(k) => return Err(format!(
-                                            "instr[{i}] LoopBegin: byte_offset v{} is {:?}, expected ByteOffset",
-                                            byte_offset.0, k)),
-                                        None => {}
+                                    for offset in offsets {
+                                        match kinds.get(&offset.vreg) {
+                                            Some(VRegKind::ByteOffset) => {}
+                                            Some(k) => return Err(format!(
+                                                "instr[{i}] LoopBegin: offset v{} is {:?}, expected ByteOffset",
+                                                offset.vreg.0, k)),
+                                            None => {}
+                                        }
                                     }
                  Ok(()) },
             _ => Ok(()),

@@ -1,4 +1,30 @@
 
+/// Per-iteration stride semantics for a loop-maintained byte offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LoopStride {
+    /// Fixed byte distance for fixed-width SIMD and scalar loops.
+    FixedBytes(usize),
+    /// Element width for a dynamically scalable SVE vector length.
+    ScalableElemBytes(usize),
+}
+
+impl LoopStride {
+    /// Return the compile-time byte stride, if this stride is fixed-width.
+    pub fn as_fixed_bytes(self) -> Option<usize> {
+        match self {
+            Self::FixedBytes(bytes) => Some(bytes),
+            Self::ScalableElemBytes(_) => None,
+        }
+    }
+}
+
+/// A byte-offset register and its independent per-iteration stride.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LoopOffset {
+    pub vreg: VRegId,
+    pub stride: LoopStride,
+}
+
 #[derive(Debug, Clone)]
 pub enum VmInstr {
     // ── 内存操作 ──
@@ -253,15 +279,16 @@ pub enum VmInstr {
     // ── 控制流 ──
 
     /// 循环开始
+    ///
+    /// Each `(offset, step)` pair is maintained independently by the loop.
+    /// @trace REQ-VR-001 [req:VmInstr-LoopBegin-MultiOffset]
     LoopBegin {
         /// 循环计数器 VReg
         counter: VRegId,
-        /// 关联的字节偏移 VReg (= counter × step_bytes, 自动维护)
-        byte_offset: VRegId,
+        /// 每个被循环维护的字节偏移 VReg 及其独立步进
+        offsets: Vec<LoopOffset>,
         /// 循环上界
         bound: BoundExpr,
-        /// 每次迭代的字节步进
-        step_bytes: usize,
     },
     /// 循环结束 (自动步进 counter 和 byte_offset)
     LoopEnd,

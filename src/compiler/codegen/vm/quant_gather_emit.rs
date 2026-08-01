@@ -908,9 +908,9 @@ mod tests {
 
         // Assert: find the block loop (inner loop with BoundExpr::Const(4))
         let block_loop = prog.instrs.iter().find(|i| {
-            if let VmInstr::LoopBegin { bound: BoundExpr::Const(4), step_bytes, .. } = i {
+            if let VmInstr::LoopBegin { bound: BoundExpr::Const(4), offsets, .. } = i {
                 // Q4_0 block_bytes=18, so the block loop step should be 18
-                *step_bytes == 18
+                offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(18)
             } else {
                 false
             }
@@ -1705,8 +1705,8 @@ mod tests {
         assert!(result.is_ok(), "hidden_dim=512 should succeed: {:?}", result);
         // Verify the block loop bound reflects 16 blocks
         let block_loop_16 = prog.instrs.iter().any(|i| {
-            if let VmInstr::LoopBegin { bound: BoundExpr::Const(16), step_bytes, .. } = i {
-                *step_bytes == 18 // Q4_0 block_bytes=18
+            if let VmInstr::LoopBegin { bound: BoundExpr::Const(16), offsets, .. } = i {
+                offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(18) // Q4_0 block_bytes=18
             } else {
                 false
             }

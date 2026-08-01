@@ -45,7 +45,7 @@ pub struct AArch64Lower {
     /// which never falls through) would execute table bytes as instructions.
     /// Tables are flushed past RET, unreachable by control flow.
     data_tables: Vec<(usize, Vec<u8>)>,
-    /// 循环控制: (loop_top_offset, branch_placeholder_offset, counter_reg, offset_reg, step, is_sve)
+    /// 循环控制栈；每个循环保存 counter 和所有独立的 offset/stride 状态。
     loop_stack: Vec<LoopCtx>,
     /// 目标平台特性
     platform: AArch64Features,
@@ -99,8 +99,9 @@ struct LoopCtx {
     /// NEON: B.GE placeholder 在 code 中的偏移; SVE2: B.NONE placeholder 偏移
     branch_placeholder: usize,
     counter_reg: u8,
-    offset_reg: u8,
-    step: usize,
+    /// Each entry is (offset register, fixed byte step, scalable element width).
+    /// Exactly one stride variant is present for each offset.
+    offsets: Vec<(u8, LoopStride)>,
     is_sve: bool,
     /// SVE2 路径: 存放 bound 的 GPR (x17 / 传入的 reg)
     bound_reg: Option<u8>,

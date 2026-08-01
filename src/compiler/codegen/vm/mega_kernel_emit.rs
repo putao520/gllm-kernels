@@ -139,9 +139,8 @@ fn emit_compact_serial(
 
     prog.emit(VmInstr::LoopBegin {
         counter: loop_ctr,
-        byte_offset: loop_byte_off,
+        offsets: vec![LoopOffset { vreg: loop_byte_off, stride: LoopStride::FixedBytes(1) }],
         bound: BoundExpr::DynamicVReg(seq_count),
-        step_bytes: 1,
     });
 
     // Load seq_meta_base from batch_ctx
@@ -236,9 +235,8 @@ fn emit_request_queue_refill(
     prog.emit(VmInstr::GprLoadImm { dst: refill_byte_off, value: 0 });
     prog.emit(VmInstr::LoopBegin {
         counter: refill_ctr,
-        byte_offset: refill_byte_off,
+        offsets: vec![LoopOffset { vreg: refill_byte_off, stride: LoopStride::FixedBytes(1) }],
         bound: BoundExpr::DynamicVReg(free_slots),
-        step_bytes: 1,
     });
 
     // Atomically increment read_idx: atom.global.add.u64(rq_ptr + 0, 1)
@@ -1194,9 +1192,8 @@ pub fn compile_mega_kernel_vm(
 
     prog.emit(VmInstr::LoopBegin {
         counter: gen_counter,
-        byte_offset: gen_byte_offset,
+        offsets: vec![LoopOffset { vreg: gen_byte_offset, stride: LoopStride::FixedBytes(4) }],
         bound: loop_bound,
-        step_bytes: 4,
     });
 
     // ── input pointer computation: Compute per-iteration input_ptr ──
@@ -2646,7 +2643,7 @@ fn emit_batch_decode_step_loop(
         // ── Outer decode step loop ──
         let step_ctr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let step_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-        prog.emit(VmInstr::LoopBegin { counter: step_ctr, byte_offset: step_off, bound: BoundExpr::DynamicVReg(max_steps), step_bytes: 4 });
+        prog.emit(VmInstr::LoopBegin { counter: step_ctr, offsets: vec![LoopOffset { vreg: step_off, stride: LoopStride::FixedBytes(4) }], bound: BoundExpr::DynamicVReg(max_steps) });
 
         // ── Step 3a: Count num_active — active_flag is 0 or 1, just accumulate ──
         prog.emit(VmInstr::GprLoadImm { dst: num_active, value: 0 });
@@ -3004,9 +3001,8 @@ fn emit_mtp_gemv(
     let v_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
     prog.emit(VmInstr::LoopBegin {
         counter: v_ctr,
-        byte_offset: v_off,
+        offsets: vec![LoopOffset { vreg: v_off, stride: LoopStride::FixedBytes(hidden * elem_bytes) }],
         bound: BoundExpr::Const(vocab),
-        step_bytes: hidden * elem_bytes,
     });
 
     // Initialize vector accumulator to zero
@@ -3025,9 +3021,8 @@ fn emit_mtp_gemv(
         let h_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         prog.emit(VmInstr::LoopBegin {
             counter: h_ctr,
-            byte_offset: h_off,
+            offsets: vec![LoopOffset { vreg: h_off, stride: LoopStride::FixedBytes(lanes * elem_bytes) }],
             bound: BoundExpr::Const(hidden_vec_iters),
-            step_bytes: lanes * elem_bytes,
         });
 
         // Load hidden[h_off..h_off+lanes]
@@ -3265,7 +3260,7 @@ mod tests {
 
         // Assert: outer loop step_bytes = hidden * elem_bytes = 256
         let outer_loop = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), step_bytes, .. } if *v == vocab => Some(*step_bytes),
+            VmInstr::LoopBegin { bound: BoundExpr::Const(v), offsets, .. } if *v == vocab => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
             _ => None,
         });
         assert_eq!(outer_loop, Some(hidden * elem_bytes), "outer loop step must be hidden * elem_bytes");
@@ -3541,8 +3536,8 @@ mod tests {
         );
 
         let inner_step = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), step_bytes, .. }
-                if *v == hidden / lanes => Some(*step_bytes),
+            VmInstr::LoopBegin { bound: BoundExpr::Const(v), offsets, .. }
+                if *v == hidden / lanes => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
             _ => None,
         });
         assert_eq!(inner_step, Some(lanes * elem_bytes));
@@ -3591,7 +3586,7 @@ mod tests {
         assert!(result.is_ok());
         assert!(prog.validate_structure().is_ok());
         let outer_bound = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(b), step_bytes, .. } if *b == 0 && *step_bytes == 1 => Some(true),
+            VmInstr::LoopBegin { bound: BoundExpr::Const(b), offsets, .. } if *b == 0 && offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(1) => Some(true),
             _ => None,
         });
         assert!(outer_bound.is_some(), "depth=0 must emit loop with BoundExpr::Const(0)");
@@ -3822,7 +3817,7 @@ mod tests {
 
         // Assert: inner loop bound must be 1 (hidden_vec_iters = 8/8 = 1)
         let inner_bound = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), step_bytes, .. } if *v == 1 && *step_bytes == 32 => Some(true),
+            VmInstr::LoopBegin { bound: BoundExpr::Const(v), offsets, .. } if *v == 1 && offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(32) => Some(true),
             _ => None,
         });
         assert!(inner_bound.is_some(), "hidden=lanes => inner loop bound=1, step=lanes*elem_bytes=32");
@@ -3878,8 +3873,8 @@ mod tests {
 
         // Assert: inner loop step = lanes * elem_bytes = 16 * 4 = 64
         let inner_step = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), step_bytes, .. }
-                if *v == 256 / 16 => Some(*step_bytes),
+            VmInstr::LoopBegin { bound: BoundExpr::Const(v), offsets, .. }
+                if *v == 256 / 16 => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
             _ => None,
         });
         assert_eq!(inner_step, Some(64), "inner loop step must be lanes(16) * elem_bytes(4) = 64");
@@ -3934,8 +3929,8 @@ mod tests {
 
         // Assert: outer loop bound must be exactly vocab=97
         let outer_bound = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), step_bytes, .. }
-                if *step_bytes == 32 * 4 => Some(*v),
+            VmInstr::LoopBegin { bound: BoundExpr::Const(v), offsets, .. }
+                if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(32 * 4) => Some(*v),
             _ => None,
         });
         assert_eq!(outer_bound, Some(97), "outer loop bound must equal vocab size");
@@ -4227,8 +4222,8 @@ mod tests {
 
         // Assert: inner loop bound = hidden / lanes = 16 / 1 = 16
         let inner_bound = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), step_bytes, .. }
-                if *v == hidden && *step_bytes == 4 => Some(*v),
+            VmInstr::LoopBegin { bound: BoundExpr::Const(v), offsets, .. }
+                if *v == hidden && offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(4) => Some(*v),
             _ => None,
         });
         assert_eq!(
@@ -4263,7 +4258,7 @@ mod tests {
         // Assert
         assert!(result.is_ok());
         let outer_bound = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), step_bytes, .. } if *v == depth => Some(*v),
+            VmInstr::LoopBegin { bound: BoundExpr::Const(v), .. } if *v == depth => Some(*v),
             _ => None,
         });
         assert_eq!(
@@ -4506,7 +4501,7 @@ mod tests {
 
         // Assert: outer loop step_bytes must be hidden * elem_bytes = 192
         let outer_step = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), step_bytes, .. } if *v == 32 => Some(*step_bytes),
+            VmInstr::LoopBegin { bound: BoundExpr::Const(v), offsets, .. } if *v == 32 => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
             _ => None,
         });
         assert_eq!(
@@ -4732,7 +4727,7 @@ mod tests {
         // Assert: the depth loop uses step_bytes=1 (emit_loop default for counter)
         assert!(result.is_ok());
         let depth_loop = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(b), step_bytes, .. } if *b == depth => Some(*step_bytes),
+            VmInstr::LoopBegin { bound: BoundExpr::Const(b), offsets, .. } if *b == depth => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
             _ => None,
         });
         assert_eq!(
@@ -4841,15 +4836,15 @@ mod tests {
 
         // Assert: inner loop step = lanes * elem_bytes = 8 * 2 = 16
         let inner_step = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), step_bytes, .. }
-                if *v == 32 / 8 => Some(*step_bytes),
+            VmInstr::LoopBegin { bound: BoundExpr::Const(v), offsets, .. }
+                if *v == 32 / 8 => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
             _ => None,
         });
         assert_eq!(inner_step, Some(16), "inner step must be lanes(8) * elem_bytes(2) = 16");
         // Assert: outer loop step = hidden * elem_bytes = 32 * 2 = 64
         let outer_step = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), step_bytes, .. }
-                if *v == 64 => Some(*step_bytes),
+            VmInstr::LoopBegin { bound: BoundExpr::Const(v), offsets, .. }
+                if *v == 64 => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
             _ => None,
         });
         assert_eq!(outer_step, Some(64), "outer step must be hidden(32) * elem_bytes(2) = 64");
@@ -4913,7 +4908,9 @@ mod tests {
         // Assert: one depth loop (bound=4) containing nested GEMV loops (2 per iteration)
         assert!(result.is_ok());
         let depth_loop_count = prog.instrs.iter().filter(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(b), step_bytes, .. } if *b == depth && *step_bytes == 1 => true,
+            VmInstr::LoopBegin { bound: BoundExpr::Const(b), offsets, .. }
+                if *b == depth
+                    && offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(1) => true,
             _ => false,
         }).count();
         assert_eq!(depth_loop_count, 1, "must have exactly one depth loop with bound=depth and step=1");
@@ -5111,11 +5108,13 @@ mod tests {
 
         // Assert: each LoopBegin must have distinct counter and byte_offset VRegIds
         for instr in &prog.instrs {
-            if let VmInstr::LoopBegin { counter, byte_offset, .. } = instr {
-                assert_ne!(
-                    counter, byte_offset,
-                    "loop counter and byte_offset must be distinct VRegIds"
-                );
+            if let VmInstr::LoopBegin { counter, offsets, .. } = instr {
+                for offset in offsets {
+                    assert_ne!(
+                        counter, &offset.vreg,
+                        "loop counter and byte_offset must be distinct VRegIds"
+                    );
+                }
             }
         }
     }
@@ -5256,8 +5255,8 @@ mod tests {
         // Assert: inner GEMV loop must have bound = hidden / lanes = 8
         assert!(result.is_ok());
         let inner_bound = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), step_bytes, .. }
-                if *v == expected_inner_bound && *step_bytes == lanes * 4 => Some(*v),
+            VmInstr::LoopBegin { bound: BoundExpr::Const(v), offsets, .. }
+                if *v == expected_inner_bound && offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(lanes * 4) => Some(*v),
             _ => None,
         });
         assert_eq!(
@@ -5324,8 +5323,8 @@ mod tests {
         assert!(prog.validate_provenance().is_ok(), "hidden>vocab provenance must be valid");
         // GEMV outer loop bound = vocab = 16
         let gemv_outer = prog.instrs.iter().any(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(16), step_bytes, .. }
-                if *step_bytes == 128 * 4 => true,
+            VmInstr::LoopBegin { bound: BoundExpr::Const(16), offsets, .. }
+                if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(128 * 4) => true,
             _ => false,
         });
         assert!(gemv_outer, "GEMV outer loop bound must be vocab(16), step=hidden*4=512");
@@ -5426,7 +5425,7 @@ mod tests {
         assert!(prog.validate_structure().is_ok(), "depth=1 must produce balanced structure");
         // One depth loop (bound=1, step=1) containing GEMV + Argmax + ScalarStore
         let depth_loop = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(1), step_bytes: 1, .. } => Some(true),
+            VmInstr::LoopBegin { bound: BoundExpr::Const(1), offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(1) => Some(true),
             _ => None,
         });
         assert!(depth_loop.is_some(), "depth=1 must emit exactly one loop with bound=1");
@@ -5495,7 +5494,7 @@ mod tests {
 
         // Assert: phase ordering must be GEMV (LoopBegin) → Argmax → ScalarStore
         assert!(result.is_ok());
-        let gemv_loop_pos = prog.instrs.iter().position(|i| matches!(i, VmInstr::LoopBegin { bound: BoundExpr::Const(2), step_bytes: 1, .. }));
+        let gemv_loop_pos = prog.instrs.iter().position(|i| matches!(i, VmInstr::LoopBegin { bound: BoundExpr::Const(2), offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(1)));
         let argmax_pos = prog.instrs.iter().position(|i| matches!(i, VmInstr::Argmax { .. }));
         let store_pos = prog.instrs.iter().position(|i| matches!(i, VmInstr::ScalarStore { base, .. } if *base == output_tokens_ptr));
         assert!(gemv_loop_pos.is_some(), "must have depth loop (bound=2)");
@@ -5585,14 +5584,14 @@ mod tests {
 
         // Assert: inner loop step must be lanes * elem_bytes = 8
         let inner_step = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), step_bytes, .. }
-                if *v == 32 / 8 => Some(*step_bytes),
+            VmInstr::LoopBegin { bound: BoundExpr::Const(v), offsets, .. }
+                if *v == 32 / 8 => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
             _ => None,
         });
         assert_eq!(inner_step, Some(8), "inner step must be lanes(8) * elem_bytes(1) = 8");
         // Assert: outer loop step must be hidden * elem_bytes = 32
         let outer_step = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(64), step_bytes, .. } => Some(*step_bytes),
+            VmInstr::LoopBegin { bound: BoundExpr::Const(64), offsets, .. } => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
             _ => None,
         });
         assert_eq!(outer_step, Some(32), "outer step must be hidden(32) * elem_bytes(1) = 32");
@@ -5621,7 +5620,7 @@ mod tests {
         assert!(prog.validate_provenance().is_ok(), "provenance must be valid with zero-depth zero-vocab");
         // The depth loop has bound=0, inner GEMV loop has vocab=0 bound — template body still valid
         let zero_depth_loop = prog.instrs.iter().any(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(0), step_bytes: 1, .. } => true,
+            VmInstr::LoopBegin { bound: BoundExpr::Const(0), offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(1) => true,
             _ => false,
         });
         assert!(zero_depth_loop, "must emit depth loop with bound=0");
@@ -6124,9 +6123,9 @@ mod tests {
         let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let byte_offset = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         prog.emit(VmInstr::LoopBegin {
-            counter, byte_offset,
+            counter,
+            offsets: vec![LoopOffset { vreg: byte_offset, stride: LoopStride::FixedBytes(32) }],
             bound: BoundExpr::Const(4),
-            step_bytes: 32,
         });
         prog.emit(VmInstr::LoopEnd);
 
@@ -6139,9 +6138,9 @@ mod tests {
         let counter2 = prog2.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let byte_offset2 = prog2.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         prog2.emit(VmInstr::LoopBegin {
-            counter: counter2, byte_offset: byte_offset2,
+            counter: counter2,
+            offsets: vec![LoopOffset { vreg: byte_offset2, stride: LoopStride::FixedBytes(32) }],
             bound: BoundExpr::Const(4),
-            step_bytes: 32,
         });
         // Intentionally NOT emitting LoopEnd
 

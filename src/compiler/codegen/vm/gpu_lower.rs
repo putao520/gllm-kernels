@@ -47,9 +47,9 @@ pub struct GpuLower {
     indent: usize,
     /// 唯一循环标签计数器（修复 PTX 循环回跳地址）
     loop_label_counter: u32,
-    /// 循环栈：每个元素保存 (label_id, counter_vreg_name, offset_vreg_name, step_bytes)
-    /// ARCH-GPU-LOOP-TRACKING: LoopEnd 从栈读取真实 counter 名字，不再硬编码 %r0
-    loop_stack: Vec<(u32, String, String, usize)>,
+    /// 循环栈：每个元素保存 label、counter 以及全部 offset/stride 对。
+    /// ARCH-GPU-LOOP-TRACKING: LoopEnd 从栈读取真实寄存器名，不硬编码 %r0。
+    loop_stack: Vec<(u32, String, Vec<(String, LoopStride)>)>,
     /// skip 标签计数器
     skip_label_counter: u32,
     /// TMEM 是否已分配 (SM100+)

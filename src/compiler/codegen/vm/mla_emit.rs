@@ -2625,7 +2625,7 @@ mod tests {
 
         // Assert: LoopBegin with step_bytes=96 for KV iteration
         let kv_loop_with_step_96 = prog.instrs.iter().any(|instr| {
-            matches!(instr, VmInstr::LoopBegin { step_bytes: 96, .. })
+            matches!(instr, VmInstr::LoopBegin { offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(96))
         });
         assert!(kv_loop_with_step_96,
             "should emit KV loop with step_bytes=96 ((d_c+d_rope)*4)");
@@ -2678,7 +2678,7 @@ mod tests {
 
         // Assert: dc_vecs loop step is dc_vec_step = lanes * elem_bytes = 8*4=32
         let dc_loop_step_32 = prog.instrs.iter().any(|instr| {
-            matches!(instr, VmInstr::LoopBegin { step_bytes: 32, .. })
+            matches!(instr, VmInstr::LoopBegin { offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(32))
         });
         assert!(dc_loop_step_32,
             "dc_vecs inner loop should step_bytes by 32 (8 lanes * 4 bytes F32)");
@@ -2964,7 +2964,7 @@ mod tests {
 
         // Assert: heads loop uses step_bytes=128 (d_c*4)
         let heads_loop_128 = prog.instrs.iter().any(|instr| {
-            matches!(instr, VmInstr::LoopBegin { step_bytes: 128, .. })
+            matches!(instr, VmInstr::LoopBegin { offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(128))
         });
         assert!(heads_loop_128,
             "heads loop should step by d_c*elem_bytes=128 (d_c=32, F32)");
@@ -3061,7 +3061,7 @@ mod tests {
             &[c1, k1, o1, cos1, sin1, p1], width256, dtype,
         ).unwrap();
         let step_32_loops = prog256.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::LoopBegin { step_bytes: 32, .. })
+            matches!(instr, VmInstr::LoopBegin { offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(32))
         }).count();
 
         let mut prog128 = VmProgram::new();
@@ -3077,7 +3077,7 @@ mod tests {
             &[c2, k2, o2, cos2, sin2, p2], width128, dtype,
         ).unwrap();
         let step_16_loops = prog128.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::LoopBegin { step_bytes: 16, .. })
+            matches!(instr, VmInstr::LoopBegin { offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(16))
         }).count();
 
         // Assert: W256 uses step_bytes=32, W128 uses step_bytes=16
@@ -3391,7 +3391,7 @@ mod tests {
 
         // Assert: find LoopBegin with step_bytes=224 for KV loop
         let kv_loop_224 = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::LoopBegin { step_bytes: 224, .. })
+            matches!(instr, VmInstr::LoopBegin { offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(224))
         }).count();
         assert!(kv_loop_224 >= 1, "KV loop should have step_bytes=(d_c+d_rope)*4=224, got {} matches", kv_loop_224);
     }
@@ -3781,7 +3781,7 @@ mod tests {
             &[q1, kv1, w1, o1], kl1, width, dtype,
         ).unwrap();
         let has_step_96 = prog1.instrs.iter().any(|instr| {
-            matches!(instr, VmInstr::LoopBegin { step_bytes: 96, .. })
+            matches!(instr, VmInstr::LoopBegin { offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(96))
         });
 
         // Config 2: d_rope=16 → kv_row_bytes = 32*4 = 128
@@ -3796,7 +3796,7 @@ mod tests {
             &[q2, kv2, w2, o2], kl2, width, dtype,
         ).unwrap();
         let has_step_128 = prog2.instrs.iter().any(|instr| {
-            matches!(instr, VmInstr::LoopBegin { step_bytes: 128, .. })
+            matches!(instr, VmInstr::LoopBegin { offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(128))
         });
 
         // Assert: different d_rope values produce different KV loop strides

@@ -918,7 +918,7 @@ mod tests {
     }
 
     fn build_test_vm_program() -> Vec<VmInstr> {
-        use crate::compiler::codegen::vm::instr::{OffsetExpr, SimdWidth, SymBound};
+        use crate::compiler::codegen::vm::instr::{LoopOffset, LoopStride, OffsetExpr, SimdWidth, SymBound};
         use crate::compiler::codegen::vm::instr::BoundExpr;
         use crate::compiler::trace::QuantPrecision;
 
@@ -948,9 +948,11 @@ mod tests {
             },
             VmInstr::LoopBegin {
                 counter: VRegId(3),
-                byte_offset: VRegId(4),
+                offsets: vec![LoopOffset {
+                    vreg: VRegId(4),
+                    stride: LoopStride::FixedBytes(4),
+                }],
                 bound: BoundExpr::Symbolic(SymBound { name: "seq_len".to_string(), max_alloc: 2048 }),
-                step_bytes: 4,
             },
             VmInstr::Fma {
                 dst: VRegId(5),

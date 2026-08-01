@@ -1698,7 +1698,7 @@ impl Default for NumericalSimulator {
 //   Mov / LoopBegin / LoopEnd / TileConfig / TileMma / TileRelease
 // 其余指令 (控制流/GPU/通信) 不在 GEMM-FMA 路径, 解释器遇之报错 (NO-SILENT-FALLBACK)。
 
-use super::instr::{VRegId, SimdWidth, VmInstr, VmProgram, OffsetExpr, ScalarExpr, BoundExpr};
+use super::instr::{BoundExpr, LoopStride, OffsetExpr, ScalarExpr, SimdWidth, VRegId, VmInstr, VmProgram};
 use crate::compiler::trace::QuantPrecision;
 
 /// 解释器寄存器值: 一个 SIMD 向量用 Vec<f32> 表示 (lane 0..lanes-1)。
@@ -2319,7 +2319,7 @@ fn interpret_instr_slice(
     let mut pc = 0;
     while pc < instrs.len() {
         match &instrs[pc] {
-            VmInstr::LoopBegin { counter, byte_offset, bound, step_bytes } => {
+            VmInstr::LoopBegin { counter, offsets, bound } => {
                 let iters = bound_to_iters(bound)?;
                 let loop_end_idx = find_matching_loop_end(instrs, pc)
                     .ok_or_else(|| CompilerError::CodegenViolation(
@@ -2328,11 +2328,19 @@ fn interpret_instr_slice(
                 let body = &instrs[pc + 1..loop_end_idx];
                 for i in 0..iters as i64 {
                     state.loop_counters.insert(*counter, i);
-                    state.loop_byte_offsets.insert(*byte_offset, i * *step_bytes as i64);
+                    for offset in offsets {
+                        let step_bytes = match offset.stride {
+                            LoopStride::FixedBytes(step_bytes) => step_bytes,
+                            LoopStride::ScalableElemBytes(elem_bytes) => elem_bytes,
+                        };
+                        state.loop_byte_offsets.insert(offset.vreg, i * step_bytes as i64);
+                    }
                     interpret_instr_slice(body, state, width)?;
                 }
                 state.loop_counters.remove(counter);
-                state.loop_byte_offsets.remove(byte_offset);
+                for offset in offsets {
+                    state.loop_byte_offsets.remove(&offset.vreg);
+                }
                 pc = loop_end_idx + 1;
             }
             VmInstr::LoopEnd => {

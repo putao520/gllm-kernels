@@ -236,13 +236,21 @@ impl VmOptPass for LoopUnrollPass {
         let mut added = 0;
         let mut i = 0;
         while i < program.instrs.len() {
-            let unroll_info = if let VmInstr::LoopBegin { bound: BoundExpr::Const(n), step_bytes, byte_offset, .. } = &program.instrs[i] {
-                if *n <= UNROLL_THRESHOLD && *n > 0 { Some((*n, *step_bytes, *byte_offset)) } else { None }
+            let unroll_info = if let VmInstr::LoopBegin { bound: BoundExpr::Const(n), offsets, .. } = &program.instrs[i] {
+                if *n <= UNROLL_THRESHOLD && *n > 0 && !offsets.is_empty() {
+                    let steps: Option<Vec<(usize, VRegId)>> = offsets
+                        .iter()
+                        .map(|offset| offset.stride.as_fixed_bytes().map(|step| (step, offset.vreg)))
+                        .collect();
+                    steps.map(|steps| (*n, steps))
+                } else {
+                    None
+                }
             } else {
                 None
             };
 
-            if let Some((bound, step, bo_vreg)) = unroll_info {
+            if let Some((bound, offset_steps)) = unroll_info {
                 // 找对应 LoopEnd
                 let mut depth = 1;
                 let mut end_idx = i + 1;
@@ -279,12 +287,20 @@ impl VmOptPass for LoopUnrollPass {
                     continue;
                 }
 
-                // 展开: 每次替换 LoopOffset(bo_vreg) → Const(iter * step)
+                // 展开: 每次替换所有 LoopOffset(vreg) → Const(iter * step)。
+                // Legacy emit_loop 产生单元素 offset_steps，因此保持原有行为。
                 let mut unrolled = Vec::with_capacity(body_len * bound);
                 for iter in 0..bound {
-                    let byte_val = iter * step;
                     for instr in &body {
-                        unrolled.push(substitute_loop_offset_in_instr(instr, bo_vreg, byte_val));
+                        let mut substituted = instr.clone();
+                        for (step, offset_vreg) in &offset_steps {
+                            substituted = substitute_loop_offset_in_instr(
+                                &substituted,
+                                *offset_vreg,
+                                iter * *step,
+                            );
+                        }
+                        unrolled.push(substituted);
                     }
                 }
 
@@ -953,9 +969,7 @@ mod tests {
         let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         prog.emit(VmInstr::LoopBegin {
             counter,
-            byte_offset: off,
-            bound: BoundExpr::Const(8),
-            step_bytes: 32,
+            offsets: vec![LoopOffset { vreg: off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(8),
         });
         prog.emit(VmInstr::VecLoad {
             dst: vec, base: ptr,
@@ -1199,8 +1213,7 @@ mod data_structure_tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
         prog.emit(VmInstr::LoopBegin {
-            counter: counter0, byte_offset: off0,
-            bound: BoundExpr::Const(8), step_bytes: 32,
+            counter: counter0, offsets: vec![LoopOffset { vreg: off0, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(8),
         });
         prog.emit(VmInstr::Broadcast {
             dst: vec0, src: ScalarExpr::Const(1.0),
@@ -1209,8 +1222,7 @@ mod data_structure_tests {
         prog.emit(VmInstr::LoopEnd);
         // Adjacent LoopEnd→LoopBegin: should be fused
         prog.emit(VmInstr::LoopBegin {
-            counter: counter1, byte_offset: off1,
-            bound: BoundExpr::Const(8), step_bytes: 32,
+            counter: counter1, offsets: vec![LoopOffset { vreg: off1, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(8),
         });
         prog.emit(VmInstr::Broadcast {
             dst: vec0, src: ScalarExpr::Const(2.0),
@@ -1416,8 +1428,7 @@ mod data_structure_tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
         prog.emit(VmInstr::LoopBegin {
-            counter, byte_offset: off,
-            bound: BoundExpr::Const(2), step_bytes: 32,
+            counter, offsets: vec![LoopOffset { vreg: off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(2),
         });
         prog.emit(VmInstr::Broadcast {
             dst: vec0, src: ScalarExpr::Const(1.0),
@@ -1580,8 +1591,7 @@ mod data_structure_tests {
         let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         prog.emit(VmInstr::LoopBegin {
-            counter, byte_offset: off,
-            bound: BoundExpr::Const(16), step_bytes: 32,
+            counter, offsets: vec![LoopOffset { vreg: off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(16),
         });
         prog.emit(VmInstr::Comment("inside loop".into()));
         // Find the index of the Comment (which is inside the loop)
@@ -1697,8 +1707,7 @@ mod data_structure_tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
         prog.emit(VmInstr::LoopBegin {
-            counter, byte_offset: off,
-            bound: BoundExpr::Const(8), step_bytes: 32,
+            counter, offsets: vec![LoopOffset { vreg: off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(8),
         });
         prog.emit(VmInstr::Broadcast {
             dst: vec0, src: ScalarExpr::Const(1.0),
@@ -1730,12 +1739,10 @@ mod data_structure_tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
         prog.emit(VmInstr::LoopBegin {
-            counter: outer_counter, byte_offset: outer_off,
-            bound: BoundExpr::Const(2), step_bytes: 32,
+            counter: outer_counter, offsets: vec![LoopOffset { vreg: outer_off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(2),
         });
         prog.emit(VmInstr::LoopBegin {
-            counter: inner_counter, byte_offset: inner_off,
-            bound: BoundExpr::Const(2), step_bytes: 32,
+            counter: inner_counter, offsets: vec![LoopOffset { vreg: inner_off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(2),
         });
         prog.emit(VmInstr::Broadcast {
             dst: vec0, src: ScalarExpr::Const(1.0),
@@ -1944,15 +1951,15 @@ mod data_structure_tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
         // Loop 0
-        prog.emit(VmInstr::LoopBegin { counter: c0, byte_offset: off0, bound: BoundExpr::Const(4), step_bytes: 32 });
+        prog.emit(VmInstr::LoopBegin { counter: c0, offsets: vec![LoopOffset { vreg: off0, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(4)});
         prog.emit(VmInstr::Broadcast { dst: vec0, src: ScalarExpr::Const(1.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
         prog.emit(VmInstr::LoopEnd);
         // Loop 1
-        prog.emit(VmInstr::LoopBegin { counter: c1, byte_offset: off1, bound: BoundExpr::Const(4), step_bytes: 32 });
+        prog.emit(VmInstr::LoopBegin { counter: c1, offsets: vec![LoopOffset { vreg: off1, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(4)});
         prog.emit(VmInstr::Broadcast { dst: vec0, src: ScalarExpr::Const(2.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
         prog.emit(VmInstr::LoopEnd);
         // Loop 2
-        prog.emit(VmInstr::LoopBegin { counter: c2, byte_offset: off2, bound: BoundExpr::Const(4), step_bytes: 32 });
+        prog.emit(VmInstr::LoopBegin { counter: c2, offsets: vec![LoopOffset { vreg: off2, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(4)});
         prog.emit(VmInstr::Broadcast { dst: vec0, src: ScalarExpr::Const(3.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
         prog.emit(VmInstr::LoopEnd);
 
@@ -2151,8 +2158,7 @@ mod data_structure_tests {
         let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         prog.emit(VmInstr::LoopBegin {
-            counter, byte_offset: off,
-            bound: BoundExpr::Const(4), step_bytes: 32,
+            counter, offsets: vec![LoopOffset { vreg: off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(4),
         });
         prog.emit(VmInstr::Comment("inside loop".into()));
         prog.emit(VmInstr::LoopEnd);
@@ -2181,8 +2187,7 @@ mod data_structure_tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
         prog.emit(VmInstr::LoopBegin {
-            counter, byte_offset: off,
-            bound: BoundExpr::Const(0), step_bytes: 32,
+            counter, offsets: vec![LoopOffset { vreg: off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(0),
         });
         prog.emit(VmInstr::Broadcast {
             dst: vec0, src: ScalarExpr::Const(1.0),
@@ -2270,8 +2275,8 @@ mod data_structure_tests {
         let off1 = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
-        prog.emit(VmInstr::LoopBegin { counter: c0, byte_offset: off0, bound: BoundExpr::Const(4), step_bytes: 32 });
-        prog.emit(VmInstr::LoopBegin { counter: c1, byte_offset: off1, bound: BoundExpr::Const(4), step_bytes: 32 });
+        prog.emit(VmInstr::LoopBegin { counter: c0, offsets: vec![LoopOffset { vreg: off0, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(4)});
+        prog.emit(VmInstr::LoopBegin { counter: c1, offsets: vec![LoopOffset { vreg: off1, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(4)});
         prog.emit(VmInstr::Broadcast { dst: vec0, src: ScalarExpr::Const(1.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
         prog.emit(VmInstr::LoopEnd);
         prog.emit(VmInstr::LoopEnd);
@@ -2500,8 +2505,8 @@ mod data_structure_tests {
         let inner_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
-        prog.emit(VmInstr::LoopBegin { counter: outer_c, byte_offset: outer_off, bound: BoundExpr::Const(4), step_bytes: 32 });
-        prog.emit(VmInstr::LoopBegin { counter: inner_c, byte_offset: inner_off, bound: BoundExpr::Const(2), step_bytes: 32 });
+        prog.emit(VmInstr::LoopBegin { counter: outer_c, offsets: vec![LoopOffset { vreg: outer_off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(4)});
+        prog.emit(VmInstr::LoopBegin { counter: inner_c, offsets: vec![LoopOffset { vreg: inner_off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(2)});
         prog.emit(VmInstr::Broadcast { dst: vec0, src: ScalarExpr::Const(1.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
         prog.emit(VmInstr::LoopEnd); // inner
         prog.emit(VmInstr::Broadcast { dst: vec0, src: ScalarExpr::Const(2.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
@@ -2636,8 +2641,7 @@ mod data_structure_tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
         prog.emit(VmInstr::LoopBegin {
-            counter, byte_offset: off,
-            bound: BoundExpr::Const(1), step_bytes: 32,
+            counter, offsets: vec![LoopOffset { vreg: off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(1),
         });
         prog.emit(VmInstr::Broadcast {
             dst: vec0, src: ScalarExpr::Const(1.0),
@@ -2730,8 +2734,7 @@ mod data_structure_tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
         prog.emit(VmInstr::LoopBegin {
-            counter, byte_offset: off,
-            bound: BoundExpr::Const(8), step_bytes: 32,
+            counter, offsets: vec![LoopOffset { vreg: off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(8),
         });
         prog.emit(VmInstr::Broadcast {
             dst: vec0, src: ScalarExpr::Const(0.044715),
@@ -2810,12 +2813,15 @@ mod data_structure_tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
         prog.emit(VmInstr::LoopBegin {
-            counter, byte_offset: off,
+            counter,
+            offsets: vec![LoopOffset {
+                vreg: off,
+                stride: LoopStride::FixedBytes(32),
+            }],
             bound: BoundExpr::Symbolic(super::super::instr::SymBound {
                 name: "seq_len".into(),
                 max_alloc: 2048,
             }),
-            step_bytes: 32,
         });
         prog.emit(VmInstr::Broadcast {
             dst: vec0, src: ScalarExpr::Const(1.0),
