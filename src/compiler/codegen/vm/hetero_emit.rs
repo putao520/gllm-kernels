@@ -2,9 +2,7 @@
 
 use rayon::prelude::*;
 
-use super::plan_lower::{
-    LoweringContext, TensorPtrResolver, compile_layer_type_body,
-};
+use super::plan_lower::{compile_layer_type_body, LoweringContext, TensorPtrResolver};
 use crate::compiler::buffer_alloc::BufferAllocation;
 use crate::compiler::fusion::{FusionPlan, HeteroLayerType};
 use crate::compiler::graph::CompilerGraph;
@@ -81,7 +79,8 @@ pub fn compile_hetero_templates_parallel(
     }
 
     // 预编译所有层类型模板 (rayon 并行)
-    let templates: Vec<_> = boundaries.iter()
+    let templates: Vec<_> = boundaries
+        .iter()
         .map(|range| {
             let label = match range.layer_type {
                 HeteroLayerType::SlidingSmall => "ss",
@@ -100,7 +99,12 @@ pub fn compile_hetero_templates_parallel(
         .par_iter()
         .map(|(range, label)| {
             let result = compile_layer_type_body(
-                ctx, range.group_range.clone(), plan, graph, alloc, resolver,
+                ctx,
+                range.group_range.clone(),
+                plan,
+                graph,
+                alloc,
+                resolver,
             );
             (label, result)
         })
@@ -111,10 +115,15 @@ pub fn compile_hetero_templates_parallel(
         match result {
             Ok(tpl) => {
                 if std::env::var("GLLM_DEBUG_RESOURCE").is_ok() {
-                    eprintln!("[hetero-parallel] Template {} compiled: {} instrs, abi=({},{},{},{})",
-                        label, tpl.body.instrs.len(),
-                        tpl.abi_map.input_ptr.0, tpl.abi_map.weight_ptr.0,
-                        tpl.abi_map.output_ptr.0, tpl.abi_map.scratch_base.0);
+                    eprintln!(
+                        "[hetero-parallel] Template {} compiled: {} instrs, abi=({},{},{},{})",
+                        label,
+                        tpl.body.instrs.len(),
+                        tpl.abi_map.input_ptr.0,
+                        tpl.abi_map.weight_ptr.0,
+                        tpl.abi_map.output_ptr.0,
+                        tpl.abi_map.scratch_base.0
+                    );
                 }
             }
             Err(e) => {
@@ -209,7 +218,10 @@ mod tests {
 
     #[test]
     fn analyze_hetero_boundaries_empty_plan() {
-        let plan = FusionPlan { groups: vec![], op_to_group: Default::default() };
+        let plan = FusionPlan {
+            groups: vec![],
+            op_to_group: Default::default(),
+        };
         let graph = CompilerGraph::new();
         let result = analyze_hetero_layer_boundaries(&plan, &graph);
         assert!(result.is_empty());
@@ -288,7 +300,10 @@ mod tests {
     #[test]
     fn analyze_boundaries_unrecognized_labels_yield_empty() {
         // Arrange — graph with no hetero-labeled ops (empty groups)
-        let plan = FusionPlan { groups: vec![], op_to_group: Default::default() };
+        let plan = FusionPlan {
+            groups: vec![],
+            op_to_group: Default::default(),
+        };
         let graph = CompilerGraph::new();
         // Act
         let result = analyze_hetero_layer_boundaries(&plan, &graph);

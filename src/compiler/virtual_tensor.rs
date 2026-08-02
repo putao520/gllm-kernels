@@ -8,12 +8,12 @@
 //! Type II (需要分析): 部分连续 (Transpose, Permute) → 需评估 memory coalescing 影响
 //! 不可虚拟化: 跨融合组边界, 多消费者外部引用
 
-use std::collections::{HashMap, HashSet};
-use crate::compiler::graph::{CompilerGraph, OpId, TensorId};
 use crate::compiler::fusion::FusionPlan;
+use crate::compiler::graph::{CompilerGraph, OpId, TensorId};
 use crate::compiler::layout_negotiator::LayoutAssignment;
 use crate::compiler::pack_map::PackMap;
 use crate::dispatch::device_profile::DeviceProfile;
+use std::collections::{HashMap, HashSet};
 
 /// 索引变换类型 (VTC §3.2 mapping function F)
 #[derive(Debug, Clone, PartialEq)]
@@ -46,13 +46,25 @@ impl IndexMap {
             IndexMap::InterleavePair => 0.0,
             IndexMap::Transpose2D => {
                 // AVX-512 VPERM/SVE compact: 近零代价; 无硬件转置: 非合并访问惩罚
-                if profile.has_hw_transpose() { 0.1 } else { 1.0 }
+                if profile.has_hw_transpose() {
+                    0.1
+                } else {
+                    1.0
+                }
             }
             IndexMap::Permute(_) => {
-                if profile.has_hw_permute() { 0.2 } else { 2.0 }
+                if profile.has_hw_permute() {
+                    0.2
+                } else {
+                    2.0
+                }
             }
             IndexMap::Broadcast { .. } => {
-                if profile.has_hw_broadcast() { 0.0 } else { 0.5 }
+                if profile.has_hw_broadcast() {
+                    0.0
+                } else {
+                    0.5
+                }
             }
         }
     }
@@ -221,7 +233,9 @@ fn analyze_virtual_opportunity(
         let consumer_id = consumers[0];
 
         // 检查 producer 和 consumer 是否在同一融合组
-        let same_group = plan.op_to_group.get(&producer_id)
+        let same_group = plan
+            .op_to_group
+            .get(&producer_id)
             .zip(plan.op_to_group.get(&consumer_id))
             .map(|(a, b)| a == b)
             .unwrap_or(false);
@@ -256,9 +270,13 @@ fn analyze_virtual_opportunity(
     // 多消费者: 检查是否所有消费者都在同一融合组
     if consumers.len() > 1 {
         let first_group = plan.op_to_group.get(&consumers[0]);
-        let all_same = first_group.map(|fg| {
-            consumers.iter().all(|c| plan.op_to_group.get(c) == Some(fg))
-        }).unwrap_or(false);
+        let all_same = first_group
+            .map(|fg| {
+                consumers
+                    .iter()
+                    .all(|c| plan.op_to_group.get(c) == Some(fg))
+            })
+            .unwrap_or(false);
 
         if all_same {
             // 组内多消费者: 部分虚拟化 (一次物理化, 多消费点虚拟引用)
@@ -271,23 +289,25 @@ fn analyze_virtual_opportunity(
 
 /// 推断索引变换类型 (布局感知)
 /// 消费 R1.5 LayoutAssignment: 按 producer OpId 精确查找协商布局。
-fn infer_index_map(
-    producer_id: OpId,
-    layout: Option<&LayoutAssignment>,
-) -> IndexMap {
+fn infer_index_map(producer_id: OpId, layout: Option<&LayoutAssignment>) -> IndexMap {
     use crate::compiler::accel_registry::LayoutConstraint;
 
     if let Some(la) = layout {
-        if let Some(assign) = la.group_assignments.iter()
+        if let Some(assign) = la
+            .group_assignments
+            .iter()
             .find_map(|ga| ga.op_layouts.get(&producer_id))
         {
             return match &assign.output_layout {
-                LayoutConstraint::HeadSplit { num_heads, head_dim } =>
-                    IndexMap::HeadSplit { num_heads: *num_heads, head_dim: *head_dim },
-                LayoutConstraint::InterleavedPairs =>
-                    IndexMap::InterleavePair,
-                LayoutConstraint::ColMajor { .. } =>
-                    IndexMap::Transpose2D,
+                LayoutConstraint::HeadSplit {
+                    num_heads,
+                    head_dim,
+                } => IndexMap::HeadSplit {
+                    num_heads: *num_heads,
+                    head_dim: *head_dim,
+                },
+                LayoutConstraint::InterleavedPairs => IndexMap::InterleavePair,
+                LayoutConstraint::ColMajor { .. } => IndexMap::Transpose2D,
                 _ => IndexMap::Identity,
             };
         }
@@ -297,32 +317,34 @@ fn infer_index_map(
 }
 
 /// 追踪物理来源 tensor
-fn find_physical_source(
-    graph: &CompilerGraph,
-    producer_id: OpId,
-) -> Option<TensorId> {
-    graph.op(producer_id).and_then(|op| op.inputs.first().copied())
+fn find_physical_source(graph: &CompilerGraph, producer_id: OpId) -> Option<TensorId> {
+    graph
+        .op(producer_id)
+        .and_then(|op| op.inputs.first().copied())
 }
 
 /// 检查 R1.5 是否要求此 tensor 使用物理 pack 布局 (不可虚拟化)
 /// §0.2.7: PackMap 虚拟化的布局不再需要物理 pack — 返回 false
 fn requires_physical_layout(layout: &LayoutAssignment, producer_op: OpId) -> bool {
     use crate::compiler::accel_registry::LayoutConstraint;
-    layout.group_assignments.iter()
+    layout
+        .group_assignments
+        .iter()
         .find_map(|ga| ga.op_layouts.get(&producer_op))
         .is_some_and(|assign| {
             let lc = &assign.output_layout;
             // §0.2.7: PanelPacked/Vnni/AmxTile 已由 PackMap 虚拟化 — 不需要物理 pack
-            if matches!(lc,
-                LayoutConstraint::PanelPacked { .. } |
-                LayoutConstraint::VnniPacked4 |
-                LayoutConstraint::AmxTileBF16 { .. }
+            if matches!(
+                lc,
+                LayoutConstraint::PanelPacked { .. }
+                    | LayoutConstraint::VnniPacked4
+                    | LayoutConstraint::AmxTileBF16 { .. }
             ) {
                 return false;
             }
-            matches!(lc,
-                LayoutConstraint::SharedMemTile { .. } |
-                LayoutConstraint::TmaAligned2D { .. }
+            matches!(
+                lc,
+                LayoutConstraint::SharedMemTile { .. } | LayoutConstraint::TmaAligned2D { .. }
             )
         })
 }
@@ -336,7 +358,14 @@ mod tests {
         let profile = DeviceProfile::detect();
         assert_eq!(IndexMap::Identity.cost_for(&profile), 0.0);
         assert_eq!(IndexMap::Offset(16).cost_for(&profile), 0.0);
-        assert_eq!(IndexMap::HeadSplit { num_heads: 32, head_dim: 128 }.cost_for(&profile), 0.0);
+        assert_eq!(
+            IndexMap::HeadSplit {
+                num_heads: 32,
+                head_dim: 128
+            }
+            .cost_for(&profile),
+            0.0
+        );
         assert_eq!(IndexMap::InterleavePair.cost_for(&profile), 0.0);
         assert!(IndexMap::Transpose2D.cost_for(&profile) > 0.0);
         assert!(IndexMap::Permute(vec![1, 0]).cost_for(&profile) > 0.0);
@@ -347,7 +376,11 @@ mod tests {
         let profile = DeviceProfile::detect();
         assert!(IndexMap::Identity.is_type_i_for(&profile));
         assert!(IndexMap::Offset(0).is_type_i_for(&profile));
-        assert!(IndexMap::HeadSplit { num_heads: 32, head_dim: 128 }.is_type_i_for(&profile));
+        assert!(IndexMap::HeadSplit {
+            num_heads: 32,
+            head_dim: 128
+        }
+        .is_type_i_for(&profile));
         assert!(!IndexMap::Transpose2D.is_type_i_for(&profile));
     }
 
@@ -376,20 +409,26 @@ mod tests {
     #[test]
     fn test_virtual_tensor_map_physical_root() {
         let mut vtm = VirtualTensorMap::empty();
-        vtm.virtual_map.insert(TensorId(2), VirtualTensor {
-            source: TensorId(1),
-            index_map: IndexMap::Identity,
-            byte_offset: 0,
-            num_elements: 100,
-            elem_bytes: 4,
-        });
-        vtm.virtual_map.insert(TensorId(1), VirtualTensor {
-            source: TensorId(0),
-            index_map: IndexMap::Offset(16),
-            byte_offset: 0,
-            num_elements: 100,
-            elem_bytes: 4,
-        });
+        vtm.virtual_map.insert(
+            TensorId(2),
+            VirtualTensor {
+                source: TensorId(1),
+                index_map: IndexMap::Identity,
+                byte_offset: 0,
+                num_elements: 100,
+                elem_bytes: 4,
+            },
+        );
+        vtm.virtual_map.insert(
+            TensorId(1),
+            VirtualTensor {
+                source: TensorId(0),
+                index_map: IndexMap::Offset(16),
+                byte_offset: 0,
+                num_elements: 100,
+                elem_bytes: 4,
+            },
+        );
 
         // 追踪到物理根
         assert_eq!(vtm.physical_root(TensorId(2)), TensorId(0));
@@ -409,7 +448,10 @@ mod tests {
         let is_type_i = broadcast.is_type_i_for(&profile);
 
         // Assert: cost is either 0.0 (hw broadcast) or 0.5 (no hw broadcast)
-        assert!(cost == 0.0 || cost == 0.5, "unexpected broadcast cost: {cost}");
+        assert!(
+            cost == 0.0 || cost == 0.5,
+            "unexpected broadcast cost: {cost}"
+        );
         assert_eq!(is_type_i, cost == 0.0);
     }
 
@@ -424,7 +466,10 @@ mod tests {
         let cost = permute.cost_for(&profile);
 
         // Assert: must be one of the two defined cost tiers
-        assert!(cost == 0.2 || cost == 2.0, "unexpected permute cost: {cost}");
+        assert!(
+            cost == 0.2 || cost == 2.0,
+            "unexpected permute cost: {cost}"
+        );
     }
 
     // @trace TEST-VT-08 [req:REQ-VTC] [level:unit]
@@ -438,7 +483,10 @@ mod tests {
         let cost = transpose.cost_for(&profile);
 
         // Assert: must be one of the two defined cost tiers
-        assert!(cost == 0.1 || cost == 1.0, "unexpected transpose cost: {cost}");
+        assert!(
+            cost == 0.1 || cost == 1.0,
+            "unexpected transpose cost: {cost}"
+        );
     }
 
     // @trace TEST-VT-09 [req:REQ-VTC] [level:unit]
@@ -459,20 +507,21 @@ mod tests {
         // Arrange
         let profile = DeviceProfile::detect();
 
-        let configs = vec![
-            (1, 1),
-            (32, 128),
-            (8, 4096),
-            (128, 4),
-        ];
+        let configs = vec![(1, 1), (32, 128), (8, 4096), (128, 4)];
 
         for (num_heads, head_dim) in configs {
             // Act
-            let hs = IndexMap::HeadSplit { num_heads, head_dim };
+            let hs = IndexMap::HeadSplit {
+                num_heads,
+                head_dim,
+            };
             let cost = hs.cost_for(&profile);
 
             // Assert: HeadSplit is always zero-cost regardless of parameters
-            assert_eq!(cost, 0.0, "HeadSplit cost should be 0 for heads={num_heads}, dim={head_dim}");
+            assert_eq!(
+                cost, 0.0,
+                "HeadSplit cost should be 0 for heads={num_heads}, dim={head_dim}"
+            );
             assert!(hs.is_type_i_for(&profile));
         }
     }
@@ -526,7 +575,10 @@ mod tests {
         // Arrange: single element, single byte
         let vt_one = VirtualTensor {
             source: TensorId(101),
-            index_map: IndexMap::HeadSplit { num_heads: 1, head_dim: 1 },
+            index_map: IndexMap::HeadSplit {
+                num_heads: 1,
+                head_dim: 1,
+            },
             byte_offset: 0,
             num_elements: 1,
             elem_bytes: 1,
@@ -542,13 +594,16 @@ mod tests {
         // Arrange: map with one virtual tensor
         let mut vtm = VirtualTensorMap::empty();
         let tid = TensorId(42);
-        vtm.virtual_map.insert(tid, VirtualTensor {
-            source: TensorId(0),
-            index_map: IndexMap::Identity,
-            byte_offset: 0,
-            num_elements: 100,
-            elem_bytes: 4,
-        });
+        vtm.virtual_map.insert(
+            tid,
+            VirtualTensor {
+                source: TensorId(0),
+                index_map: IndexMap::Identity,
+                byte_offset: 0,
+                num_elements: 100,
+                elem_bytes: 4,
+            },
+        );
 
         // Act & Assert: present
         assert!(vtm.is_virtual(tid));
@@ -563,19 +618,25 @@ mod tests {
         // Arrange: 4-level chain: 4 → 3 → 2 → 1 → 0 (physical)
         let mut vtm = VirtualTensorMap::empty();
         for i in 1u32..=4u32 {
-            vtm.virtual_map.insert(TensorId(i), VirtualTensor {
-                source: TensorId(i - 1),
-                index_map: IndexMap::Offset(i as isize * 16),
-                byte_offset: 0,
-                num_elements: 50,
-                elem_bytes: 4,
-            });
+            vtm.virtual_map.insert(
+                TensorId(i),
+                VirtualTensor {
+                    source: TensorId(i - 1),
+                    index_map: IndexMap::Offset(i as isize * 16),
+                    byte_offset: 0,
+                    num_elements: 50,
+                    elem_bytes: 4,
+                },
+            );
         }
 
         // Act & Assert: all resolve to TensorId(0)
         for i in 1u32..=4u32 {
-            assert_eq!(vtm.physical_root(TensorId(i)), TensorId(0),
-                "TensorId({i}) should resolve to TensorId(0)");
+            assert_eq!(
+                vtm.physical_root(TensorId(i)),
+                TensorId(0),
+                "TensorId({i}) should resolve to TensorId(0)"
+            );
         }
 
         // Act & Assert: physical tensor returns itself
@@ -589,13 +650,16 @@ mod tests {
     fn test_virtual_tensor_map_physical_root_single_step() {
         // Arrange: one virtual tensor pointing directly to a physical source
         let mut vtm = VirtualTensorMap::empty();
-        vtm.virtual_map.insert(TensorId(5), VirtualTensor {
-            source: TensorId(10),
-            index_map: IndexMap::Transpose2D,
-            byte_offset: 256,
-            num_elements: 512,
-            elem_bytes: 2,
-        });
+        vtm.virtual_map.insert(
+            TensorId(5),
+            VirtualTensor {
+                source: TensorId(10),
+                index_map: IndexMap::Transpose2D,
+                byte_offset: 256,
+                num_elements: 512,
+                elem_bytes: 2,
+            },
+        );
 
         // Act & Assert: resolves in one step
         assert_eq!(vtm.physical_root(TensorId(5)), TensorId(10));
@@ -617,17 +681,35 @@ mod tests {
             IndexMap::Permute(vec![2, 0, 1])
         );
         assert_eq!(
-            IndexMap::HeadSplit { num_heads: 8, head_dim: 64 },
-            IndexMap::HeadSplit { num_heads: 8, head_dim: 64 }
+            IndexMap::HeadSplit {
+                num_heads: 8,
+                head_dim: 64
+            },
+            IndexMap::HeadSplit {
+                num_heads: 8,
+                head_dim: 64
+            }
         );
         assert_ne!(
-            IndexMap::HeadSplit { num_heads: 8, head_dim: 64 },
-            IndexMap::HeadSplit { num_heads: 8, head_dim: 128 }
+            IndexMap::HeadSplit {
+                num_heads: 8,
+                head_dim: 64
+            },
+            IndexMap::HeadSplit {
+                num_heads: 8,
+                head_dim: 128
+            }
         );
         assert_eq!(IndexMap::InterleavePair, IndexMap::InterleavePair);
         assert_eq!(IndexMap::Transpose2D, IndexMap::Transpose2D);
-        assert_eq!(IndexMap::Broadcast { factor: 3 }, IndexMap::Broadcast { factor: 3 });
-        assert_ne!(IndexMap::Broadcast { factor: 3 }, IndexMap::Broadcast { factor: 4 });
+        assert_eq!(
+            IndexMap::Broadcast { factor: 3 },
+            IndexMap::Broadcast { factor: 3 }
+        );
+        assert_ne!(
+            IndexMap::Broadcast { factor: 3 },
+            IndexMap::Broadcast { factor: 4 }
+        );
     }
 
     // @trace TEST-VT-17 [req:REQ-VTC] [level:unit]
@@ -637,7 +719,10 @@ mod tests {
         let vtm = VirtualTensorMap::empty();
 
         // Act & Assert: pack_maps starts empty
-        assert!(vtm.pack_maps.is_empty(), "empty map should have no pack maps");
+        assert!(
+            vtm.pack_maps.is_empty(),
+            "empty map should have no pack maps"
+        );
     }
 
     // @trace TEST-VT-18 [req:REQ-VTC] [level:unit]
@@ -666,13 +751,16 @@ mod tests {
     fn test_virtual_tensor_map_physical_set_tracking() {
         // Arrange: map with both virtual and physical tensors
         let mut vtm = VirtualTensorMap::empty();
-        vtm.virtual_map.insert(TensorId(10), VirtualTensor {
-            source: TensorId(0),
-            index_map: IndexMap::Identity,
-            byte_offset: 0,
-            num_elements: 64,
-            elem_bytes: 4,
-        });
+        vtm.virtual_map.insert(
+            TensorId(10),
+            VirtualTensor {
+                source: TensorId(0),
+                index_map: IndexMap::Identity,
+                byte_offset: 0,
+                num_elements: 64,
+                elem_bytes: 4,
+            },
+        );
         vtm.physical_set.insert(TensorId(0));
         vtm.physical_set.insert(TensorId(20));
         vtm.bytes_saved = 512;
@@ -692,7 +780,10 @@ mod tests {
         let mut vtm = VirtualTensorMap::empty();
         let pm_panel = PackMap::PanelPack { nr: 4, kc: 256 };
         let pm_vnni = PackMap::VnniPack { interleave: 4 };
-        let pm_tile = PackMap::TilePack { tile_rows: 16, tile_cols: 16 };
+        let pm_tile = PackMap::TilePack {
+            tile_rows: 16,
+            tile_cols: 16,
+        };
         vtm.pack_maps.insert(TensorId(100), pm_panel.clone());
         vtm.pack_maps.insert(TensorId(200), pm_vnni.clone());
         vtm.pack_maps.insert(TensorId(300), pm_tile.clone());
@@ -715,13 +806,16 @@ mod tests {
         }
         // Virtual tensors pointing to physical sources
         for i in 100..110u32 {
-            vtm.virtual_map.insert(TensorId(i), VirtualTensor {
-                source: TensorId(i - 100),
-                index_map: IndexMap::Offset(0),
-                byte_offset: 0,
-                num_elements: 64,
-                elem_bytes: 4,
-            });
+            vtm.virtual_map.insert(
+                TensorId(i),
+                VirtualTensor {
+                    source: TensorId(i - 100),
+                    index_map: IndexMap::Offset(0),
+                    byte_offset: 0,
+                    num_elements: 64,
+                    elem_bytes: 4,
+                },
+            );
         }
 
         // Act & Assert: physical set has correct size
@@ -749,15 +843,24 @@ mod tests {
             IndexMap::Offset(0),
             IndexMap::Offset(isize::MAX),
             IndexMap::Offset(isize::MIN),
-            IndexMap::HeadSplit { num_heads: 1, head_dim: 1 },
-            IndexMap::HeadSplit { num_heads: 128, head_dim: 4096 },
+            IndexMap::HeadSplit {
+                num_heads: 1,
+                head_dim: 1,
+            },
+            IndexMap::HeadSplit {
+                num_heads: 128,
+                head_dim: 4096,
+            },
             IndexMap::InterleavePair,
         ];
 
         for variant in &type_i_variants {
             // Act & Assert
-            assert!(variant.is_type_i_for(&profile),
-                "{:?} should be Type I (zero cost)", variant);
+            assert!(
+                variant.is_type_i_for(&profile),
+                "{:?} should be Type I (zero cost)",
+                variant
+            );
         }
 
         // Transpose2D is never Type I
@@ -769,11 +872,11 @@ mod tests {
     fn test_virtual_tensor_bytes_saved_various_elem_bytes() {
         // Arrange: test bytes_saved with different element sizes
         let configs: Vec<(usize, usize, usize)> = vec![
-            (0, 1, 0),    // zero elements -> 0 bytes saved
-            (1, 1, 2),    // 1 elem, 1 byte -> 2 bytes
-            (1, 2, 4),    // 1 elem, 2 bytes -> 4 bytes
-            (1, 4, 8),    // 1 elem, 4 bytes -> 8 bytes
-            (1, 8, 16),   // 1 elem, 8 bytes -> 16 bytes
+            (0, 1, 0),       // zero elements -> 0 bytes saved
+            (1, 1, 2),       // 1 elem, 1 byte -> 2 bytes
+            (1, 2, 4),       // 1 elem, 2 bytes -> 4 bytes
+            (1, 4, 8),       // 1 elem, 4 bytes -> 8 bytes
+            (1, 8, 16),      // 1 elem, 8 bytes -> 16 bytes
             (1024, 2, 4096), // 1024 elems, 2 bytes -> 4096 bytes
         ];
 
@@ -788,8 +891,11 @@ mod tests {
             };
 
             // Assert
-            assert_eq!(vt.bytes_saved(), expected,
-                "bytes_saved mismatch for num_elements={num_elements}, elem_bytes={elem_bytes}");
+            assert_eq!(
+                vt.bytes_saved(),
+                expected,
+                "bytes_saved mismatch for num_elements={num_elements}, elem_bytes={elem_bytes}"
+            );
         }
     }
 
@@ -798,14 +904,16 @@ mod tests {
     fn test_virtual_tensor_map_empty_is_virtual_for_all_absent() {
         // Arrange: empty map, check several TensorIds
         let vtm = VirtualTensorMap::empty();
-        let absent_ids: Vec<TensorId> = vec![
-            TensorId(0), TensorId(1), TensorId(100), TensorId(u32::MAX),
-        ];
+        let absent_ids: Vec<TensorId> =
+            vec![TensorId(0), TensorId(1), TensorId(100), TensorId(u32::MAX)];
 
         // Act & Assert: none should be virtual
         for tid in &absent_ids {
-            assert!(!vtm.is_virtual(*tid),
-                "empty map should report TensorId({}) as non-virtual", tid.0);
+            assert!(
+                !vtm.is_virtual(*tid),
+                "empty map should report TensorId({}) as non-virtual",
+                tid.0
+            );
         }
     }
 
@@ -833,27 +941,36 @@ mod tests {
     fn test_virtual_tensor_map_physical_root_with_mixed_types() {
         // Arrange: chain with different IndexMap types
         let mut vtm = VirtualTensorMap::empty();
-        vtm.virtual_map.insert(TensorId(3), VirtualTensor {
-            source: TensorId(2),
-            index_map: IndexMap::Transpose2D,
-            byte_offset: 0,
-            num_elements: 64,
-            elem_bytes: 4,
-        });
-        vtm.virtual_map.insert(TensorId(2), VirtualTensor {
-            source: TensorId(1),
-            index_map: IndexMap::Permute(vec![1, 0]),
-            byte_offset: 128,
-            num_elements: 64,
-            elem_bytes: 4,
-        });
-        vtm.virtual_map.insert(TensorId(1), VirtualTensor {
-            source: TensorId(0),
-            index_map: IndexMap::Broadcast { factor: 4 },
-            byte_offset: 256,
-            num_elements: 64,
-            elem_bytes: 4,
-        });
+        vtm.virtual_map.insert(
+            TensorId(3),
+            VirtualTensor {
+                source: TensorId(2),
+                index_map: IndexMap::Transpose2D,
+                byte_offset: 0,
+                num_elements: 64,
+                elem_bytes: 4,
+            },
+        );
+        vtm.virtual_map.insert(
+            TensorId(2),
+            VirtualTensor {
+                source: TensorId(1),
+                index_map: IndexMap::Permute(vec![1, 0]),
+                byte_offset: 128,
+                num_elements: 64,
+                elem_bytes: 4,
+            },
+        );
+        vtm.virtual_map.insert(
+            TensorId(1),
+            VirtualTensor {
+                source: TensorId(0),
+                index_map: IndexMap::Broadcast { factor: 4 },
+                byte_offset: 256,
+                num_elements: 64,
+                elem_bytes: 4,
+            },
+        );
 
         // Act & Assert: 3 → 2 → 1 → 0 (physical)
         assert_eq!(vtm.physical_root(TensorId(3)), TensorId(0));
@@ -875,7 +992,10 @@ mod tests {
             IndexMap::Permute(vec![1, 0, 2]),
             IndexMap::Broadcast { factor: 1 },
             IndexMap::Broadcast { factor: 1024 },
-            IndexMap::HeadSplit { num_heads: 32, head_dim: 128 },
+            IndexMap::HeadSplit {
+                num_heads: 32,
+                head_dim: 128,
+            },
             IndexMap::InterleavePair,
         ];
 
@@ -894,13 +1014,16 @@ mod tests {
         // Arrange: a VirtualTensorMap where the same TensorId(0) is both
         // a physical_set member and the source of a virtual tensor
         let mut vtm = VirtualTensorMap::empty();
-        vtm.virtual_map.insert(TensorId(10), VirtualTensor {
-            source: TensorId(0),
-            index_map: IndexMap::Offset(64),
-            byte_offset: 0,
-            num_elements: 256,
-            elem_bytes: 4,
-        });
+        vtm.virtual_map.insert(
+            TensorId(10),
+            VirtualTensor {
+                source: TensorId(0),
+                index_map: IndexMap::Offset(64),
+                byte_offset: 0,
+                num_elements: 256,
+                elem_bytes: 4,
+            },
+        );
         vtm.physical_set.insert(TensorId(0));
         vtm.physical_set.insert(TensorId(20));
         vtm.bytes_saved = 2048;
@@ -998,7 +1121,10 @@ mod tests {
 
         // Assert: cost depends only on hardware support, not factor magnitude
         assert_eq!(cost_small, cost_large);
-        assert_eq!(bcast_small.is_type_i_for(&profile), bcast_large.is_type_i_for(&profile));
+        assert_eq!(
+            bcast_small.is_type_i_for(&profile),
+            bcast_large.is_type_i_for(&profile)
+        );
     }
 
     // @trace TEST-VT-34 [req:REQ-VTC] [level:unit]
@@ -1097,8 +1223,14 @@ mod tests {
             IndexMap::Permute(vec![2, 1, 0]),
             IndexMap::Broadcast { factor: 1 },
             IndexMap::Broadcast { factor: 16 },
-            IndexMap::HeadSplit { num_heads: 4, head_dim: 64 },
-            IndexMap::HeadSplit { num_heads: 128, head_dim: 8 },
+            IndexMap::HeadSplit {
+                num_heads: 4,
+                head_dim: 64,
+            },
+            IndexMap::HeadSplit {
+                num_heads: 128,
+                head_dim: 8,
+            },
             IndexMap::InterleavePair,
         ];
 
@@ -1108,9 +1240,17 @@ mod tests {
 
             // Assert: Type I implies exactly zero cost
             if is_type_i {
-                assert_eq!(cost, 0.0, "Type I variant {:?} should have zero cost", variant);
+                assert_eq!(
+                    cost, 0.0,
+                    "Type I variant {:?} should have zero cost",
+                    variant
+                );
             } else {
-                assert!(cost > 0.0, "Non-Type I variant {:?} should have positive cost", variant);
+                assert!(
+                    cost > 0.0,
+                    "Non-Type I variant {:?} should have positive cost",
+                    variant
+                );
             }
         }
     }

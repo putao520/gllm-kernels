@@ -39,12 +39,17 @@ impl IsvGemm for AccelerateBackend {
     }
 
     unsafe fn sgemm(
-        m: usize, n: usize, k: usize,
+        m: usize,
+        n: usize,
+        k: usize,
         alpha: f32,
-        a: *const f32, lda: usize,
-        b: *const f32, ldb: usize,
+        a: *const f32,
+        lda: usize,
+        b: *const f32,
+        ldb: usize,
         beta: f32,
-        c: *mut f32, ldc: usize,
+        c: *mut f32,
+        ldc: usize,
     ) -> Result<(), CompilerError> {
         #[cfg(target_os = "macos")]
         {
@@ -52,12 +57,17 @@ impl IsvGemm for AccelerateBackend {
                 CBLAS_ROW_MAJOR,
                 CBLAS_NO_TRANS,
                 CBLAS_NO_TRANS,
-                m as i32, n as i32, k as i32,
+                m as i32,
+                n as i32,
+                k as i32,
                 alpha,
-                a, lda as i32,
-                b, ldb as i32,
+                a,
+                lda as i32,
+                b,
+                ldb as i32,
                 beta,
-                c, ldc as i32,
+                c,
+                ldc as i32,
             );
             return Ok(());
         }

@@ -9,8 +9,10 @@
 //! `can_fuse_quant_aware` / `select_fusion_groups` functions to the fusion
 //! pipeline (`FusionEngine` → `fuse_with_dag_prebuilt`).
 
+use super::quant_aware::{
+    can_fuse_quant_aware, fusion_cost, select_fusion_groups, QuantFusionDecision,
+};
 use crate::quant::QuantType;
-use super::quant_aware::{can_fuse_quant_aware, QuantFusionDecision, select_fusion_groups, fusion_cost};
 
 /// Fusion rule identification.
 ///
@@ -179,11 +181,7 @@ impl FusionEngine {
     ///
     /// Lower cost = more attractive to fuse. Same-precision pairs cost 0.
     /// Cross-precision pairs cost more depending on the quant family distance.
-    pub fn merge_cost(
-        &self,
-        quant_a: Option<QuantType>,
-        quant_b: Option<QuantType>,
-    ) -> f32 {
+    pub fn merge_cost(&self, quant_a: Option<QuantType>, quant_b: Option<QuantType>) -> f32 {
         if !self.is_quant_aware() {
             return 0.0;
         }
@@ -215,10 +213,7 @@ impl FusionEngine {
     /// requantize to new precision). This function identifies those boundaries.
     ///
     /// Returns a list of boundary indices where casts are needed.
-    pub fn find_cast_boundaries(
-        &self,
-        op_quant_types: &[Option<QuantType>],
-    ) -> Vec<usize> {
+    pub fn find_cast_boundaries(&self, op_quant_types: &[Option<QuantType>]) -> Vec<usize> {
         if !self.is_quant_aware() || op_quant_types.is_empty() {
             return Vec::new();
         }
@@ -270,7 +265,10 @@ mod tests {
     #[test]
     fn test_fusion_rule_descriptions() {
         let desc = FusionRule::QuantAwareFusion.description();
-        assert!(desc.contains("same-precision"), "description should mention same-precision");
+        assert!(
+            desc.contains("same-precision"),
+            "description should mention same-precision"
+        );
     }
 
     // ── FusionEngine tests ────────────────────────────────────────────
@@ -332,7 +330,10 @@ mod tests {
     #[test]
     fn test_merge_cost_same_precision_zero() {
         let engine = FusionEngine::all();
-        assert_eq!(engine.merge_cost(Some(QuantType::Q4_0), Some(QuantType::Q4_0)), 0.0);
+        assert_eq!(
+            engine.merge_cost(Some(QuantType::Q4_0), Some(QuantType::Q4_0)),
+            0.0
+        );
         assert_eq!(engine.merge_cost(None, None), 0.0);
     }
 
@@ -340,13 +341,19 @@ mod tests {
     fn test_merge_cost_cross_precision_positive() {
         let engine = FusionEngine::all();
         let cost = engine.merge_cost(Some(QuantType::Q4_0), Some(QuantType::Q6K));
-        assert!(cost > 0.0, "cross-precision merge should have positive cost");
+        assert!(
+            cost > 0.0,
+            "cross-precision merge should have positive cost"
+        );
     }
 
     #[test]
     fn test_standard_engine_cost_zero() {
         let engine = FusionEngine::standard_only();
-        assert_eq!(engine.merge_cost(Some(QuantType::Q4_0), Some(QuantType::Q6K)), 0.0);
+        assert_eq!(
+            engine.merge_cost(Some(QuantType::Q4_0), Some(QuantType::Q6K)),
+            0.0
+        );
     }
 
     // ── Group selection tests ─────────────────────────────────────────
@@ -370,10 +377,7 @@ mod tests {
     #[test]
     fn test_select_groups_standard() {
         let engine = FusionEngine::standard_only();
-        let ops = vec![
-            Some(QuantType::Q4_0),
-            Some(QuantType::Q6K),
-        ];
+        let ops = vec![Some(QuantType::Q4_0), Some(QuantType::Q6K)];
         let groups = engine.select_groups(&ops);
         // Without quant awareness, everything is one group
         assert_eq!(groups.len(), 1);
@@ -384,14 +388,13 @@ mod tests {
     #[test]
     fn test_find_cast_boundaries_same_precision() {
         let engine = FusionEngine::all();
-        let ops = vec![
-            Some(QuantType::Q4_0),
-            Some(QuantType::Q4_0),
-            None,
-        ];
+        let ops = vec![Some(QuantType::Q4_0), Some(QuantType::Q4_0), None];
         let boundaries = engine.find_cast_boundaries(&ops);
         // No boundaries: same Q4_0 throughout, then None (fusable)
-        assert!(boundaries.is_empty(), "same precision chain should have no cast boundaries");
+        assert!(
+            boundaries.is_empty(),
+            "same precision chain should have no cast boundaries"
+        );
     }
 
     #[test]
@@ -404,7 +407,10 @@ mod tests {
         ];
         let boundaries = engine.find_cast_boundaries(&ops);
         // Boundary at index 2 (transition from Q4_0 to Q6K)
-        assert!(!boundaries.is_empty(), "cross-precision should have cast boundaries");
+        assert!(
+            !boundaries.is_empty(),
+            "cross-precision should have cast boundaries"
+        );
     }
 
     #[test]
@@ -416,10 +422,7 @@ mod tests {
     #[test]
     fn test_find_cast_boundaries_standard_engine() {
         let engine = FusionEngine::standard_only();
-        let ops = vec![
-            Some(QuantType::Q4_0),
-            Some(QuantType::Q6K),
-        ];
+        let ops = vec![Some(QuantType::Q4_0), Some(QuantType::Q6K)];
         // Standard engine doesn't find boundaries
         assert!(engine.find_cast_boundaries(&ops).is_empty());
     }
@@ -434,7 +437,11 @@ mod tests {
             FusionRule::HardwareConstrained,
         ]);
         let sorted = engine.sorted_rules();
-        assert_eq!(sorted[0], FusionRule::QuantAwareFusion, "QuantAwareFusion should be first");
+        assert_eq!(
+            sorted[0],
+            FusionRule::QuantAwareFusion,
+            "QuantAwareFusion should be first"
+        );
         assert_eq!(sorted[1], FusionRule::HardwareConstrained);
         assert_eq!(sorted[2], FusionRule::Standard);
     }
@@ -458,7 +465,11 @@ mod tests {
         ];
         for rule in &rules {
             let desc = rule.description();
-            assert!(!desc.is_empty(), "description for {:?} should not be empty", rule);
+            assert!(
+                !desc.is_empty(),
+                "description for {:?} should not be empty",
+                rule
+            );
         }
     }
 

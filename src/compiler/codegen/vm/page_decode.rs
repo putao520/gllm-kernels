@@ -7,7 +7,7 @@
 //! REQ-COMP-003: LZ4 JIT 解压
 //! REQ-COMP-004: BitPackRle JIT 解压
 
-use super::instr::{VmInstr, VmProgram, VRegId};
+use super::instr::{VRegId, VmInstr, VmProgram};
 
 /// Emit an LZ4 stream decode instruction into `prog`.
 ///
@@ -161,13 +161,18 @@ pub fn lz4_decode_reference(compressed: &[u8]) -> Result<Vec<u8>, String> {
                 let ext = compressed[src] as usize;
                 src += 1;
                 lit_len += ext;
-                if ext < 255 { break; }
+                if ext < 255 {
+                    break;
+                }
             }
         }
 
         // Copy literals
         if src + lit_len > compressed.len() {
-            return Err(format!("literal overrun: need {} bytes at pos {}", lit_len, src));
+            return Err(format!(
+                "literal overrun: need {} bytes at pos {}",
+                lit_len, src
+            ));
         }
         out.extend_from_slice(&compressed[src..src + lit_len]);
         src += lit_len;
@@ -194,13 +199,19 @@ pub fn lz4_decode_reference(compressed: &[u8]) -> Result<Vec<u8>, String> {
                 let ext = compressed[src] as usize;
                 src += 1;
                 match_len += ext;
-                if ext < 255 { break; }
+                if ext < 255 {
+                    break;
+                }
             }
         }
 
         // Copy match (may overlap)
         if moff == 0 || out.len() < moff {
-            return Err(format!("invalid match offset {} at dst_pos {}", moff, out.len()));
+            return Err(format!(
+                "invalid match offset {} at dst_pos {}",
+                moff,
+                out.len()
+            ));
         }
         let match_start = out.len() - moff;
         for k in 0..match_len {
@@ -222,11 +233,15 @@ pub fn bitpack_rle_decode_reference(compressed: &[u8]) -> Vec<u8> {
         let mut run_len = (byte >> 4) as usize;
         if run_len == 15 {
             loop {
-                if src >= compressed.len() { break; }
+                if src >= compressed.len() {
+                    break;
+                }
                 let ext = compressed[src] as usize;
                 src += 1;
                 run_len += ext;
-                if ext < 255 { break; }
+                if ext < 255 {
+                    break;
+                }
             }
         }
         for _ in 0..run_len {
@@ -243,7 +258,7 @@ pub fn bitpack_rle_decode_reference(compressed: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::codegen::vm::instr::{VmProgram, VRegKind, SimdWidth};
+    use crate::compiler::codegen::vm::instr::{SimdWidth, VRegKind, VmProgram};
 
     /// Verify that `emit_lz4_decode` appends a `Lz4Decode` instruction to the program.
     #[test]
@@ -256,7 +271,11 @@ mod tests {
         emit_lz4_decode(&mut prog, src, dst, csz, 4096);
 
         // There should be 3 DeclareVReg + 1 Lz4Decode
-        let lz4_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::Lz4Decode { .. })).count();
+        let lz4_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::Lz4Decode { .. }))
+            .count();
         assert_eq!(lz4_count, 1, "expected exactly 1 Lz4Decode instruction");
     }
 
@@ -270,10 +289,15 @@ mod tests {
 
         emit_bitpack_rle_decode(&mut prog, src, dst, csz, 4, 256);
 
-        let rle_count = prog.instrs.iter()
+        let rle_count = prog
+            .instrs
+            .iter()
             .filter(|i| matches!(i, VmInstr::BitPackRleDecode { .. }))
             .count();
-        assert_eq!(rle_count, 1, "expected exactly 1 BitPackRleDecode instruction");
+        assert_eq!(
+            rle_count, 1,
+            "expected exactly 1 BitPackRleDecode instruction"
+        );
     }
 
     /// LZ4 reference encoder + decoder round-trip with minimal data.
@@ -286,8 +310,8 @@ mod tests {
         let compressed = lz4_compress_literals_only(&original);
 
         // Decompress using reference decoder
-        let decompressed = lz4_decode_reference(&compressed)
-            .expect("lz4 reference decode should succeed");
+        let decompressed =
+            lz4_decode_reference(&compressed).expect("lz4 reference decode should succeed");
 
         assert_eq!(
             decompressed, original,
@@ -305,8 +329,8 @@ mod tests {
         }
 
         let compressed = lz4_compress_literals_only(&original);
-        let decompressed = lz4_decode_reference(&compressed)
-            .expect("lz4 page-size round-trip should succeed");
+        let decompressed =
+            lz4_decode_reference(&compressed).expect("lz4 page-size round-trip should succeed");
 
         assert_eq!(decompressed, original, "LZ4 4096-byte round-trip failed");
     }
@@ -315,18 +339,12 @@ mod tests {
     #[test]
     fn bitpack_rle_kivi4_roundtrip() {
         // KIVI4 nibble stream: 256 nibble values (4-bit each, stored as bytes 0..=15)
-        let original: Vec<u8> = (0u8..=15u8)
-            .cycle()
-            .take(256)
-            .collect();
+        let original: Vec<u8> = (0u8..=15u8).cycle().take(256).collect();
 
         let compressed = bitpack_rle_compress(&original);
         let decompressed = bitpack_rle_decode_reference(&compressed);
 
-        assert_eq!(
-            decompressed, original,
-            "BitPackRle KIVI4 round-trip failed"
-        );
+        assert_eq!(decompressed, original, "BitPackRle KIVI4 round-trip failed");
     }
 
     /// BitPackRle round-trip with long runs (triggers extension encoding).
@@ -338,12 +356,16 @@ mod tests {
         let compressed = bitpack_rle_compress(&original);
         let decompressed = bitpack_rle_decode_reference(&compressed);
 
-        assert_eq!(decompressed, original, "BitPackRle long-run round-trip failed");
+        assert_eq!(
+            decompressed, original,
+            "BitPackRle long-run round-trip failed"
+        );
         // Compressed should be much smaller than original
         assert!(
             compressed.len() < original.len(),
             "BitPackRle compression should shrink repeated data: compressed={}, original={}",
-            compressed.len(), original.len()
+            compressed.len(),
+            original.len()
         );
     }
 
@@ -357,11 +379,19 @@ mod tests {
 
         emit_lz4_decode(&mut prog, src, dst, csz, 8192);
 
-        let instr = prog.instrs.iter()
+        let instr = prog
+            .instrs
+            .iter()
             .find(|i| matches!(i, VmInstr::Lz4Decode { .. }))
             .expect("Lz4Decode instruction not found");
 
-        if let VmInstr::Lz4Decode { src_ptr, dst_ptr, compressed_size, decompressed_size } = instr {
+        if let VmInstr::Lz4Decode {
+            src_ptr,
+            dst_ptr,
+            compressed_size,
+            decompressed_size,
+        } = instr
+        {
             assert_eq!(*src_ptr, src);
             assert_eq!(*dst_ptr, dst);
             assert_eq!(*compressed_size, csz);
@@ -379,13 +409,20 @@ mod tests {
 
         emit_bitpack_rle_decode(&mut prog, src, dst, csz, 2, 512);
 
-        let instr = prog.instrs.iter()
+        let instr = prog
+            .instrs
+            .iter()
             .find(|i| matches!(i, VmInstr::BitPackRleDecode { .. }))
             .expect("BitPackRleDecode instruction not found");
 
         if let VmInstr::BitPackRleDecode {
-            src_ptr, dst_ptr, compressed_size, nibble_bits, element_count
-        } = instr {
+            src_ptr,
+            dst_ptr,
+            compressed_size,
+            nibble_bits,
+            element_count,
+        } = instr
+        {
             assert_eq!(*src_ptr, src);
             assert_eq!(*dst_ptr, dst);
             assert_eq!(*compressed_size, csz);
@@ -402,7 +439,11 @@ mod tests {
         let compressed = lz4_compress_literals_only(&[]);
 
         // Token byte with lit_len=0 → token = 0x00, no literals follow
-        assert_eq!(compressed, vec![0x00u8], "empty input should produce [0x00] token");
+        assert_eq!(
+            compressed,
+            vec![0x00u8],
+            "empty input should produce [0x00] token"
+        );
     }
 
     /// LZ4 round-trip for input shorter than 15 bytes (fits in token nibble).
@@ -411,13 +452,19 @@ mod tests {
         let original = vec![0xABu8, 0xCD, 0xEF, 0x12, 0x34];
 
         let compressed = lz4_compress_literals_only(&original);
-        let decompressed = lz4_decode_reference(&compressed)
-            .expect("lz4 short input round-trip should succeed");
+        let decompressed =
+            lz4_decode_reference(&compressed).expect("lz4 short input round-trip should succeed");
 
         // Verify token encodes literal length directly (no extension bytes)
-        assert_eq!(compressed[0] >> 4, original.len() as u8,
-            "token high nibble should equal literal count for short input");
-        assert_eq!(decompressed, original, "LZ4 short round-trip output mismatch");
+        assert_eq!(
+            compressed[0] >> 4,
+            original.len() as u8,
+            "token high nibble should equal literal count for short input"
+        );
+        assert_eq!(
+            decompressed, original,
+            "LZ4 short round-trip output mismatch"
+        );
     }
 
     /// LZ4 round-trip for input exactly 15 bytes (boundary: triggers extension).
@@ -426,13 +473,23 @@ mod tests {
         let original: Vec<u8> = (0..15).collect();
 
         let compressed = lz4_compress_literals_only(&original);
-        let decompressed = lz4_decode_reference(&compressed)
-            .expect("lz4 15-byte round-trip should succeed");
+        let decompressed =
+            lz4_decode_reference(&compressed).expect("lz4 15-byte round-trip should succeed");
 
         // At 15 bytes, token high nibble = 15 and extension = 0
-        assert_eq!(compressed[0] & 0xF0, 0xF0, "token should indicate extension");
-        assert_eq!(compressed[1], 0u8, "extension byte should be 0 for exactly 15 literals");
-        assert_eq!(decompressed, original, "LZ4 15-byte round-trip output mismatch");
+        assert_eq!(
+            compressed[0] & 0xF0,
+            0xF0,
+            "token should indicate extension"
+        );
+        assert_eq!(
+            compressed[1], 0u8,
+            "extension byte should be 0 for exactly 15 literals"
+        );
+        assert_eq!(
+            decompressed, original,
+            "LZ4 15-byte round-trip output mismatch"
+        );
     }
 
     /// LZ4 round-trip for a larger input that needs multiple extension bytes (>= 270 literals).
@@ -448,7 +505,10 @@ mod tests {
         // Verify extension encoding: 0xFF then remaining 30
         assert_eq!(compressed[1], 0xFF, "first extension byte should be 255");
         assert_eq!(compressed[2], 30u8, "second extension byte should be 30");
-        assert_eq!(decompressed, original, "LZ4 multi-extension round-trip output mismatch");
+        assert_eq!(
+            decompressed, original,
+            "LZ4 multi-extension round-trip output mismatch"
+        );
     }
 
     /// LZ4 reference decoder rejects truncated literal extension bytes.
@@ -483,7 +543,10 @@ mod tests {
     #[test]
     fn bitpack_rle_compress_empty() {
         let compressed = bitpack_rle_compress(&[]);
-        assert!(compressed.is_empty(), "empty input should produce empty output");
+        assert!(
+            compressed.is_empty(),
+            "empty input should produce empty output"
+        );
     }
 
     /// BitPackRle round-trip with all identical values (maximum compression).
@@ -500,7 +563,10 @@ mod tests {
             "single-value stream should compress heavily: got {} bytes",
             compressed.len()
         );
-        assert_eq!(decompressed, original, "BitPackRle single-value round-trip mismatch");
+        assert_eq!(
+            decompressed, original,
+            "BitPackRle single-value round-trip mismatch"
+        );
     }
 
     /// BitPackRle round-trip with alternating values (worst case: no runs).
@@ -517,7 +583,10 @@ mod tests {
             original.len(),
             "alternating values should have 1:1 compression ratio"
         );
-        assert_eq!(decompressed, original, "BitPackRle alternating round-trip mismatch");
+        assert_eq!(
+            decompressed, original,
+            "BitPackRle alternating round-trip mismatch"
+        );
     }
 
     /// BitPackRle decode reference handles a single byte encoding run_len < 15.
@@ -527,7 +596,11 @@ mod tests {
         let compressed = vec![0x53u8];
         let decompressed = bitpack_rle_decode_reference(&compressed);
 
-        assert_eq!(decompressed, vec![3u8; 5], "single encoded byte should expand to 5 copies of value 3");
+        assert_eq!(
+            decompressed,
+            vec![3u8; 5],
+            "single encoded byte should expand to 5 copies of value 3"
+        );
     }
 
     /// Multiple emit calls accumulate instructions correctly in VmProgram.
@@ -542,8 +615,16 @@ mod tests {
         emit_bitpack_rle_decode(&mut prog, src, dst, csz, 4, 128);
         emit_lz4_decode(&mut prog, src, dst, csz, 8192);
 
-        let lz4_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::Lz4Decode { .. })).count();
-        let rle_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::BitPackRleDecode { .. })).count();
+        let lz4_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::Lz4Decode { .. }))
+            .count();
+        let rle_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::BitPackRleDecode { .. }))
+            .count();
 
         assert_eq!(lz4_count, 2, "expected 2 Lz4Decode instructions");
         assert_eq!(rle_count, 1, "expected 1 BitPackRleDecode instruction");
@@ -601,7 +682,10 @@ mod tests {
         let original: Vec<u8> = vec![0x1A, 0x1A, 0x1A];
         let compressed = bitpack_rle_compress(&original);
         let decompressed = bitpack_rle_decode_reference(&compressed);
-        assert!(decompressed.iter().all(|&v| v == 0x0A), "values should be masked to low nibble");
+        assert!(
+            decompressed.iter().all(|&v| v == 0x0A),
+            "values should be masked to low nibble"
+        );
     }
 
     /// BitPackRle round-trip with KIVI2 nibble width (2-bit values).
@@ -633,10 +717,15 @@ mod tests {
 
         emit_lz4_decode(&mut prog, src, dst, csz, 0);
 
-        let instr = prog.instrs.iter()
+        let instr = prog
+            .instrs
+            .iter()
             .find(|i| matches!(i, VmInstr::Lz4Decode { .. }))
             .expect("Lz4Decode should exist");
-        if let VmInstr::Lz4Decode { decompressed_size, .. } = instr {
+        if let VmInstr::Lz4Decode {
+            decompressed_size, ..
+        } = instr
+        {
             assert_eq!(*decompressed_size, 0);
         }
     }
@@ -651,10 +740,17 @@ mod tests {
 
         emit_bitpack_rle_decode(&mut prog, src, dst, csz, 2, 1024);
 
-        let instr = prog.instrs.iter()
+        let instr = prog
+            .instrs
+            .iter()
             .find(|i| matches!(i, VmInstr::BitPackRleDecode { .. }))
             .expect("BitPackRleDecode should exist");
-        if let VmInstr::BitPackRleDecode { nibble_bits, element_count, .. } = instr {
+        if let VmInstr::BitPackRleDecode {
+            nibble_bits,
+            element_count,
+            ..
+        } = instr
+        {
             assert_eq!(*nibble_bits, 2);
             assert_eq!(*element_count, 1024);
         }

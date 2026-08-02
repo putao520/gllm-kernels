@@ -1,18 +1,17 @@
 //! Fusion group emission — layout transform + per-mode fusion group lowering.
 
+use super::gemm_emit::{emit_gemm_inline_with_epilogue, emit_gemm_inline_with_hook};
 use super::instr::*;
-use super::vm_state::AbiPtrs;
 use super::plan_lower::{
-    LoweringContext, TensorPtrResolver,
-    emit_standalone_op, emit_elementwise_inline,
-    extract_gemm_dims_sym, collect_epilogue_trace,
-    load_op_scratch_ptr, extract_op_trace, infer_output_shape_sym,
+    collect_epilogue_trace, emit_elementwise_inline, emit_standalone_op, extract_gemm_dims_sym,
+    extract_op_trace, infer_output_shape_sym, load_op_scratch_ptr, LoweringContext,
+    TensorPtrResolver,
 };
-use super::gemm_emit::{emit_gemm_inline_with_hook, emit_gemm_inline_with_epilogue};
+use super::vm_state::AbiPtrs;
 
+use crate::compiler::buffer_alloc::BufferAllocation;
 use crate::compiler::fusion::{FusionGroup, FusionMode};
 use crate::compiler::graph::{CompilerGraph, CompilerOp};
-use crate::compiler::buffer_alloc::BufferAllocation;
 use crate::compiler::layout_negotiator::MovementType;
 use crate::compiler::trace::QuantPrecision;
 use crate::types::CompilerError;
@@ -36,15 +35,47 @@ fn emit_bias_add(
     let row_bytes = n * elem;
     let row_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     prog.emit_loop(m_bound, row_bytes, |prog, _row_ctr, row_off| {
-        prog.emit(VmInstr::GprBinOp { dst: row_ptr, a: output_ptr, b: GprOperand::VReg(row_off), op: GprOp::Add });
+        prog.emit(VmInstr::GprBinOp {
+            dst: row_ptr,
+            a: output_ptr,
+            b: GprOperand::VReg(row_off),
+            op: GprOp::Add,
+        });
         for vj in 0..n_vec {
             let byte_off = vj * lanes * elem;
             let b_data = prog.alloc_vreg(VRegKind::Vec, width);
             let c_data = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecLoad { dst: b_data, base: bias_ptr, offset: OffsetExpr::Const(byte_off), width, dtype , predicate: None });
-            prog.emit(VmInstr::VecLoad { dst: c_data, base: row_ptr, offset: OffsetExpr::Const(byte_off), width, dtype , predicate: None });
-            prog.emit(VmInstr::VecBinOp { dst: c_data, a: c_data, b: b_data, op: VecOp::Add, dtype });
-            prog.emit(VmInstr::VecStore { base: row_ptr, offset: OffsetExpr::Const(byte_off), src: c_data, width, dtype , predicate: None });
+            prog.emit(VmInstr::VecLoad {
+                dst: b_data,
+                base: bias_ptr,
+                offset: OffsetExpr::Const(byte_off),
+                width,
+                dtype,
+                predicate: None,
+            });
+            prog.emit(VmInstr::VecLoad {
+                dst: c_data,
+                base: row_ptr,
+                offset: OffsetExpr::Const(byte_off),
+                width,
+                dtype,
+                predicate: None,
+            });
+            prog.emit(VmInstr::VecBinOp {
+                dst: c_data,
+                a: c_data,
+                b: b_data,
+                op: VecOp::Add,
+                dtype,
+            });
+            prog.emit(VmInstr::VecStore {
+                base: row_ptr,
+                offset: OffsetExpr::Const(byte_off),
+                src: c_data,
+                width,
+                dtype,
+                predicate: None,
+            });
         }
         if n_tail > 0 {
             let tail_base = n_vec * lanes * elem;
@@ -52,10 +83,37 @@ fn emit_bias_add(
                 let byte_off = tail_base + jj * elem;
                 let b_s = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
                 let c_s = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
-                prog.emit(VmInstr::VecLoad { dst: b_s, base: bias_ptr, offset: OffsetExpr::Const(byte_off), width: SimdWidth::Scalar, dtype , predicate: None });
-                prog.emit(VmInstr::VecLoad { dst: c_s, base: row_ptr, offset: OffsetExpr::Const(byte_off), width: SimdWidth::Scalar, dtype , predicate: None });
-                prog.emit(VmInstr::VecBinOp { dst: c_s, a: c_s, b: b_s, op: VecOp::Add, dtype });
-                prog.emit(VmInstr::VecStore { base: row_ptr, offset: OffsetExpr::Const(byte_off), src: c_s, width: SimdWidth::Scalar, dtype , predicate: None });
+                prog.emit(VmInstr::VecLoad {
+                    dst: b_s,
+                    base: bias_ptr,
+                    offset: OffsetExpr::Const(byte_off),
+                    width: SimdWidth::Scalar,
+                    dtype,
+                    predicate: None,
+                });
+                prog.emit(VmInstr::VecLoad {
+                    dst: c_s,
+                    base: row_ptr,
+                    offset: OffsetExpr::Const(byte_off),
+                    width: SimdWidth::Scalar,
+                    dtype,
+                    predicate: None,
+                });
+                prog.emit(VmInstr::VecBinOp {
+                    dst: c_s,
+                    a: c_s,
+                    b: b_s,
+                    op: VecOp::Add,
+                    dtype,
+                });
+                prog.emit(VmInstr::VecStore {
+                    base: row_ptr,
+                    offset: OffsetExpr::Const(byte_off),
+                    src: c_s,
+                    width: SimdWidth::Scalar,
+                    dtype,
+                    predicate: None,
+                });
             }
         }
     });
@@ -82,33 +140,32 @@ pub(super) fn emit_layout_transform(
 
     match (&xform.source, &xform.target) {
         // RowMajor <-> ColMajor: 需要 2D transpose
-        (LayoutConstraint::RowMajor { .. }, LayoutConstraint::ColMajor { .. }) |
-        (LayoutConstraint::ColMajor { .. }, LayoutConstraint::RowMajor { .. }) => {
+        (LayoutConstraint::RowMajor { .. }, LayoutConstraint::ColMajor { .. })
+        | (LayoutConstraint::ColMajor { .. }, LayoutConstraint::RowMajor { .. }) => {
             // Transpose 由下游 op 的 stride 计算隐式处理 — 不需要额外的内存搬运。
             // 融合模式中的 stride 重计算已在 emit_gemm/emit_elementwise 中完成。
             // 对于 Standalone 模式，TensorPtrResolver 的 offset 计算已考虑布局差异。
             // 此处标记已消费即可。
         }
         // HeadSplit is a zero-cost reshape of RowMajor — no transform needed
-        (LayoutConstraint::RowMajor { .. }, LayoutConstraint::HeadSplit { .. }) |
-        (LayoutConstraint::HeadSplit { .. }, LayoutConstraint::RowMajor { .. }) => {}
+        (LayoutConstraint::RowMajor { .. }, LayoutConstraint::HeadSplit { .. })
+        | (LayoutConstraint::HeadSplit { .. }, LayoutConstraint::RowMajor { .. }) => {}
         // PanelPacked/Vnni/AmxTile — handled by PackMap (§0.2.7)
-        (LayoutConstraint::PanelPacked { .. }, _) |
-        (_, LayoutConstraint::PanelPacked { .. }) |
-        (LayoutConstraint::VnniPacked4, _) |
-        (_, LayoutConstraint::VnniPacked4) |
-        (LayoutConstraint::AmxTileBF16 { .. }, _) |
-        (_, LayoutConstraint::AmxTileBF16 { .. }) => {}
+        (LayoutConstraint::PanelPacked { .. }, _)
+        | (_, LayoutConstraint::PanelPacked { .. })
+        | (LayoutConstraint::VnniPacked4, _)
+        | (_, LayoutConstraint::VnniPacked4)
+        | (LayoutConstraint::AmxTileBF16 { .. }, _)
+        | (_, LayoutConstraint::AmxTileBF16 { .. }) => {}
         // GPU layouts — handled by GPU codegen path
-        (LayoutConstraint::SharedMemTile { .. }, _) |
-        (_, LayoutConstraint::SharedMemTile { .. }) |
-        (LayoutConstraint::TmaAligned2D { .. }, _) |
-        (_, LayoutConstraint::TmaAligned2D { .. }) => {}
+        (LayoutConstraint::SharedMemTile { .. }, _)
+        | (_, LayoutConstraint::SharedMemTile { .. })
+        | (LayoutConstraint::TmaAligned2D { .. }, _)
+        | (_, LayoutConstraint::TmaAligned2D { .. }) => {}
         // Any is always compatible — no transform
         (LayoutConstraint::Any, _) | (_, LayoutConstraint::Any) => {}
         // InterleavedPairs is a stride-level transform consumed by SwiGLU auto_select
-        (LayoutConstraint::InterleavedPairs, _) |
-        (_, LayoutConstraint::InterleavedPairs) => {}
+        (LayoutConstraint::InterleavedPairs, _) | (_, LayoutConstraint::InterleavedPairs) => {}
         _ => {}
     }
     Ok(())
@@ -138,7 +195,9 @@ pub(super) fn verify_and_emit_dtype_casts(
     let mut cast_count = 0usize;
 
     // 收集组内所有 op（按执行顺序）
-    let ops: Vec<&CompilerOp> = group.ops.iter()
+    let ops: Vec<&CompilerOp> = group
+        .ops
+        .iter()
         .chain(group.epilogue.iter())
         .filter_map(|&oid| graph.op(oid))
         .collect();
@@ -162,9 +221,13 @@ pub(super) fn verify_and_emit_dtype_casts(
         if next_dtype.elem_bytes() > prev_dtype.elem_bytes() {
             // Widening: prev 输出是窄 dtype，next 输入需要宽 dtype
             // 需要在 prev 输出 → next 输入之间插入 VecWiden
-            let src_ptr = prev_op.outputs.first()
+            let src_ptr = prev_op
+                .outputs
+                .first()
                 .and_then(|&tid| resolver.materialize(prog, tid, abi));
-            let dst_ptr = next_op.inputs.first()
+            let dst_ptr = next_op
+                .inputs
+                .first()
                 .and_then(|&tid| resolver.materialize(prog, tid, abi));
 
             if let (Some(_src), Some(_dst)) = (src_ptr, dst_ptr) {
@@ -172,14 +235,18 @@ pub(super) fn verify_and_emit_dtype_casts(
                 // 在 elementwise emit 路径中，VecWiden 在 load 后、compute 前插入。
                 // 此处仅记录诊断信息；实际的 widen/narrow 由 emit_elementwise_inline
                 // 和 emit_standalone_op 中的 dtype 参数传播自动处理。
-                eprintln!("[DTYPE-003] VecWiden needed: {:?}→{:?} between '{}' and '{}'",
-                    prev_dtype, next_dtype, prev_op.label, next_op.label);
+                eprintln!(
+                    "[DTYPE-003] VecWiden needed: {:?}→{:?} between '{}' and '{}'",
+                    prev_dtype, next_dtype, prev_op.label, next_op.label
+                );
                 cast_count += 1;
             }
         } else if next_dtype.elem_bytes() < prev_dtype.elem_bytes() {
             // Narrowing: prev 输出是宽 dtype，next 输入需要窄 dtype
-            eprintln!("[DTYPE-003] VecNarrow needed: {:?}→{:?} between '{}' and '{}'",
-                prev_dtype, next_dtype, prev_op.label, next_op.label);
+            eprintln!(
+                "[DTYPE-003] VecNarrow needed: {:?}→{:?} between '{}' and '{}'",
+                prev_dtype, next_dtype, prev_op.label, next_op.label
+            );
             cast_count += 1;
         }
     }
@@ -189,8 +256,10 @@ pub(super) fn verify_and_emit_dtype_casts(
         for op in &ops {
             let op_dtype = op_input_dtype(op, graph);
             if op_dtype != group_dtype && op_dtype.elem_bytes() != group_dtype.elem_bytes() {
-                eprintln!("[DTYPE-003] WARNING: op '{}' dtype {:?} != group dominant {:?}",
-                    op.label, op_dtype, group_dtype);
+                eprintln!(
+                    "[DTYPE-003] WARNING: op '{}' dtype {:?} != group dominant {:?}",
+                    op.label, op_dtype, group_dtype
+                );
             }
         }
     }
@@ -274,8 +343,11 @@ pub(super) fn emit_fusion_group_by_mode(
     let registry = ctx.session.registry;
 
     // §0.2.11: 获取当前融合组的布局协商结果
-    let group_layout = ctx.session.layout
-        .and_then(|la| la.group_assignments.iter().find(|ga| ga.group_id == group.id));
+    let group_layout = ctx.session.layout.and_then(|la| {
+        la.group_assignments
+            .iter()
+            .find(|ga| ga.group_id == group.id)
+    });
 
     // §0.2.11: 处理 InterOpTransform — 在 op 间插入布局变换 VmInstr
     // 仅处理 RegisterDirect 不兼容的 case（需要显式变换）。
@@ -291,7 +363,10 @@ pub(super) fn emit_fusion_group_by_mode(
     // REQ-DTYPE-003: 融合组内 dtype 连续性验证 + 自动 cast 插入
     let dtype_cast_count = verify_and_emit_dtype_casts(group, graph, ctx, prog, resolver, abi)?;
     if dtype_cast_count > 0 {
-        eprintln!("[DTYPE-003] group {} has {} dtype cast points", group.id, dtype_cast_count);
+        eprintln!(
+            "[DTYPE-003] group {} has {} dtype cast points",
+            group.id, dtype_cast_count
+        );
     }
 
     // QuantGemm ops can only be lowered via emit_standalone_op, which dispatches
@@ -299,38 +374,70 @@ pub(super) fn emit_fusion_group_by_mode(
     // modes such as NormIntoGemm and QkvSharedInput otherwise call the generic
     // F32 GEMM emitter. Detect QuantGemm in any group position, not only the
     // anchor, and lower every member independently.
-    let all_ops_preview: Vec<_> = group.ops.iter().chain(group.epilogue.iter()).copied().collect();
-    let any_quant_gemm = all_ops_preview.iter()
+    let all_ops_preview: Vec<_> = group
+        .ops
+        .iter()
+        .chain(group.epilogue.iter())
+        .copied()
+        .collect();
+    let any_quant_gemm = all_ops_preview
+        .iter()
         .filter_map(|&oid| graph.op(oid))
         .any(|op| op.op_is_quant_gemm(graph));
-    if any_quant_gemm
-        && !matches!(group.mode, FusionMode::Standalone | FusionMode::LoopFusion)
-    {
+    if any_quant_gemm && !matches!(group.mode, FusionMode::Standalone | FusionMode::LoopFusion) {
         let all_ops = all_ops_preview;
         for &op_id in &all_ops {
-            let op = graph.op(op_id).ok_or_else(|| CompilerError::CodegenViolation(
-                format!("QuantGemm fallback: op {:?} not found", op_id)))?;
-            let op_input = op.inputs.first()
+            let op = graph.op(op_id).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!(
+                    "QuantGemm fallback: op {:?} not found",
+                    op_id
+                ))
+            })?;
+            let op_input = op
+                .inputs
+                .first()
                 .and_then(|&tid| resolver.materialize(prog, tid, abi))
                 .unwrap_or(input_ptr);
-            let op_weight = op.inputs.get(1)
+            let op_weight = op
+                .inputs
+                .get(1)
                 .and_then(|&tid| resolver.materialize(prog, tid, abi))
                 .unwrap_or(weight_ptr);
-            let op_output = op.outputs.first()
+            let op_output = op
+                .outputs
+                .first()
                 .and_then(|&tid| resolver.materialize(prog, tid, abi))
                 .unwrap_or(output_ptr);
-            emit_standalone_op(prog, op, graph, ctx,
-                op_input, op_weight, op_output, rope_cache_offset,
-                resolver, abi)?;
+            emit_standalone_op(
+                prog,
+                op,
+                graph,
+                ctx,
+                op_input,
+                op_weight,
+                op_output,
+                rope_cache_offset,
+                resolver,
+                abi,
+            )?;
         }
         return Ok(());
     }
 
     match &group.mode {
         FusionMode::Standalone | FusionMode::LoopFusion => {
-            emit_standalone_op(prog, anchor_op, graph, ctx,
-                group_input_ptr, group_weight_ptr, group_output_ptr, rope_cache_offset,
-                resolver, abi)?;
+            emit_standalone_op(
+                prog,
+                anchor_op,
+                graph,
+                ctx,
+                group_input_ptr,
+                group_weight_ptr,
+                group_output_ptr,
+                rope_cache_offset,
+                resolver,
+                abi,
+            )?;
         }
 
         FusionMode::EpilogueInjection => {
@@ -339,7 +446,9 @@ pub(super) fn emit_fusion_group_by_mode(
             for op in &epi_trace {
                 if let crate::compiler::trace::TraceOp::Input(n) = op {
                     if *n >= 1 {
-                        let epi_kinds: Vec<_> = group.epilogue.iter()
+                        let epi_kinds: Vec<_> = group
+                            .epilogue
+                            .iter()
                             .filter_map(|&oid| graph.op(oid))
                             .map(|o| format!("{:?}(inputs={})", o.op, o.inputs.len()))
                             .collect();
@@ -353,11 +462,13 @@ pub(super) fn emit_fusion_group_by_mode(
             }
             let terminal_op_id = group.epilogue.last().copied().unwrap_or(anchor_op.id);
             let gemm_output_ptr = if anchor_op.op_is_gemm_like(graph)
-                && anchor_op.outputs.first() != graph.op(terminal_op_id).and_then(|op| op.outputs.first())
+                && anchor_op.outputs.first()
+                    != graph.op(terminal_op_id).and_then(|op| op.outputs.first())
             {
                 group_output_ptr
             } else {
-                graph.op(terminal_op_id)
+                graph
+                    .op(terminal_op_id)
                     .and_then(|op| op.outputs.first().copied())
                     .and_then(|tid| resolver.materialize(prog, tid, abi))
                     .unwrap_or(group_output_ptr)
@@ -368,94 +479,203 @@ pub(super) fn emit_fusion_group_by_mode(
             // Decompose: GEMM(no epilogue) → bias add → elementwise epilogue ops.
             if anchor_op.op_is_gemm_with_bias(graph) && !epi_trace.is_empty() {
                 // BCE-20260629-003 (Pattern c): per-matrix dtype — b_dtype from weight tensor
-                let b_dt = anchor_op.inputs.get(1)
+                let b_dt = anchor_op
+                    .inputs
+                    .get(1)
                     .and_then(|&tid| graph.tensor(tid))
                     .map(|t| t.dtype.to_quant_precision())
                     .unwrap_or(ctx.accum_dtype);
                 // Step 1: GEMM without epilogue → writes unbiased result to gemm_output_ptr
-                emit_gemm_inline_with_epilogue(prog, &m_dim, n, k, width,
-                    group_input_ptr, group_weight_ptr, gemm_output_ptr,
-                    &[], sym_map, false, seq_bound_override, ctx.accum_dtype, b_dt, ctx.accum_dtype, gemm_trans_b,
-                    super::isa_hook::EpiloguePlace::OnAccumulators)?;
+                emit_gemm_inline_with_epilogue(
+                    prog,
+                    &m_dim,
+                    n,
+                    k,
+                    width,
+                    group_input_ptr,
+                    group_weight_ptr,
+                    gemm_output_ptr,
+                    &[],
+                    sym_map,
+                    false,
+                    seq_bound_override,
+                    ctx.accum_dtype,
+                    b_dt,
+                    ctx.accum_dtype,
+                    gemm_trans_b,
+                    super::isa_hook::EpiloguePlace::OnAccumulators,
+                )?;
                 // Step 2: Bias add (broadcast across M rows)
                 if let Some(&bias_tid) = anchor_op.inputs.get(2) {
-                    let bias_ptr = resolver.materialize(prog, bias_tid, abi)
-                        .ok_or_else(|| CompilerError::CodegenViolation(
-                            format!("GemmBias EpilogueInjection: bias tensor {} cannot be materialized", bias_tid.0)
-                        ))?;
-                    let m_bound = seq_bound_override.cloned()
+                    let bias_ptr = resolver.materialize(prog, bias_tid, abi).ok_or_else(|| {
+                        CompilerError::CodegenViolation(format!(
+                            "GemmBias EpilogueInjection: bias tensor {} cannot be materialized",
+                            bias_tid.0
+                        ))
+                    })?;
+                    let m_bound = seq_bound_override
+                        .cloned()
                         .unwrap_or_else(|| sym_map.to_bound(&m_dim));
-                    emit_bias_add(prog, gemm_output_ptr, bias_ptr, n, m_bound, width, ctx.accum_dtype, sym_map);
+                    emit_bias_add(
+                        prog,
+                        gemm_output_ptr,
+                        bias_ptr,
+                        n,
+                        m_bound,
+                        width,
+                        ctx.accum_dtype,
+                        sym_map,
+                    );
                 }
                 // Step 3: Apply epilogue ops as standalone elementwise on biased output
                 for &epi_op_id in &group.epilogue {
                     if let Some(epi_op) = graph.op(epi_op_id) {
-                        let epi_input_ptr = epi_op.inputs.first()
+                        let epi_input_ptr = epi_op
+                            .inputs
+                            .first()
                             .and_then(|&tid| resolver.materialize(prog, tid, abi))
                             .unwrap_or(gemm_output_ptr);
-                        let epi_output_ptr = epi_op.outputs.first()
+                        let epi_output_ptr = epi_op
+                            .outputs
+                            .first()
                             .and_then(|&tid| resolver.materialize(prog, tid, abi))
                             .unwrap_or(gemm_output_ptr);
                         // Epilogue ops are elementwise (GELU, SiLU, etc.) — use standalone dispatch
-                        emit_standalone_op(prog, epi_op, graph, ctx,
-                            epi_input_ptr, group_weight_ptr, epi_output_ptr, rope_cache_offset,
-                            resolver, abi)?;
+                        emit_standalone_op(
+                            prog,
+                            epi_op,
+                            graph,
+                            ctx,
+                            epi_input_ptr,
+                            group_weight_ptr,
+                            epi_output_ptr,
+                            rope_cache_offset,
+                            resolver,
+                            abi,
+                        )?;
                     }
                 }
             } else {
-                let b_dt = anchor_op.inputs.get(1)
+                let b_dt = anchor_op
+                    .inputs
+                    .get(1)
                     .and_then(|&tid| graph.tensor(tid))
                     .map(|t| t.dtype.to_quant_precision())
                     .unwrap_or(ctx.accum_dtype);
-                emit_gemm_inline_with_epilogue(prog, &m_dim, n, k, width,
-                    group_input_ptr, group_weight_ptr, gemm_output_ptr,
-                    &epi_trace, sym_map, graph.telemetry.gemm_row_stats, seq_bound_override, ctx.accum_dtype, b_dt, ctx.accum_dtype, gemm_trans_b,
-                    super::isa_hook::EpiloguePlace::OnAccumulators)?;
+                emit_gemm_inline_with_epilogue(
+                    prog,
+                    &m_dim,
+                    n,
+                    k,
+                    width,
+                    group_input_ptr,
+                    group_weight_ptr,
+                    gemm_output_ptr,
+                    &epi_trace,
+                    sym_map,
+                    graph.telemetry.gemm_row_stats,
+                    seq_bound_override,
+                    ctx.accum_dtype,
+                    b_dt,
+                    ctx.accum_dtype,
+                    gemm_trans_b,
+                    super::isa_hook::EpiloguePlace::OnAccumulators,
+                )?;
             }
         }
 
         FusionMode::NormIntoGemm => {
-            let norm_op = group.ops.iter()
+            let norm_op = group
+                .ops
+                .iter()
                 .filter_map(|&oid| graph.op(oid))
                 .find(|op| op.op_is_norm_like(graph))
-                .ok_or_else(|| CompilerError::CodegenViolation(
-                    "NormIntoGemm: group.ops 中未找到 Norm op".into()))?;
-            let norm_output_tid = norm_op.outputs.first().copied()
-                .ok_or_else(|| CompilerError::CodegenViolation(
-                    "NormIntoGemm: Norm op 无输出张量".into()))?;
-            let scratch_offset = alloc.offset_of(norm_output_tid)
-                .ok_or_else(|| CompilerError::CodegenViolation(
-                    format!("NormIntoGemm: BufferAllocation 中未找到张量 {:?} 的 scratchpad 偏移", norm_output_tid)))?;
+                .ok_or_else(|| {
+                    CompilerError::CodegenViolation(
+                        "NormIntoGemm: group.ops 中未找到 Norm op".into(),
+                    )
+                })?;
+            let norm_output_tid = norm_op.outputs.first().copied().ok_or_else(|| {
+                CompilerError::CodegenViolation("NormIntoGemm: Norm op 无输出张量".into())
+            })?;
+            let scratch_offset = alloc.offset_of(norm_output_tid).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!(
+                    "NormIntoGemm: BufferAllocation 中未找到张量 {:?} 的 scratchpad 偏移",
+                    norm_output_tid
+                ))
+            })?;
             let scratch_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoadPtr { dst: scratch_ptr, src: PtrExpr::VRegPlusConst(scratch_base, scratch_offset) });
+            prog.emit(VmInstr::LoadPtr {
+                dst: scratch_ptr,
+                src: PtrExpr::VRegPlusConst(scratch_base, scratch_offset),
+            });
 
-            let norm_input_ptr = norm_op.inputs.first()
+            let norm_input_ptr = norm_op
+                .inputs
+                .first()
                 .and_then(|&tid| resolver.materialize(prog, tid, abi))
                 .unwrap_or(input_ptr);
-            let norm_weight_ptr = norm_op.inputs.get(1)
+            let norm_weight_ptr = norm_op
+                .inputs
+                .get(1)
                 .and_then(|&tid| resolver.materialize(prog, tid, abi))
                 .unwrap_or(weight_ptr);
             prog.emit_scope(|p| -> Result<(), CompilerError> {
-                emit_standalone_op(p, norm_op, graph, ctx,
-                    norm_input_ptr, norm_weight_ptr, scratch_ptr, rope_cache_offset,
-                    resolver, abi)?;
+                emit_standalone_op(
+                    p,
+                    norm_op,
+                    graph,
+                    ctx,
+                    norm_input_ptr,
+                    norm_weight_ptr,
+                    scratch_ptr,
+                    rope_cache_offset,
+                    resolver,
+                    abi,
+                )?;
                 let (m_dim, n, k) = extract_gemm_dims_sym(anchor_op, graph)?;
                 let pm = ctx.pack_map_for_gemm(anchor_op.inputs.get(1).copied());
                 let norm_into_gemm_trans_b = anchor_op.op_gemm_trans_b(graph);
-                let b_dt = anchor_op.inputs.get(1)
+                let b_dt = anchor_op
+                    .inputs
+                    .get(1)
                     .and_then(|&tid| graph.tensor(tid))
                     .map(|t| t.dtype.to_quant_precision())
                     .unwrap_or(ctx.accum_dtype);
-                emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx,
-                    scratch_ptr, group_weight_ptr, group_output_ptr, seq_bound_override, Some(anchor_op.id), pm, norm_into_gemm_trans_b,
-                    ctx.accum_dtype, b_dt, ctx.accum_dtype)?;
+                emit_gemm_inline_with_hook(
+                    p,
+                    &m_dim,
+                    n,
+                    k,
+                    ctx,
+                    scratch_ptr,
+                    group_weight_ptr,
+                    group_output_ptr,
+                    seq_bound_override,
+                    Some(anchor_op.id),
+                    pm,
+                    norm_into_gemm_trans_b,
+                    ctx.accum_dtype,
+                    b_dt,
+                    ctx.accum_dtype,
+                )?;
                 // GemmBias: add bias after GEMM in NormIntoGemm mode
                 if anchor_op.op_is_gemm_with_bias(graph) {
                     if let Some(&bias_tid) = anchor_op.inputs.get(2) {
                         if let Some(bias_ptr) = resolver.materialize(p, bias_tid, abi) {
-                            let m_bound = seq_bound_override.cloned()
+                            let m_bound = seq_bound_override
+                                .cloned()
                                 .unwrap_or_else(|| sym_map.to_bound(&m_dim));
-                            emit_bias_add(p, group_output_ptr, bias_ptr, n, m_bound, ctx.session.width, ctx.accum_dtype, sym_map);
+                            emit_bias_add(
+                                p,
+                                group_output_ptr,
+                                bias_ptr,
+                                n,
+                                m_bound,
+                                ctx.session.width,
+                                ctx.accum_dtype,
+                                sym_map,
+                            );
                         }
                     }
                 }
@@ -467,29 +687,63 @@ pub(super) fn emit_fusion_group_by_mode(
             for &op_id in &group.ops {
                 if let Some(op) = graph.op(op_id) {
                     if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(op, graph) {
-                        let out_ptr = load_op_scratch_ptr(prog, scratch_base, op, alloc, resolver, abi)?;
-                        let gemm_input = op.inputs.first().copied()
+                        let out_ptr =
+                            load_op_scratch_ptr(prog, scratch_base, op, alloc, resolver, abi)?;
+                        let gemm_input = op
+                            .inputs
+                            .first()
+                            .copied()
                             .and_then(|tid| resolver.materialize(prog, tid, abi))
                             .unwrap_or(input_ptr);
-                        let gemm_weight = op.inputs.get(1).copied()
+                        let gemm_weight = op
+                            .inputs
+                            .get(1)
+                            .copied()
                             .and_then(|tid| resolver.materialize(prog, tid, abi))
                             .unwrap_or(weight_ptr);
                         let pm = ctx.pack_map_for_gemm(op.inputs.get(1).copied());
                         let qkv_trans_b = op.op_gemm_trans_b(graph);
-                        let qkv_b_dt = op.inputs.get(1)
+                        let qkv_b_dt = op
+                            .inputs
+                            .get(1)
                             .and_then(|&tid| graph.tensor(tid))
                             .map(|t| t.dtype.to_quant_precision())
                             .unwrap_or(ctx.accum_dtype);
                         prog.emit_scope(|p| -> Result<(), CompilerError> {
-                            emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx, gemm_input, gemm_weight, out_ptr, seq_bound_override, Some(op.id), pm, qkv_trans_b,
-                                ctx.accum_dtype, qkv_b_dt, ctx.accum_dtype)?;
+                            emit_gemm_inline_with_hook(
+                                p,
+                                &m_dim,
+                                n,
+                                k,
+                                ctx,
+                                gemm_input,
+                                gemm_weight,
+                                out_ptr,
+                                seq_bound_override,
+                                Some(op.id),
+                                pm,
+                                qkv_trans_b,
+                                ctx.accum_dtype,
+                                qkv_b_dt,
+                                ctx.accum_dtype,
+                            )?;
                             // GemmBias: add bias after GEMM in QkvSharedInput mode
                             if op.op_is_gemm_with_bias(graph) {
                                 if let Some(&bias_tid) = op.inputs.get(2) {
                                     if let Some(bias_ptr) = resolver.materialize(p, bias_tid, abi) {
-                                        let m_bound = seq_bound_override.cloned()
+                                        let m_bound = seq_bound_override
+                                            .cloned()
                                             .unwrap_or_else(|| sym_map.to_bound(&m_dim));
-                                        emit_bias_add(p, out_ptr, bias_ptr, n, m_bound, ctx.session.width, ctx.accum_dtype, sym_map);
+                                        emit_bias_add(
+                                            p,
+                                            out_ptr,
+                                            bias_ptr,
+                                            n,
+                                            m_bound,
+                                            ctx.session.width,
+                                            ctx.accum_dtype,
+                                            sym_map,
+                                        );
                                     }
                                 }
                             }
@@ -501,112 +755,247 @@ pub(super) fn emit_fusion_group_by_mode(
         }
 
         FusionMode::TileLevelFusion { predecessor, .. } => {
-            let pre_op = graph.op(*predecessor).ok_or_else(|| CompilerError::CodegenViolation(
-                format!("TileLevelFusion predecessor {:?} not found", predecessor)))?;
-            let pre_scratch = load_op_scratch_ptr(prog, scratch_base, pre_op, alloc, resolver, abi)?;
+            let pre_op = graph.op(*predecessor).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!(
+                    "TileLevelFusion predecessor {:?} not found",
+                    predecessor
+                ))
+            })?;
+            let pre_scratch =
+                load_op_scratch_ptr(prog, scratch_base, pre_op, alloc, resolver, abi)?;
 
-            let pre_input_ptr = pre_op.inputs.first()
+            let pre_input_ptr = pre_op
+                .inputs
+                .first()
                 .and_then(|&tid| resolver.materialize(prog, tid, abi))
                 .unwrap_or(input_ptr);
-            let pre_weight_ptr = pre_op.inputs.get(1)
+            let pre_weight_ptr = pre_op
+                .inputs
+                .get(1)
                 .and_then(|&tid| resolver.materialize(prog, tid, abi))
                 .unwrap_or(weight_ptr);
-            emit_standalone_op(prog, pre_op, graph, ctx,
-                pre_input_ptr, pre_weight_ptr, pre_scratch, rope_cache_offset,
-                resolver, abi)?;
+            emit_standalone_op(
+                prog,
+                pre_op,
+                graph,
+                ctx,
+                pre_input_ptr,
+                pre_weight_ptr,
+                pre_scratch,
+                rope_cache_offset,
+                resolver,
+                abi,
+            )?;
 
             let (m_dim, n, k) = extract_gemm_dims_sym(anchor_op, graph)?;
             let pm = ctx.pack_map_for_gemm(anchor_op.inputs.get(1).copied());
             let pre_fusion_trans_b = anchor_op.op_gemm_trans_b(graph);
-            let b_dt = anchor_op.inputs.get(1)
+            let b_dt = anchor_op
+                .inputs
+                .get(1)
                 .and_then(|&tid| graph.tensor(tid))
                 .map(|t| t.dtype.to_quant_precision())
                 .unwrap_or(ctx.accum_dtype);
-            emit_gemm_inline_with_hook(prog, &m_dim, n, k, ctx,
-                pre_scratch, group_weight_ptr, group_output_ptr, seq_bound_override, Some(anchor_op.id), pm, pre_fusion_trans_b,
-                ctx.accum_dtype, b_dt, ctx.accum_dtype)?;
+            emit_gemm_inline_with_hook(
+                prog,
+                &m_dim,
+                n,
+                k,
+                ctx,
+                pre_scratch,
+                group_weight_ptr,
+                group_output_ptr,
+                seq_bound_override,
+                Some(anchor_op.id),
+                pm,
+                pre_fusion_trans_b,
+                ctx.accum_dtype,
+                b_dt,
+                ctx.accum_dtype,
+            )?;
             // GemmBias: add bias after GEMM in TileLevelFusion mode
             if anchor_op.op_is_gemm_with_bias(graph) {
                 if let Some(&bias_tid) = anchor_op.inputs.get(2) {
                     if let Some(bias_ptr) = resolver.materialize(prog, bias_tid, abi) {
-                        let m_bound = seq_bound_override.cloned()
+                        let m_bound = seq_bound_override
+                            .cloned()
                             .unwrap_or_else(|| sym_map.to_bound(&m_dim));
-                        emit_bias_add(prog, group_output_ptr, bias_ptr, n, m_bound, ctx.session.width, ctx.accum_dtype, sym_map);
+                        emit_bias_add(
+                            prog,
+                            group_output_ptr,
+                            bias_ptr,
+                            n,
+                            m_bound,
+                            ctx.session.width,
+                            ctx.accum_dtype,
+                            sym_map,
+                        );
                     }
                 }
             }
         }
 
         FusionMode::ComputeRoot { predecessor } => {
-            let pre_op = graph.op(*predecessor).ok_or_else(|| CompilerError::CodegenViolation(
-                format!("ComputeRoot predecessor {:?} not found", predecessor)))?;
-            let pre_scratch = load_op_scratch_ptr(prog, scratch_base, pre_op, alloc, resolver, abi)?;
+            let pre_op = graph.op(*predecessor).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!(
+                    "ComputeRoot predecessor {:?} not found",
+                    predecessor
+                ))
+            })?;
+            let pre_scratch =
+                load_op_scratch_ptr(prog, scratch_base, pre_op, alloc, resolver, abi)?;
 
-            let pre_input_ptr = pre_op.inputs.first()
+            let pre_input_ptr = pre_op
+                .inputs
+                .first()
                 .and_then(|&tid| resolver.materialize(prog, tid, abi))
                 .unwrap_or(input_ptr);
-            let pre_weight_ptr = pre_op.inputs.get(1)
+            let pre_weight_ptr = pre_op
+                .inputs
+                .get(1)
                 .and_then(|&tid| resolver.materialize(prog, tid, abi))
                 .unwrap_or(weight_ptr);
             prog.emit_scope(|p| -> Result<(), CompilerError> {
-                emit_standalone_op(p, pre_op, graph, ctx,
-                    pre_input_ptr, pre_weight_ptr, pre_scratch, rope_cache_offset,
-                    resolver, abi)?;
+                emit_standalone_op(
+                    p,
+                    pre_op,
+                    graph,
+                    ctx,
+                    pre_input_ptr,
+                    pre_weight_ptr,
+                    pre_scratch,
+                    rope_cache_offset,
+                    resolver,
+                    abi,
+                )?;
                 Ok(())
             })?;
 
             let (m_dim, n, k) = extract_gemm_dims_sym(anchor_op, graph)?;
             let pm = ctx.pack_map_for_gemm(anchor_op.inputs.get(1).copied());
             let pre_fusion_trans_b = anchor_op.op_gemm_trans_b(graph);
-            let cr_b_dt = anchor_op.inputs.get(1)
+            let cr_b_dt = anchor_op
+                .inputs
+                .get(1)
                 .and_then(|&tid| graph.tensor(tid))
                 .map(|t| t.dtype.to_quant_precision())
                 .unwrap_or(ctx.accum_dtype);
-            emit_gemm_inline_with_hook(prog, &m_dim, n, k, ctx,
-                pre_scratch, group_weight_ptr, group_output_ptr, seq_bound_override, Some(anchor_op.id), pm, pre_fusion_trans_b,
-                ctx.accum_dtype, cr_b_dt, ctx.accum_dtype)?;
+            emit_gemm_inline_with_hook(
+                prog,
+                &m_dim,
+                n,
+                k,
+                ctx,
+                pre_scratch,
+                group_weight_ptr,
+                group_output_ptr,
+                seq_bound_override,
+                Some(anchor_op.id),
+                pm,
+                pre_fusion_trans_b,
+                ctx.accum_dtype,
+                cr_b_dt,
+                ctx.accum_dtype,
+            )?;
             // GemmBias: add bias after GEMM in ComputeRoot mode
             if anchor_op.op_is_gemm_with_bias(graph) {
                 if let Some(&bias_tid) = anchor_op.inputs.get(2) {
                     if let Some(bias_ptr) = resolver.materialize(prog, bias_tid, abi) {
-                        let m_bound = seq_bound_override.cloned()
+                        let m_bound = seq_bound_override
+                            .cloned()
                             .unwrap_or_else(|| sym_map.to_bound(&m_dim));
-                        emit_bias_add(prog, group_output_ptr, bias_ptr, n, m_bound, ctx.session.width, ctx.accum_dtype, sym_map);
+                        emit_bias_add(
+                            prog,
+                            group_output_ptr,
+                            bias_ptr,
+                            n,
+                            m_bound,
+                            ctx.session.width,
+                            ctx.accum_dtype,
+                            sym_map,
+                        );
                     }
                 }
             }
         }
 
-        FusionMode::FFNBlock { gate_gemm, up_gemm, activation, combine } => {
-            let gate_op = graph.op(*gate_gemm).ok_or_else(|| CompilerError::CodegenViolation(
-                format!("FFNBlock gate_gemm op {:?} not found", gate_gemm)))?;
-            let up_op = graph.op(*up_gemm).ok_or_else(|| CompilerError::CodegenViolation(
-                format!("FFNBlock up_gemm op {:?} not found", up_gemm)))?;
-            let gate_scratch = load_op_scratch_ptr(prog, scratch_base, gate_op, alloc, resolver, abi)?;
+        FusionMode::FFNBlock {
+            gate_gemm,
+            up_gemm,
+            activation,
+            combine,
+        } => {
+            let gate_op = graph.op(*gate_gemm).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!(
+                    "FFNBlock gate_gemm op {:?} not found",
+                    gate_gemm
+                ))
+            })?;
+            let up_op = graph.op(*up_gemm).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!(
+                    "FFNBlock up_gemm op {:?} not found",
+                    up_gemm
+                ))
+            })?;
+            let gate_scratch =
+                load_op_scratch_ptr(prog, scratch_base, gate_op, alloc, resolver, abi)?;
             let up_scratch = load_op_scratch_ptr(prog, scratch_base, up_op, alloc, resolver, abi)?;
 
-            let gate_input = gate_op.inputs.first().copied()
+            let gate_input = gate_op
+                .inputs
+                .first()
+                .copied()
                 .and_then(|tid| resolver.materialize(prog, tid, abi))
                 .unwrap_or(input_ptr);
-            let gate_weight = gate_op.inputs.get(1).copied()
+            let gate_weight = gate_op
+                .inputs
+                .get(1)
+                .copied()
                 .and_then(|tid| resolver.materialize(prog, tid, abi))
                 .unwrap_or(weight_ptr);
             if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(gate_op, graph) {
                 let pm = ctx.pack_map_for_gemm(gate_op.inputs.get(1).copied());
                 let gate_trans_b = gate_op.op_gemm_trans_b(graph);
-                let gate_b_dt = gate_op.inputs.get(1)
+                let gate_b_dt = gate_op
+                    .inputs
+                    .get(1)
                     .and_then(|&tid| graph.tensor(tid))
                     .map(|t| t.dtype.to_quant_precision())
                     .unwrap_or(ctx.accum_dtype);
                 prog.emit_scope(|p| -> Result<(), CompilerError> {
-                    emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx, gate_input, gate_weight, gate_scratch, seq_bound_override, Some(gate_op.id), pm, gate_trans_b,
-                        ctx.accum_dtype, gate_b_dt, ctx.accum_dtype)?;
+                    emit_gemm_inline_with_hook(
+                        p,
+                        &m_dim,
+                        n,
+                        k,
+                        ctx,
+                        gate_input,
+                        gate_weight,
+                        gate_scratch,
+                        seq_bound_override,
+                        Some(gate_op.id),
+                        pm,
+                        gate_trans_b,
+                        ctx.accum_dtype,
+                        gate_b_dt,
+                        ctx.accum_dtype,
+                    )?;
                     if gate_op.op_is_gemm_with_bias(graph) {
                         if let Some(&bias_tid) = gate_op.inputs.get(2) {
                             if let Some(bias_ptr) = resolver.materialize(p, bias_tid, abi) {
-                                let m_bound = seq_bound_override.cloned()
+                                let m_bound = seq_bound_override
+                                    .cloned()
                                     .unwrap_or_else(|| sym_map.to_bound(&m_dim));
-                                emit_bias_add(p, gate_scratch, bias_ptr, n, m_bound, ctx.session.width, ctx.accum_dtype, sym_map);
+                                emit_bias_add(
+                                    p,
+                                    gate_scratch,
+                                    bias_ptr,
+                                    n,
+                                    m_bound,
+                                    ctx.session.width,
+                                    ctx.accum_dtype,
+                                    sym_map,
+                                );
                             }
                         }
                     }
@@ -614,28 +1003,61 @@ pub(super) fn emit_fusion_group_by_mode(
                 })?;
             }
 
-            let up_input = up_op.inputs.first().copied()
+            let up_input = up_op
+                .inputs
+                .first()
+                .copied()
                 .and_then(|tid| resolver.materialize(prog, tid, abi))
                 .unwrap_or(input_ptr);
-            let up_weight = up_op.inputs.get(1).copied()
+            let up_weight = up_op
+                .inputs
+                .get(1)
+                .copied()
                 .and_then(|tid| resolver.materialize(prog, tid, abi))
                 .unwrap_or(weight_ptr);
             if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(up_op, graph) {
                 let pm = ctx.pack_map_for_gemm(up_op.inputs.get(1).copied());
                 let up_trans_b = up_op.op_gemm_trans_b(graph);
-                let up_b_dt = up_op.inputs.get(1)
+                let up_b_dt = up_op
+                    .inputs
+                    .get(1)
                     .and_then(|&tid| graph.tensor(tid))
                     .map(|t| t.dtype.to_quant_precision())
                     .unwrap_or(ctx.accum_dtype);
                 prog.emit_scope(|p| -> Result<(), CompilerError> {
-                    emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx, up_input, up_weight, up_scratch, seq_bound_override, Some(up_op.id), pm, up_trans_b,
-                        ctx.accum_dtype, up_b_dt, ctx.accum_dtype)?;
+                    emit_gemm_inline_with_hook(
+                        p,
+                        &m_dim,
+                        n,
+                        k,
+                        ctx,
+                        up_input,
+                        up_weight,
+                        up_scratch,
+                        seq_bound_override,
+                        Some(up_op.id),
+                        pm,
+                        up_trans_b,
+                        ctx.accum_dtype,
+                        up_b_dt,
+                        ctx.accum_dtype,
+                    )?;
                     if up_op.op_is_gemm_with_bias(graph) {
                         if let Some(&bias_tid) = up_op.inputs.get(2) {
                             if let Some(bias_ptr) = resolver.materialize(p, bias_tid, abi) {
-                                let m_bound = seq_bound_override.cloned()
+                                let m_bound = seq_bound_override
+                                    .cloned()
                                     .unwrap_or_else(|| sym_map.to_bound(&m_dim));
-                                emit_bias_add(p, up_scratch, bias_ptr, n, m_bound, ctx.session.width, ctx.accum_dtype, sym_map);
+                                emit_bias_add(
+                                    p,
+                                    up_scratch,
+                                    bias_ptr,
+                                    n,
+                                    m_bound,
+                                    ctx.session.width,
+                                    ctx.accum_dtype,
+                                    sym_map,
+                                );
                             }
                         }
                     }
@@ -643,85 +1065,194 @@ pub(super) fn emit_fusion_group_by_mode(
                 })?;
             }
 
-            let act_op = graph.op(*activation).ok_or_else(|| CompilerError::CodegenViolation(
-                format!("FFNBlock activation op {:?} not found", activation)))?;
-            let act_scratch = load_op_scratch_ptr(prog, scratch_base, act_op, alloc, resolver, abi)?;
+            let act_op = graph.op(*activation).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!(
+                    "FFNBlock activation op {:?} not found",
+                    activation
+                ))
+            })?;
+            let act_scratch =
+                load_op_scratch_ptr(prog, scratch_base, act_op, alloc, resolver, abi)?;
             let act_trace = extract_op_trace(act_op, registry, graph)?;
             let (act_shape, _) = infer_output_shape_sym(act_op, graph)?;
-            emit_elementwise_inline(prog, &act_trace, &act_shape, width, false,
+            emit_elementwise_inline(
+                prog,
+                &act_trace,
+                &act_shape,
+                width,
                 false,
-                gate_scratch, weight_ptr, act_scratch, sym_map, seq_bound_override, ctx.accum_dtype)?;
-            let combine_op = graph.op(*combine).ok_or_else(|| CompilerError::CodegenViolation(
-                format!("FFNBlock combine op {:?} not found", combine)))?;
+                false,
+                gate_scratch,
+                weight_ptr,
+                act_scratch,
+                sym_map,
+                seq_bound_override,
+                ctx.accum_dtype,
+            )?;
+            let combine_op = graph.op(*combine).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!(
+                    "FFNBlock combine op {:?} not found",
+                    combine
+                ))
+            })?;
             let combine_trace = extract_op_trace(combine_op, registry, graph)?;
             let (combine_shape, _) = infer_output_shape_sym(combine_op, graph)?;
-            let combine_output = combine_op.outputs.first().copied()
+            let combine_output = combine_op
+                .outputs
+                .first()
+                .copied()
                 .and_then(|tid| resolver.materialize(prog, tid, abi))
                 .unwrap_or(output_ptr);
-            emit_elementwise_inline(prog, &combine_trace, &combine_shape, width, true,
+            emit_elementwise_inline(
+                prog,
+                &combine_trace,
+                &combine_shape,
+                width,
+                true,
                 false,
-                act_scratch, up_scratch, combine_output, sym_map, seq_bound_override, ctx.accum_dtype)?;
+                act_scratch,
+                up_scratch,
+                combine_output,
+                sym_map,
+                seq_bound_override,
+                ctx.accum_dtype,
+            )?;
         }
 
         FusionMode::CrossLayerResidual { residual, norm } => {
-            let res_op = graph.op(*residual).ok_or_else(|| CompilerError::CodegenViolation(
-                format!("CrossLayerResidual residual {:?} not found", residual)))?;
-            let norm_op = graph.op(*norm).ok_or_else(|| CompilerError::CodegenViolation(
-                format!("CrossLayerResidual norm {:?} not found", norm)))?;
-            let res_scratch = load_op_scratch_ptr(prog, scratch_base, res_op, alloc, resolver, abi)?;
+            let res_op = graph.op(*residual).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!(
+                    "CrossLayerResidual residual {:?} not found",
+                    residual
+                ))
+            })?;
+            let norm_op = graph.op(*norm).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!(
+                    "CrossLayerResidual norm {:?} not found",
+                    norm
+                ))
+            })?;
+            let res_scratch =
+                load_op_scratch_ptr(prog, scratch_base, res_op, alloc, resolver, abi)?;
 
-            let res_input0 = res_op.inputs.first().copied()
+            let res_input0 = res_op
+                .inputs
+                .first()
+                .copied()
                 .and_then(|tid| resolver.materialize(prog, tid, abi))
                 .unwrap_or(input_ptr);
-            let res_input1 = res_op.inputs.get(1).copied()
+            let res_input1 = res_op
+                .inputs
+                .get(1)
+                .copied()
                 .and_then(|tid| resolver.materialize(prog, tid, abi))
                 .unwrap_or(weight_ptr);
 
             let res_trace = extract_op_trace(res_op, registry, graph)?;
             let (res_shape, _) = infer_output_shape_sym(res_op, graph)?;
             let res_is_binary = res_op.inputs.len() > 1;
-            emit_elementwise_inline(prog, &res_trace, &res_shape, width, res_is_binary,
+            emit_elementwise_inline(
+                prog,
+                &res_trace,
+                &res_shape,
+                width,
+                res_is_binary,
                 false,
-                res_input0, res_input1, res_scratch, sym_map, seq_bound_override, ctx.accum_dtype)?;
+                res_input0,
+                res_input1,
+                res_scratch,
+                sym_map,
+                seq_bound_override,
+                ctx.accum_dtype,
+            )?;
 
-            let norm_input0 = norm_op.inputs.first().copied()
+            let norm_input0 = norm_op
+                .inputs
+                .first()
+                .copied()
                 .and_then(|tid| resolver.materialize(prog, tid, abi))
                 .unwrap_or(res_scratch);
-            let norm_weight = norm_op.inputs.get(1).copied()
+            let norm_weight = norm_op
+                .inputs
+                .get(1)
+                .copied()
                 .and_then(|tid| resolver.materialize(prog, tid, abi))
                 .unwrap_or(weight_ptr);
-            let norm_output = norm_op.outputs.first().copied()
+            let norm_output = norm_op
+                .outputs
+                .first()
+                .copied()
                 .and_then(|tid| resolver.materialize(prog, tid, abi))
                 .unwrap_or(output_ptr);
 
             let norm_trace = extract_op_trace(norm_op, registry, graph)?;
             let (norm_shape, _) = infer_output_shape_sym(norm_op, graph)?;
             let norm_is_binary = norm_op.inputs.len() > 1;
-            emit_elementwise_inline(prog, &norm_trace, &norm_shape, width, norm_is_binary,
+            emit_elementwise_inline(
+                prog,
+                &norm_trace,
+                &norm_shape,
+                width,
+                norm_is_binary,
                 false,
-                norm_input0, norm_weight, norm_output, sym_map, seq_bound_override, ctx.accum_dtype)?;
+                norm_input0,
+                norm_weight,
+                norm_output,
+                sym_map,
+                seq_bound_override,
+                ctx.accum_dtype,
+            )?;
         }
 
-        FusionMode::FusedQkvNormRope { gemm_q, gemm_k, gemm_v, .. } => {
+        FusionMode::FusedQkvNormRope {
+            gemm_q,
+            gemm_k,
+            gemm_v,
+            ..
+        } => {
             for &op_id in &[*gemm_q, *gemm_k, *gemm_v] {
                 if let Some(op) = graph.op(op_id) {
                     if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(op, graph) {
-                        let out_ptr = load_op_scratch_ptr(prog, scratch_base, op, alloc, resolver, abi)?;
-                        let gemm_input = op.inputs.first().copied()
+                        let out_ptr =
+                            load_op_scratch_ptr(prog, scratch_base, op, alloc, resolver, abi)?;
+                        let gemm_input = op
+                            .inputs
+                            .first()
+                            .copied()
                             .and_then(|tid| resolver.materialize(prog, tid, abi))
                             .unwrap_or(input_ptr);
-                        let gemm_weight = op.inputs.get(1).copied()
+                        let gemm_weight = op
+                            .inputs
+                            .get(1)
+                            .copied()
                             .and_then(|tid| resolver.materialize(prog, tid, abi))
                             .unwrap_or(weight_ptr);
                         let pm = ctx.pack_map_for_gemm(op.inputs.get(1).copied());
                         let fqnr_trans_b = op.op_gemm_trans_b(graph);
-                        let fqnr_b_dt = op.inputs.get(1)
+                        let fqnr_b_dt = op
+                            .inputs
+                            .get(1)
                             .and_then(|&tid| graph.tensor(tid))
                             .map(|t| t.dtype.to_quant_precision())
                             .unwrap_or(ctx.accum_dtype);
                         prog.emit_scope(|p| -> Result<(), CompilerError> {
-                            emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx, gemm_input, gemm_weight, out_ptr, seq_bound_override, Some(op.id), pm, fqnr_trans_b,
-                                ctx.accum_dtype, fqnr_b_dt, ctx.accum_dtype)?;
+                            emit_gemm_inline_with_hook(
+                                p,
+                                &m_dim,
+                                n,
+                                k,
+                                ctx,
+                                gemm_input,
+                                gemm_weight,
+                                out_ptr,
+                                seq_bound_override,
+                                Some(op.id),
+                                pm,
+                                fqnr_trans_b,
+                                ctx.accum_dtype,
+                                fqnr_b_dt,
+                                ctx.accum_dtype,
+                            )?;
                             Ok(())
                         })?;
                     }
@@ -730,18 +1261,36 @@ pub(super) fn emit_fusion_group_by_mode(
             for &op_id in &group.ops {
                 if let Some(op) = graph.op(op_id) {
                     if !op.op_is_gemm_like(graph) {
-                        let op_input = op.inputs.first().copied()
+                        let op_input = op
+                            .inputs
+                            .first()
+                            .copied()
                             .and_then(|tid| resolver.materialize(prog, tid, abi))
                             .unwrap_or(input_ptr);
-                        let op_weight = op.inputs.get(1).copied()
+                        let op_weight = op
+                            .inputs
+                            .get(1)
+                            .copied()
                             .and_then(|tid| resolver.materialize(prog, tid, abi))
                             .unwrap_or(weight_ptr);
-                        let op_output = op.outputs.first().copied()
+                        let op_output = op
+                            .outputs
+                            .first()
+                            .copied()
                             .and_then(|tid| resolver.materialize(prog, tid, abi))
                             .unwrap_or(output_ptr);
-                        emit_standalone_op(prog, op, graph, ctx,
-                            op_input, op_weight, op_output, rope_cache_offset,
-                            resolver, abi)?;
+                        emit_standalone_op(
+                            prog,
+                            op,
+                            graph,
+                            ctx,
+                            op_input,
+                            op_weight,
+                            op_output,
+                            rope_cache_offset,
+                            resolver,
+                            abi,
+                        )?;
                     }
                 }
             }
@@ -753,17 +1302,19 @@ pub(super) fn emit_fusion_group_by_mode(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::plan_lower::CompileSession;
     use super::super::op_impl::FeatureSet as OpFeatureSet;
-    use crate::compiler::fusion::GroupMarker;
-        use crate::compiler::layout_negotiator::{
-        LayoutTransform, InterOpTransform, MovementType, GroupLayoutAssignment,
-        LayoutAssignment,
-    };
+    use super::super::plan_lower::CompileSession;
+    use super::*;
     use crate::compiler::accel_registry::LayoutConstraint;
-    use crate::compiler::fusion::{FusionGroup, FusionMode, FusionCost};
-    use crate::compiler::graph::{OpId, MultiOutputConfig, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+    use crate::compiler::fusion::GroupMarker;
+    use crate::compiler::fusion::{FusionCost, FusionGroup, FusionMode};
+    use crate::compiler::graph::{
+        AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, DualRopeSpec, GemmSpec,
+        MlaSpec, MultiOutputConfig, NormSpec, Op, OpId, QuantGemmSpec, RopeSpec, SinksSpec,
+    };
+    use crate::compiler::layout_negotiator::{
+        GroupLayoutAssignment, InterOpTransform, LayoutAssignment, LayoutTransform, MovementType,
+    };
     use std::collections::HashMap;
 
     /// Helper: build a minimal AbiPtrs with dummy VRegIds for emit_layout_transform tests.
@@ -794,7 +1345,11 @@ mod tests {
     fn make_test_resolver() -> TensorPtrResolver {
         let graph = CompilerGraph::new();
         let alloc = BufferAllocation::default();
-        TensorPtrResolver::build(&graph, &alloc, &super::super::topology::GraphTopologyAnalysis::analyze(&graph))
+        TensorPtrResolver::build(
+            &graph,
+            &alloc,
+            &super::super::topology::GraphTopologyAnalysis::analyze(&graph),
+        )
     }
 
     // ── emit_layout_transform: all layout pairs return Ok and emit nothing ──
@@ -827,7 +1382,10 @@ mod tests {
         let mut prog = VmProgram::new();
         let xform = LayoutTransform {
             source: LayoutConstraint::RowMajor { align_bytes: 32 },
-            target: LayoutConstraint::HeadSplit { num_heads: 8, head_dim: 64 },
+            target: LayoutConstraint::HeadSplit {
+                num_heads: 8,
+                head_dim: 64,
+            },
             cost: 0.0,
         };
         let graph = CompilerGraph::new();
@@ -1001,11 +1559,17 @@ mod tests {
     fn fusion_mode_tile_level_fusion_fields() {
         // Arrange & Act
         let pred = OpId(5);
-        let mode = FusionMode::TileLevelFusion { predecessor: pred, tile_rows: 64 };
+        let mode = FusionMode::TileLevelFusion {
+            predecessor: pred,
+            tile_rows: 64,
+        };
 
         // Assert
         match mode {
-            FusionMode::TileLevelFusion { predecessor, tile_rows } => {
+            FusionMode::TileLevelFusion {
+                predecessor,
+                tile_rows,
+            } => {
                 assert_eq!(predecessor, OpId(5));
                 assert_eq!(tile_rows, 64);
             }
@@ -1020,7 +1584,10 @@ mod tests {
         // Arrange & Act & Assert
         assert_ne!(MovementType::RegisterDirect, MovementType::RegisterToMemory);
         assert_ne!(MovementType::RegisterToMemory, MovementType::MemoryToMemory);
-        assert_ne!(MovementType::MemoryToMemory, MovementType::GpuGlobalToShared);
+        assert_ne!(
+            MovementType::MemoryToMemory,
+            MovementType::GpuGlobalToShared
+        );
         assert_eq!(MovementType::RegisterDirect, MovementType::RegisterDirect);
     }
 
@@ -1083,7 +1650,10 @@ mod tests {
         assert_eq!(found.unwrap().total_benefit, 10.0);
         // Simulate the filter from emit_fusion_group_by_mode line 106:
         // only RegisterDirect + cost > 0
-        let costly_direct: Vec<_> = found.unwrap().inter_op_transforms.iter()
+        let costly_direct: Vec<_> = found
+            .unwrap()
+            .inter_op_transforms
+            .iter()
             .filter(|t| t.movement == MovementType::RegisterDirect && t.transform.cost > 0.0)
             .collect();
         assert_eq!(costly_direct.len(), 1);
@@ -1112,7 +1682,11 @@ mod tests {
     fn layout_transform_gpu_shared_mem_tile_is_ok() {
         let mut prog = VmProgram::new();
         let xform = LayoutTransform {
-            source: LayoutConstraint::SharedMemTile { tile_rows: 16, tile_cols: 16, padding_bytes: 4 },
+            source: LayoutConstraint::SharedMemTile {
+                tile_rows: 16,
+                tile_cols: 16,
+                padding_bytes: 4,
+            },
             target: LayoutConstraint::RowMajor { align_bytes: 128 },
             cost: 2.5,
         };
@@ -1151,7 +1725,10 @@ mod tests {
         let mut prog = VmProgram::new();
         let xform = LayoutTransform {
             source: LayoutConstraint::RowMajor { align_bytes: 128 },
-            target: LayoutConstraint::TmaAligned2D { tile_m: 64, tile_n: 64 },
+            target: LayoutConstraint::TmaAligned2D {
+                tile_m: 64,
+                tile_n: 64,
+            },
             cost: 0.5,
         };
         let graph = CompilerGraph::new();
@@ -1170,7 +1747,9 @@ mod tests {
         let pred = OpId(7);
         let mode_a = FusionMode::ComputeRoot { predecessor: pred };
         let mode_b = FusionMode::ComputeRoot { predecessor: pred };
-        let mode_c = FusionMode::ComputeRoot { predecessor: OpId(99) };
+        let mode_c = FusionMode::ComputeRoot {
+            predecessor: OpId(99),
+        };
 
         assert_eq!(mode_a, mode_b);
         assert_ne!(mode_a, mode_c);
@@ -1182,7 +1761,10 @@ mod tests {
         let norm = OpId(21);
         let mode_a = FusionMode::CrossLayerResidual { residual, norm };
         let mode_b = FusionMode::CrossLayerResidual { residual, norm };
-        let mode_c = FusionMode::CrossLayerResidual { residual: OpId(0), norm };
+        let mode_c = FusionMode::CrossLayerResidual {
+            residual: OpId(0),
+            norm,
+        };
 
         assert_eq!(mode_a, mode_b);
         assert_ne!(mode_a, mode_c);
@@ -1344,7 +1926,9 @@ mod tests {
             total_transform_cost: 5.0,
         };
 
-        let costly_direct: Vec<_> = gla.inter_op_transforms.iter()
+        let costly_direct: Vec<_> = gla
+            .inter_op_transforms
+            .iter()
             .filter(|t| t.movement == MovementType::RegisterDirect && t.transform.cost > 0.0)
             .collect();
 
@@ -1428,7 +2012,11 @@ mod tests {
         let mut prog = VmProgram::new();
         let xform = LayoutTransform {
             source: LayoutConstraint::RowMajor { align_bytes: 64 },
-            target: LayoutConstraint::SharedMemTile { tile_rows: 32, tile_cols: 32, padding_bytes: 8 },
+            target: LayoutConstraint::SharedMemTile {
+                tile_rows: 32,
+                tile_cols: 32,
+                padding_bytes: 8,
+            },
             cost: 3.0,
         };
         let graph = CompilerGraph::new();
@@ -1453,7 +2041,13 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let tid = graph.add_tensor_concrete("hidden", &[1, 512], DType::BF16);
         let out_tid = graph.add_tensor_concrete("output", &[1, 512], DType::BF16);
-        let op_id = graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }),
+        let op_id = graph.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
             vec![tid],
             vec![out_tid],
             "norm",
@@ -1475,7 +2069,10 @@ mod tests {
         group.infer_dominant_dtype(&graph);
 
         // Assert
-        assert_eq!(group.dominant_dtype, Some(crate::compiler::trace::QuantPrecision::BF16));
+        assert_eq!(
+            group.dominant_dtype,
+            Some(crate::compiler::trace::QuantPrecision::BF16)
+        );
     }
 
     #[test]
@@ -1486,15 +2083,25 @@ mod tests {
         let op1 = OpId(1);
         let op2 = OpId(2);
         let g0 = FusionGroup {
-            id: 0, anchor: op0, epilogue: vec![], mode: FusionMode::Standalone,
-            ops: vec![op0], multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 0,
+            anchor: op0,
+            epilogue: vec![],
+            mode: FusionMode::Standalone,
+            ops: vec![op0],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
         };
         let g1 = FusionGroup {
-            id: 1, anchor: op1, epilogue: vec![op2], mode: FusionMode::EpilogueInjection,
-            ops: vec![op1, op2], multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 1,
+            anchor: op1,
+            epilogue: vec![op2],
+            mode: FusionMode::EpilogueInjection,
+            ops: vec![op1, op2],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
@@ -1506,7 +2113,10 @@ mod tests {
 
         // Act & Assert
         assert_eq!(plan.group_of(op0).unwrap().mode, FusionMode::Standalone);
-        assert_eq!(plan.group_of(op1).unwrap().mode, FusionMode::EpilogueInjection);
+        assert_eq!(
+            plan.group_of(op1).unwrap().mode,
+            FusionMode::EpilogueInjection
+        );
         assert_eq!(plan.group_of(op2).unwrap().id, 1);
         assert!(plan.group_of(OpId(99)).is_none());
     }
@@ -1517,22 +2127,37 @@ mod tests {
         use crate::compiler::fusion::FusionPlan;
         let ops: Vec<OpId> = (0..6).map(OpId).collect();
         let g0 = FusionGroup {
-            id: 0, anchor: ops[0], epilogue: vec![], mode: FusionMode::Standalone,
-            ops: vec![ops[0]], multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 0,
+            anchor: ops[0],
+            epilogue: vec![],
+            mode: FusionMode::Standalone,
+            ops: vec![ops[0]],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
         };
         let g1 = FusionGroup {
-            id: 1, anchor: ops[1], epilogue: vec![ops[2]], mode: FusionMode::LoopFusion,
-            ops: vec![ops[1], ops[2]], multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 1,
+            anchor: ops[1],
+            epilogue: vec![ops[2]],
+            mode: FusionMode::LoopFusion,
+            ops: vec![ops[1], ops[2]],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
         };
         let g2 = FusionGroup {
-            id: 2, anchor: ops[3], epilogue: vec![ops[4], ops[5]], mode: FusionMode::QkvSharedInput,
-            ops: vec![ops[3], ops[4], ops[5]], multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 2,
+            anchor: ops[3],
+            epilogue: vec![ops[4], ops[5]],
+            mode: FusionMode::QkvSharedInput,
+            ops: vec![ops[3], ops[4], ops[5]],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
@@ -1540,7 +2165,12 @@ mod tests {
         let plan = FusionPlan {
             groups: vec![g0, g1, g2],
             op_to_group: HashMap::from([
-                (ops[0], 0), (ops[1], 1), (ops[2], 1), (ops[3], 2), (ops[4], 2), (ops[5], 2),
+                (ops[0], 0),
+                (ops[1], 1),
+                (ops[2], 1),
+                (ops[3], 2),
+                (ops[4], 2),
+                (ops[5], 2),
             ]),
         };
 
@@ -1592,8 +2222,13 @@ mod tests {
 
         // Build a group with the single config.
         let group = FusionGroup {
-            id: 0, anchor: op0, epilogue: vec![op1], mode: FusionMode::Standalone,
-            ops: vec![op0, op1], multi_output: single_config, dominant_dtype: None,
+            id: 0,
+            anchor: op0,
+            epilogue: vec![op1],
+            mode: FusionMode::Standalone,
+            ops: vec![op0, op1],
+            multi_output: single_config,
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
@@ -1662,7 +2297,10 @@ mod tests {
         // Arrange: HeadSplit -> RowMajor (reverse direction of existing test).
         let mut prog = VmProgram::new();
         let xform = LayoutTransform {
-            source: LayoutConstraint::HeadSplit { num_heads: 16, head_dim: 64 },
+            source: LayoutConstraint::HeadSplit {
+                num_heads: 16,
+                head_dim: 64,
+            },
             target: LayoutConstraint::RowMajor { align_bytes: 32 },
             cost: 0.0,
         };
@@ -1708,8 +2346,14 @@ mod tests {
 
         // Assert
         assert_eq!(cloned.cost, 2.75);
-        assert!(matches!(cloned.source, LayoutConstraint::RowMajor { align_bytes: 128 }));
-        assert!(matches!(cloned.target, LayoutConstraint::ColMajor { align_bytes: 64 }));
+        assert!(matches!(
+            cloned.source,
+            LayoutConstraint::RowMajor { align_bytes: 128 }
+        ));
+        assert!(matches!(
+            cloned.target,
+            LayoutConstraint::ColMajor { align_bytes: 64 }
+        ));
     }
 
     #[test]
@@ -1740,7 +2384,13 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let tid = graph.add_tensor_concrete("hidden_f32", &[1, 256], DType::F32);
         let out_tid = graph.add_tensor_concrete("output_f32", &[1, 256], DType::F32);
-        let op_id = graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }),
+        let op_id = graph.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-6,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
             vec![tid],
             vec![out_tid],
             "norm_f32",
@@ -1762,7 +2412,10 @@ mod tests {
         group.infer_dominant_dtype(&graph);
 
         // Assert
-        assert_eq!(group.dominant_dtype, Some(crate::compiler::trace::QuantPrecision::F32));
+        assert_eq!(
+            group.dominant_dtype,
+            Some(crate::compiler::trace::QuantPrecision::F32)
+        );
     }
 
     #[test]
@@ -1773,7 +2426,13 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let tid = graph.add_tensor_concrete("hidden_f16", &[2, 128], DType::F16);
         let out_tid = graph.add_tensor_concrete("output_f16", &[2, 128], DType::F16);
-        let op_id = graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }),
+        let op_id = graph.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
             vec![tid],
             vec![out_tid],
             "norm_f16",
@@ -1795,7 +2454,10 @@ mod tests {
         group.infer_dominant_dtype(&graph);
 
         // Assert
-        assert_eq!(group.dominant_dtype, Some(crate::compiler::trace::QuantPrecision::F16));
+        assert_eq!(
+            group.dominant_dtype,
+            Some(crate::compiler::trace::QuantPrecision::F16)
+        );
     }
 
     #[test]
@@ -1847,7 +2509,8 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let len_before = prog.instrs.len();
         prog.emit(VmInstr::VecWiden {
-            dst, src,
+            dst,
+            src,
             dst_dtype: QuantPrecision::F32,
             src_dtype: QuantPrecision::BF16,
             width: SimdWidth::W256,
@@ -1861,12 +2524,18 @@ mod tests {
         let mut prog = VmProgram::new();
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let result = maybe_emit_widen_before_compute(
-            &mut prog, acc,
-            QuantPrecision::BF16, QuantPrecision::F32, SimdWidth::W256,
+            &mut prog,
+            acc,
+            QuantPrecision::BF16,
+            QuantPrecision::F32,
+            SimdWidth::W256,
         );
         // Should have emitted a VecWiden and returned a new VRegId
         assert_ne!(result, acc, "widen should return a new register");
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::VecWiden { .. })));
+        assert!(prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecWiden { .. })));
     }
 
     #[test]
@@ -1874,11 +2543,20 @@ mod tests {
         let mut prog = VmProgram::new();
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let result = maybe_emit_widen_before_compute(
-            &mut prog, acc,
-            QuantPrecision::F32, QuantPrecision::F32, SimdWidth::W256,
+            &mut prog,
+            acc,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            SimdWidth::W256,
         );
-        assert_eq!(result, acc, "same QuantPrecision::F32 should return same register");
-        assert!(!prog.instrs.iter().any(|i| matches!(i, VmInstr::VecWiden { .. })));
+        assert_eq!(
+            result, acc,
+            "same QuantPrecision::F32 should return same register"
+        );
+        assert!(!prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecWiden { .. })));
     }
 
     #[test]
@@ -1886,11 +2564,17 @@ mod tests {
         let mut prog = VmProgram::new();
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let result = maybe_emit_narrow_after_compute(
-            &mut prog, acc,
-            QuantPrecision::F32, QuantPrecision::BF16, SimdWidth::W256,
+            &mut prog,
+            acc,
+            QuantPrecision::F32,
+            QuantPrecision::BF16,
+            SimdWidth::W256,
         );
         assert_ne!(result, acc, "narrow should return a new register");
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::VecNarrow { .. })));
+        assert!(prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecNarrow { .. })));
     }
 
     #[test]
@@ -1898,11 +2582,20 @@ mod tests {
         let mut prog = VmProgram::new();
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let result = maybe_emit_narrow_after_compute(
-            &mut prog, acc,
-            QuantPrecision::BF16, QuantPrecision::BF16, SimdWidth::W256,
+            &mut prog,
+            acc,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+            SimdWidth::W256,
         );
-        assert_eq!(result, acc, "same QuantPrecision::F32 should return same register");
-        assert!(!prog.instrs.iter().any(|i| matches!(i, VmInstr::VecNarrow { .. })));
+        assert_eq!(
+            result, acc,
+            "same QuantPrecision::F32 should return same register"
+        );
+        assert!(!prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecNarrow { .. })));
     }
 
     #[test]
@@ -1913,34 +2606,73 @@ mod tests {
         let t0 = graph.add_tensor_concrete("in", &[1, 64], DType::BF16);
         let t1 = graph.add_tensor_concrete("mid", &[1, 64], DType::BF16);
         let t2 = graph.add_tensor_concrete("out", &[1, 64], DType::BF16);
-        let op0 = graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![t0], vec![t1], "norm");
-        let op1 = graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![t1], vec![t2], "norm2");
+        let op0 = graph.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![t0],
+            vec![t1],
+            "norm",
+        );
+        let op1 = graph.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![t1],
+            vec![t2],
+            "norm2",
+        );
         let group = FusionGroup {
-            id: 0, anchor: op0, epilogue: vec![op1], mode: FusionMode::LoopFusion,
-            ops: vec![op0, op1], multi_output: MultiOutputConfig::single(),
-            dominant_dtype: Some(QuantPrecision::BF16), marker: GroupMarker::None,
-            is_layer_group: false, hetero_layer_type: None,
+            id: 0,
+            anchor: op0,
+            epilogue: vec![op1],
+            mode: FusionMode::LoopFusion,
+            ops: vec![op0, op1],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: Some(QuantPrecision::BF16),
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let alloc = BufferAllocation::default();
-        let resolver = TensorPtrResolver::build(&graph, &alloc, &super::super::topology::GraphTopologyAnalysis::analyze(&graph));
+        let resolver = TensorPtrResolver::build(
+            &graph,
+            &alloc,
+            &super::super::topology::GraphTopologyAnalysis::analyze(&graph),
+        );
         let mut prog = VmProgram::new();
         let width = SimdWidth::W256;
         let sym_map = super::super::plan_lower::SymDimSlotMap::mega_kernel_abi();
         let sess = CompileSession {
-            width, sym_map: &sym_map,
-            registry: None, hook: None,
+            width,
+            sym_map: &sym_map,
+            registry: None,
+            hook: None,
             feature_set: OpFeatureSet::EMPTY,
             budget: None,
-            page_size: 0, dot_cap: crate::dispatch::device_profile::DotProductCap::None,
-            kv_elem_bytes: 2, debug_jit: false,
-            virtual_activation: None, virtual_tensor_map: None, layout: None,
+            page_size: 0,
+            dot_cap: crate::dispatch::device_profile::DotProductCap::None,
+            kv_elem_bytes: 2,
+            debug_jit: false,
+            virtual_activation: None,
+            virtual_tensor_map: None,
+            layout: None,
             batch_ctx_ptr: None,
         };
         let ctx = LoweringContext {
             session: &sess,
             accum_dtype: QuantPrecision::BF16,
-            rope_req: None, ple_req: None, dwc_req: None,
-            exec_pattern: None, bottleneck_map: None,
+            rope_req: None,
+            ple_req: None,
+            dwc_req: None,
+            exec_pattern: None,
+            bottleneck_map: None,
             parallelism: None,
         };
         let abi = make_test_abi();
@@ -1950,6 +2682,10 @@ mod tests {
 
         // Assert: same QuantPrecision::F32 group should have zero cast points
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 0, "same-QuantPrecision::F32 group should have no QuantPrecision::F32 cast points");
+        assert_eq!(
+            result.unwrap(),
+            0,
+            "same-QuantPrecision::F32 group should have no QuantPrecision::F32 cast points"
+        );
     }
 }

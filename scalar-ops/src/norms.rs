@@ -67,7 +67,6 @@ pub unsafe extern "C" fn scalar_layer_norm(
     }
 }
 
-
 /// Value-Normalization: RMSNorm without learned scale.
 ///
 /// `out[i] = x[i] / sqrt(mean(x^2) + eps)`
@@ -105,11 +104,7 @@ pub unsafe extern "C" fn scalar_value_norm(
 /// No weight parameter — pure geometric normalization.
 #[no_mangle]
 #[inline(never)]
-pub unsafe extern "C" fn scalar_l2_normalize(
-    x: *const f32,
-    out: *mut f32,
-    n: usize,
-) {
+pub unsafe extern "C" fn scalar_l2_normalize(x: *const f32, out: *mut f32, n: usize) {
     unsafe {
         // Pass 1: sum of squares
         let mut sum_sq = 0.0_f32;
@@ -300,7 +295,8 @@ mod tests {
             assert!(
                 (out[i] - x[i]).abs() < 1e-5,
                 "l2_normalize_unit[{i}]: got {}, expected {}",
-                out[i], x[i]
+                out[i],
+                x[i]
             );
         }
     }

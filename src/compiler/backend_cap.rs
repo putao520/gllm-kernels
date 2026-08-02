@@ -114,13 +114,16 @@ impl BackendCapMatrix {
 
             let (supported, strategy) = derive_capability(op_kind, profile);
 
-            entries.insert(key, CapEntry {
-                op_kind: op_kind.clone(),
-                isa_level: profile.isa,
-                pattern: None, // Pattern not needed for gating; available on demand via registry
-                supported,
-                strategy,
-            });
+            entries.insert(
+                key,
+                CapEntry {
+                    op_kind: op_kind.clone(),
+                    isa_level: profile.isa,
+                    pattern: None, // Pattern not needed for gating; available on demand via registry
+                    supported,
+                    strategy,
+                },
+            );
         }
 
         BackendCapMatrix { entries }
@@ -344,8 +347,8 @@ fn is_stub_op(op_kind: &OpKindKey) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dispatch::device_profile::{DeviceProfile, IsaLevel};
     use crate::compiler::registry::ScalarOpRegistry;
+    use crate::dispatch::device_profile::{DeviceProfile, IsaLevel};
 
     // @trace TEST-BACKEND-CAP-001 [req:REQ-BACKEND-CAP-001]
     #[test]
@@ -400,15 +403,17 @@ mod tests {
         assert_eq!(entry.strategy, CapStrategy::Unsupported);
 
         // Validate should return Err for unsupported ops
-        let result = matrix.validate_graph_ops(
-            &[stub_key],
-            profile.isa,
-            "test-profile",
-        );
+        let result = matrix.validate_graph_ops(&[stub_key], profile.isa, "test-profile");
         assert!(result.is_err(), "Unsupported op should fail validation");
         let err = result.unwrap_err();
-        assert!(err.op_kind.contains("VariableLengthBatch"), "Error should mention OpKind");
-        assert!(err.device_profile.contains("test-profile"), "Error should mention DeviceProfile");
+        assert!(
+            err.op_kind.contains("VariableLengthBatch"),
+            "Error should mention OpKind"
+        );
+        assert!(
+            err.device_profile.contains("test-profile"),
+            "Error should mention DeviceProfile"
+        );
     }
 
     // @trace TEST-BACKEND-CAP-001 [req:REQ-BACKEND-CAP-001]
@@ -419,11 +424,18 @@ mod tests {
         let registered_keys: Vec<OpKindKey> = registry.registered_keys();
 
         // Matrix should not be empty
-        assert!(!registered_keys.is_empty(), "Registry should have registered ops");
+        assert!(
+            !registered_keys.is_empty(),
+            "Registry should have registered ops"
+        );
 
         let matrix = BackendCapMatrix::build(&profile, &registered_keys);
         assert!(!matrix.is_empty(), "Matrix should have entries");
-        assert_eq!(matrix.len(), registered_keys.len(), "Matrix size should match registry size");
+        assert_eq!(
+            matrix.len(),
+            registered_keys.len(),
+            "Matrix size should match registry size"
+        );
     }
 
     // @trace TEST-BACKEND-CAP-002 [req:REQ-BACKEND-CAP-002]
@@ -459,7 +471,10 @@ mod tests {
         assert_eq!(matrix.len(), 2);
         assert!(matrix.query(&OpKindKey::Silu, profile.isa).is_some());
         assert!(matrix.query(&OpKindKey::Gelu, profile.isa).is_some());
-        assert!(matrix.query(&OpKindKey::Tanh, profile.isa).is_none(), "Unregistered key should not be in matrix");
+        assert!(
+            matrix.query(&OpKindKey::Tanh, profile.isa).is_none(),
+            "Unregistered key should not be in matrix"
+        );
     }
 
     // @trace TEST-BACKEND-CAP-002 [req:REQ-BACKEND-CAP-002]
@@ -475,12 +490,19 @@ mod tests {
         // On any real machine (AVX2+), compute ops should get JitSimd
         match profile.isa {
             IsaLevel::Scalar => {
-                assert_eq!(silu_entry.strategy, CapStrategy::JitNative,
-                    "Scalar ISA should get JitNative for compute ops");
+                assert_eq!(
+                    silu_entry.strategy,
+                    CapStrategy::JitNative,
+                    "Scalar ISA should get JitNative for compute ops"
+                );
             }
             _ => {
-                assert_eq!(silu_entry.strategy, CapStrategy::JitSimd,
-                    "SIMD ISA should get JitSimd for compute ops, got {:?}", silu_entry.strategy);
+                assert_eq!(
+                    silu_entry.strategy,
+                    CapStrategy::JitSimd,
+                    "SIMD ISA should get JitSimd for compute ops, got {:?}",
+                    silu_entry.strategy
+                );
             }
         }
     }
@@ -493,11 +515,24 @@ mod tests {
         let registered_keys: Vec<OpKindKey> = registry.registered_keys();
         let matrix = BackendCapMatrix::build(&profile, &registered_keys);
 
-        for metadata_op in &[OpKindKey::Reshape, OpKindKey::Transpose, OpKindKey::SliceView] {
+        for metadata_op in &[
+            OpKindKey::Reshape,
+            OpKindKey::Transpose,
+            OpKindKey::SliceView,
+        ] {
             let entry = matrix.query(metadata_op, profile.isa);
             if let Some(e) = entry {
-                assert!(e.supported, "Metadata op {:?} should be supported", metadata_op);
-                assert_eq!(e.strategy, CapStrategy::JitNative, "Metadata op {:?} should be JitNative", metadata_op);
+                assert!(
+                    e.supported,
+                    "Metadata op {:?} should be supported",
+                    metadata_op
+                );
+                assert_eq!(
+                    e.strategy,
+                    CapStrategy::JitNative,
+                    "Metadata op {:?} should be JitNative",
+                    metadata_op
+                );
             }
         }
     }
@@ -514,7 +549,12 @@ mod tests {
             let entry = matrix.query(ctrl_op, profile.isa);
             if let Some(e) = entry {
                 assert!(e.supported, "Control op {:?} should be supported", ctrl_op);
-                assert_eq!(e.strategy, CapStrategy::JitNative, "Control op {:?} should be JitNative", ctrl_op);
+                assert_eq!(
+                    e.strategy,
+                    CapStrategy::JitNative,
+                    "Control op {:?} should be JitNative",
+                    ctrl_op
+                );
             }
         }
     }
@@ -537,9 +577,18 @@ mod tests {
         let err = result.unwrap_err();
 
         // REQ-BACKEND-CAP-003: error must contain OpKind name + DeviceProfile + missing path
-        assert!(err.op_kind.contains("VariableLengthBatch"), "Error must mention OpKind: {err}");
-        assert!(err.device_profile.contains("Intel Skylake AVX2"), "Error must mention DeviceProfile: {err}");
-        assert!(!err.reason.is_empty(), "Error must explain the missing path: {err}");
+        assert!(
+            err.op_kind.contains("VariableLengthBatch"),
+            "Error must mention OpKind: {err}"
+        );
+        assert!(
+            err.device_profile.contains("Intel Skylake AVX2"),
+            "Error must mention DeviceProfile: {err}"
+        );
+        assert!(
+            !err.reason.is_empty(),
+            "Error must explain the missing path: {err}"
+        );
     }
 
     // @trace TEST-BACKEND-CAP-003 [req:REQ-BACKEND-CAP-003]
@@ -566,14 +615,13 @@ mod tests {
         // Empty registry → no keys → matrix has no entries
         let matrix = BackendCapMatrix::build(&profile, &[]);
 
-        let result = matrix.validate_graph_ops(
-            &[OpKindKey::Silu],
-            profile.isa,
-            "test-profile",
-        );
+        let result = matrix.validate_graph_ops(&[OpKindKey::Silu], profile.isa, "test-profile");
         assert!(result.is_err(), "Unregistered op should fail validation");
         let err = result.unwrap_err();
-        assert!(err.reason.contains("not found"), "Error should mention not found: {err}");
+        assert!(
+            err.reason.contains("not found"),
+            "Error should mention not found: {err}"
+        );
     }
 
     // @trace TEST-BACKEND-CAP-003 [req:REQ-BACKEND-CAP-003]
@@ -595,13 +643,13 @@ mod tests {
             let entry = matrix.query(stub, profile.isa);
             if let Some(e) = entry {
                 if !e.supported {
-                    let result = matrix.validate_graph_ops(
-                        &[stub.clone()],
-                        profile.isa,
-                        "test-profile",
+                    let result =
+                        matrix.validate_graph_ops(&[stub.clone()], profile.isa, "test-profile");
+                    assert!(
+                        result.is_err(),
+                        "Unsupported op {:?} must produce Err, not silently pass",
+                        stub
                     );
-                    assert!(result.is_err(),
-                        "Unsupported op {:?} must produce Err, not silently pass", stub);
                 }
             }
         }
@@ -618,7 +666,10 @@ mod tests {
         ];
         for s in &strategies {
             let displayed = s.to_string();
-            assert!(!displayed.is_empty(), "CapStrategy display should not be empty");
+            assert!(
+                !displayed.is_empty(),
+                "CapStrategy display should not be empty"
+            );
         }
     }
 
@@ -631,10 +682,19 @@ mod tests {
             reason: "no lowering path for GEMM on this ISA".to_string(),
         };
         let msg = format!("{err}");
-        assert!(msg.contains("CAP-ERR"), "Error prefix should be CAP-ERR: {msg}");
+        assert!(
+            msg.contains("CAP-ERR"),
+            "Error prefix should be CAP-ERR: {msg}"
+        );
         assert!(msg.contains("Gemm"), "Error should mention OpKind: {msg}");
-        assert!(msg.contains("AMD Zen4 AVX-512"), "Error should mention DeviceProfile: {msg}");
-        assert!(msg.contains("Unsupported"), "Error should mention strategy: {msg}");
+        assert!(
+            msg.contains("AMD Zen4 AVX-512"),
+            "Error should mention DeviceProfile: {msg}"
+        );
+        assert!(
+            msg.contains("Unsupported"),
+            "Error should mention strategy: {msg}"
+        );
     }
 
     #[test]
@@ -648,7 +708,11 @@ mod tests {
         let supported = matrix.supported_count();
         let unsupported = matrix.unsupported_count();
 
-        assert_eq!(supported + unsupported, total, "supported + unsupported must equal total");
+        assert_eq!(
+            supported + unsupported,
+            total,
+            "supported + unsupported must equal total"
+        );
         assert!(supported > 0, "At least some ops should be supported");
     }
 
@@ -669,7 +733,10 @@ mod tests {
             _ => IsaLevel::Scalar,
         };
         let entry_diff = matrix.query(&OpKindKey::Silu, different_isa);
-        assert!(entry_diff.is_none(), "Silu should not be found for different ISA (matrix built for current)");
+        assert!(
+            entry_diff.is_none(),
+            "Silu should not be found for different ISA (matrix built for current)"
+        );
     }
 
     #[test]
@@ -679,8 +746,14 @@ mod tests {
         let registered_keys: Vec<OpKindKey> = registry.registered_keys();
         let matrix = BackendCapMatrix::build(&profile, &registered_keys);
 
-        assert!(matrix.is_supported(&OpKindKey::Silu, profile.isa), "Silu should be supported");
-        assert!(!matrix.is_supported(&OpKindKey::VariableLengthBatch, profile.isa), "Stub op should not be supported");
+        assert!(
+            matrix.is_supported(&OpKindKey::Silu, profile.isa),
+            "Silu should be supported"
+        );
+        assert!(
+            !matrix.is_supported(&OpKindKey::VariableLengthBatch, profile.isa),
+            "Stub op should not be supported"
+        );
     }
 
     #[test]
@@ -705,10 +778,19 @@ mod tests {
 
         for stub in &stub_ops {
             let entry = matrix.query(stub, profile.isa);
-            assert!(entry.is_some(), "Stub op {:?} should have a matrix entry", stub);
+            assert!(
+                entry.is_some(),
+                "Stub op {:?} should have a matrix entry",
+                stub
+            );
             let entry = entry.unwrap();
             assert!(!entry.supported, "Stub op {:?} should be unsupported", stub);
-            assert_eq!(entry.strategy, CapStrategy::Unsupported, "Stub op {:?} should have Unsupported strategy", stub);
+            assert_eq!(
+                entry.strategy,
+                CapStrategy::Unsupported,
+                "Stub op {:?} should have Unsupported strategy",
+                stub
+            );
         }
     }
 
@@ -720,16 +802,27 @@ mod tests {
         let matrix = BackendCapMatrix::build(&profile, &registered_keys);
 
         let compute_ops = [
-            OpKindKey::Silu, OpKindKey::Gelu, OpKindKey::Tanh,
-            OpKindKey::RmsNorm, OpKindKey::LayerNorm,
-            OpKindKey::Gemm, OpKindKey::GemmBias,
-            OpKindKey::Add, OpKindKey::Mul, OpKindKey::Residual,
-            OpKindKey::Softmax, OpKindKey::RoPE,
+            OpKindKey::Silu,
+            OpKindKey::Gelu,
+            OpKindKey::Tanh,
+            OpKindKey::RmsNorm,
+            OpKindKey::LayerNorm,
+            OpKindKey::Gemm,
+            OpKindKey::GemmBias,
+            OpKindKey::Add,
+            OpKindKey::Mul,
+            OpKindKey::Residual,
+            OpKindKey::Softmax,
+            OpKindKey::RoPE,
         ];
 
         for op in &compute_ops {
             let entry = matrix.query(op, profile.isa);
-            assert!(entry.is_some(), "Compute op {:?} should have a matrix entry", op);
+            assert!(
+                entry.is_some(),
+                "Compute op {:?} should have a matrix entry",
+                op
+            );
             let entry = entry.unwrap();
             assert!(entry.supported, "Compute op {:?} should be supported", op);
         }

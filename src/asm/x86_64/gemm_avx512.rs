@@ -78,10 +78,8 @@ global_asm!(
     "mov [rsp + 48], rbx",
     "lea rbx, [rbx + r8]",
     "mov [rsp + 56], rbx",
-
     "test r9, r9",
     "jz .Lavx512_zero_c",
-
     // -- Load existing C --
     "vmovups zmm0, [rdx]",
     "vmovups zmm1, [rdx + 64]",
@@ -120,7 +118,6 @@ global_asm!(
     "vmovups zmm26, [rbx]",
     "vmovups zmm27, [rbx + 64]",
     "jmp .Lavx512_k_setup",
-
     ".Lavx512_zero_c:",
     "vpxord zmm0, zmm0, zmm0",
     "vpxord zmm1, zmm1, zmm1",
@@ -150,437 +147,365 @@ global_asm!(
     "vpxord zmm25, zmm25, zmm25",
     "vpxord zmm26, zmm26, zmm26",
     "vpxord zmm27, zmm27, zmm27",
-
     ".Lavx512_k_setup:",
     "mov r15, rcx",
     "cmp r15, 4",
     "jl .Lavx512_k_check_2x",
-
     // Pre-load B[k=0]
     "vmovups zmm30, [rsi]",
     "vmovups zmm31, [rsi + 64]",
-
     // -- Main K-loop: 4x unrolled with software pipeline --
     ".align 64",
     ".Lavx512_k_loop_4x:",
     // ---- k+0 with L1 prefetch ---- B in zmm30/zmm31
     "prefetcht0 [rdi + 256]",
     "prefetcht0 [rsi + 512]",
-
     "vbroadcastss zmm28, [rdi + 0]",
     "vbroadcastss zmm29, [rdi + 4]",
     "vfmadd231ps zmm0, zmm28, zmm30",
     "vfmadd231ps zmm1, zmm28, zmm31",
     "vfmadd231ps zmm2, zmm29, zmm30",
     "vfmadd231ps zmm3, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 8]",
     "vbroadcastss zmm29, [rdi + 12]",
     "vfmadd231ps zmm4, zmm28, zmm30",
     "vfmadd231ps zmm5, zmm28, zmm31",
     "vfmadd231ps zmm6, zmm29, zmm30",
     "vfmadd231ps zmm7, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 16]",
     "vbroadcastss zmm29, [rdi + 20]",
     "vfmadd231ps zmm8, zmm28, zmm30",
     "vfmadd231ps zmm9, zmm28, zmm31",
     "vfmadd231ps zmm10, zmm29, zmm30",
     "vfmadd231ps zmm11, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 24]",
     "vbroadcastss zmm29, [rdi + 28]",
     "vfmadd231ps zmm12, zmm28, zmm30",
     "vfmadd231ps zmm13, zmm28, zmm31",
     "vfmadd231ps zmm14, zmm29, zmm30",
     "vfmadd231ps zmm15, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 32]",
     "vbroadcastss zmm29, [rdi + 36]",
     "vfmadd231ps zmm16, zmm28, zmm30",
     "vfmadd231ps zmm17, zmm28, zmm31",
     "vfmadd231ps zmm18, zmm29, zmm30",
     "vfmadd231ps zmm19, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 40]",
     "vbroadcastss zmm29, [rdi + 44]",
     "vfmadd231ps zmm20, zmm28, zmm30",
     "vfmadd231ps zmm21, zmm28, zmm31",
     "vfmadd231ps zmm22, zmm29, zmm30",
     "vfmadd231ps zmm23, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 48]",
     "vbroadcastss zmm29, [rdi + 52]",
     "vfmadd231ps zmm24, zmm28, zmm30",
     "vfmadd231ps zmm25, zmm28, zmm31",
     "vfmadd231ps zmm26, zmm29, zmm30",
     "vfmadd231ps zmm27, zmm29, zmm31",
-
     // Software pipeline: load B[k+1]
     "vmovups zmm30, [rsi + 128]",
     "vmovups zmm31, [rsi + 192]",
-
     // ---- k+1 with L2 prefetch ---- B in zmm30/zmm31
     "prefetcht1 [rdi + 768]",
     "prefetcht1 [rsi + 1536]",
-
     "vbroadcastss zmm28, [rdi + 56]",
     "vbroadcastss zmm29, [rdi + 60]",
     "vfmadd231ps zmm0, zmm28, zmm30",
     "vfmadd231ps zmm1, zmm28, zmm31",
     "vfmadd231ps zmm2, zmm29, zmm30",
     "vfmadd231ps zmm3, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 64]",
     "vbroadcastss zmm29, [rdi + 68]",
     "vfmadd231ps zmm4, zmm28, zmm30",
     "vfmadd231ps zmm5, zmm28, zmm31",
     "vfmadd231ps zmm6, zmm29, zmm30",
     "vfmadd231ps zmm7, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 72]",
     "vbroadcastss zmm29, [rdi + 76]",
     "vfmadd231ps zmm8, zmm28, zmm30",
     "vfmadd231ps zmm9, zmm28, zmm31",
     "vfmadd231ps zmm10, zmm29, zmm30",
     "vfmadd231ps zmm11, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 80]",
     "vbroadcastss zmm29, [rdi + 84]",
     "vfmadd231ps zmm12, zmm28, zmm30",
     "vfmadd231ps zmm13, zmm28, zmm31",
     "vfmadd231ps zmm14, zmm29, zmm30",
     "vfmadd231ps zmm15, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 88]",
     "vbroadcastss zmm29, [rdi + 92]",
     "vfmadd231ps zmm16, zmm28, zmm30",
     "vfmadd231ps zmm17, zmm28, zmm31",
     "vfmadd231ps zmm18, zmm29, zmm30",
     "vfmadd231ps zmm19, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 96]",
     "vbroadcastss zmm29, [rdi + 100]",
     "vfmadd231ps zmm20, zmm28, zmm30",
     "vfmadd231ps zmm21, zmm28, zmm31",
     "vfmadd231ps zmm22, zmm29, zmm30",
     "vfmadd231ps zmm23, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 104]",
     "vbroadcastss zmm29, [rdi + 108]",
     "vfmadd231ps zmm24, zmm28, zmm30",
     "vfmadd231ps zmm25, zmm28, zmm31",
     "vfmadd231ps zmm26, zmm29, zmm30",
     "vfmadd231ps zmm27, zmm29, zmm31",
-
     // Software pipeline: load B[k+2]
     "vmovups zmm30, [rsi + 256]",
     "vmovups zmm31, [rsi + 320]",
-
     // ---- k+2 with L1 prefetch (second distance) ---- B in zmm30/zmm31
     "prefetcht0 [rdi + 448]",
     "prefetcht0 [rsi + 768]",
-
     "vbroadcastss zmm28, [rdi + 112]",
     "vbroadcastss zmm29, [rdi + 116]",
     "vfmadd231ps zmm0, zmm28, zmm30",
     "vfmadd231ps zmm1, zmm28, zmm31",
     "vfmadd231ps zmm2, zmm29, zmm30",
     "vfmadd231ps zmm3, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 120]",
     "vbroadcastss zmm29, [rdi + 124]",
     "vfmadd231ps zmm4, zmm28, zmm30",
     "vfmadd231ps zmm5, zmm28, zmm31",
     "vfmadd231ps zmm6, zmm29, zmm30",
     "vfmadd231ps zmm7, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 128]",
     "vbroadcastss zmm29, [rdi + 132]",
     "vfmadd231ps zmm8, zmm28, zmm30",
     "vfmadd231ps zmm9, zmm28, zmm31",
     "vfmadd231ps zmm10, zmm29, zmm30",
     "vfmadd231ps zmm11, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 136]",
     "vbroadcastss zmm29, [rdi + 140]",
     "vfmadd231ps zmm12, zmm28, zmm30",
     "vfmadd231ps zmm13, zmm28, zmm31",
     "vfmadd231ps zmm14, zmm29, zmm30",
     "vfmadd231ps zmm15, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 144]",
     "vbroadcastss zmm29, [rdi + 148]",
     "vfmadd231ps zmm16, zmm28, zmm30",
     "vfmadd231ps zmm17, zmm28, zmm31",
     "vfmadd231ps zmm18, zmm29, zmm30",
     "vfmadd231ps zmm19, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 152]",
     "vbroadcastss zmm29, [rdi + 156]",
     "vfmadd231ps zmm20, zmm28, zmm30",
     "vfmadd231ps zmm21, zmm28, zmm31",
     "vfmadd231ps zmm22, zmm29, zmm30",
     "vfmadd231ps zmm23, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 160]",
     "vbroadcastss zmm29, [rdi + 164]",
     "vfmadd231ps zmm24, zmm28, zmm30",
     "vfmadd231ps zmm25, zmm28, zmm31",
     "vfmadd231ps zmm26, zmm29, zmm30",
     "vfmadd231ps zmm27, zmm29, zmm31",
-
     // Software pipeline: load B[k+3]
     "vmovups zmm30, [rsi + 384]",
     "vmovups zmm31, [rsi + 448]",
-
     // ---- k+3 (no prefetch) ---- B in zmm30/zmm31
-
     "vbroadcastss zmm28, [rdi + 168]",
     "vbroadcastss zmm29, [rdi + 172]",
     "vfmadd231ps zmm0, zmm28, zmm30",
     "vfmadd231ps zmm1, zmm28, zmm31",
     "vfmadd231ps zmm2, zmm29, zmm30",
     "vfmadd231ps zmm3, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 176]",
     "vbroadcastss zmm29, [rdi + 180]",
     "vfmadd231ps zmm4, zmm28, zmm30",
     "vfmadd231ps zmm5, zmm28, zmm31",
     "vfmadd231ps zmm6, zmm29, zmm30",
     "vfmadd231ps zmm7, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 184]",
     "vbroadcastss zmm29, [rdi + 188]",
     "vfmadd231ps zmm8, zmm28, zmm30",
     "vfmadd231ps zmm9, zmm28, zmm31",
     "vfmadd231ps zmm10, zmm29, zmm30",
     "vfmadd231ps zmm11, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 192]",
     "vbroadcastss zmm29, [rdi + 196]",
     "vfmadd231ps zmm12, zmm28, zmm30",
     "vfmadd231ps zmm13, zmm28, zmm31",
     "vfmadd231ps zmm14, zmm29, zmm30",
     "vfmadd231ps zmm15, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 200]",
     "vbroadcastss zmm29, [rdi + 204]",
     "vfmadd231ps zmm16, zmm28, zmm30",
     "vfmadd231ps zmm17, zmm28, zmm31",
     "vfmadd231ps zmm18, zmm29, zmm30",
     "vfmadd231ps zmm19, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 208]",
     "vbroadcastss zmm29, [rdi + 212]",
     "vfmadd231ps zmm20, zmm28, zmm30",
     "vfmadd231ps zmm21, zmm28, zmm31",
     "vfmadd231ps zmm22, zmm29, zmm30",
     "vfmadd231ps zmm23, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 216]",
     "vbroadcastss zmm29, [rdi + 220]",
     "vfmadd231ps zmm24, zmm28, zmm30",
     "vfmadd231ps zmm25, zmm28, zmm31",
     "vfmadd231ps zmm26, zmm29, zmm30",
     "vfmadd231ps zmm27, zmm29, zmm31",
-
     // Advance: A += 4*MR*4 = 224, B += 4*NR*4 = 512
     "add rdi, 224",
     "add rsi, 512",
-
     "sub r15, 4",
     "cmp r15, 4",
     "jl .Lavx512_k_check_2x",
-
     // Pre-load B for next 4x iteration
     "vmovups zmm30, [rsi]",
     "vmovups zmm31, [rsi + 64]",
     "jmp .Lavx512_k_loop_4x",
-
     // -- K-remainder (2x) --
     ".Lavx512_k_check_2x:",
     "cmp r15, 2",
     "jl .Lavx512_k_remainder",
-
     "vmovups zmm30, [rsi]",
     "vmovups zmm31, [rsi + 64]",
-
     // ---- 2x remainder: k+0 ---- B in zmm30/zmm31
-
     "vbroadcastss zmm28, [rdi + 0]",
     "vbroadcastss zmm29, [rdi + 4]",
     "vfmadd231ps zmm0, zmm28, zmm30",
     "vfmadd231ps zmm1, zmm28, zmm31",
     "vfmadd231ps zmm2, zmm29, zmm30",
     "vfmadd231ps zmm3, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 8]",
     "vbroadcastss zmm29, [rdi + 12]",
     "vfmadd231ps zmm4, zmm28, zmm30",
     "vfmadd231ps zmm5, zmm28, zmm31",
     "vfmadd231ps zmm6, zmm29, zmm30",
     "vfmadd231ps zmm7, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 16]",
     "vbroadcastss zmm29, [rdi + 20]",
     "vfmadd231ps zmm8, zmm28, zmm30",
     "vfmadd231ps zmm9, zmm28, zmm31",
     "vfmadd231ps zmm10, zmm29, zmm30",
     "vfmadd231ps zmm11, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 24]",
     "vbroadcastss zmm29, [rdi + 28]",
     "vfmadd231ps zmm12, zmm28, zmm30",
     "vfmadd231ps zmm13, zmm28, zmm31",
     "vfmadd231ps zmm14, zmm29, zmm30",
     "vfmadd231ps zmm15, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 32]",
     "vbroadcastss zmm29, [rdi + 36]",
     "vfmadd231ps zmm16, zmm28, zmm30",
     "vfmadd231ps zmm17, zmm28, zmm31",
     "vfmadd231ps zmm18, zmm29, zmm30",
     "vfmadd231ps zmm19, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 40]",
     "vbroadcastss zmm29, [rdi + 44]",
     "vfmadd231ps zmm20, zmm28, zmm30",
     "vfmadd231ps zmm21, zmm28, zmm31",
     "vfmadd231ps zmm22, zmm29, zmm30",
     "vfmadd231ps zmm23, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 48]",
     "vbroadcastss zmm29, [rdi + 52]",
     "vfmadd231ps zmm24, zmm28, zmm30",
     "vfmadd231ps zmm25, zmm28, zmm31",
     "vfmadd231ps zmm26, zmm29, zmm30",
     "vfmadd231ps zmm27, zmm29, zmm31",
-
     // Software pipeline: load B[k+1]
     "vmovups zmm30, [rsi + 128]",
     "vmovups zmm31, [rsi + 192]",
-
     // ---- 2x remainder: k+1 ---- B in zmm30/zmm31
-
     "vbroadcastss zmm28, [rdi + 56]",
     "vbroadcastss zmm29, [rdi + 60]",
     "vfmadd231ps zmm0, zmm28, zmm30",
     "vfmadd231ps zmm1, zmm28, zmm31",
     "vfmadd231ps zmm2, zmm29, zmm30",
     "vfmadd231ps zmm3, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 64]",
     "vbroadcastss zmm29, [rdi + 68]",
     "vfmadd231ps zmm4, zmm28, zmm30",
     "vfmadd231ps zmm5, zmm28, zmm31",
     "vfmadd231ps zmm6, zmm29, zmm30",
     "vfmadd231ps zmm7, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 72]",
     "vbroadcastss zmm29, [rdi + 76]",
     "vfmadd231ps zmm8, zmm28, zmm30",
     "vfmadd231ps zmm9, zmm28, zmm31",
     "vfmadd231ps zmm10, zmm29, zmm30",
     "vfmadd231ps zmm11, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 80]",
     "vbroadcastss zmm29, [rdi + 84]",
     "vfmadd231ps zmm12, zmm28, zmm30",
     "vfmadd231ps zmm13, zmm28, zmm31",
     "vfmadd231ps zmm14, zmm29, zmm30",
     "vfmadd231ps zmm15, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 88]",
     "vbroadcastss zmm29, [rdi + 92]",
     "vfmadd231ps zmm16, zmm28, zmm30",
     "vfmadd231ps zmm17, zmm28, zmm31",
     "vfmadd231ps zmm18, zmm29, zmm30",
     "vfmadd231ps zmm19, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 96]",
     "vbroadcastss zmm29, [rdi + 100]",
     "vfmadd231ps zmm20, zmm28, zmm30",
     "vfmadd231ps zmm21, zmm28, zmm31",
     "vfmadd231ps zmm22, zmm29, zmm30",
     "vfmadd231ps zmm23, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 104]",
     "vbroadcastss zmm29, [rdi + 108]",
     "vfmadd231ps zmm24, zmm28, zmm30",
     "vfmadd231ps zmm25, zmm28, zmm31",
     "vfmadd231ps zmm26, zmm29, zmm30",
     "vfmadd231ps zmm27, zmm29, zmm31",
-
     "add rdi, 112",
     "add rsi, 256",
     "sub r15, 2",
-
     // -- K-remainder (1x) --
     ".Lavx512_k_remainder:",
     "test r15, r15",
     "jz .Lavx512_prefetch_c",
-
     ".Lavx512_k_tail:",
     "vmovups zmm30, [rsi]",
     "vmovups zmm31, [rsi + 64]",
-
     // ---- 1x tail ---- B in zmm30/zmm31
-
     "vbroadcastss zmm28, [rdi + 0]",
     "vbroadcastss zmm29, [rdi + 4]",
     "vfmadd231ps zmm0, zmm28, zmm30",
     "vfmadd231ps zmm1, zmm28, zmm31",
     "vfmadd231ps zmm2, zmm29, zmm30",
     "vfmadd231ps zmm3, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 8]",
     "vbroadcastss zmm29, [rdi + 12]",
     "vfmadd231ps zmm4, zmm28, zmm30",
     "vfmadd231ps zmm5, zmm28, zmm31",
     "vfmadd231ps zmm6, zmm29, zmm30",
     "vfmadd231ps zmm7, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 16]",
     "vbroadcastss zmm29, [rdi + 20]",
     "vfmadd231ps zmm8, zmm28, zmm30",
     "vfmadd231ps zmm9, zmm28, zmm31",
     "vfmadd231ps zmm10, zmm29, zmm30",
     "vfmadd231ps zmm11, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 24]",
     "vbroadcastss zmm29, [rdi + 28]",
     "vfmadd231ps zmm12, zmm28, zmm30",
     "vfmadd231ps zmm13, zmm28, zmm31",
     "vfmadd231ps zmm14, zmm29, zmm30",
     "vfmadd231ps zmm15, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 32]",
     "vbroadcastss zmm29, [rdi + 36]",
     "vfmadd231ps zmm16, zmm28, zmm30",
     "vfmadd231ps zmm17, zmm28, zmm31",
     "vfmadd231ps zmm18, zmm29, zmm30",
     "vfmadd231ps zmm19, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 40]",
     "vbroadcastss zmm29, [rdi + 44]",
     "vfmadd231ps zmm20, zmm28, zmm30",
     "vfmadd231ps zmm21, zmm28, zmm31",
     "vfmadd231ps zmm22, zmm29, zmm30",
     "vfmadd231ps zmm23, zmm29, zmm31",
-
     "vbroadcastss zmm28, [rdi + 48]",
     "vbroadcastss zmm29, [rdi + 52]",
     "vfmadd231ps zmm24, zmm28, zmm30",
     "vfmadd231ps zmm25, zmm28, zmm31",
     "vfmadd231ps zmm26, zmm29, zmm30",
     "vfmadd231ps zmm27, zmm29, zmm31",
-
     "add rdi, 56",
     "add rsi, 128",
     "dec r15",
     "jnz .Lavx512_k_tail",
-
     // -- Prefetch C rows before store (reduce RFO latency) --
     ".Lavx512_prefetch_c:",
     "prefetcht0 [rdx]",
@@ -619,20 +544,16 @@ global_asm!(
     "mov rbx, [rsp + 56]",
     "prefetcht0 [rbx]",
     "prefetcht0 [rbx + 64]",
-
     // -- Store C --
     ".Lavx512_store_c:",
-
     // ── Fuse bias if bias pointer (7th arg) is non-null ──
     // Stack layout: sub rsp 64 + 6 pushes (48) + return addr (8) = 120
     "mov rax, [rsp + 120]",
     "test rax, rax",
     "jz .Lavx512_store_no_bias",
-
     // Load bias vector (32 floats = 2 zmm)
     "vmovups zmm28, [rax]",
     "vmovups zmm29, [rax + 64]",
-
     // Add bias to all 14 rows
     "vaddps zmm0, zmm0, zmm28",
     "vaddps zmm1, zmm1, zmm29",
@@ -662,9 +583,7 @@ global_asm!(
     "vaddps zmm25, zmm25, zmm29",
     "vaddps zmm26, zmm26, zmm28",
     "vaddps zmm27, zmm27, zmm29",
-
     ".Lavx512_store_no_bias:",
-
     "vmovups [rdx], zmm0",
     "vmovups [rdx + 64], zmm1",
     "vmovups [r10], zmm2",
@@ -701,7 +620,6 @@ global_asm!(
     "mov rbx, [rsp + 56]",
     "vmovups [rbx], zmm26",
     "vmovups [rbx + 64], zmm27",
-
     "add rsp, 64",
     "vzeroupper",
     "pop rbp",
@@ -711,7 +629,6 @@ global_asm!(
     "pop r12",
     "pop rbx",
     "ret",
-
     ".size _gllm_gemm_14x32_avx512_f32, . - _gllm_gemm_14x32_avx512_f32",
 );
 
@@ -738,7 +655,15 @@ pub unsafe fn gemm_kernel_14x32_f32(
     ldc: usize,
     accumulate: bool,
 ) {
-    _gllm_gemm_14x32_avx512_f32(packed_a, packed_b, c_ptr, kc, ldc, accumulate as usize, std::ptr::null());
+    _gllm_gemm_14x32_avx512_f32(
+        packed_a,
+        packed_b,
+        c_ptr,
+        kc,
+        ldc,
+        accumulate as usize,
+        std::ptr::null(),
+    );
 }
 
 /// AVX-512 GEMM microkernel with fused bias addition.
@@ -754,5 +679,13 @@ pub unsafe fn gemm_kernel_14x32_f32_bias(
     accumulate: bool,
     bias: *const f32,
 ) {
-    _gllm_gemm_14x32_avx512_f32(packed_a, packed_b, c_ptr, kc, ldc, accumulate as usize, bias);
+    _gllm_gemm_14x32_avx512_f32(
+        packed_a,
+        packed_b,
+        c_ptr,
+        kc,
+        ldc,
+        accumulate as usize,
+        bias,
+    );
 }

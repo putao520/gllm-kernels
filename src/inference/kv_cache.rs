@@ -142,7 +142,10 @@ impl KvCache {
 
             // SAFETY: page was just pushed in the offset_in_page==0 branch above,
             // or a prior iteration already pushed a page that is not yet full.
-            let page_id = *table.pages.last().expect("SAFETY: page guaranteed present — pushed when offset_in_page==0");
+            let page_id = *table
+                .pages
+                .last()
+                .expect("SAFETY: page guaranteed present — pushed when offset_in_page==0");
             positions.push((page_id, offset_in_page));
             table.seq_len += 1;
             self.pages[page_id].used = offset_in_page + 1;
@@ -278,12 +281,10 @@ impl KvCache {
                 let src = (tok * self.num_kv_heads + h) * hb;
 
                 let k_dst = self.page_offset(0, h, off);
-                self.pages[page_id].data[k_dst..k_dst + hb]
-                    .copy_from_slice(&k_data[src..src + hb]);
+                self.pages[page_id].data[k_dst..k_dst + hb].copy_from_slice(&k_data[src..src + hb]);
 
                 let v_dst = self.page_offset(1, h, off);
-                self.pages[page_id].data[v_dst..v_dst + hb]
-                    .copy_from_slice(&v_data[src..src + hb]);
+                self.pages[page_id].data[v_dst..v_dst + hb].copy_from_slice(&v_data[src..src + hb]);
             }
         }
         Ok(())
@@ -323,7 +324,11 @@ impl KvCache {
                 PAGE_SIZE
             } else {
                 let rem = seq_len % PAGE_SIZE;
-                if rem == 0 { PAGE_SIZE } else { rem }
+                if rem == 0 {
+                    PAGE_SIZE
+                } else {
+                    rem
+                }
             };
 
             for t in 0..tokens_in_page {
@@ -357,8 +362,7 @@ impl KvCache {
         }
         for (i, &pid) in page_ids.iter().enumerate() {
             let off = i * self.bytes_per_page;
-            buf[off..off + self.bytes_per_page]
-                .copy_from_slice(&self.pages[pid].data);
+            buf[off..off + self.bytes_per_page].copy_from_slice(&self.pages[pid].data);
         }
         Ok(())
     }
@@ -459,7 +463,10 @@ impl KvCache {
             table.pages.reserve(num_pages);
 
             for pi in 0..num_pages {
-                let page_id = self.free_pages.pop().expect("SAFETY: free_pages.len() >= pages_needed checked above");
+                let page_id = self
+                    .free_pages
+                    .pop()
+                    .expect("SAFETY: free_pages.len() >= pages_needed checked above");
 
                 self.pages[page_id]
                     .data
@@ -469,7 +476,11 @@ impl KvCache {
                 let is_last = pi == num_pages - 1;
                 self.pages[page_id].used = if is_last {
                     let rem = seq_len % PAGE_SIZE;
-                    if rem == 0 { PAGE_SIZE } else { rem }
+                    if rem == 0 {
+                        PAGE_SIZE
+                    } else {
+                        rem
+                    }
                 } else {
                     PAGE_SIZE
                 };
@@ -609,7 +620,7 @@ mod tests {
         assert_eq!(positions.len(), 20);
         // First 16 tokens in page 0, next 4 in page 1
         assert_eq!(positions[15].1, 15); // last slot of first page
-        assert_eq!(positions[16].1, 0);  // first slot of second page
+        assert_eq!(positions[16].1, 0); // first slot of second page
 
         let k_data = make_kv_bytes(20, 4, 16, 0.0);
         let v_data = make_kv_bytes(20, 4, 16, 90000.0);
@@ -1400,7 +1411,10 @@ mod tests {
         let l0_pages = cache.seq_pages(0, 0);
         let l1_pages = cache.seq_pages(1, 0);
         for &p0 in l0_pages {
-            assert!(!l1_pages.contains(&p0), "layer 0 and layer 1 should use distinct pages");
+            assert!(
+                !l1_pages.contains(&p0),
+                "layer 0 and layer 1 should use distinct pages"
+            );
         }
     }
 
@@ -1533,7 +1547,9 @@ mod tests {
         // byte offset = 1 * 1024 * 4 = 4096
         let kv_plane_bytes = 4 * PAGE_SIZE * 16 * 4; // num_kv_heads * PAGE_SIZE * head_dim * sizeof(f32)
         let v_first = f32::from_ne_bytes(
-            page_data[kv_plane_bytes..kv_plane_bytes + 4].try_into().unwrap(),
+            page_data[kv_plane_bytes..kv_plane_bytes + 4]
+                .try_into()
+                .unwrap(),
         );
         assert_eq!(v_first, 200.0);
     }
@@ -1584,8 +1600,14 @@ mod tests {
             cache.read_kv(layer, 1, &mut k_out, &mut v_out).unwrap();
             let k_expected = make_kv_bytes(8, 4, 16, layer as f32 * 2000.0);
             let v_expected = make_kv_bytes(8, 4, 16, layer as f32 * 2000.0 + 600.0);
-            assert_eq!(k_out, k_expected, "seq 1 K data corrupted after swap on layer {layer}");
-            assert_eq!(v_out, v_expected, "seq 1 V data corrupted after swap on layer {layer}");
+            assert_eq!(
+                k_out, k_expected,
+                "seq 1 K data corrupted after swap on layer {layer}"
+            );
+            assert_eq!(
+                v_out, v_expected,
+                "seq 1 V data corrupted after swap on layer {layer}"
+            );
         }
     }
 
@@ -1670,7 +1692,9 @@ mod tests {
         let k_correct = vec![0u8; 3 * token_kv];
         let v_correct = vec![0u8; 3 * token_kv];
         // This should succeed (correct sizes)
-        cache.write_kv(0, 0, &positions, &k_correct, &v_correct).unwrap();
+        cache
+            .write_kv(0, 0, &positions, &k_correct, &v_correct)
+            .unwrap();
 
         // Providing token_kv - 1 bytes (off by 1) should fail
         let k_short = vec![0u8; 3 * token_kv - 1];
@@ -1806,9 +1830,7 @@ mod tests {
 
         // Verify the page has non-zero data before reset
         let ptr_before = cache.page_ptr(page_id);
-        let has_nonzero = unsafe {
-            (0..bpp).any(|i| *ptr_before.add(i) != 0)
-        };
+        let has_nonzero = unsafe { (0..bpp).any(|i| *ptr_before.add(i) != 0) };
         assert!(has_nonzero, "page should have non-zero data after write");
 
         // Act: reset the sequence
@@ -1836,7 +1858,7 @@ mod tests {
         cache.append(0, 0, 5).unwrap();
         cache.append(0, 1, 16).unwrap(); // exactly 1 page
         cache.append(0, 2, 17).unwrap(); // just over 1 page
-        cache.append(0, 3, 1).unwrap();  // minimal
+        cache.append(0, 3, 1).unwrap(); // minimal
 
         // Assert: independent seq_len tracking
         assert_eq!(cache.seq_len(0, 0), 5);
@@ -1938,7 +1960,9 @@ mod tests {
         // Corrupt pages, swap in, verify restoration
         for pid in 0..3 {
             let ptr = cache.page_mut_ptr(pid);
-            unsafe { std::ptr::write_bytes(ptr, 0, bpp); }
+            unsafe {
+                std::ptr::write_bytes(ptr, 0, bpp);
+            }
         }
         cache.swap_in(&page_ids, &buf).unwrap();
 
@@ -1981,7 +2005,7 @@ mod tests {
         // Assert: handle metadata reflects asymmetric layer usage
         assert_eq!(handle.layer_info.len(), 2);
         assert_eq!(handle.layer_info[0], (20, 2)); // layer 0: 20 tokens, 2 pages
-        assert_eq!(handle.layer_info[1], (5, 1));  // layer 1: 5 tokens, 1 page
+        assert_eq!(handle.layer_info[1], (5, 1)); // layer 1: 5 tokens, 1 page
         assert_eq!(handle.total_bytes(), 3 * cache.bytes_per_page());
 
         // Swap back in and verify data for each layer
@@ -2121,7 +2145,11 @@ mod tests {
         // Assert: the physical page is now zeroed
         let ptr_after = cache.page_ptr(page_id);
         for i in 0..bpp {
-            assert_eq!(unsafe { *ptr_after.add(i) }, 0, "page byte {i} not zeroed after swap_out");
+            assert_eq!(
+                unsafe { *ptr_after.add(i) },
+                0,
+                "page byte {i} not zeroed after swap_out"
+            );
         }
     }
 
@@ -2152,7 +2180,7 @@ mod tests {
         let mut cache = KvCache::new(&cfg, 1, 64).unwrap();
 
         cache.append(0, 0, 30).unwrap(); // ceil(30/16) = 2 pages
-        cache.append(1, 0, 3).unwrap();  // 1 page
+        cache.append(1, 0, 3).unwrap(); // 1 page
 
         // Act
         let mut swap_buf = Vec::new();
@@ -2542,7 +2570,9 @@ mod tests {
 
         // Also populate layer 1
         for layer in 0..2 {
-            if layer == 0 { continue; }
+            if layer == 0 {
+                continue;
+            }
             let pos = cache.append(layer, 0, 12).unwrap();
             let k = make_kv_bytes(12, 4, 16, 50.0);
             let v = make_kv_bytes(12, 4, 16, 60.0);

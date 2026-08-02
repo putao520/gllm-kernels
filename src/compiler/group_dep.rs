@@ -3,9 +3,9 @@
 //! 分析 FusionPlan 的 group 间数据依赖，返回拓扑层级列表。
 //! 同一层级的 groups 之间无数据依赖，可以用 rayon 并行 lower。
 
-use std::collections::{HashMap, HashSet, VecDeque};
 use crate::compiler::fusion::FusionPlan;
 use crate::compiler::graph::{CompilerGraph, OpId};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// 拓扑层级 — 同一层级的 groups 之间无数据依赖
 #[derive(Debug, Clone)]
@@ -25,10 +25,7 @@ impl GroupDependencyAnalyzer {
     /// 基于 tensor 生产-消费关系:
     /// - group A 的 anchor output tensor → group B 的 anchor input tensor → A blocks B
     /// - 同一层级的 groups 之间没有 tensor 流转关系
-    pub fn analyze(
-        plan: &FusionPlan,
-        graph: &CompilerGraph,
-    ) -> Vec<TopoLevel> {
+    pub fn analyze(plan: &FusionPlan, graph: &CompilerGraph) -> Vec<TopoLevel> {
         let num_groups = plan.groups.len();
         if num_groups == 0 {
             return Vec::new();
@@ -118,8 +115,11 @@ impl GroupDependencyAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::graph::{SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
     use crate::compiler::fusion::GroupMarker;
+    use crate::compiler::graph::{
+        AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, DualRopeSpec, GemmSpec,
+        MlaSpec, NormSpec, Op, QuantGemmSpec, RopeSpec, SinksSpec, SymDim,
+    };
     use crate::types::DType;
 
     #[test]
@@ -151,7 +151,7 @@ mod tests {
                 dominant_dtype: None,
                 marker: GroupMarker::None,
                 is_layer_group: false,
-            hetero_layer_type: None,
+                hetero_layer_type: None,
             }],
             op_to_group: {
                 let mut m = HashMap::new();
@@ -177,18 +177,38 @@ mod tests {
         let t_2 = graph.add_tensor("t2", vec![SymDim::Concrete(4)], DType::F32);
 
         let op0 = graph.add_op(Op::Silu, vec![t_input], vec![t_0], "silu");
-        let op1 = graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![t_0], vec![t_1], "norm");
-        let op2 = graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }), vec![t_1, t_w1], vec![t_2], "gemm");
+        let op1 = graph.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![t_0],
+            vec![t_1],
+            "norm",
+        );
+        let op2 = graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 64,
+                k: 4,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![t_1, t_w1],
+            vec![t_2],
+            "gemm",
+        );
 
         let plan = FusionPlan {
-            groups: vec![
-                make_group(0, op0),
-                make_group(1, op1),
-                make_group(2, op2),
-            ],
+            groups: vec![make_group(0, op0), make_group(1, op1), make_group(2, op2)],
             op_to_group: {
                 let mut m = HashMap::new();
-                m.insert(op0, 0); m.insert(op1, 1); m.insert(op2, 2);
+                m.insert(op0, 0);
+                m.insert(op1, 1);
+                m.insert(op2, 2);
                 m
             },
         };
@@ -214,13 +234,11 @@ mod tests {
         let op1 = graph.add_op(Op::Silu, vec![t_in1], vec![t_out1], "silu1");
 
         let plan = FusionPlan {
-            groups: vec![
-                make_group(0, op0),
-                make_group(1, op1),
-            ],
+            groups: vec![make_group(0, op0), make_group(1, op1)],
             op_to_group: {
                 let mut m = HashMap::new();
-                m.insert(op0, 0); m.insert(op1, 1);
+                m.insert(op0, 0);
+                m.insert(op1, 1);
                 m
             },
         };
@@ -317,7 +335,17 @@ mod tests {
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
         let op0 = graph.add_op(Op::Silu, vec![t_in], vec![t_mid], "silu");
-        let op1 = graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![t_mid], vec![t_a], "norm");
+        let op1 = graph.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![t_mid],
+            vec![t_a],
+            "norm",
+        );
         let op2 = graph.add_op(Op::Silu, vec![t_a], vec![t_out], "silu2");
 
         let plan = FusionPlan {
@@ -332,7 +360,7 @@ mod tests {
                     dominant_dtype: None,
                     marker: GroupMarker::None,
                     is_layer_group: false,
-            hetero_layer_type: None,
+                    hetero_layer_type: None,
                 },
                 make_group(1, op2),
             ],
@@ -389,7 +417,8 @@ mod tests {
 
         let mut consumer_ops = Vec::new();
         for i in 0..5 {
-            let t_out = graph.add_tensor(&format!("out{}", i), vec![SymDim::Concrete(4)], DType::F32);
+            let t_out =
+                graph.add_tensor(&format!("out{}", i), vec![SymDim::Concrete(4)], DType::F32);
             let opi = graph.add_op(Op::Silu, vec![t_src], vec![t_out], &format!("c{}", i));
             consumer_ops.push(opi);
         }
@@ -493,7 +522,7 @@ mod tests {
                 dominant_dtype: None,
                 marker: GroupMarker::None,
                 is_layer_group: false,
-            hetero_layer_type: None,
+                hetero_layer_type: None,
             }],
             op_to_group: {
                 let mut m = HashMap::new();
@@ -524,11 +553,7 @@ mod tests {
         let op2 = graph.add_op(Op::Silu, vec![t2], vec![t3], "c");
 
         let plan = FusionPlan {
-            groups: vec![
-                make_group(0, op0),
-                make_group(1, op1),
-                make_group(2, op2),
-            ],
+            groups: vec![make_group(0, op0), make_group(1, op1), make_group(2, op2)],
             op_to_group: {
                 let mut m = HashMap::new();
                 m.insert(op0, 0);
@@ -553,22 +578,21 @@ mod tests {
         let t_a = graph.add_tensor("a", vec![SymDim::Concrete(8)], DType::F32);
         let t_b = graph.add_tensor("b", vec![SymDim::Concrete(8)], DType::F32);
 
-        let op0 = graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }),
+        let op0 = graph.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-6,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
             vec![t_in],
             vec![t_a],
             "norm",
         );
-        let op1 = graph.add_op(Op::Mul,
-            vec![t_a, t_in],
-            vec![t_b],
-            "mul",
-        );
+        let op1 = graph.add_op(Op::Mul, vec![t_a, t_in], vec![t_b], "mul");
 
         let plan = FusionPlan {
-            groups: vec![
-                make_group(0, op0),
-                make_group(1, op1),
-            ],
+            groups: vec![make_group(0, op0), make_group(1, op1)],
             op_to_group: {
                 let mut m = HashMap::new();
                 m.insert(op0, 0);
@@ -638,10 +662,7 @@ mod tests {
         let phantom_op = OpId(9999);
 
         let plan = FusionPlan {
-            groups: vec![
-                make_group(0, real_op),
-                make_group(1, phantom_op),
-            ],
+            groups: vec![make_group(0, real_op), make_group(1, phantom_op)],
             op_to_group: {
                 let mut m = HashMap::new();
                 m.insert(real_op, 0);
@@ -740,11 +761,7 @@ mod tests {
         let op2 = graph.add_op(Op::Add, vec![t_a, t_b], vec![t_out], "consumer");
 
         let plan = FusionPlan {
-            groups: vec![
-                make_group(0, op0),
-                make_group(1, op1),
-                make_group(2, op2),
-            ],
+            groups: vec![make_group(0, op0), make_group(1, op1), make_group(2, op2)],
             op_to_group: {
                 let mut m = HashMap::new();
                 m.insert(op0, 0);
@@ -794,7 +811,7 @@ mod tests {
                     dominant_dtype: None,
                     marker: GroupMarker::None,
                     is_layer_group: false,
-            hetero_layer_type: None,
+                    hetero_layer_type: None,
                 },
                 make_group(1, op1),
             ],
@@ -834,11 +851,7 @@ mod tests {
         let op2 = graph.add_op(Op::Mul, vec![t_a, t_b, t_z], vec![t_out], "merge");
 
         let plan = FusionPlan {
-            groups: vec![
-                make_group(0, op0),
-                make_group(1, op1),
-                make_group(2, op2),
-            ],
+            groups: vec![make_group(0, op0), make_group(1, op1), make_group(2, op2)],
             op_to_group: {
                 let mut m = HashMap::new();
                 m.insert(op0, 0);
@@ -931,10 +944,7 @@ mod tests {
         let op1 = graph.add_op(Op::Silu, vec![t_shared], vec![t_out1], "path_b");
 
         let plan = FusionPlan {
-            groups: vec![
-                make_group(0, op0),
-                make_group(1, op1),
-            ],
+            groups: vec![make_group(0, op0), make_group(1, op1)],
             op_to_group: {
                 let mut m = HashMap::new();
                 m.insert(op0, 0);
@@ -961,7 +971,8 @@ mod tests {
 
         for i in 0..7 {
             let t_in = graph.add_tensor(&format!("in{}", i), vec![SymDim::Concrete(4)], DType::F32);
-            let t_out = graph.add_tensor(&format!("out{}", i), vec![SymDim::Concrete(4)], DType::F32);
+            let t_out =
+                graph.add_tensor(&format!("out{}", i), vec![SymDim::Concrete(4)], DType::F32);
             let op = graph.add_op(Op::Silu, vec![t_in], vec![t_out], &format!("op{}", i));
             groups.push(make_group(i, op));
             op_map.insert(op, i);
@@ -1002,7 +1013,8 @@ mod tests {
 
         // Consumer takes first two producer outputs as inputs
         let t_final = graph.add_tensor("final", vec![SymDim::Concrete(4)], DType::F32);
-        let consumer = graph.add_op(Op::Add,
+        let consumer = graph.add_op(
+            Op::Add,
             vec![producer_outputs[0], producer_outputs[1]],
             vec![t_final],
             "consumer",
@@ -1086,7 +1098,7 @@ mod tests {
                     dominant_dtype: None,
                     marker: GroupMarker::None,
                     is_layer_group: false,
-            hetero_layer_type: None,
+                    hetero_layer_type: None,
                 },
             ],
             op_to_group: {
@@ -1219,7 +1231,7 @@ mod tests {
                     dominant_dtype: None,
                     marker: GroupMarker::None,
                     is_layer_group: false,
-            hetero_layer_type: None,
+                    hetero_layer_type: None,
                 },
                 crate::compiler::fusion::FusionGroup {
                     id: 3,
@@ -1231,7 +1243,7 @@ mod tests {
                     dominant_dtype: None,
                     marker: GroupMarker::None,
                     is_layer_group: false,
-            hetero_layer_type: None,
+                    hetero_layer_type: None,
                 },
                 crate::compiler::fusion::FusionGroup {
                     id: 1,
@@ -1243,7 +1255,7 @@ mod tests {
                     dominant_dtype: None,
                     marker: GroupMarker::None,
                     is_layer_group: false,
-            hetero_layer_type: None,
+                    hetero_layer_type: None,
                 },
             ],
             op_to_group: {
@@ -1304,7 +1316,11 @@ mod tests {
 
         let ops = [op0, op1, op2, op3, op4, op5, op6, op7, op8];
         let plan = FusionPlan {
-            groups: ops.iter().enumerate().map(|(i, &op)| make_group(i, op)).collect(),
+            groups: ops
+                .iter()
+                .enumerate()
+                .map(|(i, &op)| make_group(i, op))
+                .collect(),
             op_to_group: ops.iter().enumerate().map(|(i, &op)| (op, i)).collect(),
         };
 
@@ -1342,10 +1358,7 @@ mod tests {
         let op1 = graph.add_op(Op::Add, vec![t_produced, t_ext], vec![t_out], "consumer");
 
         let plan = FusionPlan {
-            groups: vec![
-                make_group(0, op0),
-                make_group(1, op1),
-            ],
+            groups: vec![make_group(0, op0), make_group(1, op1)],
             op_to_group: {
                 let mut m = HashMap::new();
                 m.insert(op0, 0);
@@ -1431,7 +1444,17 @@ mod tests {
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
         let op0 = graph.add_op(Op::Silu, vec![t_in], vec![t_mid1], "inner0");
-        let op1 = graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![t_mid1], vec![t_mid2], "inner1");
+        let op1 = graph.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![t_mid1],
+            vec![t_mid2],
+            "inner1",
+        );
         let op2 = graph.add_op(Op::Silu, vec![t_mid2], vec![t_out], "inner2");
 
         let plan = FusionPlan {
@@ -1445,7 +1468,7 @@ mod tests {
                 dominant_dtype: None,
                 marker: GroupMarker::None,
                 is_layer_group: false,
-            hetero_layer_type: None,
+                hetero_layer_type: None,
             }],
             op_to_group: {
                 let mut m = HashMap::new();
@@ -1487,7 +1510,8 @@ mod tests {
 
         // Consumer takes first and last mid outputs
         let t_final = graph.add_tensor("final", vec![SymDim::Concrete(4)], DType::F32);
-        let consumer = graph.add_op(Op::Add,
+        let consumer = graph.add_op(
+            Op::Add,
             vec![mid_outputs[0], mid_outputs[3]],
             vec![t_final],
             "consumer",
@@ -1581,9 +1605,12 @@ mod tests {
             .collect();
 
         let deps: Vec<(usize, usize)> = vec![
-            (0, 1), (0, 2), // g0 → g1, g0 → g2
-            (1, 3), (2, 3), // g1 → g3, g2 → g3
-            (1, 4), (2, 4), // g1 → g4, g2 → g4
+            (0, 1),
+            (0, 2), // g0 → g1, g0 → g2
+            (1, 3),
+            (2, 3), // g1 → g3, g2 → g3
+            (1, 4),
+            (2, 4), // g1 → g4, g2 → g4
         ];
 
         for (src, dst) in &deps {
@@ -1592,7 +1619,10 @@ mod tests {
             assert!(
                 sl < dl,
                 "dependency g{}(level {}) → g{}(level {}) violates ordering",
-                src, sl, dst, dl,
+                src,
+                sl,
+                dst,
+                dl,
             );
         }
 
@@ -1627,7 +1657,7 @@ mod tests {
                 dominant_dtype: None,
                 marker: GroupMarker::None,
                 is_layer_group: false,
-            hetero_layer_type: None,
+                hetero_layer_type: None,
             }],
             op_to_group: {
                 let mut m = HashMap::new();
@@ -1659,13 +1689,17 @@ mod tests {
         op_map.insert(op0, 0);
 
         for i in 0..8 {
-            let t_out = graph.add_tensor(&format!("out{}", i), vec![SymDim::Concrete(4)], DType::F32);
+            let t_out =
+                graph.add_tensor(&format!("out{}", i), vec![SymDim::Concrete(4)], DType::F32);
             let op = graph.add_op(Op::Silu, vec![t_src], vec![t_out], &format!("c{}", i));
             groups.push(make_group(i + 1, op));
             op_map.insert(op, i + 1);
         }
 
-        let plan = FusionPlan { groups, op_to_group: op_map };
+        let plan = FusionPlan {
+            groups,
+            op_to_group: op_map,
+        };
 
         // Act
         let levels = GroupDependencyAnalyzer::analyze(&plan, &graph);
@@ -1729,19 +1763,29 @@ mod tests {
         }
 
         let t_final = graph.add_tensor("final", vec![SymDim::Concrete(4)], DType::F32);
-        let consumer = graph.add_op(Op::Mul,
+        let consumer = graph.add_op(
+            Op::Mul,
             vec![prod_outputs[0], prod_outputs[1], prod_outputs[2]],
             vec![t_final],
             "consumer",
         );
 
-        let mut groups: Vec<_> = prod_ops.iter().enumerate().map(|(i, &op)| make_group(i, op)).collect();
+        let mut groups: Vec<_> = prod_ops
+            .iter()
+            .enumerate()
+            .map(|(i, &op)| make_group(i, op))
+            .collect();
         groups.push(make_group(3, consumer));
         let mut op_map = HashMap::new();
-        for (i, &op) in prod_ops.iter().enumerate() { op_map.insert(op, i); }
+        for (i, &op) in prod_ops.iter().enumerate() {
+            op_map.insert(op, i);
+        }
         op_map.insert(consumer, 3);
 
-        let plan = FusionPlan { groups, op_to_group: op_map };
+        let plan = FusionPlan {
+            groups,
+            op_to_group: op_map,
+        };
 
         // Act
         let levels = GroupDependencyAnalyzer::analyze(&plan, &graph);
@@ -1774,7 +1818,7 @@ mod tests {
                     dominant_dtype: None,
                     marker: GroupMarker::None,
                     is_layer_group: false,
-            hetero_layer_type: None,
+                    hetero_layer_type: None,
                 },
             ],
             op_to_group: {
@@ -1849,13 +1893,21 @@ mod tests {
 
         let plan = FusionPlan {
             groups: vec![
-                make_group(0, op0), make_group(1, op1), make_group(2, op2),
-                make_group(3, op3), make_group(4, op4), make_group(5, op5),
+                make_group(0, op0),
+                make_group(1, op1),
+                make_group(2, op2),
+                make_group(3, op3),
+                make_group(4, op4),
+                make_group(5, op5),
             ],
             op_to_group: {
                 let mut m = HashMap::new();
-                m.insert(op0, 0); m.insert(op1, 1); m.insert(op2, 2);
-                m.insert(op3, 3); m.insert(op4, 4); m.insert(op5, 5);
+                m.insert(op0, 0);
+                m.insert(op1, 1);
+                m.insert(op2, 2);
+                m.insert(op3, 3);
+                m.insert(op4, 4);
+                m.insert(op5, 5);
                 m
             },
         };
@@ -1883,7 +1935,17 @@ mod tests {
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
         let op0 = graph.add_op(Op::Silu, vec![t_in], vec![t_m1], "a");
-        let op1 = graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }), vec![t_m1], vec![t_m2], "b");
+        let op1 = graph.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-6,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![t_m1],
+            vec![t_m2],
+            "b",
+        );
         let op2 = graph.add_op(Op::Silu, vec![t_m2], vec![t_m3], "c");
         let op3 = graph.add_op(Op::Silu, vec![t_m3], vec![t_out], "d");
 
@@ -1899,13 +1961,16 @@ mod tests {
                     dominant_dtype: None,
                     marker: GroupMarker::None,
                     is_layer_group: false,
-            hetero_layer_type: None,
+                    hetero_layer_type: None,
                 },
                 make_group(1, op3),
             ],
             op_to_group: {
                 let mut m = HashMap::new();
-                m.insert(op0, 0); m.insert(op1, 0); m.insert(op2, 0); m.insert(op3, 1);
+                m.insert(op0, 0);
+                m.insert(op1, 0);
+                m.insert(op2, 0);
+                m.insert(op3, 1);
                 m
             },
         };
@@ -1937,7 +2002,11 @@ mod tests {
         let mut prev_b = t_b0;
         let mut b_ops = Vec::new();
         for i in 0..4 {
-            let t = graph.add_tensor(&format!("b{}", i + 1), vec![SymDim::Concrete(4)], DType::F32);
+            let t = graph.add_tensor(
+                &format!("b{}", i + 1),
+                vec![SymDim::Concrete(4)],
+                DType::F32,
+            );
             let op = graph.add_op(Op::Silu, vec![prev_b], vec![t], &format!("b{}", i));
             b_ops.push(op);
             prev_b = t;
@@ -1952,7 +2021,10 @@ mod tests {
             op_map.insert(op, i + 2);
         }
 
-        let plan = FusionPlan { groups, op_to_group: op_map };
+        let plan = FusionPlan {
+            groups,
+            op_to_group: op_map,
+        };
 
         // Act
         let levels = GroupDependencyAnalyzer::analyze(&plan, &graph);
@@ -1974,13 +2046,17 @@ mod tests {
 
         for i in 0..5 {
             let t_in = graph.add_tensor(&format!("in{}", i), vec![SymDim::Concrete(4)], DType::F32);
-            let t_out = graph.add_tensor(&format!("out{}", i), vec![SymDim::Concrete(4)], DType::F32);
+            let t_out =
+                graph.add_tensor(&format!("out{}", i), vec![SymDim::Concrete(4)], DType::F32);
             let op = graph.add_op(Op::Silu, vec![t_in], vec![t_out], &format!("op{}", i));
             groups.push(make_group(i, op));
             op_map.insert(op, i);
         }
 
-        let plan = FusionPlan { groups, op_to_group: op_map };
+        let plan = FusionPlan {
+            groups,
+            op_to_group: op_map,
+        };
 
         // Act
         let levels = GroupDependencyAnalyzer::analyze(&plan, &graph);
@@ -2036,7 +2112,11 @@ mod tests {
         }
 
         let plan = FusionPlan {
-            groups: ops.iter().enumerate().map(|(i, &op)| make_group(i, op)).collect(),
+            groups: ops
+                .iter()
+                .enumerate()
+                .map(|(i, &op)| make_group(i, op))
+                .collect(),
             op_to_group: ops.iter().enumerate().map(|(i, &op)| (op, i)).collect(),
         };
 
@@ -2070,10 +2150,18 @@ mod tests {
         let op3 = graph.add_op(Op::Mul, vec![t_a, t_b, t_c], vec![t_out], "merge");
 
         let plan = FusionPlan {
-            groups: vec![make_group(0, op0), make_group(1, op1), make_group(2, op2), make_group(3, op3)],
+            groups: vec![
+                make_group(0, op0),
+                make_group(1, op1),
+                make_group(2, op2),
+                make_group(3, op3),
+            ],
             op_to_group: {
                 let mut m = HashMap::new();
-                m.insert(op0, 0); m.insert(op1, 1); m.insert(op2, 2); m.insert(op3, 3);
+                m.insert(op0, 0);
+                m.insert(op1, 1);
+                m.insert(op2, 2);
+                m.insert(op3, 3);
                 m
             },
         };
@@ -2109,7 +2197,12 @@ mod tests {
         }
 
         let t_final = graph.add_tensor("final", vec![SymDim::Concrete(4)], DType::F32);
-        let op_merge = graph.add_op(Op::Add, vec![mid_outs[0], mid_outs[1], mid_outs[2]], vec![t_final], "merge");
+        let op_merge = graph.add_op(
+            Op::Add,
+            vec![mid_outs[0], mid_outs[1], mid_outs[2]],
+            vec![t_final],
+            "merge",
+        );
 
         let t_ext5 = graph.add_tensor("ext5", vec![SymDim::Concrete(4)], DType::F32);
         let t_out5 = graph.add_tensor("out5", vec![SymDim::Concrete(4)], DType::F32);
@@ -2122,7 +2215,9 @@ mod tests {
         let plan = FusionPlan {
             groups: vec![
                 make_group(0, op0),
-                make_group(1, mid_ops[0]), make_group(2, mid_ops[1]), make_group(3, mid_ops[2]),
+                make_group(1, mid_ops[0]),
+                make_group(2, mid_ops[1]),
+                make_group(3, mid_ops[2]),
                 make_group(4, op_merge),
                 make_group(5, op5),
                 make_group(6, op6),
@@ -2130,8 +2225,12 @@ mod tests {
             op_to_group: {
                 let mut m = HashMap::new();
                 m.insert(op0, 0);
-                m.insert(mid_ops[0], 1); m.insert(mid_ops[1], 2); m.insert(mid_ops[2], 3);
-                m.insert(op_merge, 4); m.insert(op5, 5); m.insert(op6, 6);
+                m.insert(mid_ops[0], 1);
+                m.insert(mid_ops[1], 2);
+                m.insert(mid_ops[2], 3);
+                m.insert(op_merge, 4);
+                m.insert(op5, 5);
+                m.insert(op6, 6);
                 m
             },
         };
@@ -2168,12 +2267,20 @@ mod tests {
         let op4 = graph.add_op(Op::Silu, vec![t_c], vec![t_out2], "consumer_r");
 
         let plan = FusionPlan {
-            groups: vec![make_group(0, op0), make_group(1, op1), make_group(2, op2),
-                         make_group(3, op3), make_group(4, op4)],
+            groups: vec![
+                make_group(0, op0),
+                make_group(1, op1),
+                make_group(2, op2),
+                make_group(3, op3),
+                make_group(4, op4),
+            ],
             op_to_group: {
                 let mut m = HashMap::new();
-                m.insert(op0, 0); m.insert(op1, 1); m.insert(op2, 2);
-                m.insert(op3, 3); m.insert(op4, 4);
+                m.insert(op0, 0);
+                m.insert(op1, 1);
+                m.insert(op2, 2);
+                m.insert(op3, 3);
+                m.insert(op4, 4);
                 m
             },
         };
@@ -2217,7 +2324,11 @@ mod tests {
 
         let ops = [op0, op1, op2, op3, op4, op5, op6, op7, op8];
         let plan = FusionPlan {
-            groups: ops.iter().enumerate().map(|(i, &op)| make_group(i, op)).collect(),
+            groups: ops
+                .iter()
+                .enumerate()
+                .map(|(i, &op)| make_group(i, op))
+                .collect(),
             op_to_group: ops.iter().enumerate().map(|(i, &op)| (op, i)).collect(),
         };
 
@@ -2244,15 +2355,33 @@ mod tests {
         let o2 = graph.add_tensor("o2", vec![SymDim::Concrete(4)], DType::F32);
 
         let op0 = graph.add_op(Op::Silu, vec![t0], vec![o0], "silu");
-        let op1 = graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![t1], vec![o1], "norm");
+        let op1 = graph.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![t1],
+            vec![o1],
+            "norm",
+        );
         let op2 = graph.add_op(Op::Mul, vec![t2, t3], vec![o2], "mul");
         let op3 = graph.add_op(Op::Add, vec![t4, t0], vec![o0], "add");
 
         let plan = FusionPlan {
-            groups: vec![make_group(0, op0), make_group(1, op1), make_group(2, op2), make_group(3, op3)],
+            groups: vec![
+                make_group(0, op0),
+                make_group(1, op1),
+                make_group(2, op2),
+                make_group(3, op3),
+            ],
             op_to_group: {
                 let mut m = HashMap::new();
-                m.insert(op0, 0); m.insert(op1, 1); m.insert(op2, 2); m.insert(op3, 3);
+                m.insert(op0, 0);
+                m.insert(op1, 1);
+                m.insert(op2, 2);
+                m.insert(op3, 3);
                 m
             },
         };
@@ -2298,7 +2427,9 @@ mod tests {
             groups: vec![make_group(0, op0), make_group(1, op1), make_group(2, op2)],
             op_to_group: {
                 let mut m = HashMap::new();
-                m.insert(op0, 0); m.insert(op1, 1); m.insert(op2, 2);
+                m.insert(op0, 0);
+                m.insert(op1, 1);
+                m.insert(op2, 2);
                 m
             },
         };
@@ -2338,13 +2469,24 @@ mod tests {
         // 2 merge groups, each consuming 2 mid outputs
         let t_f1 = graph.add_tensor("f1", vec![SymDim::Concrete(4)], DType::F32);
         let t_f2 = graph.add_tensor("f2", vec![SymDim::Concrete(4)], DType::F32);
-        let op_m1 = graph.add_op(Op::Add, vec![mid_outs[0], mid_outs[1]], vec![t_f1], "merge1");
-        let op_m2 = graph.add_op(Op::Add, vec![mid_outs[2], mid_outs[3]], vec![t_f2], "merge2");
+        let op_m1 = graph.add_op(
+            Op::Add,
+            vec![mid_outs[0], mid_outs[1]],
+            vec![t_f1],
+            "merge1",
+        );
+        let op_m2 = graph.add_op(
+            Op::Add,
+            vec![mid_outs[2], mid_outs[3]],
+            vec![t_f2],
+            "merge2",
+        );
 
         // 4 independent external groups
         let mut indep_ops = Vec::new();
         for i in 0..4 {
-            let t_in = graph.add_tensor(&format!("ext{}", i), vec![SymDim::Concrete(4)], DType::F32);
+            let t_in =
+                graph.add_tensor(&format!("ext{}", i), vec![SymDim::Concrete(4)], DType::F32);
             let t_o = graph.add_tensor(&format!("eo{}", i), vec![SymDim::Concrete(4)], DType::F32);
             let op = graph.add_op(Op::Silu, vec![t_in], vec![t_o], &format!("ind{}", i));
             indep_ops.push(op);
@@ -2362,7 +2504,11 @@ mod tests {
         all_ops.push(op_sink);
 
         let plan = FusionPlan {
-            groups: all_ops.iter().enumerate().map(|(i, &op)| make_group(i, op)).collect(),
+            groups: all_ops
+                .iter()
+                .enumerate()
+                .map(|(i, &op)| make_group(i, op))
+                .collect(),
             op_to_group: all_ops.iter().enumerate().map(|(i, &op)| (op, i)).collect(),
         };
 
@@ -2371,7 +2517,11 @@ mod tests {
 
         // Assert: level indices monotonic
         for (i, level) in levels.iter().enumerate() {
-            assert_eq!(level.level, i, "level index not monotonic at position {}", i);
+            assert_eq!(
+                level.level, i,
+                "level index not monotonic at position {}",
+                i
+            );
         }
         // All 12 groups accounted for
         let total: usize = levels.iter().map(|l| l.groups.len()).sum();
@@ -2437,14 +2587,22 @@ mod tests {
 
         let plan = FusionPlan {
             groups: vec![
-                make_group(0, op0), make_group(1, op1), make_group(2, op2),
-                make_group(3, op3), make_group(4, op4), make_group(5, op5),
+                make_group(0, op0),
+                make_group(1, op1),
+                make_group(2, op2),
+                make_group(3, op3),
+                make_group(4, op4),
+                make_group(5, op5),
                 make_group(6, op6),
             ],
             op_to_group: {
                 let mut m = HashMap::new();
-                m.insert(op0, 0); m.insert(op1, 1); m.insert(op2, 2);
-                m.insert(op3, 3); m.insert(op4, 4); m.insert(op5, 5);
+                m.insert(op0, 0);
+                m.insert(op1, 1);
+                m.insert(op2, 2);
+                m.insert(op3, 3);
+                m.insert(op4, 4);
+                m.insert(op5, 5);
                 m.insert(op6, 6);
                 m
             },
@@ -2503,13 +2661,17 @@ mod tests {
 
         let plan = FusionPlan {
             groups: vec![
-                make_group(0, op0), make_group(1, op1),
-                make_group(2, op2), make_group(3, op3),
+                make_group(0, op0),
+                make_group(1, op1),
+                make_group(2, op2),
+                make_group(3, op3),
             ],
             op_to_group: {
                 let mut m = HashMap::new();
-                m.insert(op0, 0); m.insert(op1, 1);
-                m.insert(op2, 2); m.insert(op3, 3);
+                m.insert(op0, 0);
+                m.insert(op1, 1);
+                m.insert(op2, 2);
+                m.insert(op3, 3);
                 m
             },
         };
@@ -2556,7 +2718,9 @@ mod tests {
             groups: vec![make_group(0, op0), make_group(1, op1), make_group(2, op2)],
             op_to_group: {
                 let mut m = HashMap::new();
-                m.insert(op0, 0); m.insert(op1, 1); m.insert(op2, 2);
+                m.insert(op0, 0);
+                m.insert(op1, 1);
+                m.insert(op2, 2);
                 m
             },
         };
@@ -2590,13 +2754,17 @@ mod tests {
 
         let plan = FusionPlan {
             groups: vec![
-                make_group(0, op0), make_group(1, op1),
-                make_group(2, op2), make_group(3, op3),
+                make_group(0, op0),
+                make_group(1, op1),
+                make_group(2, op2),
+                make_group(3, op3),
             ],
             op_to_group: {
                 let mut m = HashMap::new();
-                m.insert(op0, 0); m.insert(op1, 1);
-                m.insert(op2, 2); m.insert(op3, 3);
+                m.insert(op0, 0);
+                m.insert(op1, 1);
+                m.insert(op2, 2);
+                m.insert(op3, 3);
                 m
             },
         };
@@ -2632,13 +2800,19 @@ mod tests {
 
         let plan = FusionPlan {
             groups: vec![
-                make_group(0, op0), make_group(1, op1), make_group(2, op2),
-                make_group(3, op3), make_group(4, op4),
+                make_group(0, op0),
+                make_group(1, op1),
+                make_group(2, op2),
+                make_group(3, op3),
+                make_group(4, op4),
             ],
             op_to_group: {
                 let mut m = HashMap::new();
-                m.insert(op0, 0); m.insert(op1, 1); m.insert(op2, 2);
-                m.insert(op3, 3); m.insert(op4, 4);
+                m.insert(op0, 0);
+                m.insert(op1, 1);
+                m.insert(op2, 2);
+                m.insert(op3, 3);
+                m.insert(op4, 4);
                 m
             },
         };
@@ -2700,7 +2874,11 @@ mod tests {
         }
 
         let plan = FusionPlan {
-            groups: ops.iter().enumerate().map(|(i, &op)| make_group(i, op)).collect(),
+            groups: ops
+                .iter()
+                .enumerate()
+                .map(|(i, &op)| make_group(i, op))
+                .collect(),
             op_to_group: ops.iter().enumerate().map(|(i, &op)| (op, i)).collect(),
         };
 
@@ -2740,13 +2918,21 @@ mod tests {
 
         let plan = FusionPlan {
             groups: vec![
-                make_group(0, op0), make_group(1, op1), make_group(2, op2),
-                make_group(3, op3), make_group(4, op4), make_group(5, op5),
+                make_group(0, op0),
+                make_group(1, op1),
+                make_group(2, op2),
+                make_group(3, op3),
+                make_group(4, op4),
+                make_group(5, op5),
             ],
             op_to_group: {
                 let mut m = HashMap::new();
-                m.insert(op0, 0); m.insert(op1, 1); m.insert(op2, 2);
-                m.insert(op3, 3); m.insert(op4, 4); m.insert(op5, 5);
+                m.insert(op0, 0);
+                m.insert(op1, 1);
+                m.insert(op2, 2);
+                m.insert(op3, 3);
+                m.insert(op4, 4);
+                m.insert(op5, 5);
                 m
             },
         };
@@ -2788,13 +2974,17 @@ mod tests {
 
         let plan = FusionPlan {
             groups: vec![
-                make_group(0, op0), make_group(1, op1),
-                make_group(2, op2), make_group(3, op3),
+                make_group(0, op0),
+                make_group(1, op1),
+                make_group(2, op2),
+                make_group(3, op3),
             ],
             op_to_group: {
                 let mut m = HashMap::new();
-                m.insert(op0, 0); m.insert(op1, 1);
-                m.insert(op2, 2); m.insert(op3, 3);
+                m.insert(op0, 0);
+                m.insert(op1, 1);
+                m.insert(op2, 2);
+                m.insert(op3, 3);
                 m
             },
         };
@@ -2819,14 +3009,19 @@ mod tests {
         let mut op_map = HashMap::new();
 
         for i in 0..6 {
-            let t_in = graph.add_tensor(&format!("in{}", i), vec![SymDim::Concrete(16)], DType::F32);
-            let t_out = graph.add_tensor(&format!("out{}", i), vec![SymDim::Concrete(16)], DType::F32);
+            let t_in =
+                graph.add_tensor(&format!("in{}", i), vec![SymDim::Concrete(16)], DType::F32);
+            let t_out =
+                graph.add_tensor(&format!("out{}", i), vec![SymDim::Concrete(16)], DType::F32);
             let op = graph.add_op(Op::Silu, vec![t_in], vec![t_out], &format!("op{}", i));
             groups.push(make_group(i, op));
             op_map.insert(op, i);
         }
 
-        let plan = FusionPlan { groups, op_to_group: op_map };
+        let plan = FusionPlan {
+            groups,
+            op_to_group: op_map,
+        };
 
         // Act
         let levels = GroupDependencyAnalyzer::analyze(&plan, &graph);
@@ -2835,7 +3030,11 @@ mod tests {
         assert_eq!(levels.len(), 1);
         assert_eq!(levels[0].groups.len(), 6);
         for i in 0..6 {
-            assert!(levels[0].groups.contains(&i), "group {} missing from level 0", i);
+            assert!(
+                levels[0].groups.contains(&i),
+                "group {} missing from level 0",
+                i
+            );
         }
     }
 
@@ -2866,7 +3065,11 @@ mod tests {
 
         let ops = [op0, op1, op2, op3, op4, op5, op6];
         let plan = FusionPlan {
-            groups: ops.iter().enumerate().map(|(i, &op)| make_group(i, op)).collect(),
+            groups: ops
+                .iter()
+                .enumerate()
+                .map(|(i, &op)| make_group(i, op))
+                .collect(),
             op_to_group: ops.iter().enumerate().map(|(i, &op)| (op, i)).collect(),
         };
 
@@ -2913,7 +3116,7 @@ mod tests {
                     dominant_dtype: None,
                     marker: GroupMarker::None,
                     is_layer_group: false,
-            hetero_layer_type: None,
+                    hetero_layer_type: None,
                 },
                 make_group(1, op1),
             ],
@@ -2957,13 +3160,19 @@ mod tests {
 
         let plan = FusionPlan {
             groups: vec![
-                make_group(0, op0), make_group(1, op1), make_group(2, op2),
-                make_group(3, op3), make_group(4, op4),
+                make_group(0, op0),
+                make_group(1, op1),
+                make_group(2, op2),
+                make_group(3, op3),
+                make_group(4, op4),
             ],
             op_to_group: {
                 let mut m = HashMap::new();
-                m.insert(op0, 0); m.insert(op1, 1); m.insert(op2, 2);
-                m.insert(op3, 3); m.insert(op4, 4);
+                m.insert(op0, 0);
+                m.insert(op1, 1);
+                m.insert(op2, 2);
+                m.insert(op3, 3);
+                m.insert(op4, 4);
                 m
             },
         };
@@ -3013,7 +3222,11 @@ mod tests {
 
         let ops = [op0, op1, op2, op3, op4, op5, op6, op7];
         let plan = FusionPlan {
-            groups: ops.iter().enumerate().map(|(i, &op)| make_group(i, op)).collect(),
+            groups: ops
+                .iter()
+                .enumerate()
+                .map(|(i, &op)| make_group(i, op))
+                .collect(),
             op_to_group: ops.iter().enumerate().map(|(i, &op)| (op, i)).collect(),
         };
 
@@ -3027,14 +3240,24 @@ mod tests {
             .collect();
 
         let edges = vec![
-            (0, 1), (0, 2), (1, 3), (2, 3),
-            (3, 4), (3, 5), (4, 6), (5, 6), (6, 7),
+            (0, 1),
+            (0, 2),
+            (1, 3),
+            (2, 3),
+            (3, 4),
+            (3, 5),
+            (4, 6),
+            (5, 6),
+            (6, 7),
         ];
         for (src, dst) in &edges {
             assert!(
                 g2l[src] < g2l[dst],
                 "dependency g{}(level {}) -> g{}(level {}) violates ordering",
-                src, g2l[src], dst, g2l[dst],
+                src,
+                g2l[src],
+                dst,
+                g2l[dst],
             );
         }
 
@@ -3064,7 +3287,9 @@ mod tests {
             groups: vec![make_group(0, op0), make_group(1, op1), make_group(2, op2)],
             op_to_group: {
                 let mut m = HashMap::new();
-                m.insert(op0, 0); m.insert(op1, 1); m.insert(op2, 2);
+                m.insert(op0, 0);
+                m.insert(op1, 1);
+                m.insert(op2, 2);
                 m
             },
         };
@@ -3122,7 +3347,17 @@ mod tests {
         let t_indep = graph.add_tensor("indep_out", vec![SymDim::Concrete(4)], DType::F32);
 
         let op0a = graph.add_op(Op::Silu, vec![t_in], vec![t_mid], "fused_a");
-        let op0b = graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![t_mid], vec![t_a], "fused_b");
+        let op0b = graph.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![t_mid],
+            vec![t_a],
+            "fused_b",
+        );
         let op1 = graph.add_op(Op::Silu, vec![t_a], vec![t_out], "downstream");
         let op2 = graph.add_op(Op::Silu, vec![t_ext], vec![t_indep], "independent");
 
@@ -3138,15 +3373,17 @@ mod tests {
                     dominant_dtype: None,
                     marker: GroupMarker::None,
                     is_layer_group: false,
-            hetero_layer_type: None,
+                    hetero_layer_type: None,
                 },
                 make_group(1, op1),
                 make_group(2, op2),
             ],
             op_to_group: {
                 let mut m = HashMap::new();
-                m.insert(op0a, 0); m.insert(op0b, 0);
-                m.insert(op1, 1); m.insert(op2, 2);
+                m.insert(op0a, 0);
+                m.insert(op0b, 0);
+                m.insert(op1, 1);
+                m.insert(op2, 2);
                 m
             },
         };
@@ -3182,7 +3419,8 @@ mod tests {
         }
 
         let t_final = graph.add_tensor("final", vec![SymDim::Concrete(4)], DType::F32);
-        let op_consumer = graph.add_op(Op::Add,
+        let op_consumer = graph.add_op(
+            Op::Add,
             vec![mid_outs[0], mid_outs[2]],
             vec![t_final],
             "partial_consumer",
@@ -3204,7 +3442,10 @@ mod tests {
         op_map.insert(op_consumer, 6);
         op_map.insert(op_indep, 7);
 
-        let plan = FusionPlan { groups, op_to_group: op_map };
+        let plan = FusionPlan {
+            groups,
+            op_to_group: op_map,
+        };
 
         // Act
         let levels = GroupDependencyAnalyzer::analyze(&plan, &graph);
@@ -3256,7 +3497,11 @@ mod tests {
 
         let ops = [op0, op1, op2, op3, op4, op5, op6];
         let plan = FusionPlan {
-            groups: ops.iter().enumerate().map(|(i, &op)| make_group(i, op)).collect(),
+            groups: ops
+                .iter()
+                .enumerate()
+                .map(|(i, &op)| make_group(i, op))
+                .collect(),
             op_to_group: ops.iter().enumerate().map(|(i, &op)| (op, i)).collect(),
         };
 
@@ -3292,7 +3537,17 @@ mod tests {
         let t_indep = graph.add_tensor("indep_out", vec![SymDim::Concrete(4)], DType::F32);
 
         let op0a = graph.add_op(Op::Silu, vec![t_in], vec![t_mid0], "g0a");
-        let op0b = graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![t_mid0], vec![t_a], "g0b");
+        let op0b = graph.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![t_mid0],
+            vec![t_a],
+            "g0b",
+        );
         let op1a = graph.add_op(Op::Silu, vec![t_a], vec![t_mid1], "g1a");
         let op1b = graph.add_op(Op::Mul, vec![t_mid1, t_w], vec![t_b], "g1b");
         let op2 = graph.add_op(Op::Silu, vec![t_ext], vec![t_indep], "indep");
@@ -3309,7 +3564,7 @@ mod tests {
                     dominant_dtype: None,
                     marker: GroupMarker::None,
                     is_layer_group: false,
-            hetero_layer_type: None,
+                    hetero_layer_type: None,
                 },
                 crate::compiler::fusion::FusionGroup {
                     id: 1,
@@ -3321,14 +3576,16 @@ mod tests {
                     dominant_dtype: None,
                     marker: GroupMarker::None,
                     is_layer_group: false,
-            hetero_layer_type: None,
+                    hetero_layer_type: None,
                 },
                 make_group(2, op2),
             ],
             op_to_group: {
                 let mut m = HashMap::new();
-                m.insert(op0a, 0); m.insert(op0b, 0);
-                m.insert(op1a, 1); m.insert(op1b, 1);
+                m.insert(op0a, 0);
+                m.insert(op0b, 0);
+                m.insert(op1a, 1);
+                m.insert(op1b, 1);
                 m.insert(op2, 2);
                 m
             },
@@ -3358,6 +3615,6 @@ fn make_group(id: usize, anchor: OpId) -> crate::compiler::fusion::FusionGroup {
         dominant_dtype: None,
         marker: crate::compiler::fusion::GroupMarker::None,
         is_layer_group: false,
-            hetero_layer_type: None,
+        hetero_layer_type: None,
     }
 }

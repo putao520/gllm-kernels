@@ -14,7 +14,9 @@ use std::time::Instant;
 // ---------------------------------------------------------------------------
 
 fn median_time(warmup: usize, iters: usize, mut f: impl FnMut()) -> f64 {
-    for _ in 0..warmup { f(); }
+    for _ in 0..warmup {
+        f();
+    }
     let mut times = Vec::with_capacity(iters);
     for _ in 0..iters {
         let t = Instant::now();
@@ -97,9 +99,9 @@ impl HwParams {
 #[derive(Clone)]
 struct BenchResult {
     name: String,
-    metric: f64,      // GFLOPS or GB/s
+    metric: f64, // GFLOPS or GB/s
     unit: &'static str,
-    efficiency: f64,   // percent of theoretical peak
+    efficiency: f64, // percent of theoretical peak
 }
 
 // ---------------------------------------------------------------------------
@@ -109,16 +111,16 @@ struct BenchResult {
 fn bench_gemm(hw: &HwParams) -> Vec<BenchResult> {
     let kernels = CpuKernels::<f32>::new();
     let shapes: &[(&str, usize, usize, usize, usize, usize)] = &[
-        ("gemm 256x256x256",       256,  256,  256,  5, 100),
-        ("gemm 512x512x512",       512,  512,  512,  3, 30),
-        ("gemm 1024x1024x1024",    1024, 1024, 1024, 2, 10),
-        ("gemm 128x4096x4096",     128,  4096, 4096, 2, 5),
-        ("gemv 1x4096x4096",       1,    4096, 4096, 5, 30),
+        ("gemm 256x256x256", 256, 256, 256, 5, 100),
+        ("gemm 512x512x512", 512, 512, 512, 3, 30),
+        ("gemm 1024x1024x1024", 1024, 1024, 1024, 2, 10),
+        ("gemm 128x4096x4096", 128, 4096, 4096, 2, 5),
+        ("gemv 1x4096x4096", 1, 4096, 4096, 5, 30),
     ];
     let mut results = Vec::new();
     for &(name, m, n, k, warmup, iters) in shapes {
-        let a: Vec<f32> = (0..m*k).map(|i| (i % 97) as f32 * 0.01).collect();
-        let b: Vec<f32> = (0..k*n).map(|i| (i % 89) as f32 * 0.01).collect();
+        let a: Vec<f32> = (0..m * k).map(|i| (i % 97) as f32 * 0.01).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i % 89) as f32 * 0.01).collect();
         let mut c = vec![0.0f32; m * n];
         let secs = median_time(warmup, iters, || {
             kernels.gemm(&a, &b, &mut c, m, n, k);
@@ -137,9 +139,9 @@ fn bench_gemm(hw: &HwParams) -> Vec<BenchResult> {
 
 fn bench_quant_gemv(_hw: &HwParams) -> Vec<BenchResult> {
     let kernels = CpuKernels::<f32>::new();
-    let k = 4096usize;   // input features
-    let m = 4096usize;   // output features (weight rows)
-    let n = 1usize;      // batch size
+    let k = 4096usize; // input features
+    let m = 4096usize; // output features (weight rows)
+    let n = 1usize; // batch size
     let mut results = Vec::new();
 
     // Q4_K GEMV via gemm_q4 (m=batch, n=out_features, k=in_features — different convention)
@@ -180,8 +182,15 @@ fn bench_quant_gemv(_hw: &HwParams) -> Vec<BenchResult> {
         let input = vec![1.0f32; k * n]; // [k x n]
         let mut output = vec![0.0f32; m * n];
         let secs = median_time(3, 20, || {
-            kernels.kquant_matmul(&weight_raw, &input, &mut output,
-                gllm_kernels::quant::QuantType::Q8K, m, n, k);
+            kernels.kquant_matmul(
+                &weight_raw,
+                &input,
+                &mut output,
+                gllm_kernels::quant::QuantType::Q8K,
+                m,
+                n,
+                k,
+            );
         });
         let gflops = (2.0 * m as f64 * n as f64 * k as f64) / secs / 1e9;
         let bw = (weight_bytes_total as f64 + (k * n * 4) as f64) / secs / 1e9;
@@ -227,7 +236,9 @@ fn bench_memory_ops(_hw: &HwParams) -> Vec<BenchResult> {
 
     // softmax
     {
-        let data = (0..dim).map(|i| (i % 100) as f32 * 0.01).collect::<Vec<_>>();
+        let data = (0..dim)
+            .map(|i| (i % 100) as f32 * 0.01)
+            .collect::<Vec<_>>();
         let mut out = vec![0.0f32; dim];
         let secs = median_time(5, 100, || {
             kernels.softmax(&data, &mut out);
@@ -277,7 +288,9 @@ fn results_to_json(results: &[BenchResult]) -> String {
             "    {{\"name\": \"{}\", \"metric\": {:.4}, \"unit\": \"{}\"}}",
             r.name, r.metric, r.unit
         ));
-        if i + 1 < results.len() { s.push(','); }
+        if i + 1 < results.len() {
+            s.push(',');
+        }
         s.push('\n');
     }
     s.push_str("  ]\n}\n");
@@ -289,7 +302,9 @@ fn load_baseline(path: &str) -> Option<Vec<BenchResult>> {
     let mut results = Vec::new();
     for line in content.lines() {
         let line = line.trim();
-        if !line.starts_with("{\"name\"") { continue; }
+        if !line.starts_with("{\"name\"") {
+            continue;
+        }
         let line = line.trim_end_matches(',');
         // Parse: {"name": "...", "metric": ..., "unit": "..."}
         let name = extract_json_str(line, "name")?;
@@ -300,7 +315,12 @@ fn load_baseline(path: &str) -> Option<Vec<BenchResult>> {
             "GB/s" => "GB/s",
             _ => "?",
         };
-        results.push(BenchResult { name, metric, unit: unit_static, efficiency: 0.0 });
+        results.push(BenchResult {
+            name,
+            metric,
+            unit: unit_static,
+            efficiency: 0.0,
+        });
     }
     Some(results)
 }
@@ -309,7 +329,9 @@ fn extract_json_str(line: &str, key: &str) -> Option<String> {
     let pat = format!("\"{}\":", key);
     let idx = line.find(&pat)? + pat.len();
     let rest = &line[idx..].trim_start();
-    if !rest.starts_with('"') { return None; }
+    if !rest.starts_with('"') {
+        return None;
+    }
     let end = rest[1..].find('"')? + 1;
     Some(rest[1..end].to_string())
 }
@@ -318,7 +340,9 @@ fn extract_json_num(line: &str, key: &str) -> Option<f64> {
     let pat = format!("\"{}\":", key);
     let idx = line.find(&pat)? + pat.len();
     let rest = line[idx..].trim_start();
-    let end = rest.find(|c: char| c == ',' || c == '}').unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| c == ',' || c == '}')
+        .unwrap_or(rest.len());
     rest[..end].trim().parse().ok()
 }
 
@@ -336,19 +360,31 @@ fn main() {
     let isa = get_isa_level();
 
     println!("=== gllm-kernels Performance Regression Test ===");
-    println!("ISA: {:?}  Cores: {}  Freq: {:.1} GHz  FMA: {}x{}",
-             isa, hw.cores, hw.freq_ghz, hw.ports, hw.lanes);
-    println!("Peak: {:.1} GFLOPS (1-core)  {:.0} GFLOPS (all-core)",
-             hw.peak_gflops_1core(), hw.peak_gflops_all());
+    println!(
+        "ISA: {:?}  Cores: {}  Freq: {:.1} GHz  FMA: {}x{}",
+        isa, hw.cores, hw.freq_ghz, hw.ports, hw.lanes
+    );
+    println!(
+        "Peak: {:.1} GFLOPS (1-core)  {:.0} GFLOPS (all-core)",
+        hw.peak_gflops_1core(),
+        hw.peak_gflops_all()
+    );
     println!("Rayon threads: {}", rayon::current_num_threads());
     println!();
 
-    let baseline = if compare { load_baseline(baseline_path) } else { None };
+    let baseline = if compare {
+        load_baseline(baseline_path)
+    } else {
+        None
+    };
 
     let mut all_results = Vec::new();
 
     // GEMM
-    println!("{:<42} {:>10} {:>6} {:>8}", "Benchmark", "Result", "Unit", "Eff%");
+    println!(
+        "{:<42} {:>10} {:>6} {:>8}",
+        "Benchmark", "Result", "Unit", "Eff%"
+    );
     println!("{}", "-".repeat(70));
 
     let gemm = bench_gemm(&hw);
@@ -386,12 +422,22 @@ fn print_result(r: &BenchResult, baseline: &Option<Vec<BenchResult>>) {
         "—".to_string()
     };
 
-    let delta = baseline.as_ref().and_then(|bl| {
-        bl.iter().find(|b| b.name == r.name).map(|b| {
-            let pct = (r.metric - b.metric) / b.metric * 100.0;
-            if pct >= 0.0 { format!(" +{:.1}%", pct) } else { format!(" {:.1}%", pct) }
+    let delta = baseline
+        .as_ref()
+        .and_then(|bl| {
+            bl.iter().find(|b| b.name == r.name).map(|b| {
+                let pct = (r.metric - b.metric) / b.metric * 100.0;
+                if pct >= 0.0 {
+                    format!(" +{:.1}%", pct)
+                } else {
+                    format!(" {:.1}%", pct)
+                }
+            })
         })
-    }).unwrap_or_default();
+        .unwrap_or_default();
 
-    println!("{:<42} {:>8.1} {:>6} {:>8}{}", r.name, r.metric, r.unit, eff_str, delta);
+    println!(
+        "{:<42} {:>8.1} {:>6} {:>8}{}",
+        r.name, r.metric, r.unit, eff_str, delta
+    );
 }

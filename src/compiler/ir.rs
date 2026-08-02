@@ -3,9 +3,9 @@
 //! Not a general-purpose DAG — this is a transformer-specific IR that
 //! captures the computation graph of a single layer for the JIT compiler.
 
-use crate::types::DType;
 use crate::quant::QuantType;
 use crate::traits::Activation;
+use crate::types::DType;
 
 /// MoE configuration — derived from graph topology, not a bool flag.
 ///
@@ -56,10 +56,7 @@ pub struct LayerIR {
 
 impl LayerIR {
     /// Build a LayerIR from a ModelConfig.
-    pub fn from_model_config(
-        config: &crate::types::ModelConfig,
-        max_batch: usize,
-    ) -> Self {
+    pub fn from_model_config(config: &crate::types::ModelConfig, max_batch: usize) -> Self {
         let activation = match config.arch {
             crate::types::ModelArch::Gemma => Activation::GeGlu,
             crate::types::ModelArch::Gpt2 => Activation::Gelu,
@@ -114,7 +111,11 @@ impl LayerIR {
         // Output projection: 2*q*h
         let o_flops = 2 * q * h;
         // FFN: gated (3 GEMM) = 6*h*inter, non-gated (2 GEMM) = 4*h*inter
-        let ffn_flops = if self.activation.is_gated() { 6 * h * inter } else { 4 * h * inter };
+        let ffn_flops = if self.activation.is_gated() {
+            6 * h * inter
+        } else {
+            4 * h * inter
+        };
         // Attention: ~4*seq*head_dim per head (approximate for seq=1)
         let attn_flops = 4 * self.head_dim as u64 * self.num_heads as u64;
 
@@ -137,8 +138,7 @@ impl LayerIR {
             // non-gated: up + down
             h * inter + inter * h
         };
-        (h * q + h * kv + h * kv + q * h + ffn_weights) * elem
-            + 2 * h * elem
+        (h * q + h * kv + h * kv + q * h + ffn_weights) * elem + 2 * h * elem
     }
 }
 
@@ -175,14 +175,20 @@ mod tests {
 
     #[test]
     fn moe_config_fields() {
-        let moe = MoeConfig { num_experts: 8, top_k: 2 };
+        let moe = MoeConfig {
+            num_experts: 8,
+            top_k: 2,
+        };
         assert_eq!(moe.num_experts, 8);
         assert_eq!(moe.top_k, 2);
     }
 
     #[test]
     fn moe_config_clone() {
-        let moe = MoeConfig { num_experts: 4, top_k: 1 };
+        let moe = MoeConfig {
+            num_experts: 4,
+            top_k: 1,
+        };
         let cloned = moe;
         assert_eq!(cloned.num_experts, moe.num_experts);
     }
@@ -324,7 +330,10 @@ mod tests {
 
     #[test]
     fn moe_config_debug_format() {
-        let moe = MoeConfig { num_experts: 64, top_k: 8 };
+        let moe = MoeConfig {
+            num_experts: 64,
+            top_k: 8,
+        };
         let debug = format!("{:?}", moe);
         assert!(debug.contains("64"), "should contain num_experts: {debug}");
         assert!(debug.contains("8"), "should contain top_k: {debug}");
@@ -342,8 +351,10 @@ mod tests {
         config_big.intermediate_size = 22016;
         let ir_big = LayerIR::from_model_config(&config_big, 1);
 
-        assert!(ir_big.flops_per_token() > ir_small.flops_per_token(),
-            "larger model should have more FLOPs");
+        assert!(
+            ir_big.flops_per_token() > ir_small.flops_per_token(),
+            "larger model should have more FLOPs"
+        );
     }
 
     #[test]
@@ -357,8 +368,10 @@ mod tests {
         config_big.intermediate_size = 22016;
         let ir_big = LayerIR::from_model_config(&config_big, 1);
 
-        assert!(ir_big.weight_bytes() > ir_small.weight_bytes(),
-            "larger model should have more weight bytes");
+        assert!(
+            ir_big.weight_bytes() > ir_small.weight_bytes(),
+            "larger model should have more weight bytes"
+        );
     }
 
     #[test]

@@ -56,7 +56,12 @@ impl FlashAttnConfig {
     ///
     /// Optimal tile_kv = L1 / (2 * head_dim * sizeof(f32)) — fits one K tile
     /// and one V tile in L1 simultaneously, rounded down to power of 2.
-    pub fn with_cache_hint(head_dim: usize, num_heads: usize, num_kv_heads: usize, l1_bytes: usize) -> Self {
+    pub fn with_cache_hint(
+        head_dim: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        l1_bytes: usize,
+    ) -> Self {
         // Each tile needs K[tile_kv, head_dim] + V[tile_kv, head_dim] in cache
         let bytes_per_kv_row = head_dim * std::mem::size_of::<f32>() * 2; // K + V, f32
         let max_tile = if bytes_per_kv_row > 0 {
@@ -140,7 +145,10 @@ pub fn flash_attn_single_head(
 
             // Online softmax update
             let old_max = row_max[qi];
-            let tile_max = tile_scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let tile_max = tile_scores
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
             let new_max = old_max.max(tile_max);
 
             // Rescale previous accumulator
@@ -801,7 +809,15 @@ mod tests {
         // --- FlashAttention ---
         let mut flash_output = vec![0.0f32; seq_q * head_dim];
         flash_attn_single_head(
-            &q, &k, &v, &mut flash_output, seq_q, seq_kv, head_dim, scale, true,
+            &q,
+            &k,
+            &v,
+            &mut flash_output,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            true,
         );
 
         // Compare
@@ -910,12 +926,8 @@ mod tests {
             let mut flash_out = vec![0.0f32; num_heads * seq_len * head_dim];
             let mut naive_out = vec![0.0f32; num_heads * seq_len * head_dim];
 
-            flash_attn_multi_head(
-                &config, &q, &k, &v, &mut flash_out, seq_len, seq_len, true,
-            );
-            naive_attention_multi_head(
-                &config, &q, &k, &v, &mut naive_out, seq_len, seq_len, true,
-            );
+            flash_attn_multi_head(&config, &q, &k, &v, &mut flash_out, seq_len, seq_len, true);
+            naive_attention_multi_head(&config, &q, &k, &v, &mut naive_out, seq_len, seq_len, true);
 
             let max_rel_err = flash_out
                 .iter()
@@ -954,7 +966,15 @@ mod tests {
 
         let mut flash_out = vec![0.0f32; seq_len * head_dim];
         flash_attn_single_head(
-            &q, &k, &v, &mut flash_out, seq_len, seq_len, head_dim, scale, true,
+            &q,
+            &k,
+            &v,
+            &mut flash_out,
+            seq_len,
+            seq_len,
+            head_dim,
+            scale,
+            true,
         );
 
         // Verify output is finite and non-trivial
@@ -1046,9 +1066,7 @@ mod tests {
         let attn_config = FlashAttnConfig::new(head_dim, num_heads, num_kv_heads);
 
         // Generate deterministic K/V data
-        let make_val = |i: usize, seed: usize| -> f32 {
-            ((i + seed) as f32 * 0.11).sin() * 0.3
-        };
+        let make_val = |i: usize, seed: usize| -> f32 { ((i + seed) as f32 * 0.11).sin() * 0.3 };
 
         // Append tokens and write K/V into cache pages
         let v_base = num_kv_heads * PAGE_SIZE * head_dim;
@@ -1189,9 +1207,7 @@ mod tests {
 
         let mut kv_cache = KvCache::new(&cfg, 1, cfg.max_seq_len).unwrap();
 
-        let make_val = |i: usize, seed: usize| -> f32 {
-            ((i + seed) as f32 * 0.13).sin() * 0.25
-        };
+        let make_val = |i: usize, seed: usize| -> f32 { ((i + seed) as f32 * 0.13).sin() * 0.25 };
 
         // Accumulate K/V for naive reference
         let mut all_k = Vec::<Vec<f32>>::new(); // [num_kv_heads][t * head_dim..]
@@ -1320,26 +1336,8 @@ mod tests {
         let mut prefill_out = vec![0.0f32; num_heads * seq_len * head_dim];
         let mut naive_out = vec![0.0f32; num_heads * seq_len * head_dim];
 
-        flash_attn_prefill(
-            &config,
-            &q,
-            &k,
-            &v,
-            &mut prefill_out,
-            seq_len,
-            seq_len,
-            0,
-        );
-        naive_attention_multi_head(
-            &config,
-            &q,
-            &k,
-            &v,
-            &mut naive_out,
-            seq_len,
-            seq_len,
-            true,
-        );
+        flash_attn_prefill(&config, &q, &k, &v, &mut prefill_out, seq_len, seq_len, 0);
+        naive_attention_multi_head(&config, &q, &k, &v, &mut naive_out, seq_len, seq_len, true);
 
         let max_rel_err = prefill_out
             .iter()
@@ -1393,9 +1391,7 @@ mod tests {
         let decode_steps = 4usize;
         let total_len = prefill_len + decode_steps;
 
-        let make_val = |i: usize, seed: usize| -> f32 {
-            ((i + seed) as f32 * 0.11).sin() * 0.3
-        };
+        let make_val = |i: usize, seed: usize| -> f32 { ((i + seed) as f32 * 0.11).sin() * 0.3 };
 
         // Pre-generate all K/V/Q for all positions
         let all_k_flat: Vec<Vec<f32>> = (0..num_kv_heads)
@@ -1534,12 +1530,8 @@ mod tests {
         let mut flash_out = vec![0.0f32; num_heads * seq_len * head_dim];
         let mut naive_out = vec![0.0f32; num_heads * seq_len * head_dim];
 
-        flash_attn_multi_head(
-            &config, &q, &k, &v, &mut flash_out, seq_len, seq_len, true,
-        );
-        naive_attention_multi_head(
-            &config, &q, &k, &v, &mut naive_out, seq_len, seq_len, true,
-        );
+        flash_attn_multi_head(&config, &q, &k, &v, &mut flash_out, seq_len, seq_len, true);
+        naive_attention_multi_head(&config, &q, &k, &v, &mut naive_out, seq_len, seq_len, true);
 
         // All 32 query heads share the same single KV head
         // Verify all heads that share a KV head produce identical results
@@ -1567,7 +1559,14 @@ mod tests {
             .repeat(num_heads * seq_len);
         let mut out_same = vec![0.0f32; num_heads * seq_len * head_dim];
         flash_attn_multi_head(
-            &config, &q_same, &k, &v, &mut out_same, seq_len, seq_len, true,
+            &config,
+            &q_same,
+            &k,
+            &v,
+            &mut out_same,
+            seq_len,
+            seq_len,
+            true,
         );
 
         // All heads should produce identical output since Q is the same
@@ -1653,7 +1652,10 @@ mod tests {
             "tile_kv = {} should be in [16, 512]",
             config.tile_kv
         );
-        assert!(config.tile_kv.is_power_of_two(), "tile_kv should be power of 2");
+        assert!(
+            config.tile_kv.is_power_of_two(),
+            "tile_kv should be power of 2"
+        );
 
         // Verify scale is still correct
         let expected_scale = 1.0 / (head_dim as f32).sqrt();
@@ -1672,7 +1674,10 @@ mod tests {
         let config = FlashAttnConfig::with_cache_hint(128, 4, 2, 512);
 
         // Assert
-        assert_eq!(config.tile_kv, 16, "tiny L1 should floor tile_kv to minimum 16");
+        assert_eq!(
+            config.tile_kv, 16,
+            "tiny L1 should floor tile_kv to minimum 16"
+        );
     }
 
     /// FlashAttnConfig struct update syntax preserves unmodified fields.
@@ -1757,7 +1762,17 @@ mod tests {
         let mut output = vec![0.0f32; seq_len * head_dim];
 
         // Act: non-causal
-        flash_attn_single_head(&q, &k, &v, &mut output, seq_len, seq_len, head_dim, scale, false);
+        flash_attn_single_head(
+            &q,
+            &k,
+            &v,
+            &mut output,
+            seq_len,
+            seq_len,
+            head_dim,
+            scale,
+            false,
+        );
 
         // Assert: uniform attention => each output = mean of V = [1/3, 1/3, 1/3, 0]
         let expected = 1.0 / 3.0;
@@ -1876,7 +1891,9 @@ mod tests {
         let config = FlashAttnConfig::new(head_dim, num_heads, num_kv_heads);
 
         let make_data = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i + seed) as f32 * 0.07).sin() * 0.4).collect()
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.07).sin() * 0.4)
+                .collect()
         };
 
         let q = make_data(num_heads * seq_q * head_dim, 0);
@@ -1887,7 +1904,16 @@ mod tests {
         let mut naive_out = vec![0.0f32; num_heads * seq_q * head_dim];
 
         // Act
-        flash_attn_prefill(&config, &q, &k, &v, &mut prefill_out, seq_q, seq_kv, kv_offset);
+        flash_attn_prefill(
+            &config,
+            &q,
+            &k,
+            &v,
+            &mut prefill_out,
+            seq_q,
+            seq_kv,
+            kv_offset,
+        );
         naive_attention_multi_head(&config, &q, &k, &v, &mut naive_out, seq_q, seq_kv, true);
 
         // Assert: prefill with offset should match naive causal attention
@@ -2001,8 +2027,28 @@ mod tests {
         let mut naive_out = vec![0.0f32; seq_len * head_dim];
 
         // Act
-        flash_attn_single_head(&q, &k, &v, &mut flash_out, seq_len, seq_len, head_dim, scale, true);
-        naive_attention_single_head(&q, &k, &v, &mut naive_out, seq_len, seq_len, head_dim, scale, true);
+        flash_attn_single_head(
+            &q,
+            &k,
+            &v,
+            &mut flash_out,
+            seq_len,
+            seq_len,
+            head_dim,
+            scale,
+            true,
+        );
+        naive_attention_single_head(
+            &q,
+            &k,
+            &v,
+            &mut naive_out,
+            seq_len,
+            seq_len,
+            head_dim,
+            scale,
+            true,
+        );
 
         // Assert: all outputs finite
         assert!(
@@ -2074,7 +2120,10 @@ mod tests {
         let config = FlashAttnConfig::with_cache_hint(4, 8, 4, 4 * 1024 * 1024);
 
         // Assert
-        assert_eq!(config.tile_kv, 512, "huge L1 should cap tile_kv at maximum 512");
+        assert_eq!(
+            config.tile_kv, 512,
+            "huge L1 should cap tile_kv at maximum 512"
+        );
     }
 
     /// Double transpose: head-major -> token-major -> head-major should round-trip.
@@ -2095,7 +2144,13 @@ mod tests {
         // Act: original(token) -> head -> token -> head
         transpose_to_head_major(&original, &mut head_major, seq_len, num_heads, head_dim);
         transpose_to_token_major(&head_major, &mut token_major, seq_len, num_heads, head_dim);
-        transpose_to_head_major(&token_major, &mut back_to_head, seq_len, num_heads, head_dim);
+        transpose_to_head_major(
+            &token_major,
+            &mut back_to_head,
+            seq_len,
+            num_heads,
+            head_dim,
+        );
 
         // Assert: head_major round-trips through token-major
         let max_diff = head_major
@@ -2118,8 +2173,12 @@ mod tests {
         let head_dim = 6;
         let scale = 1.0 / (head_dim as f32).sqrt();
 
-        let q: Vec<f32> = (0..head_dim).map(|d| ((d + 1) as f32 * 0.5).sin()).collect();
-        let k: Vec<f32> = (0..head_dim).map(|d| ((d + 3) as f32 * 0.7).cos()).collect();
+        let q: Vec<f32> = (0..head_dim)
+            .map(|d| ((d + 1) as f32 * 0.5).sin())
+            .collect();
+        let k: Vec<f32> = (0..head_dim)
+            .map(|d| ((d + 3) as f32 * 0.7).cos())
+            .collect();
         let v: Vec<f32> = (0..head_dim).map(|d| (d as f32 + 1.0) * 0.3).collect();
         let mut output = vec![0.0f32; head_dim];
 
@@ -2159,7 +2218,17 @@ mod tests {
         let mut output = vec![0.0f32; head_dim];
 
         // Act
-        flash_attn_single_head(&q, &k, &v, &mut output, seq_q, seq_kv, head_dim, scale, false);
+        flash_attn_single_head(
+            &q,
+            &k,
+            &v,
+            &mut output,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            false,
+        );
 
         // Assert: uniform attention => output dim0 = mean(1,2,3,4) = 2.5
         let expected_mean = (1.0 + 2.0 + 3.0 + 4.0) / 4.0;
@@ -2190,7 +2259,9 @@ mod tests {
         let scale = 1.0 / (head_dim as f32).sqrt();
 
         let make_data = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i + seed) as f32 * 0.11).sin() * 0.4).collect()
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.11).sin() * 0.4)
+                .collect()
         };
 
         let q = make_data(seq_q * head_dim, 0);
@@ -2201,8 +2272,28 @@ mod tests {
         let mut naive_out = vec![0.0f32; seq_q * head_dim];
 
         // Act
-        flash_attn_single_head(&q, &k, &v, &mut flash_out, seq_q, seq_kv, head_dim, scale, false);
-        naive_attention_single_head(&q, &k, &v, &mut naive_out, seq_q, seq_kv, head_dim, scale, false);
+        flash_attn_single_head(
+            &q,
+            &k,
+            &v,
+            &mut flash_out,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            false,
+        );
+        naive_attention_single_head(
+            &q,
+            &k,
+            &v,
+            &mut naive_out,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            false,
+        );
 
         // Assert
         let max_diff = flash_out
@@ -2230,7 +2321,9 @@ mod tests {
         let config = FlashAttnConfig::new(head_dim, num_heads, num_kv_heads);
 
         let make_data = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i + seed) as f32 * 0.13).sin() * 0.3).collect()
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.13).sin() * 0.3)
+                .collect()
         };
 
         let q = make_data(num_heads * seq_len * head_dim, 0);
@@ -2301,13 +2394,25 @@ mod tests {
         let seq_kv = 1;
         let scale = 1.0 / (head_dim as f32).sqrt();
 
-        let q: Vec<f32> = (0..seq_q * head_dim).map(|i| ((i as f32 * 0.3).sin())).collect();
+        let q: Vec<f32> = (0..seq_q * head_dim)
+            .map(|i| ((i as f32 * 0.3).sin()))
+            .collect();
         let k: Vec<f32> = (0..head_dim).map(|d| ((d as f32 * 0.5).cos())).collect();
         let v: Vec<f32> = (0..head_dim).map(|d| (d as f32 + 1.0) * 0.25).collect();
         let mut output = vec![0.0f32; seq_q * head_dim];
 
         // Act
-        flash_attn_single_head(&q, &k, &v, &mut output, seq_q, seq_kv, head_dim, scale, false);
+        flash_attn_single_head(
+            &q,
+            &k,
+            &v,
+            &mut output,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            false,
+        );
 
         // Assert: single KV => softmax=[1.0] for every query => output=V
         for qi in 0..seq_q {
@@ -2335,7 +2440,9 @@ mod tests {
         let config = FlashAttnConfig::new(head_dim, num_heads, num_kv_heads);
 
         let make_data = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i + seed) as f32 * 0.09).cos() * 0.35).collect()
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.09).cos() * 0.35)
+                .collect()
         };
 
         let q = make_data(num_heads * seq_len * head_dim, 0);
@@ -2377,7 +2484,9 @@ mod tests {
         let scale = 1.0 / (head_dim as f32).sqrt();
 
         let make_data = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i + seed) as f32 * 0.09).sin() * 0.35).collect()
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.09).sin() * 0.35)
+                .collect()
         };
 
         let q = make_data(seq_q * head_dim, 0);
@@ -2387,8 +2496,28 @@ mod tests {
         let mut naive_out = vec![0.0f32; seq_q * head_dim];
 
         // Act
-        flash_attn_single_head(&q, &k, &v, &mut flash_out, seq_q, seq_kv, head_dim, scale, true);
-        naive_attention_single_head(&q, &k, &v, &mut naive_out, seq_q, seq_kv, head_dim, scale, true);
+        flash_attn_single_head(
+            &q,
+            &k,
+            &v,
+            &mut flash_out,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            true,
+        );
+        naive_attention_single_head(
+            &q,
+            &k,
+            &v,
+            &mut naive_out,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            true,
+        );
 
         // Assert
         let max_diff = flash_out
@@ -2417,7 +2546,9 @@ mod tests {
         let config = FlashAttnConfig::new(head_dim, num_heads, num_kv_heads);
 
         let make_data = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i + seed) as f32 * 0.07).cos() * 0.3).collect()
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.07).cos() * 0.3)
+                .collect()
         };
 
         let q = make_data(num_heads * seq_q * head_dim, 0);
@@ -2428,7 +2559,16 @@ mod tests {
         let mut naive_out = vec![0.0f32; num_heads * seq_q * head_dim];
 
         // Act
-        flash_attn_prefill(&config, &q, &k, &v, &mut prefill_out, seq_q, seq_kv, kv_offset);
+        flash_attn_prefill(
+            &config,
+            &q,
+            &k,
+            &v,
+            &mut prefill_out,
+            seq_q,
+            seq_kv,
+            kv_offset,
+        );
         naive_attention_multi_head(&config, &q, &k, &v, &mut naive_out, seq_q, seq_kv, true);
 
         // Assert
@@ -2482,9 +2622,7 @@ mod tests {
         let mut kv_cache = KvCache::new(&cfg, 1, cfg.max_seq_len).unwrap();
         let attn_config = FlashAttnConfig::new(head_dim, num_heads, num_kv_heads);
 
-        let make_val = |i: usize, seed: usize| -> f32 {
-            ((i + seed) as f32 * 0.11).sin() * 0.3
-        };
+        let make_val = |i: usize, seed: usize| -> f32 { ((i + seed) as f32 * 0.11).sin() * 0.3 };
 
         // Write 10 tokens into paged cache
         let kv_dtype = kv_cache.dtype();
@@ -2648,7 +2786,9 @@ mod tests {
         let config = FlashAttnConfig::new(head_dim, num_heads, num_kv_heads);
 
         let make_data = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i + seed) as f32 * 0.13).cos() * 0.35).collect()
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.13).cos() * 0.35)
+                .collect()
         };
 
         let q = make_data(num_heads * seq_q * head_dim, 0);
@@ -2658,7 +2798,14 @@ mod tests {
 
         // Act
         naive_attention_multi_head(
-            &config, &q, &k, &v, &mut naive_multi_out, seq_q, seq_kv, false,
+            &config,
+            &q,
+            &k,
+            &v,
+            &mut naive_multi_out,
+            seq_q,
+            seq_kv,
+            false,
         );
 
         // Assert: each head must match independent naive_attention_single_head
@@ -2768,7 +2915,8 @@ mod tests {
 
         // Act
         let config_new = FlashAttnConfig::new(head_dim, num_heads, num_kv_heads);
-        let config_hint = FlashAttnConfig::with_cache_hint(head_dim, num_heads, num_kv_heads, l1_bytes);
+        let config_hint =
+            FlashAttnConfig::with_cache_hint(head_dim, num_heads, num_kv_heads, l1_bytes);
 
         // Assert: structural fields must match
         assert_eq!(config_hint.head_dim, head_dim);
@@ -2808,16 +2956,36 @@ mod tests {
         let k = vec![1.0f32; seq_kv * head_dim];
         // Distinct V rows so we can verify only V[0] contributes
         let mut v = vec![0.0f32; seq_kv * head_dim];
-        v[0] = 1.0;                    // V[0] = [1, 0, 0, 0]
-        v[head_dim + 1] = 2.0;         // V[1] = [0, 2, 0, 0]
-        v[2 * head_dim + 2] = 3.0;     // V[2] = [0, 0, 3, 0]
+        v[0] = 1.0; // V[0] = [1, 0, 0, 0]
+        v[head_dim + 1] = 2.0; // V[1] = [0, 2, 0, 0]
+        v[2 * head_dim + 2] = 3.0; // V[2] = [0, 0, 3, 0]
 
         let mut flash_out = vec![0.0f32; head_dim];
         let mut naive_out = vec![0.0f32; head_dim];
 
         // Act
-        flash_attn_single_head(&q, &k, &v, &mut flash_out, seq_q, seq_kv, head_dim, scale, true);
-        naive_attention_single_head(&q, &k, &v, &mut naive_out, seq_q, seq_kv, head_dim, scale, true);
+        flash_attn_single_head(
+            &q,
+            &k,
+            &v,
+            &mut flash_out,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            true,
+        );
+        naive_attention_single_head(
+            &q,
+            &k,
+            &v,
+            &mut naive_out,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            true,
+        );
 
         // Assert: flash matches naive
         let max_diff = flash_out
@@ -2866,7 +3034,9 @@ mod tests {
         let config = FlashAttnConfig::new(head_dim, num_heads, num_kv_heads);
 
         let make_data = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i + seed) as f32 * 0.07).sin() * 0.4).collect()
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.07).sin() * 0.4)
+                .collect()
         };
 
         let q = make_data(num_heads * seq_q * head_dim, 0);
@@ -2876,7 +3046,16 @@ mod tests {
         let mut prefill_out = vec![0.0f32; num_heads * seq_q * head_dim];
 
         // Act
-        flash_attn_prefill(&config, &q, &k, &v, &mut prefill_out, seq_q, seq_kv, kv_offset);
+        flash_attn_prefill(
+            &config,
+            &q,
+            &k,
+            &v,
+            &mut prefill_out,
+            seq_q,
+            seq_kv,
+            kv_offset,
+        );
 
         // Assert: manually verify each query position
         let scale = config.scale;
@@ -2938,7 +3117,9 @@ mod tests {
         let scale = 1.0 / (head_dim as f32).sqrt();
 
         let make_data = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i + seed) as f32 * 0.17).cos() * 0.5).collect()
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.17).cos() * 0.5)
+                .collect()
         };
 
         let q = make_data(seq_q * head_dim, 0);
@@ -2948,8 +3129,28 @@ mod tests {
         let mut naive_out = vec![0.0f32; seq_q * head_dim];
 
         // Act
-        flash_attn_single_head(&q, &k, &v, &mut flash_out, seq_q, seq_kv, head_dim, scale, true);
-        naive_attention_single_head(&q, &k, &v, &mut naive_out, seq_q, seq_kv, head_dim, scale, true);
+        flash_attn_single_head(
+            &q,
+            &k,
+            &v,
+            &mut flash_out,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            true,
+        );
+        naive_attention_single_head(
+            &q,
+            &k,
+            &v,
+            &mut naive_out,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            true,
+        );
 
         // Assert
         let max_diff = flash_out
@@ -2975,7 +3176,9 @@ mod tests {
         let custom_scale = 0.125f32; // deliberately different from 1/sqrt(8) ~ 0.354
 
         let make_data = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i + seed) as f32 * 0.11).sin() * 0.4).collect()
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.11).sin() * 0.4)
+                .collect()
         };
 
         let q = make_data(seq_q * head_dim, 0);
@@ -2985,8 +3188,28 @@ mod tests {
         let mut naive_out = vec![0.0f32; seq_q * head_dim];
 
         // Act
-        flash_attn_single_head(&q, &k, &v, &mut flash_out, seq_q, seq_kv, head_dim, custom_scale, false);
-        naive_attention_single_head(&q, &k, &v, &mut naive_out, seq_q, seq_kv, head_dim, custom_scale, false);
+        flash_attn_single_head(
+            &q,
+            &k,
+            &v,
+            &mut flash_out,
+            seq_q,
+            seq_kv,
+            head_dim,
+            custom_scale,
+            false,
+        );
+        naive_attention_single_head(
+            &q,
+            &k,
+            &v,
+            &mut naive_out,
+            seq_q,
+            seq_kv,
+            head_dim,
+            custom_scale,
+            false,
+        );
 
         // Assert
         let max_diff = flash_out
@@ -3019,10 +3242,22 @@ mod tests {
 
         // Mix of large positive and negative values
         let q: Vec<f32> = (0..seq_q * head_dim)
-            .map(|i| if i % 3 == 0 { -10.0 } else { (i as f32 * 0.13).sin() * 2.0 })
+            .map(|i| {
+                if i % 3 == 0 {
+                    -10.0
+                } else {
+                    (i as f32 * 0.13).sin() * 2.0
+                }
+            })
             .collect();
         let k: Vec<f32> = (0..seq_kv * head_dim)
-            .map(|i| if i % 5 == 0 { -8.0 } else { (i as f32 * 0.17).cos() * 1.5 })
+            .map(|i| {
+                if i % 5 == 0 {
+                    -8.0
+                } else {
+                    (i as f32 * 0.17).cos() * 1.5
+                }
+            })
             .collect();
         let v: Vec<f32> = (0..seq_kv * head_dim)
             .map(|i| (i as f32 * 0.03).sin() * 0.5)
@@ -3032,8 +3267,28 @@ mod tests {
         let mut naive_out = vec![0.0f32; seq_q * head_dim];
 
         // Act
-        flash_attn_single_head(&q, &k, &v, &mut flash_out, seq_q, seq_kv, head_dim, scale, false);
-        naive_attention_single_head(&q, &k, &v, &mut naive_out, seq_q, seq_kv, head_dim, scale, false);
+        flash_attn_single_head(
+            &q,
+            &k,
+            &v,
+            &mut flash_out,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            false,
+        );
+        naive_attention_single_head(
+            &q,
+            &k,
+            &v,
+            &mut naive_out,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            false,
+        );
 
         // Assert
         assert!(
@@ -3067,7 +3322,9 @@ mod tests {
         let config = FlashAttnConfig::new(head_dim, num_heads, num_kv_heads);
 
         let make_data = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i + seed) as f32 * 0.07).sin() * 0.3).collect()
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.07).sin() * 0.3)
+                .collect()
         };
 
         let q = make_data(num_heads * seq_q * head_dim, 0);
@@ -3173,7 +3430,17 @@ mod tests {
         let mut output = vec![0.0f32; seq_q * head_dim];
 
         // Act: causal => qi=0 sees kj=0 only; qi=1 sees kj=0,1
-        naive_attention_single_head(&q, &k, &v, &mut output, seq_q, seq_kv, head_dim, scale, true);
+        naive_attention_single_head(
+            &q,
+            &k,
+            &v,
+            &mut output,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            true,
+        );
 
         // Assert: qi=0 sees only V[0] => output[0] = V[0][0] = 1.0
         assert!(
@@ -3234,9 +3501,7 @@ mod tests {
         let mut kv_cache = KvCache::new(&cfg, 1, cfg.max_seq_len).unwrap();
         let attn_config = FlashAttnConfig::new(head_dim, num_heads, num_kv_heads);
 
-        let make_val = |i: usize, seed: usize| -> f32 {
-            ((i + seed) as f32 * 0.11).sin() * 0.3
-        };
+        let make_val = |i: usize, seed: usize| -> f32 { ((i + seed) as f32 * 0.11).sin() * 0.3 };
 
         // Write K/V into cache
         let kv_dtype = kv_cache.dtype();
@@ -3351,7 +3616,9 @@ mod tests {
         let config = FlashAttnConfig::new(head_dim, num_heads, num_kv_heads);
 
         let make_data = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i + seed) as f32 * 0.09).sin() * 0.4).collect()
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.09).sin() * 0.4)
+                .collect()
         };
 
         let q = make_data(num_heads * seq_q * head_dim, 0);
@@ -3432,7 +3699,9 @@ mod tests {
         let scale = 1.0 / (head_dim as f32).sqrt();
 
         let make_data = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i + seed) as f32 * 0.03).sin() * 0.4).collect()
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.03).sin() * 0.4)
+                .collect()
         };
 
         let q = make_data(seq_q * head_dim, 0);
@@ -3442,8 +3711,28 @@ mod tests {
         let mut naive_out = vec![0.0f32; seq_q * head_dim];
 
         // Act
-        flash_attn_single_head(&q, &k, &v, &mut flash_out, seq_q, seq_kv, head_dim, scale, false);
-        naive_attention_single_head(&q, &k, &v, &mut naive_out, seq_q, seq_kv, head_dim, scale, false);
+        flash_attn_single_head(
+            &q,
+            &k,
+            &v,
+            &mut flash_out,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            false,
+        );
+        naive_attention_single_head(
+            &q,
+            &k,
+            &v,
+            &mut naive_out,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            false,
+        );
 
         // Assert
         let max_diff = flash_out
@@ -3513,7 +3802,10 @@ mod tests {
         flash_attn_single_head(&[], &k, &v, &mut output, 0, 3, head_dim, scale, false);
 
         // Assert: output is empty (no crash, no panic)
-        assert!(output.is_empty(), "zero queries should produce empty output");
+        assert!(
+            output.is_empty(),
+            "zero queries should produce empty output"
+        );
     }
 
     /// FlashAttnConfig::new with head_dim=1: scale = 1.0, tile_kv = 256.
@@ -3552,7 +3844,17 @@ mod tests {
         let mut output = vec![0.0f32; head_dim];
 
         // Act
-        naive_attention_single_head(&q, &k, &v, &mut output, seq_q, seq_kv, head_dim, scale, false);
+        naive_attention_single_head(
+            &q,
+            &k,
+            &v,
+            &mut output,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            false,
+        );
 
         // Assert: uniform attention => mean(V dim0) = (2+4+6)/3 = 4.0
         let expected_mean = 4.0f32;
@@ -3583,7 +3885,7 @@ mod tests {
 
         let q: Vec<f32> = (0..head_dim).map(|d| (d as f32 + 0.5)).collect();
         let k = vec![1.0f32; seq_kv * head_dim]; // all K rows identical
-        // V rows carry distinct values in dim 0
+                                                 // V rows carry distinct values in dim 0
         let mut v = vec![0.0f32; seq_kv * head_dim];
         for t in 0..seq_kv {
             v[t * head_dim] = (t + 1) as f32;
@@ -3591,7 +3893,17 @@ mod tests {
         let mut output = vec![0.0f32; head_dim];
 
         // Act
-        flash_attn_single_head(&q, &k, &v, &mut output, seq_q, seq_kv, head_dim, scale, false);
+        flash_attn_single_head(
+            &q,
+            &k,
+            &v,
+            &mut output,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            false,
+        );
 
         // Assert: uniform scores => output dim0 = mean(1,2,3,4) = 2.5
         let expected_mean = (1.0 + 2.0 + 3.0 + 4.0) / 4.0;
@@ -3622,7 +3934,9 @@ mod tests {
         let config = FlashAttnConfig::new(head_dim, num_heads, num_kv_heads);
 
         let make_data = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i + seed) as f32 * 0.11).sin() * 0.3).collect()
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.11).sin() * 0.3)
+                .collect()
         };
 
         let q = make_data(num_heads * seq_q * head_dim, 0);
@@ -3737,8 +4051,28 @@ mod tests {
         let mut naive_out = vec![0.0f32; seq_q * head_dim];
 
         // Act
-        flash_attn_single_head(&q, &k, &v, &mut flash_out, seq_q, seq_kv, head_dim, scale, false);
-        naive_attention_single_head(&q, &k, &v, &mut naive_out, seq_q, seq_kv, head_dim, scale, false);
+        flash_attn_single_head(
+            &q,
+            &k,
+            &v,
+            &mut flash_out,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            false,
+        );
+        naive_attention_single_head(
+            &q,
+            &k,
+            &v,
+            &mut naive_out,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            false,
+        );
 
         // Assert
         assert!(
@@ -3767,7 +4101,9 @@ mod tests {
         let config = FlashAttnConfig::new(head_dim, 1, 1);
 
         let make_data = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i + seed) as f32 * 0.13).sin() * 0.35).collect()
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.13).sin() * 0.35)
+                .collect()
         };
 
         let q = make_data(seq_len * head_dim, 0);
@@ -3778,7 +4114,17 @@ mod tests {
 
         // Act
         flash_attn_multi_head(&config, &q, &k, &v, &mut multi_out, seq_len, seq_len, true);
-        flash_attn_single_head(&q, &k, &v, &mut single_out, seq_len, seq_len, head_dim, config.scale, true);
+        flash_attn_single_head(
+            &q,
+            &k,
+            &v,
+            &mut single_out,
+            seq_len,
+            seq_len,
+            head_dim,
+            config.scale,
+            true,
+        );
 
         // Assert
         let max_diff = multi_out
@@ -3808,7 +4154,9 @@ mod tests {
         let config = FlashAttnConfig::new(head_dim, num_heads, num_kv_heads);
 
         let make_data = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i + seed) as f32 * 0.07).sin() * 0.4).collect()
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.07).sin() * 0.4)
+                .collect()
         };
 
         let q = make_data(num_heads * seq_q * head_dim, 0);
@@ -3818,7 +4166,16 @@ mod tests {
         let mut prefill_out = vec![0.0f32; num_heads * seq_q * head_dim];
 
         // Act
-        flash_attn_prefill(&config, &q, &k, &v, &mut prefill_out, seq_q, seq_kv, kv_offset);
+        flash_attn_prefill(
+            &config,
+            &q,
+            &k,
+            &v,
+            &mut prefill_out,
+            seq_q,
+            seq_kv,
+            kv_offset,
+        );
 
         // Assert: manually compute — all 5 KV positions visible, no masking
         let scale = config.scale;
@@ -3992,14 +4349,39 @@ mod tests {
         let mut naive_out = vec![0.0f32; seq_q];
 
         // Act
-        flash_attn_single_head(&q, &k, &v, &mut flash_out, seq_q, seq_kv, head_dim, scale, true);
-        naive_attention_single_head(&q, &k, &v, &mut naive_out, seq_q, seq_kv, head_dim, scale, true);
+        flash_attn_single_head(
+            &q,
+            &k,
+            &v,
+            &mut flash_out,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            true,
+        );
+        naive_attention_single_head(
+            &q,
+            &k,
+            &v,
+            &mut naive_out,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            true,
+        );
 
         // Assert
-        let max_diff = flash_out.iter().zip(naive_out.iter())
+        let max_diff = flash_out
+            .iter()
+            .zip(naive_out.iter())
             .map(|(&a, &b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        assert!(max_diff < 1e-6, "head_dim=1 flash vs naive max_diff = {max_diff:.2e}");
+        assert!(
+            max_diff < 1e-6,
+            "head_dim=1 flash vs naive max_diff = {max_diff:.2e}"
+        );
     }
 
     /// head_dim=128: realistic transformer head dimension, flash matches naive.
@@ -4011,21 +4393,52 @@ mod tests {
         let seq_kv = 3;
         let scale = 1.0 / (head_dim as f32).sqrt();
 
-        let q: Vec<f32> = (0..seq_q * head_dim).map(|i| ((i as f32 * 0.01).sin())).collect();
-        let k: Vec<f32> = (0..seq_kv * head_dim).map(|i| ((i as f32 * 0.02).cos())).collect();
-        let v: Vec<f32> = (0..seq_kv * head_dim).map(|i| (i as f32 * 0.005 + 0.1)).collect();
+        let q: Vec<f32> = (0..seq_q * head_dim)
+            .map(|i| ((i as f32 * 0.01).sin()))
+            .collect();
+        let k: Vec<f32> = (0..seq_kv * head_dim)
+            .map(|i| ((i as f32 * 0.02).cos()))
+            .collect();
+        let v: Vec<f32> = (0..seq_kv * head_dim)
+            .map(|i| (i as f32 * 0.005 + 0.1))
+            .collect();
         let mut flash_out = vec![0.0f32; seq_q * head_dim];
         let mut naive_out = vec![0.0f32; seq_q * head_dim];
 
         // Act
-        flash_attn_single_head(&q, &k, &v, &mut flash_out, seq_q, seq_kv, head_dim, scale, false);
-        naive_attention_single_head(&q, &k, &v, &mut naive_out, seq_q, seq_kv, head_dim, scale, false);
+        flash_attn_single_head(
+            &q,
+            &k,
+            &v,
+            &mut flash_out,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            false,
+        );
+        naive_attention_single_head(
+            &q,
+            &k,
+            &v,
+            &mut naive_out,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            false,
+        );
 
         // Assert
-        let max_diff = flash_out.iter().zip(naive_out.iter())
+        let max_diff = flash_out
+            .iter()
+            .zip(naive_out.iter())
             .map(|(&a, &b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        assert!(max_diff < 1e-4, "head_dim=128 flash vs naive max_diff = {max_diff:.2e}");
+        assert!(
+            max_diff < 1e-4,
+            "head_dim=128 flash vs naive max_diff = {max_diff:.2e}"
+        );
     }
 
     /// GQA 8:2 grouping: 8 query heads share 2 KV heads, each group of 4 Q heads
@@ -4042,7 +4455,9 @@ mod tests {
         let heads_per_kv = num_heads / num_kv_heads;
 
         let make_data = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i + seed) as f32 * 0.07).sin() * 0.4).collect()
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.07).sin() * 0.4)
+                .collect()
         };
 
         let k = make_data(num_kv_heads * seq_kv * head_dim, 50);
@@ -4088,7 +4503,9 @@ mod tests {
         let config = FlashAttnConfig::new(head_dim, num_heads, num_kv_heads);
 
         let make_data = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i + seed) as f32 * 0.09).cos() * 0.25).collect()
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.09).cos() * 0.25)
+                .collect()
         };
 
         let q = make_data(num_heads * seq_q * head_dim, 0);
@@ -4108,13 +4525,21 @@ mod tests {
                 &k,
                 &v,
                 &mut single_out,
-                seq_q, seq_kv, head_dim, config.scale, true,
+                seq_q,
+                seq_kv,
+                head_dim,
+                config.scale,
+                true,
             );
             let max_diff = multi_out[q_off..q_off + seq_q * head_dim]
-                .iter().zip(single_out.iter())
+                .iter()
+                .zip(single_out.iter())
                 .map(|(&a, &b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
-            assert!(max_diff < 1e-6, "single KV head group: head {h} max_diff = {max_diff:.2e}");
+            assert!(
+                max_diff < 1e-6,
+                "single KV head group: head {h} max_diff = {max_diff:.2e}"
+            );
         }
     }
 
@@ -4127,22 +4552,56 @@ mod tests {
         let seq_kv = 3;
         let scale = 1.0 / (head_dim as f32).sqrt();
         let tiny = f32::from_bits(1); // smallest positive subnormal
-        let q: Vec<f32> = (0..seq_q * head_dim).map(|i| tiny * (i as f32 + 1.0)).collect();
-        let k: Vec<f32> = (0..seq_kv * head_dim).map(|i| tiny * (i as f32 + 2.0)).collect();
-        let v: Vec<f32> = (0..seq_kv * head_dim).map(|i| tiny * (i as f32 + 3.0)).collect();
+        let q: Vec<f32> = (0..seq_q * head_dim)
+            .map(|i| tiny * (i as f32 + 1.0))
+            .collect();
+        let k: Vec<f32> = (0..seq_kv * head_dim)
+            .map(|i| tiny * (i as f32 + 2.0))
+            .collect();
+        let v: Vec<f32> = (0..seq_kv * head_dim)
+            .map(|i| tiny * (i as f32 + 3.0))
+            .collect();
         let mut flash_out = vec![0.0f32; seq_q * head_dim];
         let mut naive_out = vec![0.0f32; seq_q * head_dim];
 
         // Act
-        flash_attn_single_head(&q, &k, &v, &mut flash_out, seq_q, seq_kv, head_dim, scale, false);
-        naive_attention_single_head(&q, &k, &v, &mut naive_out, seq_q, seq_kv, head_dim, scale, false);
+        flash_attn_single_head(
+            &q,
+            &k,
+            &v,
+            &mut flash_out,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            false,
+        );
+        naive_attention_single_head(
+            &q,
+            &k,
+            &v,
+            &mut naive_out,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            false,
+        );
 
         // Assert
-        assert!(flash_out.iter().all(|v| v.is_finite()), "subnormal flash output non-finite");
-        let max_diff = flash_out.iter().zip(naive_out.iter())
+        assert!(
+            flash_out.iter().all(|v| v.is_finite()),
+            "subnormal flash output non-finite"
+        );
+        let max_diff = flash_out
+            .iter()
+            .zip(naive_out.iter())
             .map(|(&a, &b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        assert!(max_diff < 1e-12, "subnormal flash vs naive max_diff = {max_diff:.2e}");
+        assert!(
+            max_diff < 1e-12,
+            "subnormal flash vs naive max_diff = {max_diff:.2e}"
+        );
     }
 
     /// Very large Q·K scores: scale=1.0 (no normalizing denominator), verify
@@ -4162,13 +4621,41 @@ mod tests {
         let mut naive_out = vec![0.0f32; seq_q * head_dim];
 
         // Act
-        flash_attn_single_head(&q, &k, &v, &mut flash_out, seq_q, seq_kv, head_dim, scale, false);
-        naive_attention_single_head(&q, &k, &v, &mut naive_out, seq_q, seq_kv, head_dim, scale, false);
+        flash_attn_single_head(
+            &q,
+            &k,
+            &v,
+            &mut flash_out,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            false,
+        );
+        naive_attention_single_head(
+            &q,
+            &k,
+            &v,
+            &mut naive_out,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            false,
+        );
 
         // Assert: both must be finite and agree
-        assert!(flash_out.iter().all(|v| v.is_finite()), "extreme scores: flash non-finite");
-        assert!(naive_out.iter().all(|v| v.is_finite()), "extreme scores: naive non-finite");
-        let max_diff = flash_out.iter().zip(naive_out.iter())
+        assert!(
+            flash_out.iter().all(|v| v.is_finite()),
+            "extreme scores: flash non-finite"
+        );
+        assert!(
+            naive_out.iter().all(|v| v.is_finite()),
+            "extreme scores: naive non-finite"
+        );
+        let max_diff = flash_out
+            .iter()
+            .zip(naive_out.iter())
             .map(|(&a, &b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(max_diff < 1e-2, "extreme scores: max_diff = {max_diff:.2e}");
@@ -4193,7 +4680,9 @@ mod tests {
         for d in 0..head_dim {
             assert!(
                 (output[d] - v[d]).abs() < 1e-6,
-                "dim {d}: got {}, expected {}", output[d], v[d]
+                "dim {d}: got {}, expected {}",
+                output[d],
+                v[d]
             );
         }
     }
@@ -4211,7 +4700,9 @@ mod tests {
         let config = FlashAttnConfig::new(head_dim, num_heads, num_kv_heads);
 
         let make_data = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i + seed) as f32 * 0.11).sin() * 0.3).collect()
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.11).sin() * 0.3)
+                .collect()
         };
         let q = make_data(num_heads * seq_q * head_dim, 0);
         let k = make_data(num_kv_heads * seq_kv * head_dim, 50);
@@ -4225,7 +4716,9 @@ mod tests {
         for d in 0..head_dim {
             assert!(
                 (prefill_out[d] - v[d]).abs() < 1e-5,
-                "prefill causal qi=0 dim {d}: got {}, expected {}", prefill_out[d], v[d]
+                "prefill causal qi=0 dim {d}: got {}, expected {}",
+                prefill_out[d],
+                v[d]
             );
         }
     }
@@ -4255,7 +4748,17 @@ mod tests {
         let mut output = vec![0.0f32; head_dim];
 
         // Act
-        flash_attn_single_head(&q, &k, &v, &mut output, seq_q, seq_kv, head_dim, scale, false);
+        flash_attn_single_head(
+            &q,
+            &k,
+            &v,
+            &mut output,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            false,
+        );
 
         // Assert: manually compute softmax
         // scores = [0.7071, 0.0], max = 0.7071
@@ -4276,7 +4779,9 @@ mod tests {
         for d in 0..head_dim {
             assert!(
                 (output[d] - expected[d]).abs() < 1e-5,
-                "dim {d}: got {}, expected {}", output[d], expected[d]
+                "dim {d}: got {}, expected {}",
+                output[d],
+                expected[d]
             );
         }
     }
@@ -4292,7 +4797,9 @@ mod tests {
         let scale = 1.0 / (head_dim as f32).sqrt();
 
         let make_data = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i + seed) as f32 * 0.11).sin() * 2.0 - 1.0).collect()
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.11).sin() * 2.0 - 1.0)
+                .collect()
         };
 
         let q = make_data(seq_q * head_dim, 0);
@@ -4301,7 +4808,17 @@ mod tests {
         let mut output = vec![0.0f32; seq_q * head_dim];
 
         // Act
-        flash_attn_single_head(&q, &k, &v, &mut output, seq_q, seq_kv, head_dim, scale, false);
+        flash_attn_single_head(
+            &q,
+            &k,
+            &v,
+            &mut output,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            false,
+        );
 
         // Assert: for each query and each dimension, output must be within [min(V_dim), max(V_dim)]
         for qi in 0..seq_q {
@@ -4346,11 +4863,13 @@ mod tests {
         for qi in 0..seq_q {
             assert!(
                 (output[qi * head_dim] - expected_d0).abs() < 1e-5,
-                "qi={qi} dim0 = {}, expected {expected_d0}", output[qi * head_dim]
+                "qi={qi} dim0 = {}, expected {expected_d0}",
+                output[qi * head_dim]
             );
             assert!(
                 (output[qi * head_dim + 1] - expected_d1).abs() < 1e-5,
-                "qi={qi} dim1 = {}, expected {expected_d1}", output[qi * head_dim + 1]
+                "qi={qi} dim1 = {}, expected {expected_d1}",
+                output[qi * head_dim + 1]
             );
         }
     }
@@ -4404,14 +4923,26 @@ mod tests {
         let mut output = vec![0.0f32; seq_q * head_dim];
 
         // Act
-        flash_attn_single_head(&q, &k, &v, &mut output, seq_q, seq_kv, head_dim, scale, true);
+        flash_attn_single_head(
+            &q,
+            &k,
+            &v,
+            &mut output,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            true,
+        );
 
         // Assert: every query position output equals the identical V row
         for qi in 0..seq_q {
             for d in 0..head_dim {
                 assert!(
                     (output[qi * head_dim + d] - v_row[d]).abs() < 1e-5,
-                    "qi={qi} dim={d}: got {}, expected {}", output[qi * head_dim + d], v_row[d]
+                    "qi={qi} dim={d}: got {}, expected {}",
+                    output[qi * head_dim + d],
+                    v_row[d]
                 );
             }
         }
@@ -4433,7 +4964,9 @@ mod tests {
         let config = FlashAttnConfig::new(head_dim, num_heads, num_kv_heads);
 
         let make_data = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i + seed) as f32 * 0.07).sin() * 0.4).collect()
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.07).sin() * 0.4)
+                .collect()
         };
 
         let q = make_data(num_heads * seq_q * head_dim, 0);
@@ -4443,7 +4976,16 @@ mod tests {
         let mut naive_out = vec![0.0f32; num_heads * seq_q * head_dim];
 
         // Act: prefill with kv_offset=100 (all KV visible)
-        flash_attn_prefill(&config, &q, &k, &v, &mut prefill_out, seq_q, seq_kv, kv_offset);
+        flash_attn_prefill(
+            &config,
+            &q,
+            &k,
+            &v,
+            &mut prefill_out,
+            seq_q,
+            seq_kv,
+            kv_offset,
+        );
         // Naive non-causal: all positions visible
         naive_attention_multi_head(&config, &q, &k, &v, &mut naive_out, seq_q, seq_kv, false);
 
@@ -4473,7 +5015,9 @@ mod tests {
             let config = FlashAttnConfig::new(hd, 4, 2);
             assert!(
                 config.scale < prev_scale,
-                "head_dim={hd}: scale={} not less than prev={}", config.scale, prev_scale
+                "head_dim={hd}: scale={} not less than prev={}",
+                config.scale,
+                prev_scale
             );
             prev_scale = config.scale;
         }
@@ -4492,17 +5036,29 @@ mod tests {
 
         // Q aligned with K0 (large dot product) and orthogonal to K1, K2
         let q = vec![10.0f32, 0.0, 0.0, 0.0];
-        let k = vec![10.0f32, 1.0, 1.0, 1.0,   // K0 aligned with Q => large dot
-                     0.0, 10.0, 1.0, 1.0,         // K1 orthogonal to Q
-                     0.0, 1.0, 10.0, 1.0];         // K2 orthogonal to Q
-        // V rows with distinct values
-        let v = vec![10.0f32, 20.0, 30.0, 40.0,
-                     50.0f32, 60.0, 70.0, 80.0,
-                     90.0f32, 100.0, 110.0, 120.0];
+        let k = vec![
+            10.0f32, 1.0, 1.0, 1.0, // K0 aligned with Q => large dot
+            0.0, 10.0, 1.0, 1.0, // K1 orthogonal to Q
+            0.0, 1.0, 10.0, 1.0,
+        ]; // K2 orthogonal to Q
+           // V rows with distinct values
+        let v = vec![
+            10.0f32, 20.0, 30.0, 40.0, 50.0f32, 60.0, 70.0, 80.0, 90.0f32, 100.0, 110.0, 120.0,
+        ];
         let mut output = vec![0.0f32; head_dim];
 
         // Act
-        flash_attn_single_head(&q, &k, &v, &mut output, seq_q, seq_kv, head_dim, scale, false);
+        flash_attn_single_head(
+            &q,
+            &k,
+            &v,
+            &mut output,
+            seq_q,
+            seq_kv,
+            head_dim,
+            scale,
+            false,
+        );
 
         // Assert: dominant position is K0, output should be close to V0
         // dot(Q,K0) = 100*scale ~ 50, dot(Q,K1) = 0, dot(Q,K2) = 0
@@ -4510,7 +5066,9 @@ mod tests {
         for d in 0..head_dim {
             assert!(
                 (output[d] - v[d]).abs() < 0.1,
-                "dim {d}: got {}, expected ~{}", output[d], v[d]
+                "dim {d}: got {}, expected ~{}",
+                output[d],
+                v[d]
             );
         }
     }
@@ -4552,9 +5110,7 @@ mod tests {
         let mut kv_cache = KvCache::new(&cfg, 1, cfg.max_seq_len).unwrap();
         let attn_config = FlashAttnConfig::new(head_dim, num_heads, num_kv_heads);
 
-        let make_val = |i: usize, seed: usize| -> f32 {
-            ((i + seed) as f32 * 0.11).sin() * 0.3
-        };
+        let make_val = |i: usize, seed: usize| -> f32 { ((i + seed) as f32 * 0.11).sin() * 0.3 };
 
         // Write exactly sliding_window tokens
         let kv_dtype = kv_cache.dtype();
@@ -4603,7 +5159,14 @@ mod tests {
 
         // Act: decode with sliding_window at the boundary
         flash_attn_decode_paged(
-            &attn_config, &q, &mut paged_out, &kv_cache, 0, 0, token_pos, Some(sliding_window),
+            &attn_config,
+            &q,
+            &mut paged_out,
+            &kv_cache,
+            0,
+            0,
+            token_pos,
+            Some(sliding_window),
         );
 
         // Assert: all cached positions should be visible (no eviction at boundary)
@@ -4624,12 +5187,19 @@ mod tests {
             let mut naive_out = vec![0.0f32; head_dim];
             naive_attention_single_head(
                 &q[q_off..q_off + head_dim],
-                &k_cont, &v_cont, &mut naive_out,
-                1, cached_len, head_dim, attn_config.scale, false,
+                &k_cont,
+                &v_cont,
+                &mut naive_out,
+                1,
+                cached_len,
+                head_dim,
+                attn_config.scale,
+                false,
             );
 
             let max_diff = paged_out[q_off..q_off + head_dim]
-                .iter().zip(naive_out.iter())
+                .iter()
+                .zip(naive_out.iter())
                 .map(|(&a, &b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
 
@@ -4651,7 +5221,9 @@ mod tests {
         let scale = 1.0 / (head_dim as f32).sqrt();
 
         let make_data = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i + seed) as f32 * 0.09).sin() * 0.4).collect()
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.09).sin() * 0.4)
+                .collect()
         };
 
         let q = make_data(seq_q * head_dim, 0);
@@ -4667,10 +5239,26 @@ mod tests {
         let mut full_causal_out = vec![0.0f32; seq_kv * head_dim];
         let mut full_non_causal_out = vec![0.0f32; seq_kv * head_dim];
         naive_attention_single_head(
-            &q_full, &k, &v, &mut full_causal_out, seq_kv, seq_kv, head_dim, scale, true,
+            &q_full,
+            &k,
+            &v,
+            &mut full_causal_out,
+            seq_kv,
+            seq_kv,
+            head_dim,
+            scale,
+            true,
         );
         naive_attention_single_head(
-            &q_full, &k, &v, &mut full_non_causal_out, seq_kv, seq_kv, head_dim, scale, false,
+            &q_full,
+            &k,
+            &v,
+            &mut full_non_causal_out,
+            seq_kv,
+            seq_kv,
+            head_dim,
+            scale,
+            false,
         );
 
         // Assert: last query position (qi=seq_kv-1) should have same output
@@ -4680,7 +5268,8 @@ mod tests {
             assert!(
                 (full_causal_out[last_off + d] - full_non_causal_out[last_off + d]).abs() < 1e-6,
                 "last position dim {d}: causal={}, non-causal={}",
-                full_causal_out[last_off + d], full_non_causal_out[last_off + d]
+                full_causal_out[last_off + d],
+                full_non_causal_out[last_off + d]
             );
         }
     }
@@ -4696,7 +5285,9 @@ mod tests {
         let seq_len = 4;
 
         let make_data = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|i| ((i + seed) as f32 * 0.13).sin() * 0.4).collect()
+            (0..n)
+                .map(|i| ((i + seed) as f32 * 0.13).sin() * 0.4)
+                .collect()
         };
 
         let q = make_data(num_heads * seq_len * head_dim, 0);
@@ -4716,19 +5307,42 @@ mod tests {
         let mut out_large = vec![0.0f32; num_heads * seq_len * head_dim];
 
         // Act
-        flash_attn_multi_head(&config_small, &q, &k, &v, &mut out_small, seq_len, seq_len, true);
-        flash_attn_multi_head(&config_large, &q, &k, &v, &mut out_large, seq_len, seq_len, true);
-
-        // Assert: outputs must differ (small scale => more uniform, large scale => more peaked)
-        let any_diff = out_small.iter().zip(out_large.iter())
-            .any(|(&a, &b)| (a - b).abs() > 1e-5);
-        assert!(
-            any_diff,
-            "different scales must produce different outputs"
+        flash_attn_multi_head(
+            &config_small,
+            &q,
+            &k,
+            &v,
+            &mut out_small,
+            seq_len,
+            seq_len,
+            true,
+        );
+        flash_attn_multi_head(
+            &config_large,
+            &q,
+            &k,
+            &v,
+            &mut out_large,
+            seq_len,
+            seq_len,
+            true,
         );
 
+        // Assert: outputs must differ (small scale => more uniform, large scale => more peaked)
+        let any_diff = out_small
+            .iter()
+            .zip(out_large.iter())
+            .any(|(&a, &b)| (a - b).abs() > 1e-5);
+        assert!(any_diff, "different scales must produce different outputs");
+
         // Assert: both must be finite
-        assert!(out_small.iter().all(|v| v.is_finite()), "small scale output non-finite");
-        assert!(out_large.iter().all(|v| v.is_finite()), "large scale output non-finite");
+        assert!(
+            out_small.iter().all(|v| v.is_finite()),
+            "small scale output non-finite"
+        );
+        assert!(
+            out_large.iter().all(|v| v.is_finite()),
+            "large scale output non-finite"
+        );
     }
 }

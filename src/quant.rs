@@ -71,7 +71,9 @@ pub enum QuantType {
     ///
     /// Used by OpenAI gpt-oss-20b MoE expert weights. e2m1 encodes the 16 values
     /// `{0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}` indexed by `bit[3]=sign, bit[2:1]=exp, bit[0]=mantissa`.
-    Mxfp4 { block_size: usize },
+    Mxfp4 {
+        block_size: usize,
+    },
     /// NVIDIA NVFP4 (GGUF type 40).
     ///
     /// Layout per block (64 elements, 36 bytes):
@@ -154,7 +156,6 @@ pub struct BlockQ8K {
     pub bsums: [i16; 16],
 }
 
-
 // ==========================================================================
 // IQ Block Structures (importance-matrix quantization, matching llama.cpp)
 // ==========================================================================
@@ -205,7 +206,6 @@ pub struct BlockIQ2S {
     pub scales: [u8; QK_K / 32],
 }
 
-
 /// IQ3_XXS: 3-bit importance quantization (extra extra small).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -252,53 +252,53 @@ pub struct BlockIQ4XS {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BlockQ4_0 {
-    pub d: f16,        // delta (scale)
-    pub qs: [u8; 16],  // 32 x 4-bit quantized values
+    pub d: f16,       // delta (scale)
+    pub qs: [u8; 16], // 32 x 4-bit quantized values
 }
 
 /// Q4_1: 4-bit quantization with min, 32 elements per block, 20 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BlockQ4_1 {
-    pub d: f16,        // delta (scale)
-    pub m: f16,        // min value
-    pub qs: [u8; 16],  // 32 x 4-bit quantized values
+    pub d: f16,       // delta (scale)
+    pub m: f16,       // min value
+    pub qs: [u8; 16], // 32 x 4-bit quantized values
 }
 
 /// Q5_0: 5-bit quantization, 32 elements per block, 22 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BlockQ5_0 {
-    pub d: f16,        // delta (scale)
-    pub qh: [u8; 4],   // 32 high bits (1 bit each)
-    pub qs: [u8; 16],  // 32 x low 4-bit
+    pub d: f16,       // delta (scale)
+    pub qh: [u8; 4],  // 32 high bits (1 bit each)
+    pub qs: [u8; 16], // 32 x low 4-bit
 }
 
 /// Q5_1: 5-bit quantization with min, 32 elements per block, 24 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BlockQ5_1 {
-    pub d: f16,        // delta (scale)
-    pub m: f16,        // min value
-    pub qh: [u8; 4],   // 32 high bits
-    pub qs: [u8; 16],  // 32 x low 4-bit
+    pub d: f16,       // delta (scale)
+    pub m: f16,       // min value
+    pub qh: [u8; 4],  // 32 high bits
+    pub qs: [u8; 16], // 32 x low 4-bit
 }
 
 /// Q8_0: 8-bit quantization, 32 elements per block, 34 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BlockQ8_0 {
-    pub d: f16,        // delta (scale)
-    pub qs: [i8; 32],  // 32 x 8-bit quantized values
+    pub d: f16,       // delta (scale)
+    pub qs: [i8; 32], // 32 x 8-bit quantized values
 }
 
 /// Q8_1: 8-bit quantization with sum, 32 elements per block, 36 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BlockQ8_1 {
-    pub d: f16,        // delta (scale)
-    pub s: f16,        // sum of quantized values * d
-    pub qs: [i8; 32],  // 32 x 8-bit quantized values
+    pub d: f16,       // delta (scale)
+    pub s: f16,       // sum of quantized values * d
+    pub qs: [i8; 32], // 32 x 8-bit quantized values
 }
 
 // ==========================================================================
@@ -375,8 +375,13 @@ impl QuantType {
     pub const fn block_size(self) -> usize {
         match self {
             Self::Bf16 | Self::F16 | Self::F32 => 1, // native float: no blocking
-            Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1
-            | Self::Q8_0 | Self::Q8_1 | Self::IQ4NL => 32,
+            Self::Q4_0
+            | Self::Q4_1
+            | Self::Q5_0
+            | Self::Q5_1
+            | Self::Q8_0
+            | Self::Q8_1
+            | Self::IQ4NL => 32,
             Self::Mxfp4 { block_size } => block_size,
             Self::Nvfp4 => QK_NVFP4,
             // AWQ4/GPTQ4: group_size=128, block_bytes=72 per group
@@ -434,7 +439,13 @@ impl QuantType {
             Self::IQ1S | Self::IQ1M => 1,
             Self::Q2K | Self::IQ2XXS | Self::IQ2XS | Self::IQ2S | Self::TQ2_0 => 2,
             Self::Q3K | Self::IQ3XXS | Self::IQ3S | Self::Squeeze | Self::TQ1_0 => 3,
-            Self::Q4_0 | Self::Q4_1 | Self::Q4K | Self::IQ4NL | Self::IQ4XS | Self::AWQ4 | Self::GPTQ4 => 4,
+            Self::Q4_0
+            | Self::Q4_1
+            | Self::Q4K
+            | Self::IQ4NL
+            | Self::IQ4XS
+            | Self::AWQ4
+            | Self::GPTQ4 => 4,
             Self::Mxfp4 { .. } => 4,
             Self::Nvfp4 => 4,
             Self::Q5_0 | Self::Q5_1 | Self::Q5K => 5,
@@ -489,19 +500,40 @@ mod tests {
 
     #[test]
     fn block_size_classic_32() {
-        for qt in [QuantType::Q4_0, QuantType::Q4_1, QuantType::Q5_0,
-                    QuantType::Q5_1, QuantType::Q8_0, QuantType::Q8_1, QuantType::IQ4NL] {
+        for qt in [
+            QuantType::Q4_0,
+            QuantType::Q4_1,
+            QuantType::Q5_0,
+            QuantType::Q5_1,
+            QuantType::Q8_0,
+            QuantType::Q8_1,
+            QuantType::IQ4NL,
+        ] {
             assert_eq!(qt.block_size(), 32, "{:?}.block_size should be 32", qt);
         }
     }
 
     #[test]
     fn block_size_k_quant_256() {
-        for qt in [QuantType::Q2K, QuantType::Q3K, QuantType::Q4K, QuantType::Q5K,
-                    QuantType::Q6K, QuantType::Q8K, QuantType::IQ1S, QuantType::IQ1M,
-                    QuantType::IQ2XXS, QuantType::IQ2XS, QuantType::IQ2S,
-                    QuantType::IQ3XXS, QuantType::IQ3S, QuantType::IQ4XS,
-                    QuantType::TQ1_0, QuantType::TQ2_0, QuantType::Squeeze] {
+        for qt in [
+            QuantType::Q2K,
+            QuantType::Q3K,
+            QuantType::Q4K,
+            QuantType::Q5K,
+            QuantType::Q6K,
+            QuantType::Q8K,
+            QuantType::IQ1S,
+            QuantType::IQ1M,
+            QuantType::IQ2XXS,
+            QuantType::IQ2XS,
+            QuantType::IQ2S,
+            QuantType::IQ3XXS,
+            QuantType::IQ3S,
+            QuantType::IQ4XS,
+            QuantType::TQ1_0,
+            QuantType::TQ2_0,
+            QuantType::Squeeze,
+        ] {
             assert_eq!(qt.block_size(), 256, "{:?}.block_size should be 256", qt);
         }
     }
@@ -618,12 +650,25 @@ mod tests {
 
     #[test]
     fn has_scale_zero_equals_is_quantized() {
-        for qt in [QuantType::Bf16, QuantType::F16, QuantType::F32,
-                    QuantType::Q4_0, QuantType::Q8_0, QuantType::Q2K,
-                    QuantType::AWQ4, QuantType::GPTQ4, QuantType::Nvfp4,
-                    QuantType::Fp8E4M3, QuantType::Mxfp4 { block_size: 32 }] {
-            assert_eq!(qt.has_scale_zero(), qt.is_quantized(),
-                "{:?}: has_scale_zero should equal is_quantized", qt);
+        for qt in [
+            QuantType::Bf16,
+            QuantType::F16,
+            QuantType::F32,
+            QuantType::Q4_0,
+            QuantType::Q8_0,
+            QuantType::Q2K,
+            QuantType::AWQ4,
+            QuantType::GPTQ4,
+            QuantType::Nvfp4,
+            QuantType::Fp8E4M3,
+            QuantType::Mxfp4 { block_size: 32 },
+        ] {
+            assert_eq!(
+                qt.has_scale_zero(),
+                qt.is_quantized(),
+                "{:?}: has_scale_zero should equal is_quantized",
+                qt
+            );
         }
     }
 
@@ -717,36 +762,56 @@ mod tests {
     fn quant_type_equality() {
         assert_eq!(QuantType::Bf16, QuantType::Bf16);
         assert_ne!(QuantType::Bf16, QuantType::F16);
-        assert_eq!(QuantType::Mxfp4 { block_size: 32 }, QuantType::Mxfp4 { block_size: 32 });
-        assert_ne!(QuantType::Mxfp4 { block_size: 32 }, QuantType::Mxfp4 { block_size: 64 });
+        assert_eq!(
+            QuantType::Mxfp4 { block_size: 32 },
+            QuantType::Mxfp4 { block_size: 32 }
+        );
+        assert_ne!(
+            QuantType::Mxfp4 { block_size: 32 },
+            QuantType::Mxfp4 { block_size: 64 }
+        );
     }
 
     // ── Block default/zero values ──
 
     #[test]
     fn block_q4_0_fields() {
-        let b = BlockQ4_0 { d: f16::from_f32(1.0), qs: [0; 16] };
+        let b = BlockQ4_0 {
+            d: f16::from_f32(1.0),
+            qs: [0; 16],
+        };
         assert_eq!(b.qs.len(), 16);
         assert!((b.d.to_f32() - 1.0).abs() < 1e-4);
     }
 
     #[test]
     fn block_q8_k_fields() {
-        let b = BlockQ8K { d: 0.5f32, qs: [0i8; 256], bsums: [0i16; 16] };
+        let b = BlockQ8K {
+            d: 0.5f32,
+            qs: [0i8; 256],
+            bsums: [0i16; 16],
+        };
         assert_eq!(b.qs.len(), QK_K);
         assert_eq!(b.bsums.len(), 16);
     }
 
     #[test]
     fn block_nvfp4_fields() {
-        let b = BlockNvfp4 { d: [0u8; 4], qs: [0u8; 32] };
+        let b = BlockNvfp4 {
+            d: [0u8; 4],
+            qs: [0u8; 32],
+        };
         assert_eq!(b.d.len(), QK_NVFP4 / QK_NVFP4_SUB);
         assert_eq!(b.qs.len(), QK_NVFP4 / 2);
     }
 
     #[test]
     fn block_q4_1_has_min() {
-        let b = BlockQ4_1 { d: f16::from_f32(0.5), m: f16::from_f32(-1.0), qs: [0; 16] };
+        let b = BlockQ4_1 {
+            d: f16::from_f32(0.5),
+            m: f16::from_f32(-1.0),
+            qs: [0; 16],
+        };
         assert!((b.m.to_f32() - (-1.0)).abs() < 1e-3);
     }
 
@@ -792,9 +857,18 @@ mod tests {
     #[test]
     fn block_bytes_mxfp4_formula() {
         // MXFP4 block_bytes = 1 (e8m0 scale) + block_size/2 (packed e2m1).
-        assert_eq!(QuantType::Mxfp4 { block_size: 16 }.block_bytes(), 1 + 16 / 2);
-        assert_eq!(QuantType::Mxfp4 { block_size: 128 }.block_bytes(), 1 + 128 / 2);
-        assert_eq!(QuantType::Mxfp4 { block_size: 256 }.block_bytes(), 1 + 256 / 2);
+        assert_eq!(
+            QuantType::Mxfp4 { block_size: 16 }.block_bytes(),
+            1 + 16 / 2
+        );
+        assert_eq!(
+            QuantType::Mxfp4 { block_size: 128 }.block_bytes(),
+            1 + 128 / 2
+        );
+        assert_eq!(
+            QuantType::Mxfp4 { block_size: 256 }.block_bytes(),
+            1 + 256 / 2
+        );
     }
 
     #[test]
@@ -842,11 +916,18 @@ mod tests {
     fn is_float_native_false_for_all_quantized() {
         // Spot-check a wide range: every non-BF16/F16/F32 should return false.
         let quantized = [
-            QuantType::Q2K, QuantType::Q4_0, QuantType::Q8_1,
-            QuantType::AWQ4, QuantType::GPTQ4, QuantType::Squeeze,
-            QuantType::Fp8E4M3, QuantType::Fp8E5M2,
-            QuantType::TQ1_0, QuantType::TQ2_0,
-            QuantType::Mxfp4 { block_size: 32 }, QuantType::Nvfp4,
+            QuantType::Q2K,
+            QuantType::Q4_0,
+            QuantType::Q8_1,
+            QuantType::AWQ4,
+            QuantType::GPTQ4,
+            QuantType::Squeeze,
+            QuantType::Fp8E4M3,
+            QuantType::Fp8E5M2,
+            QuantType::TQ1_0,
+            QuantType::TQ2_0,
+            QuantType::Mxfp4 { block_size: 32 },
+            QuantType::Nvfp4,
         ];
         for qt in quantized {
             assert!(!qt.is_float_native(), "{qt:?} should not be float native");

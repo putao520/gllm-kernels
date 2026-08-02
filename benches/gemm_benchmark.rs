@@ -35,8 +35,12 @@ fn benchmark_gemm_f32(c: &mut Criterion) {
         group.bench_function(&format!("gemm_{m}x{n}x{k}"), |bench| {
             bench.iter(|| {
                 kernels.gemm(
-                    black_box(&a), black_box(&b), black_box(&mut c_out),
-                    black_box(m), black_box(n), black_box(k),
+                    black_box(&a),
+                    black_box(&b),
+                    black_box(&mut c_out),
+                    black_box(m),
+                    black_box(n),
+                    black_box(k),
                 )
             })
         });
@@ -46,8 +50,12 @@ fn benchmark_gemm_f32(c: &mut Criterion) {
         group.bench_function(&format!("gemm_prepacked_{m}x{n}x{k}"), |bench| {
             bench.iter(|| {
                 kernels.gemm_prepacked(
-                    black_box(&a), black_box(&packed_b), black_box(&mut c_out),
-                    black_box(m), black_box(n), black_box(k),
+                    black_box(&a),
+                    black_box(&packed_b),
+                    black_box(&mut c_out),
+                    black_box(m),
+                    black_box(n),
+                    black_box(k),
                 )
             })
         });
@@ -63,8 +71,13 @@ fn benchmark_gemm_f32(c: &mut Criterion) {
         group.bench_function(&format!("gemm_bias_{m}x{n}x{k}"), |bench| {
             bench.iter(|| {
                 kernels.gemm_bias(
-                    black_box(&a), black_box(&b), black_box(&bias), black_box(&mut c_out),
-                    black_box(m), black_box(n), black_box(k),
+                    black_box(&a),
+                    black_box(&b),
+                    black_box(&bias),
+                    black_box(&mut c_out),
+                    black_box(m),
+                    black_box(n),
+                    black_box(k),
                 )
             })
         });
@@ -73,8 +86,13 @@ fn benchmark_gemm_f32(c: &mut Criterion) {
         group.bench_function(&format!("gemm_bias_prepacked_{m}x{n}x{k}"), |bench| {
             bench.iter(|| {
                 kernels.gemm_bias_prepacked(
-                    black_box(&a), black_box(&packed_b), black_box(&bias), black_box(&mut c_out),
-                    black_box(m), black_box(n), black_box(k),
+                    black_box(&a),
+                    black_box(&packed_b),
+                    black_box(&bias),
+                    black_box(&mut c_out),
+                    black_box(m),
+                    black_box(n),
+                    black_box(k),
                 )
             })
         });

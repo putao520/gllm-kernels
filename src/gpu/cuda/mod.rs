@@ -4,8 +4,8 @@
 //! driver happens through runtime `dlopen` of `libcuda.so.1` — zero build-time
 //! dependency on the CUDA SDK.
 
-pub mod driver;
 pub mod device;
+pub mod driver;
 
-pub use driver::{CudaDriver, CUevent};
-pub use device::{CudaDevice, CudaBuffer, CudaStream, CudaModule};
+pub use device::{CudaBuffer, CudaDevice, CudaModule, CudaStream};
+pub use driver::{CUevent, CudaDriver};

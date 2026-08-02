@@ -123,8 +123,17 @@ impl std::fmt::Display for SymValue {
                 let args_str: Vec<String> = args.iter().map(|a| format!("{a}")).collect();
                 write!(f, "{func}({})", args_str.join(", "))
             }
-            SymValue::Select { kind, cond_lhs, cond_rhs, true_val, false_val } => {
-                write!(f, "select({cond_lhs} {kind} {cond_rhs}, {true_val}, {false_val})")
+            SymValue::Select {
+                kind,
+                cond_lhs,
+                cond_rhs,
+                true_val,
+                false_val,
+            } => {
+                write!(
+                    f,
+                    "select({cond_lhs} {kind} {cond_rhs}, {true_val}, {false_val})"
+                )
             }
             SymValue::Unknown(s) => write!(f, "?({s})"),
         }
@@ -164,8 +173,12 @@ impl SymValue {
                 if let (SymValue::Const(va), SymValue::Const(vb)) = (&a, &b) {
                     return SymValue::Const(va + vb);
                 }
-                if is_zero(&b) { return a; }
-                if is_zero(&a) { return b; }
+                if is_zero(&b) {
+                    return a;
+                }
+                if is_zero(&a) {
+                    return b;
+                }
                 SymValue::Add(Box::new(a), Box::new(b))
             }
 
@@ -175,8 +188,12 @@ impl SymValue {
                 if let (SymValue::Const(va), SymValue::Const(vb)) = (&a, &b) {
                     return SymValue::Const(va - vb);
                 }
-                if is_zero(&b) { return a; }
-                if sym_eq(&a, &b) { return SymValue::Const(0.0); }
+                if is_zero(&b) {
+                    return a;
+                }
+                if sym_eq(&a, &b) {
+                    return SymValue::Const(0.0);
+                }
                 SymValue::Sub(Box::new(a), Box::new(b))
             }
 
@@ -186,9 +203,15 @@ impl SymValue {
                 if let (SymValue::Const(va), SymValue::Const(vb)) = (&a, &b) {
                     return SymValue::Const(va * vb);
                 }
-                if is_zero(&a) || is_zero(&b) { return SymValue::Const(0.0); }
-                if is_one(&b) { return a; }
-                if is_one(&a) { return b; }
+                if is_zero(&a) || is_zero(&b) {
+                    return SymValue::Const(0.0);
+                }
+                if is_one(&b) {
+                    return a;
+                }
+                if is_one(&a) {
+                    return b;
+                }
                 SymValue::Mul(Box::new(a), Box::new(b))
             }
 
@@ -200,8 +223,12 @@ impl SymValue {
                         return SymValue::Const(va / vb);
                     }
                 }
-                if is_one(&b) { return a; }
-                if sym_eq(&a, &b) { return SymValue::Const(1.0); }
+                if is_one(&b) {
+                    return a;
+                }
+                if sym_eq(&a, &b) {
+                    return SymValue::Const(1.0);
+                }
                 SymValue::Div(Box::new(a), Box::new(b))
             }
 
@@ -282,7 +309,13 @@ impl SymValue {
                 SymValue::Call(*f, args)
             }
 
-            SymValue::Select { kind, cond_lhs, cond_rhs, true_val, false_val } => {
+            SymValue::Select {
+                kind,
+                cond_lhs,
+                cond_rhs,
+                true_val,
+                false_val,
+            } => {
                 let cl = cond_lhs.simplify();
                 let cr = cond_rhs.simplify();
                 let tv = true_val.simplify();
@@ -380,55 +413,37 @@ mod tests {
 
     #[test]
     fn simplify_add_zero() {
-        let v = SymValue::Add(
-            Box::new(SymValue::Param(0)),
-            Box::new(SymValue::Const(0.0)),
-        );
+        let v = SymValue::Add(Box::new(SymValue::Param(0)), Box::new(SymValue::Const(0.0)));
         assert!(matches!(v.simplify(), SymValue::Param(0)));
     }
 
     #[test]
     fn simplify_zero_add() {
-        let v = SymValue::Add(
-            Box::new(SymValue::Const(0.0)),
-            Box::new(SymValue::Param(0)),
-        );
+        let v = SymValue::Add(Box::new(SymValue::Const(0.0)), Box::new(SymValue::Param(0)));
         assert!(matches!(v.simplify(), SymValue::Param(0)));
     }
 
     #[test]
     fn simplify_mul_one() {
-        let v = SymValue::Mul(
-            Box::new(SymValue::Param(0)),
-            Box::new(SymValue::Const(1.0)),
-        );
+        let v = SymValue::Mul(Box::new(SymValue::Param(0)), Box::new(SymValue::Const(1.0)));
         assert!(matches!(v.simplify(), SymValue::Param(0)));
     }
 
     #[test]
     fn simplify_mul_zero() {
-        let v = SymValue::Mul(
-            Box::new(SymValue::Param(0)),
-            Box::new(SymValue::Const(0.0)),
-        );
+        let v = SymValue::Mul(Box::new(SymValue::Param(0)), Box::new(SymValue::Const(0.0)));
         assert!(matches!(v.simplify(), SymValue::Const(x) if x == 0.0));
     }
 
     #[test]
     fn simplify_sub_self() {
-        let v = SymValue::Sub(
-            Box::new(SymValue::Param(0)),
-            Box::new(SymValue::Param(0)),
-        );
+        let v = SymValue::Sub(Box::new(SymValue::Param(0)), Box::new(SymValue::Param(0)));
         assert!(matches!(v.simplify(), SymValue::Const(x) if x == 0.0));
     }
 
     #[test]
     fn simplify_div_self() {
-        let v = SymValue::Div(
-            Box::new(SymValue::Param(0)),
-            Box::new(SymValue::Param(0)),
-        );
+        let v = SymValue::Div(Box::new(SymValue::Param(0)), Box::new(SymValue::Param(0)));
         assert!(matches!(v.simplify(), SymValue::Const(x) if x == 1.0));
     }
 
@@ -508,7 +523,7 @@ mod tests {
         // Arrange
         let a = SelectKind::Gt;
         let b = a; // Copy
-        // Act & Assert
+                   // Act & Assert
         assert_eq!(a, b);
         assert_ne!(a, SelectKind::Lt);
     }
@@ -518,7 +533,7 @@ mod tests {
         // Arrange
         let a = LibmFn::Tanhf;
         let b = a; // Copy
-        // Act & Assert
+                   // Act & Assert
         assert_eq!(a, b);
         assert_ne!(a, LibmFn::Expf);
     }
@@ -526,10 +541,7 @@ mod tests {
     #[test]
     fn simplify_div_by_one() {
         // Arrange: param(0) / 1.0 → param(0)
-        let v = SymValue::Div(
-            Box::new(SymValue::Param(0)),
-            Box::new(SymValue::Const(1.0)),
-        );
+        let v = SymValue::Div(Box::new(SymValue::Param(0)), Box::new(SymValue::Const(1.0)));
         // Act
         let result = v.simplify();
         // Assert
@@ -539,10 +551,7 @@ mod tests {
     #[test]
     fn simplify_sub_zero_rhs() {
         // Arrange: param(0) - 0.0 → param(0)
-        let v = SymValue::Sub(
-            Box::new(SymValue::Param(0)),
-            Box::new(SymValue::Const(0.0)),
-        );
+        let v = SymValue::Sub(Box::new(SymValue::Param(0)), Box::new(SymValue::Const(0.0)));
         // Act
         let result = v.simplify();
         // Assert
@@ -690,28 +699,19 @@ mod tests {
 
     #[test]
     fn display_sub_format() {
-        let v = SymValue::Sub(
-            Box::new(SymValue::Param(0)),
-            Box::new(SymValue::Param(1)),
-        );
+        let v = SymValue::Sub(Box::new(SymValue::Param(0)), Box::new(SymValue::Param(1)));
         assert_eq!(format!("{v}"), "(param(0) - param(1))");
     }
 
     #[test]
     fn display_mul_format() {
-        let v = SymValue::Mul(
-            Box::new(SymValue::Param(0)),
-            Box::new(SymValue::Const(2.0)),
-        );
+        let v = SymValue::Mul(Box::new(SymValue::Param(0)), Box::new(SymValue::Const(2.0)));
         assert_eq!(format!("{v}"), "(param(0) * c:2.0)");
     }
 
     #[test]
     fn display_div_format() {
-        let v = SymValue::Div(
-            Box::new(SymValue::Param(0)),
-            Box::new(SymValue::Const(4.0)),
-        );
+        let v = SymValue::Div(Box::new(SymValue::Param(0)), Box::new(SymValue::Const(4.0)));
         assert_eq!(format!("{v}"), "(param(0) / c:4.0)");
     }
 
@@ -742,19 +742,13 @@ mod tests {
 
     #[test]
     fn display_max_format() {
-        let v = SymValue::Max(
-            Box::new(SymValue::Param(0)),
-            Box::new(SymValue::Param(1)),
-        );
+        let v = SymValue::Max(Box::new(SymValue::Param(0)), Box::new(SymValue::Param(1)));
         assert_eq!(format!("{v}"), "max(param(0), param(1))");
     }
 
     #[test]
     fn display_min_format() {
-        let v = SymValue::Min(
-            Box::new(SymValue::Const(0.0)),
-            Box::new(SymValue::Param(0)),
-        );
+        let v = SymValue::Min(Box::new(SymValue::Const(0.0)), Box::new(SymValue::Param(0)));
         assert_eq!(format!("{v}"), "min(c:0.0, param(0))");
     }
 
@@ -921,10 +915,7 @@ mod tests {
     #[test]
     fn simplify_mul_by_one_lhs() {
         // 1.0 * param(0) → param(0)
-        let v = SymValue::Mul(
-            Box::new(SymValue::Const(1.0)),
-            Box::new(SymValue::Param(0)),
-        );
+        let v = SymValue::Mul(Box::new(SymValue::Const(1.0)), Box::new(SymValue::Param(0)));
         assert!(matches!(v.simplify(), SymValue::Param(0)));
     }
 
@@ -965,8 +956,10 @@ mod tests {
         // base should be folded to Const(3.0)
         match result {
             SymValue::Load { base, .. } => {
-                assert!(matches!(*base, SymValue::Const(3.0)),
-                    "base should be folded to Const(3.0)");
+                assert!(
+                    matches!(*base, SymValue::Const(3.0)),
+                    "base should be folded to Const(3.0)"
+                );
             }
             other => panic!("expected Load, got {:?}", other),
         }

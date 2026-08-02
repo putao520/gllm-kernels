@@ -97,11 +97,15 @@ impl GpuThreadTile {
         // (c) 双轴切分: rows_per_lane ∈ {2,4,8,16}, cols_per_lane = warp_size/rows_per_lane
         for &rpl in &[2usize, 4, 8, 16] {
             let cpl = GPU_WARP_SIZE / rpl;
-            if cpl == 0 || warp_m % rpl != 0 || warp_n % cpl != 0 { continue; }
+            if cpl == 0 || warp_m % rpl != 0 || warp_n % cpl != 0 {
+                continue;
+            }
             let tm = warp_m / rpl;
             let tn = warp_n / cpl;
             let acc = tm * tn;
-            if acc == 0 || acc > max_acc_per_thread { continue; }
+            if acc == 0 || acc > max_acc_per_thread {
+                continue;
+            }
             let score = acc + tm.abs_diff(tn) * 10;
             best = Some(match best {
                 None => (score, rpl, cpl, tm, tn),
@@ -110,14 +114,20 @@ impl GpuThreadTile {
             });
         }
 
-        let (rows_per_lane, cols_per_lane, tm, tn) = best
-            .map(|(_, r, c, m, n)| (r, c, m, n))
-            .unwrap_or_else(|| {
+        let (rows_per_lane, cols_per_lane, tm, tn) =
+            best.map(|(_, r, c, m, n)| (r, c, m, n)).unwrap_or_else(|| {
                 // 单/双轴切分都不可行 (warp_m/warp_n 都 < warp_size 且无法整除)。
                 // 回退: 不切分 (1 thread 持有整 warp tile), 仅 warp_m*warp_n ≤ max_acc 时合法。
                 (1, 1, warp_m, warp_n)
             });
-        Self { warp_m, warp_n, tm, tn, rows_per_lane, cols_per_lane }
+        Self {
+            warp_m,
+            warp_n,
+            tm,
+            tn,
+            rows_per_lane,
+            cols_per_lane,
+        }
     }
 
     /// accumulator 数量 = tm * tn (每 thread 持有的寄存器数)。
@@ -264,7 +274,12 @@ mod tests {
         for row in 0..tile.tm {
             for col in 0..tile.tn {
                 let acc_idx = row * tile.tn + col;
-                assert!(acc_idx < tile.acc_count(), "acc_idx {} < acc_count {}", acc_idx, tile.acc_count());
+                assert!(
+                    acc_idx < tile.acc_count(),
+                    "acc_idx {} < acc_count {}",
+                    acc_idx,
+                    tile.acc_count()
+                );
             }
         }
     }
@@ -278,8 +293,11 @@ mod tests {
         assert!(tile.warp_m * tile.warp_n > 16, "warp tile > 16");
         assert!(tile.acc_count() <= 64, "thread acc ≤ 64 (register budget)");
         // 32 lane × tm*tn = warp_m*warp_n (协同覆盖完整)
-        assert_eq!(GPU_WARP_SIZE * tile.acc_count(), tile.warp_m * tile.warp_n,
-            "32 lane × tm*tn must cover full warp_m*warp_n output");
+        assert_eq!(
+            GPU_WARP_SIZE * tile.acc_count(),
+            tile.warp_m * tile.warp_n,
+            "32 lane × tm*tn must cover full warp_m*warp_n output"
+        );
         tile.validate().expect("valid single/dual-axis split");
     }
 }

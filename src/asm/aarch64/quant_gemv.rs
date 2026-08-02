@@ -73,13 +73,11 @@ global_asm!(
     ".global _gllm_gemv_q4k_block_4row_neon",
     ".type _gllm_gemv_q4k_block_4row_neon, %function",
     "_gllm_gemv_q4k_block_4row_neon:",
-
     // Save callee-saved NEON registers d8-d15
     "stp d8,  d9,  [sp, #-64]!",
     "stp d10, d11, [sp, #16]",
     "stp d12, d13, [sp, #32]",
     "stp d14, d15, [sp, #48]",
-
     // Zero all accumulators
     "movi v0.4s,  #0",
     "movi v1.4s,  #0",
@@ -91,39 +89,31 @@ global_asm!(
     "movi v7.4s,  #0",
     "movi v8.4s,  #0",
     "movi v9.4s,  #0",
-
     // Nibble mask: 0x0F in all 16 bytes
     "movi v14.16b, #0x0F",
-
     // Loop counter: 8 iterations
     "mov x7, #8",
-
     ".align 5",
     ".Lq4k_neon_block_loop:",
-
     // ---- Load 16 bytes of qs for each row ----
     "ldr q27, [x0], #16",
     "ldr q28, [x1], #16",
     "ldr q29, [x2], #16",
     "ldr q30, [x3], #16",
-
     // ---- Load first 16 f32 input values ----
     "ldp q10, q11, [x4]",
     "ldp q12, q13, [x4, #32]",
-
     // ---- Accumulate input sum ----
     "fadd v8.4s, v8.4s, v10.4s",
     "fadd v9.4s, v9.4s, v11.4s",
     "fadd v8.4s, v8.4s, v12.4s",
     "fadd v9.4s, v9.4s, v13.4s",
-
     // ==== Row 0: unpack v27 nibbles, FMA into v0-v1 ====
-    "and  v15.16b, v27.16b, v14.16b",       // lo nibbles
-    "ushr v16.16b, v27.16b, #4",            // hi nibbles
+    "and  v15.16b, v27.16b, v14.16b", // lo nibbles
+    "ushr v16.16b, v27.16b, #4",      // hi nibbles
     "and  v16.16b, v16.16b, v14.16b",
-    "zip1 v17.16b, v15.16b, v16.16b",       // interleave first half
-    "zip2 v18.16b, v15.16b, v16.16b",       // interleave second half
-
+    "zip1 v17.16b, v15.16b, v16.16b", // interleave first half
+    "zip2 v18.16b, v15.16b, v16.16b", // interleave second half
     // v17 → 16 u8 → 16 f32 (4 vectors)
     "uxtl  v19.8h, v17.8b",
     "uxtl2 v20.8h, v17.16b",
@@ -139,17 +129,14 @@ global_asm!(
     "fmla v0.4s, v22.4s, v11.4s",
     "fmla v1.4s, v23.4s, v12.4s",
     "fmla v1.4s, v24.4s, v13.4s",
-
     // Load second 16 f32 input
     "ldp q10, q11, [x4, #64]",
     "ldp q12, q13, [x4, #96]",
-
     // Accumulate input sum for second half
     "fadd v8.4s, v8.4s, v10.4s",
     "fadd v9.4s, v9.4s, v11.4s",
     "fadd v8.4s, v8.4s, v12.4s",
     "fadd v9.4s, v9.4s, v13.4s",
-
     // v18 → 16 u8 → 16 f32
     "uxtl  v19.8h, v18.8b",
     "uxtl2 v20.8h, v18.16b",
@@ -165,18 +152,15 @@ global_asm!(
     "fmla v0.4s, v22.4s, v11.4s",
     "fmla v1.4s, v23.4s, v12.4s",
     "fmla v1.4s, v24.4s, v13.4s",
-
     // ==== Row 1: unpack v28 nibbles, FMA into v2-v3 ====
     "and  v15.16b, v28.16b, v14.16b",
     "ushr v16.16b, v28.16b, #4",
     "and  v16.16b, v16.16b, v14.16b",
     "zip1 v17.16b, v15.16b, v16.16b",
     "zip2 v18.16b, v15.16b, v16.16b",
-
     // Reload first 16 f32
     "ldp q10, q11, [x4]",
     "ldp q12, q13, [x4, #32]",
-
     "uxtl  v19.8h, v17.8b",
     "uxtl2 v20.8h, v17.16b",
     "uxtl  v21.4s, v19.4h",
@@ -191,10 +175,8 @@ global_asm!(
     "fmla v2.4s, v22.4s, v11.4s",
     "fmla v3.4s, v23.4s, v12.4s",
     "fmla v3.4s, v24.4s, v13.4s",
-
     "ldp q10, q11, [x4, #64]",
     "ldp q12, q13, [x4, #96]",
-
     "uxtl  v19.8h, v18.8b",
     "uxtl2 v20.8h, v18.16b",
     "uxtl  v21.4s, v19.4h",
@@ -209,17 +191,14 @@ global_asm!(
     "fmla v2.4s, v22.4s, v11.4s",
     "fmla v3.4s, v23.4s, v12.4s",
     "fmla v3.4s, v24.4s, v13.4s",
-
     // ==== Row 2: unpack v29 nibbles, FMA into v4-v5 ====
     "and  v15.16b, v29.16b, v14.16b",
     "ushr v16.16b, v29.16b, #4",
     "and  v16.16b, v16.16b, v14.16b",
     "zip1 v17.16b, v15.16b, v16.16b",
     "zip2 v18.16b, v15.16b, v16.16b",
-
     "ldp q10, q11, [x4]",
     "ldp q12, q13, [x4, #32]",
-
     "uxtl  v19.8h, v17.8b",
     "uxtl2 v20.8h, v17.16b",
     "uxtl  v21.4s, v19.4h",
@@ -234,10 +213,8 @@ global_asm!(
     "fmla v4.4s, v22.4s, v11.4s",
     "fmla v5.4s, v23.4s, v12.4s",
     "fmla v5.4s, v24.4s, v13.4s",
-
     "ldp q10, q11, [x4, #64]",
     "ldp q12, q13, [x4, #96]",
-
     "uxtl  v19.8h, v18.8b",
     "uxtl2 v20.8h, v18.16b",
     "uxtl  v21.4s, v19.4h",
@@ -252,17 +229,14 @@ global_asm!(
     "fmla v4.4s, v22.4s, v11.4s",
     "fmla v5.4s, v23.4s, v12.4s",
     "fmla v5.4s, v24.4s, v13.4s",
-
     // ==== Row 3: unpack v30 nibbles, FMA into v6-v7 ====
     "and  v15.16b, v30.16b, v14.16b",
     "ushr v16.16b, v30.16b, #4",
     "and  v16.16b, v16.16b, v14.16b",
     "zip1 v17.16b, v15.16b, v16.16b",
     "zip2 v18.16b, v15.16b, v16.16b",
-
     "ldp q10, q11, [x4]",
     "ldp q12, q13, [x4, #32]",
-
     "uxtl  v19.8h, v17.8b",
     "uxtl2 v20.8h, v17.16b",
     "uxtl  v21.4s, v19.4h",
@@ -277,10 +251,8 @@ global_asm!(
     "fmla v6.4s, v22.4s, v11.4s",
     "fmla v7.4s, v23.4s, v12.4s",
     "fmla v7.4s, v24.4s, v13.4s",
-
     "ldp q10, q11, [x4, #64]",
     "ldp q12, q13, [x4, #96]",
-
     "uxtl  v19.8h, v18.8b",
     "uxtl2 v20.8h, v18.16b",
     "uxtl  v21.4s, v19.4h",
@@ -295,52 +267,43 @@ global_asm!(
     "fmla v6.4s, v22.4s, v11.4s",
     "fmla v7.4s, v23.4s, v12.4s",
     "fmla v7.4s, v24.4s, v13.4s",
-
     // Advance input pointer by 32 f32 = 128 bytes
     "add x4, x4, #128",
-
     // Loop
     "subs x7, x7, #1",
     "b.ne .Lq4k_neon_block_loop",
-
     // ---- Horizontal reduce accumulators → scalars ----
     // row0: v0 + v1 → scalar
     "fadd v25.4s, v0.4s, v1.4s",
     "faddp v25.4s, v25.4s, v25.4s",
     "faddp s25, v25.2s",
     "str s25, [x5, #0]",
-
     // row1
     "fadd v25.4s, v2.4s, v3.4s",
     "faddp v25.4s, v25.4s, v25.4s",
     "faddp s25, v25.2s",
     "str s25, [x5, #4]",
-
     // row2
     "fadd v25.4s, v4.4s, v5.4s",
     "faddp v25.4s, v25.4s, v25.4s",
     "faddp s25, v25.2s",
     "str s25, [x5, #8]",
-
     // row3
     "fadd v25.4s, v6.4s, v7.4s",
     "faddp v25.4s, v25.4s, v25.4s",
     "faddp s25, v25.2s",
     "str s25, [x5, #12]",
-
     // input sum
     "fadd v25.4s, v8.4s, v9.4s",
     "faddp v25.4s, v25.4s, v25.4s",
     "faddp s25, v25.2s",
     "str s25, [x6]",
-
     // Restore callee-saved registers
     "ldp d10, d11, [sp, #16]",
     "ldp d12, d13, [sp, #32]",
     "ldp d14, d15, [sp, #48]",
     "ldp d8,  d9,  [sp], #64",
     "ret",
-
     ".size _gllm_gemv_q4k_block_4row_neon, . - _gllm_gemv_q4k_block_4row_neon",
 );
 
@@ -426,7 +389,10 @@ pub unsafe fn gemv_q4k_fused_neon(
             let qs3 = base3.add(boff + Q4K_QS_OFFSET);
 
             _gllm_gemv_q4k_block_4row_neon(
-                qs0, qs1, qs2, qs3,
+                qs0,
+                qs1,
+                qs2,
+                qs3,
                 inp,
                 out_nib.as_mut_ptr(),
                 &mut out_sum,
@@ -439,7 +405,7 @@ pub unsafe fn gemv_q4k_fused_neon(
             sum3 += d3 * out_nib[3] - d3 * 8.0 * out_sum;
         }
 
-        *output.add(row)     = sum0;
+        *output.add(row) = sum0;
         *output.add(row + 1) = sum1;
         *output.add(row + 2) = sum2;
         *output.add(row + 3) = sum3;
@@ -534,13 +500,11 @@ global_asm!(
     ".global _gllm_gemv_q8k_block_4row_neon",
     ".type _gllm_gemv_q8k_block_4row_neon, %function",
     "_gllm_gemv_q8k_block_4row_neon:",
-
     // Save callee-saved NEON registers d8-d15
     "stp d8,  d9,  [sp, #-64]!",
     "stp d10, d11, [sp, #16]",
     "stp d12, d13, [sp, #32]",
     "stp d14, d15, [sp, #48]",
-
     // Zero all 8 accumulators (2 per row × 4 rows)
     "movi v0.4s,  #0",
     "movi v1.4s,  #0",
@@ -550,17 +514,13 @@ global_asm!(
     "movi v5.4s,  #0",
     "movi v6.4s,  #0",
     "movi v7.4s,  #0",
-
     // Loop counter: 16 iterations × 16 i8 = 256 elements
     "mov x6, #16",
-
     ".align 5",
     ".Lq8k_neon_block_loop:",
-
     // ---- Shared input load: 16 f32 = 64 bytes ----
     "ldp q8,  q9,  [x4]",
     "ldp q10, q11, [x4, #32]",
-
     // ---- Row 0 (qs0 = x0): load 16 i8, sign-extend to f32, FMA ----
     "ldr q12, [x0], #16",
     "sxtl  v17.8h, v12.8b",
@@ -577,7 +537,6 @@ global_asm!(
     "fmla v0.4s, v14.4s, v9.4s",
     "fmla v1.4s, v15.4s, v10.4s",
     "fmla v1.4s, v16.4s, v11.4s",
-
     // ---- Row 1 (qs1 = x1) ----
     "ldr q12, [x1], #16",
     "sxtl  v17.8h, v12.8b",
@@ -594,7 +553,6 @@ global_asm!(
     "fmla v2.4s, v14.4s, v9.4s",
     "fmla v3.4s, v15.4s, v10.4s",
     "fmla v3.4s, v16.4s, v11.4s",
-
     // ---- Row 2 (qs2 = x2) ----
     "ldr q12, [x2], #16",
     "sxtl  v17.8h, v12.8b",
@@ -611,7 +569,6 @@ global_asm!(
     "fmla v4.4s, v14.4s, v9.4s",
     "fmla v5.4s, v15.4s, v10.4s",
     "fmla v5.4s, v16.4s, v11.4s",
-
     // ---- Row 3 (qs3 = x3) ----
     "ldr q12, [x3], #16",
     "sxtl  v17.8h, v12.8b",
@@ -628,13 +585,10 @@ global_asm!(
     "fmla v6.4s, v14.4s, v9.4s",
     "fmla v7.4s, v15.4s, v10.4s",
     "fmla v7.4s, v16.4s, v11.4s",
-
     // Advance input pointer: 16 f32 = 64 bytes
     "add x4, x4, #64",
-
     "subs x6, x6, #1",
     "b.ne .Lq8k_neon_block_loop",
-
     // ---- Horizontal reduce each row pair → scalar ----
     // Pattern: fadd(acc_lo, acc_hi) → faddp → faddp → scalar
     // row0: v0 + v1 → out[0]
@@ -642,32 +596,27 @@ global_asm!(
     "faddp v25.4s, v25.4s, v25.4s",
     "faddp s25, v25.2s",
     "str s25, [x5, #0]",
-
     // row1: v2 + v3 → out[1]
     "fadd v25.4s, v2.4s, v3.4s",
     "faddp v25.4s, v25.4s, v25.4s",
     "faddp s25, v25.2s",
     "str s25, [x5, #4]",
-
     // row2: v4 + v5 → out[2]
     "fadd v25.4s, v4.4s, v5.4s",
     "faddp v25.4s, v25.4s, v25.4s",
     "faddp s25, v25.2s",
     "str s25, [x5, #8]",
-
     // row3: v6 + v7 → out[3]
     "fadd v25.4s, v6.4s, v7.4s",
     "faddp v25.4s, v25.4s, v25.4s",
     "faddp s25, v25.2s",
     "str s25, [x5, #12]",
-
     // Restore callee-saved registers
     "ldp d10, d11, [sp, #16]",
     "ldp d12, d13, [sp, #32]",
     "ldp d14, d15, [sp, #48]",
     "ldp d8,  d9,  [sp], #64",
     "ret",
-
     ".size _gllm_gemv_q8k_block_4row_neon, . - _gllm_gemv_q8k_block_4row_neon",
 );
 
@@ -811,7 +760,7 @@ pub unsafe fn gemv_q8k_fused_neon(
             sum3 += d3 * partial[3];
         }
 
-        *output.add(row)     = sum0;
+        *output.add(row) = sum0;
         *output.add(row + 1) = sum1;
         *output.add(row + 2) = sum2;
         *output.add(row + 3) = sum3;

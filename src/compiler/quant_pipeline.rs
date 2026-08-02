@@ -19,12 +19,8 @@
 //! `QuantFormatDescriptor` metadata via `DecodeTraceBuilder` trace templates.
 
 use crate::compiler::codegen::vm::auto_select;
-use crate::compiler::codegen::vm::instr::{
-    BoundExpr, SimdWidth, VRegId, VmProgram,
-};
-use crate::compiler::trace::{
-    self, QuantPrecision, TraceOp, TypedSlot,
-};
+use crate::compiler::codegen::vm::instr::{BoundExpr, SimdWidth, VRegId, VmProgram};
+use crate::compiler::trace::{self, QuantPrecision, TraceOp, TypedSlot};
 use crate::quant::QuantType;
 use crate::types::CompilerError;
 
@@ -100,11 +96,7 @@ impl QuantPipeline {
     /// The trace is designed to be consumed by `auto_select::dispatch_trace_op`,
     /// which expands `TraceOp::QuantGather` into the full loop nest with
     /// `DecodeTraceBuilder`-driven block decode.
-    pub fn build_gather_trace(
-        &self,
-        vocab_size: usize,
-        hidden_dim: usize,
-    ) -> Vec<TraceOp> {
+    pub fn build_gather_trace(&self, vocab_size: usize, hidden_dim: usize) -> Vec<TraceOp> {
         trace::build_quant_gather_trace(self.quant_type, vocab_size, hidden_dim)
     }
 
@@ -155,12 +147,7 @@ impl QuantPipeline {
     /// The trace is designed to be consumed by `auto_select::dispatch_trace_op`,
     /// which expands `TraceOp::QuantGemm` into the tiled loop nest with
     /// block decode + FMA accumulation.
-    pub fn build_gemm_trace(
-        &self,
-        m: usize,
-        n: usize,
-        k: usize,
-    ) -> Vec<TraceOp> {
+    pub fn build_gemm_trace(&self, m: usize, n: usize, k: usize) -> Vec<TraceOp> {
         trace::build_quant_gemm_trace(self.quant_type, m, n, k)
     }
 
@@ -403,9 +390,15 @@ mod tests {
         let pipeline = QuantPipeline::new(QuantType::Q4_0);
         let trace = pipeline.build_gather_trace(32000, 4096);
         // build_quant_gather_trace produces: Input, Input, Input, QuantGather
-        assert!(trace.len() >= 4, "gather trace should have at least 4 ops, got {}", trace.len());
+        assert!(
+            trace.len() >= 4,
+            "gather trace should have at least 4 ops, got {}",
+            trace.len()
+        );
 
-        let has_gather = trace.iter().any(|op| matches!(op, TraceOp::QuantGather { .. }));
+        let has_gather = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantGather { .. }));
         assert!(has_gather, "gather trace should contain QuantGather op");
     }
 
@@ -413,9 +406,15 @@ mod tests {
     fn test_build_gemm_trace_structure() {
         let pipeline = QuantPipeline::new(QuantType::Q4_0);
         let trace = pipeline.build_gemm_trace(1, 4096, 4096);
-        assert!(trace.len() >= 4, "gemm trace should have at least 4 ops, got {}", trace.len());
+        assert!(
+            trace.len() >= 4,
+            "gemm trace should have at least 4 ops, got {}",
+            trace.len()
+        );
 
-        let has_gemm = trace.iter().any(|op| matches!(op, TraceOp::QuantGemm { .. }));
+        let has_gemm = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantGemm { .. }));
         assert!(has_gemm, "gemm trace should contain QuantGemm op");
     }
 
@@ -423,11 +422,11 @@ mod tests {
     fn test_build_quant_layer_traces() {
         let traces = build_quant_layer_traces(
             QuantType::Q4_0,
-            4096,   // hidden
-            11008,  // intermediate
-            32,     // num_heads
-            32,     // num_kv_heads
-            128,    // head_dim
+            4096,  // hidden
+            11008, // intermediate
+            32,    // num_heads
+            32,    // num_kv_heads
+            128,   // head_dim
         );
         assert!(matches!(traces.quant_type, QuantType::Q4_0));
         assert!(traces.qkv_trace.len() >= 4);
@@ -443,15 +442,29 @@ mod tests {
 
     #[test]
     fn test_quant_pipeline_various_formats() {
-        for qt in [QuantType::Q4_0, QuantType::Q4_1, QuantType::Q8_0, QuantType::Q8_1] {
+        for qt in [
+            QuantType::Q4_0,
+            QuantType::Q4_1,
+            QuantType::Q8_0,
+            QuantType::Q8_1,
+        ] {
             let pipeline = QuantPipeline::new(qt);
             let gather = pipeline.build_gather_trace(32000, 4096);
-            assert!(gather.iter().any(|op| matches!(op, TraceOp::QuantGather { .. })),
-                "QuantGather trace missing for {:?}", qt);
+            assert!(
+                gather
+                    .iter()
+                    .any(|op| matches!(op, TraceOp::QuantGather { .. })),
+                "QuantGather trace missing for {:?}",
+                qt
+            );
 
             let gemm = pipeline.build_gemm_trace(1, 4096, 4096);
-            assert!(gemm.iter().any(|op| matches!(op, TraceOp::QuantGemm { .. })),
-                "QuantGemm trace missing for {:?}", qt);
+            assert!(
+                gemm.iter()
+                    .any(|op| matches!(op, TraceOp::QuantGemm { .. })),
+                "QuantGemm trace missing for {:?}",
+                qt
+            );
         }
     }
 
@@ -464,16 +477,18 @@ mod tests {
         let pipeline = QuantPipeline::new(QuantType::Q4_0);
 
         // Act & Assert: default SIMD width must be W256
-        assert_eq!(pipeline.width, SimdWidth::W256,
-            "QuantPipeline::new() should default to SimdWidth::W256");
+        assert_eq!(
+            pipeline.width,
+            SimdWidth::W256,
+            "QuantPipeline::new() should default to SimdWidth::W256"
+        );
     }
 
     // @trace TEST-QP-08 [req:REQ-QPJ] [level:unit]
     #[test]
     fn test_pipeline_with_width_overrides_default() {
         // Arrange: create pipeline and override width to W512
-        let pipeline = QuantPipeline::new(QuantType::Q8_0)
-            .with_width(SimdWidth::W512);
+        let pipeline = QuantPipeline::new(QuantType::Q8_0).with_width(SimdWidth::W512);
 
         // Act & Assert: width should be overridden
         assert_eq!(pipeline.width, SimdWidth::W512);
@@ -485,8 +500,7 @@ mod tests {
     #[test]
     fn test_pipeline_with_compute_dtype_override() {
         // Arrange: create pipeline and override compute dtype
-        let pipeline = QuantPipeline::new(QuantType::Q4_0)
-            .with_compute_dtype(QuantPrecision::BF16);
+        let pipeline = QuantPipeline::new(QuantType::Q4_0).with_compute_dtype(QuantPrecision::BF16);
 
         // Act & Assert: compute dtype should be overridden while quant_type remains
         assert_eq!(pipeline.compute_dtype, QuantPrecision::BF16);
@@ -533,12 +547,25 @@ mod tests {
 
         // Assert: exact 4 ops with correct ordering and parameters
         assert_eq!(trace.len(), 4, "gather trace should have exactly 4 ops");
-        assert!(matches!(trace[0], TraceOp::Input(0)), "first op must be Input(0) for indices_ptr");
-        assert!(matches!(trace[1], TraceOp::Input(1)), "second op must be Input(1) for embed_ptr");
-        assert!(matches!(trace[2], TraceOp::Input(2)), "third op must be Input(2) for output_ptr");
+        assert!(
+            matches!(trace[0], TraceOp::Input(0)),
+            "first op must be Input(0) for indices_ptr"
+        );
+        assert!(
+            matches!(trace[1], TraceOp::Input(1)),
+            "second op must be Input(1) for embed_ptr"
+        );
+        assert!(
+            matches!(trace[2], TraceOp::Input(2)),
+            "third op must be Input(2) for output_ptr"
+        );
 
         match &trace[3] {
-            TraceOp::QuantGather { quant_type, vocab_size, hidden_dim } => {
+            TraceOp::QuantGather {
+                quant_type,
+                vocab_size,
+                hidden_dim,
+            } => {
                 assert!(matches!(quant_type, QuantType::Q5_1));
                 assert_eq!(*vocab_size, vocab);
                 assert_eq!(*hidden_dim, hidden);
@@ -561,12 +588,26 @@ mod tests {
 
         // Assert: exact 4 ops with correct ordering and parameters
         assert_eq!(trace.len(), 4, "gemm trace should have exactly 4 ops");
-        assert!(matches!(trace[0], TraceOp::Input(0)), "first op must be Input(0) for input_ptr");
-        assert!(matches!(trace[1], TraceOp::Input(1)), "second op must be Input(1) for weight_ptr");
-        assert!(matches!(trace[2], TraceOp::Input(2)), "third op must be Input(2) for output_ptr");
+        assert!(
+            matches!(trace[0], TraceOp::Input(0)),
+            "first op must be Input(0) for input_ptr"
+        );
+        assert!(
+            matches!(trace[1], TraceOp::Input(1)),
+            "second op must be Input(1) for weight_ptr"
+        );
+        assert!(
+            matches!(trace[2], TraceOp::Input(2)),
+            "third op must be Input(2) for output_ptr"
+        );
 
         match &trace[3] {
-            TraceOp::QuantGemm { quant_type, m: m_val, n: n_val, k: k_val } => {
+            TraceOp::QuantGemm {
+                quant_type,
+                m: m_val,
+                n: n_val,
+                k: k_val,
+            } => {
                 assert!(matches!(quant_type, QuantType::Q8_1));
                 assert_eq!(*m_val, m);
                 assert_eq!(*n_val, n);
@@ -583,11 +624,11 @@ mod tests {
         // kv_dim = 8 * 128 = 1024, q_dim = 32 * 128 = 4096
         let traces = build_quant_layer_traces(
             QuantType::Q4K,
-            4096,   // hidden
-            11008,  // intermediate
-            32,     // num_heads
-            8,      // num_kv_heads (GQA: fewer KV heads)
-            128,    // head_dim
+            4096,  // hidden
+            11008, // intermediate
+            32,    // num_heads
+            8,     // num_kv_heads (GQA: fewer KV heads)
+            128,   // head_dim
         );
 
         // Act & Assert: QKV N = q_dim + 2*kv_dim = 4096 + 2048 = 6144
@@ -609,14 +650,7 @@ mod tests {
     #[test]
     fn test_layer_traces_m_dim_is_zero_symbolic() {
         // Arrange: any quant type and dimensions
-        let traces = build_quant_layer_traces(
-            QuantType::Q8K,
-            2048,
-            5632,
-            16,
-            16,
-            64,
-        );
+        let traces = build_quant_layer_traces(QuantType::Q8K, 2048, 5632, 16, 16, 64);
 
         // Act & Assert: all M dims must be 0 (symbolic, bound at runtime)
         assert_eq!(traces.qkv_dims.0, 0);
@@ -631,20 +665,29 @@ mod tests {
     fn test_gather_trace_k_quant_and_iq_formats() {
         // Arrange: K-quant and IQ family formats
         let k_quant_formats = [
-            QuantType::Q2K, QuantType::Q3K, QuantType::Q4K,
-            QuantType::Q5K, QuantType::Q6K, QuantType::Q8K,
+            QuantType::Q2K,
+            QuantType::Q3K,
+            QuantType::Q4K,
+            QuantType::Q5K,
+            QuantType::Q6K,
+            QuantType::Q8K,
         ];
-        let iq_formats = [
-            QuantType::IQ3XXS, QuantType::IQ4NL,
-        ];
+        let iq_formats = [QuantType::IQ3XXS, QuantType::IQ4NL];
 
         // Act & Assert: all K-quant and IQ formats should produce valid gather traces
         for qt in k_quant_formats.iter().chain(iq_formats.iter()) {
             let pipeline = QuantPipeline::new(*qt);
             let trace = pipeline.build_gather_trace(32000, 4096);
-            assert_eq!(trace.len(), 4, "gather trace for {:?} should have 4 ops", qt);
+            assert_eq!(
+                trace.len(),
+                4,
+                "gather trace for {:?} should have 4 ops",
+                qt
+            );
 
-            let gather_op = trace.iter().find(|op| matches!(op, TraceOp::QuantGather { .. }));
+            let gather_op = trace
+                .iter()
+                .find(|op| matches!(op, TraceOp::QuantGather { .. }));
             assert!(gather_op.is_some(), "QuantGather missing for {:?}", qt);
         }
     }
@@ -688,7 +731,11 @@ mod tests {
         // Assert: trace structure is still valid with minimum dimensions
         assert_eq!(trace.len(), 4);
         match &trace[3] {
-            TraceOp::QuantGather { vocab_size, hidden_dim, .. } => {
+            TraceOp::QuantGather {
+                vocab_size,
+                hidden_dim,
+                ..
+            } => {
                 assert_eq!(*vocab_size, 1);
                 assert_eq!(*hidden_dim, 1);
             }
@@ -710,7 +757,12 @@ mod tests {
         // Assert: large dimensions should be propagated correctly
         assert_eq!(trace.len(), 4);
         match &trace[3] {
-            TraceOp::QuantGemm { m, n: n_val, k: k_val, .. } => {
+            TraceOp::QuantGemm {
+                m,
+                n: n_val,
+                k: k_val,
+                ..
+            } => {
                 assert_eq!(*m, 0);
                 assert_eq!(*n_val, 16384);
                 assert_eq!(*k_val, 16384);
@@ -741,18 +793,14 @@ mod tests {
 
     #[test]
     fn test_quant_layer_traces_debug() {
-        let traces = build_quant_layer_traces(
-            QuantType::Q4_0, 256, 512, 4, 4, 64,
-        );
+        let traces = build_quant_layer_traces(QuantType::Q4_0, 256, 512, 4, 4, 64);
         let debug = format!("{:?}", traces);
         assert!(debug.contains("QuantLayerTraces"));
     }
 
     #[test]
     fn test_quant_layer_traces_clone() {
-        let traces = build_quant_layer_traces(
-            QuantType::Q8_0, 512, 1024, 8, 8, 64,
-        );
+        let traces = build_quant_layer_traces(QuantType::Q8_0, 512, 1024, 8, 8, 64);
         let cloned = traces.clone();
         assert_eq!(traces.qkv_dims, cloned.qkv_dims);
         assert_eq!(traces.output_dims, cloned.output_dims);
@@ -800,11 +848,11 @@ mod tests {
         // Arrange: very small model dimensions
         let traces = build_quant_layer_traces(
             QuantType::Q4_0,
-            64,     // hidden
-            128,    // intermediate
-            2,      // num_heads
-            2,      // num_kv_heads
-            32,     // head_dim
+            64,  // hidden
+            128, // intermediate
+            2,   // num_heads
+            2,   // num_kv_heads
+            32,  // head_dim
         );
 
         // kv_dim = 2*32 = 64, q_dim = 2*32 = 64
@@ -827,24 +875,31 @@ mod tests {
             let pipeline = QuantPipeline::new(qt);
             let trace = pipeline.build_gather_trace(32000, 4096);
             assert_eq!(trace.len(), 4);
-            assert!(trace.iter().any(|op| matches!(op, TraceOp::QuantGather { .. })),
-                "QuantGather missing for {:?}", qt);
+            assert!(
+                trace
+                    .iter()
+                    .any(|op| matches!(op, TraceOp::QuantGather { .. })),
+                "QuantGather missing for {:?}",
+                qt
+            );
         }
     }
 
     #[test]
     fn test_gemm_trace_nvfp4_and_mxfp4() {
-        let formats = [
-            QuantType::Nvfp4,
-            QuantType::Mxfp4 { block_size: 32 },
-        ];
+        let formats = [QuantType::Nvfp4, QuantType::Mxfp4 { block_size: 32 }];
         for qt in &formats {
             let pipeline = QuantPipeline::new(*qt);
             let trace = pipeline.build_gemm_trace(1, 512, 256);
             assert_eq!(trace.len(), 4);
 
             match &trace[3] {
-                TraceOp::QuantGemm { quant_type, m, n, k } => {
+                TraceOp::QuantGemm {
+                    quant_type,
+                    m,
+                    n,
+                    k,
+                } => {
                     assert_eq!(*quant_type, *qt);
                     assert_eq!(*m, 1);
                     assert_eq!(*n, 512);

@@ -15,9 +15,9 @@ pub mod vm;
 #[cfg(test)]
 mod test_centroid;
 
-pub use emitter::{MachineCodeEmitter, PlatformBackend, Platform};
+pub use emitter::{MachineCodeEmitter, Platform, PlatformBackend};
 #[cfg(feature = "jit-x86")]
-pub use emitter::{X86CodeGen, X86Backend};
+pub use emitter::{X86Backend, X86CodeGen};
 
 /// Code generation output 格式。
 ///
@@ -223,9 +223,14 @@ mod tests {
     #[test]
     fn rope_cache_requirement_equality() {
         let a = RopeCacheRequirement {
-            cache_offset: 0, head_dim: 64, theta: 500000.0,
-            partial: 0.25, max_seq_len: 8192, rope_scaling: None,
-            attention_scaling: 1.0, secondary_cache: None,
+            cache_offset: 0,
+            head_dim: 64,
+            theta: 500000.0,
+            partial: 0.25,
+            max_seq_len: 8192,
+            rope_scaling: None,
+            attention_scaling: 1.0,
+            secondary_cache: None,
         };
         let b = a.clone();
         assert_eq!(a, b);
@@ -241,9 +246,14 @@ mod tests {
             rope_scaling: None,
         };
         let r = RopeCacheRequirement {
-            cache_offset: 0, head_dim: 128, theta: 10000.0,
-            partial: 1.0, max_seq_len: 8192, rope_scaling: None,
-            attention_scaling: 1.0, secondary_cache: Some(sec.clone()),
+            cache_offset: 0,
+            head_dim: 128,
+            theta: 10000.0,
+            partial: 1.0,
+            max_seq_len: 8192,
+            rope_scaling: None,
+            attention_scaling: 1.0,
+            secondary_cache: Some(sec.clone()),
         };
         assert_eq!(r.secondary_cache.as_ref().unwrap().head_dim, 64);
         assert_eq!(r.secondary_cache.as_ref().unwrap().theta, 1000000.0);
@@ -272,8 +282,11 @@ mod tests {
     #[test]
     fn secondary_rope_cache_equality() {
         let a = SecondaryRopeCache {
-            head_dim: 64, cache_offset: 0, theta: 10000.0,
-            partial: 1.0, rope_scaling: None,
+            head_dim: 64,
+            cache_offset: 0,
+            theta: 10000.0,
+            partial: 1.0,
+            rope_scaling: None,
         };
         let b = a.clone();
         assert_eq!(a, b);
@@ -302,8 +315,12 @@ mod tests {
     #[test]
     fn ple_scratch_equality_and_copy() {
         let a = PleScratchRequirement {
-            ctx_offset: 0, post_mlp_offset: 512, total_bytes: 1024,
-            max_seq_len: 2048, dim_per_layer: 128, hidden: 1024,
+            ctx_offset: 0,
+            post_mlp_offset: 512,
+            total_bytes: 1024,
+            max_seq_len: 2048,
+            dim_per_layer: 128,
+            hidden: 1024,
         };
         let b = a; // Copy
         assert_eq!(a, b);
@@ -312,8 +329,12 @@ mod tests {
     #[test]
     fn ple_scratch_inequality() {
         let a = PleScratchRequirement {
-            ctx_offset: 0, post_mlp_offset: 512, total_bytes: 1024,
-            max_seq_len: 2048, dim_per_layer: 128, hidden: 1024,
+            ctx_offset: 0,
+            post_mlp_offset: 512,
+            total_bytes: 1024,
+            max_seq_len: 2048,
+            dim_per_layer: 128,
+            hidden: 1024,
         };
         let mut b = a;
         b.total_bytes = 2048;
@@ -345,8 +366,13 @@ mod tests {
     #[test]
     fn dwc_scratch_equality_and_copy() {
         let a = DwcScratchRequirement {
-            padded_offset: 0, total_bytes: 1024, max_seq_len: 256,
-            channels: 128, kernel_size: 3, causal: false, left_pad: 1,
+            padded_offset: 0,
+            total_bytes: 1024,
+            max_seq_len: 256,
+            channels: 128,
+            kernel_size: 3,
+            causal: false,
+            left_pad: 1,
         };
         let b = a; // Copy
         assert_eq!(a, b);
@@ -355,12 +381,22 @@ mod tests {
     #[test]
     fn dwc_scratch_causal_vs_non_causal() {
         let causal = DwcScratchRequirement {
-            padded_offset: 0, total_bytes: 1024, max_seq_len: 256,
-            channels: 128, kernel_size: 5, causal: true, left_pad: 4,
+            padded_offset: 0,
+            total_bytes: 1024,
+            max_seq_len: 256,
+            channels: 128,
+            kernel_size: 5,
+            causal: true,
+            left_pad: 4,
         };
         let non_causal = DwcScratchRequirement {
-            padded_offset: 0, total_bytes: 1024, max_seq_len: 256,
-            channels: 128, kernel_size: 5, causal: false, left_pad: 2,
+            padded_offset: 0,
+            total_bytes: 1024,
+            max_seq_len: 256,
+            channels: 128,
+            kernel_size: 5,
+            causal: false,
+            left_pad: 2,
         };
         assert_ne!(causal, non_causal);
     }
@@ -405,9 +441,14 @@ mod tests {
     #[test]
     fn codegen_output_with_rope_cache() {
         let rope = RopeCacheRequirement {
-            cache_offset: 256, head_dim: 128, theta: 10000.0,
-            partial: 1.0, max_seq_len: 4096, rope_scaling: None,
-            attention_scaling: 1.0, secondary_cache: None,
+            cache_offset: 256,
+            head_dim: 128,
+            theta: 10000.0,
+            partial: 1.0,
+            max_seq_len: 4096,
+            rope_scaling: None,
+            attention_scaling: 1.0,
+            secondary_cache: None,
         };
         let out = CodegenOutput {
             code: vec![],
@@ -435,7 +476,11 @@ mod tests {
         ];
         for i in 0..variants.len() {
             for j in (i + 1)..variants.len() {
-                assert_ne!(variants[i], variants[j], "{:?} should != {:?}", variants[i], variants[j]);
+                assert_ne!(
+                    variants[i], variants[j],
+                    "{:?} should != {:?}",
+                    variants[i], variants[j]
+                );
             }
         }
     }
@@ -458,8 +503,11 @@ mod tests {
     #[test]
     fn rope_cache_with_yarn_scaling() {
         let r = RopeCacheRequirement {
-            cache_offset: 0, head_dim: 64, theta: 10000.0,
-            partial: 1.0, max_seq_len: 32768,
+            cache_offset: 0,
+            head_dim: 64,
+            theta: 10000.0,
+            partial: 1.0,
+            max_seq_len: 32768,
             rope_scaling: Some(crate::compiler::graph::RopeScaling::Yarn {
                 factor: 4.0,
                 beta_fast: 32.0,
@@ -476,9 +524,14 @@ mod tests {
     #[test]
     fn rope_cache_inequality_different_fields() {
         let a = RopeCacheRequirement {
-            cache_offset: 0, head_dim: 64, theta: 10000.0,
-            partial: 1.0, max_seq_len: 4096, rope_scaling: None,
-            attention_scaling: 1.0, secondary_cache: None,
+            cache_offset: 0,
+            head_dim: 64,
+            theta: 10000.0,
+            partial: 1.0,
+            max_seq_len: 4096,
+            rope_scaling: None,
+            attention_scaling: 1.0,
+            secondary_cache: None,
         };
         let mut b = a.clone();
         b.theta = 500000.0;
@@ -492,8 +545,11 @@ mod tests {
     #[test]
     fn secondary_rope_cache_inequality() {
         let a = SecondaryRopeCache {
-            head_dim: 64, cache_offset: 0, theta: 10000.0,
-            partial: 1.0, rope_scaling: None,
+            head_dim: 64,
+            cache_offset: 0,
+            theta: 10000.0,
+            partial: 1.0,
+            rope_scaling: None,
         };
         let mut b = a.clone();
         b.partial = 0.25;
@@ -517,8 +573,13 @@ mod tests {
     #[test]
     fn dwc_scratch_non_causal_symmetric_pad() {
         let d = DwcScratchRequirement {
-            padded_offset: 0, total_bytes: 2048, max_seq_len: 512,
-            channels: 64, kernel_size: 5, causal: false, left_pad: 2,
+            padded_offset: 0,
+            total_bytes: 2048,
+            max_seq_len: 512,
+            channels: 64,
+            kernel_size: 5,
+            causal: false,
+            left_pad: 2,
         };
         assert!(!d.causal);
         assert_eq!(d.left_pad, 2);
@@ -579,8 +640,13 @@ mod tests {
     #[test]
     fn dwc_scratch_inequality_different_channels() {
         let a = DwcScratchRequirement {
-            padded_offset: 0, total_bytes: 1024, max_seq_len: 256,
-            channels: 128, kernel_size: 3, causal: false, left_pad: 1,
+            padded_offset: 0,
+            total_bytes: 1024,
+            max_seq_len: 256,
+            channels: 128,
+            kernel_size: 3,
+            causal: false,
+            left_pad: 1,
         };
         let mut b = a;
         b.channels = 256;

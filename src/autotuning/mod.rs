@@ -33,19 +33,22 @@
 //! println!("JIT optimal: {}", jit_result.config);
 //! ```
 
+pub mod cache;
 pub mod hw_info;
-pub mod search_space;
 pub mod measure;
 pub mod search;
-pub mod cache;
+pub mod search_space;
 
 use std::sync::OnceLock;
 
+pub use cache::WisdomDb;
 pub use hw_info::HwInfo;
-pub use search_space::{ProblemShape, TuningConfig, OpClass, SearchSpace, JitParams, RegAllocStrategy, JitSearchRanges, GpuGemmConfig, GpuSearchSpace};
 pub use measure::{BenchConfig, BenchResult};
 pub use search::{SearchConfig, SearchResult};
-pub use cache::WisdomDb;
+pub use search_space::{
+    GpuGemmConfig, GpuSearchSpace, JitParams, JitSearchRanges, OpClass, ProblemShape,
+    RegAllocStrategy, SearchSpace, TuningConfig,
+};
 
 /// How thorough the tuning should be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,7 +98,13 @@ pub fn global_wisdom_db() -> &'static std::sync::Mutex<WisdomDb> {
 ///
 /// Returns the optimal (KC, MC, NC, threads) configuration.
 /// Results are cached to disk and reused on subsequent calls.
-pub fn tune_gemm(m: usize, n: usize, k: usize, elem_bytes: usize, level: TuneLevel) -> TuningConfig {
+pub fn tune_gemm(
+    m: usize,
+    n: usize,
+    k: usize,
+    elem_bytes: usize,
+    level: TuneLevel,
+) -> TuningConfig {
     let result = tune_gemm_with_report(m, n, k, elem_bytes, level);
     result.config
 }
@@ -109,7 +118,13 @@ pub fn tune_gemm_with_report(
     level: TuneLevel,
 ) -> TuneResult {
     let hw = hw_info();
-    let shape = ProblemShape { m, n, k, elem_bytes, dtype_id: 0 };
+    let shape = ProblemShape {
+        m,
+        n,
+        k,
+        elem_bytes,
+        dtype_id: 0,
+    };
     let op_key = cache::op_key("gemm", &shape);
     let fp = hw.fingerprint();
 
@@ -188,11 +203,7 @@ pub fn tune_gemm_with_report(
         })
     });
 
-    let report = search::format_report(
-        &search_result,
-        "GEMM",
-        &format!("{shape}"),
-    );
+    let report = search::format_report(&search_result, "GEMM", &format!("{shape}"));
 
     // Save to cache
     {
@@ -234,7 +245,13 @@ pub fn tune_jit_gemm(
     level: TuneLevel,
 ) -> TuneResult {
     let hw = hw_info();
-    let shape = ProblemShape { m, n, k, elem_bytes: dtype.size_bytes(), dtype_id: dtype.elem_id() };
+    let shape = ProblemShape {
+        m,
+        n,
+        k,
+        elem_bytes: dtype.size_bytes(),
+        dtype_id: dtype.elem_id(),
+    };
     let op_key = cache::op_key("jit_gemm", &shape);
     let fp = hw.fingerprint();
 
@@ -285,11 +302,7 @@ pub fn tune_jit_gemm(
         }
     });
 
-    let report = search::format_report(
-        &search_result,
-        "JIT GEMM",
-        &format!("{shape}"),
-    );
+    let report = search::format_report(&search_result, "JIT GEMM", &format!("{shape}"));
 
     // Save to cache
     {
@@ -463,8 +476,8 @@ fn gemm_with_params(
     // For autotuning, we benchmark the current kernel with different
     // thread pool sizes — the blocking params (KC/MC/NC) are tested
     // by the search space but applied through the existing infrastructure.
-    use crate::traits::Kernels;
     use crate::cpu_kernels::CpuKernels;
+    use crate::traits::Kernels;
     let kernels = CpuKernels::<f32>::new();
     kernels.gemm(a, b, c, m, n, k);
 }
@@ -504,7 +517,13 @@ mod tests {
         {
             let hw = hw_info();
             let fp = hw.fingerprint();
-            let shape = search_space::ProblemShape { m: 37, n: 37, k: 37, elem_bytes: 4, dtype_id: 0 };
+            let shape = search_space::ProblemShape {
+                m: 37,
+                n: 37,
+                k: 37,
+                elem_bytes: 4,
+                dtype_id: 0,
+            };
             let key = cache::op_key("gemm", &shape);
             let mut db = wisdom_db().lock().unwrap_or_else(|e| e.into_inner());
             // Remove just this entry by re-putting after clear check
@@ -534,7 +553,13 @@ mod tests {
     #[test]
     fn test_jit_search_space_dimensions() {
         let hw = hw_info();
-        let shape = ProblemShape { m: 256, n: 256, k: 256, elem_bytes: 4, dtype_id: 0 };
+        let shape = ProblemShape {
+            m: 256,
+            n: 256,
+            k: 256,
+            elem_bytes: 4,
+            dtype_id: 0,
+        };
         let (tm, tn) = microkernel_geometry(hw, 4);
         let space = SearchSpace::for_jit_gemm(hw, &shape, tm, tn);
 
@@ -542,11 +567,26 @@ mod tests {
         let jit = space.jit_ranges.as_ref().unwrap();
 
         // Verify all 5 JIT dimensions are present
-        assert!(jit.k_unroll_range.max >= 1, "k_unroll range must be non-empty");
-        assert!(jit.prefetch_range.count() >= 1, "prefetch range must be non-empty");
-        assert!(!jit.reg_alloc_strategies.is_empty(), "reg_alloc strategies must be non-empty");
-        assert!(jit.sw_pipeline_range.count() >= 1, "sw_pipeline range must be non-empty");
-        assert!(jit.nr_variant_range.count() >= 1, "nr_variant range must be non-empty");
+        assert!(
+            jit.k_unroll_range.max >= 1,
+            "k_unroll range must be non-empty"
+        );
+        assert!(
+            jit.prefetch_range.count() >= 1,
+            "prefetch range must be non-empty"
+        );
+        assert!(
+            !jit.reg_alloc_strategies.is_empty(),
+            "reg_alloc strategies must be non-empty"
+        );
+        assert!(
+            jit.sw_pipeline_range.count() >= 1,
+            "sw_pipeline range must be non-empty"
+        );
+        assert!(
+            jit.nr_variant_range.count() >= 1,
+            "nr_variant range must be non-empty"
+        );
 
         let grid = space.grid_size();
         let base_space = SearchSpace::for_gemm(hw, &shape, tm, tn);
@@ -560,7 +600,9 @@ mod tests {
 
         eprintln!(
             "JIT search space: {} configs (base: {}, JIT multiplier: {:.1}x)",
-            grid, base_grid, grid as f64 / base_grid as f64
+            grid,
+            base_grid,
+            grid as f64 / base_grid as f64
         );
     }
 
@@ -816,8 +858,14 @@ mod tests {
         assert!(!shapes.is_empty(), "should return at least one shape");
 
         // Check that (0, 4096, 4096) appears (QKV proj and Attn out have same shape)
-        let qkv_count = shapes.iter().filter(|&&(m, n, k)| m == 0 && n == 4096 && k == 4096).count();
-        assert!(qkv_count >= 2, "QKV and Attn out should share (0,4096,4096)");
+        let qkv_count = shapes
+            .iter()
+            .filter(|&&(m, n, k)| m == 0 && n == 4096 && k == 4096)
+            .count();
+        assert!(
+            qkv_count >= 2,
+            "QKV and Attn out should share (0,4096,4096)"
+        );
 
         // All K values should be > 0 (they represent weight dimensions)
         assert!(shapes.iter().all(|&(_, _, k)| k > 0));
@@ -903,8 +951,11 @@ mod tests {
     fn problem_shape_construction() {
         // Arrange
         let shape = ProblemShape {
-            m: 512, n: 1024, k: 768,
-            elem_bytes: 4, dtype_id: 0,
+            m: 512,
+            n: 1024,
+            k: 768,
+            elem_bytes: 4,
+            dtype_id: 0,
         };
 
         // Assert
@@ -1009,8 +1060,11 @@ mod tests {
     fn gpu_gemm_config_field_access_and_clone() {
         // Arrange
         let config = GpuGemmConfig {
-            cta_m: 128, cta_n: 256, cta_k: 64,
-            warp_m: 64, warp_n: 32,
+            cta_m: 128,
+            cta_n: 256,
+            cta_k: 64,
+            warp_m: 64,
+            warp_n: 32,
             pipeline_depth: 3,
         };
 
@@ -1040,18 +1094,21 @@ mod tests {
         assert!(
             thorough.coarse_stride <= default.coarse_stride,
             "Thorough stride ({}) should be <= Default ({})",
-            thorough.coarse_stride, default.coarse_stride,
+            thorough.coarse_stride,
+            default.coarse_stride,
         );
         assert!(
             default.coarse_stride <= fast.coarse_stride,
             "Default stride ({}) should be <= Fast ({})",
-            default.coarse_stride, fast.coarse_stride,
+            default.coarse_stride,
+            fast.coarse_stride,
         );
         // Thorough should refine more
         assert!(
             thorough.refine_iters >= default.refine_iters,
             "Thorough refine_iters ({}) should be >= Default ({})",
-            thorough.refine_iters, default.refine_iters,
+            thorough.refine_iters,
+            default.refine_iters,
         );
     }
 
@@ -1081,19 +1138,39 @@ mod tests {
     fn jit_search_ranges_construction() {
         // Arrange
         let ranges = JitSearchRanges {
-            k_unroll_range: crate::autotuning::search_space::ParamRange { name: "k_unroll", min: 2, max: 8, step: 2 },
-            prefetch_range: crate::autotuning::search_space::ParamRange { name: "prefetch", min: 0, max: 8, step: 4 },
+            k_unroll_range: crate::autotuning::search_space::ParamRange {
+                name: "k_unroll",
+                min: 2,
+                max: 8,
+                step: 2,
+            },
+            prefetch_range: crate::autotuning::search_space::ParamRange {
+                name: "prefetch",
+                min: 0,
+                max: 8,
+                step: 4,
+            },
             reg_alloc_strategies: vec![RegAllocStrategy::Balanced, RegAllocStrategy::MinSpill],
-            sw_pipeline_range: crate::autotuning::search_space::ParamRange { name: "sw_pipe", min: 1, max: 3, step: 1 },
-            nr_variant_range: crate::autotuning::search_space::ParamRange { name: "nr", min: 8, max: 16, step: 8 },
+            sw_pipeline_range: crate::autotuning::search_space::ParamRange {
+                name: "sw_pipe",
+                min: 1,
+                max: 3,
+                step: 1,
+            },
+            nr_variant_range: crate::autotuning::search_space::ParamRange {
+                name: "nr",
+                min: 8,
+                max: 16,
+                step: 8,
+            },
         };
 
         // Assert
-        assert_eq!(ranges.k_unroll_range.count(), 4);  // 2,4,6,8
-        assert_eq!(ranges.prefetch_range.count(), 3);   // 0,4,8
+        assert_eq!(ranges.k_unroll_range.count(), 4); // 2,4,6,8
+        assert_eq!(ranges.prefetch_range.count(), 3); // 0,4,8
         assert_eq!(ranges.reg_alloc_strategies.len(), 2);
         assert_eq!(ranges.sw_pipeline_range.count(), 3); // 1,2,3
-        assert_eq!(ranges.nr_variant_range.count(), 2);  // 8,16
+        assert_eq!(ranges.nr_variant_range.count(), 2); // 8,16
     }
 
     // ── Test 32: SearchConfig fast has larger stride than thorough ──
@@ -1108,13 +1185,15 @@ mod tests {
         assert!(
             fast.coarse_stride > thorough.coarse_stride,
             "Fast stride ({}) should be > Thorough stride ({})",
-            fast.coarse_stride, thorough.coarse_stride,
+            fast.coarse_stride,
+            thorough.coarse_stride,
         );
         // Assert: Fast uses fewer refinement iterations
         assert!(
             fast.refine_iters < thorough.refine_iters,
             "Fast refine_iters ({}) should be < Thorough ({})",
-            fast.refine_iters, thorough.refine_iters,
+            fast.refine_iters,
+            thorough.refine_iters,
         );
     }
 
@@ -1131,12 +1210,14 @@ mod tests {
         assert!(
             fast.early_reject_ratio <= default.early_reject_ratio,
             "Fast reject ({}) should be <= Default ({})",
-            fast.early_reject_ratio, default.early_reject_ratio,
+            fast.early_reject_ratio,
+            default.early_reject_ratio,
         );
         assert!(
             default.early_reject_ratio <= thorough.early_reject_ratio,
             "Default reject ({}) should be <= Thorough ({})",
-            default.early_reject_ratio, thorough.early_reject_ratio,
+            default.early_reject_ratio,
+            thorough.early_reject_ratio,
         );
     }
 
@@ -1155,9 +1236,17 @@ mod tests {
             l3_bytes: 32 * 1024 * 1024,
             cacheline_bytes: 64,
             isa: hw_info::IsaFeatures {
-                avx2: true, fma: true, avx512f: false, avx512bw: false,
-                avx512vnni: false, avx512fp16: false, avx512bf16: false,
-                neon: false, sve: false, sve2: false, sve_vl_bytes: 0,
+                avx2: true,
+                fma: true,
+                avx512f: false,
+                avx512bw: false,
+                avx512vnni: false,
+                avx512fp16: false,
+                avx512bf16: false,
+                neon: false,
+                sve: false,
+                sve2: false,
+                sve_vl_bytes: 0,
             },
         };
 
@@ -1165,9 +1254,15 @@ mod tests {
         let display = format!("{hw}");
 
         // Assert
-        assert!(display.contains("8P/16L"), "should contain core counts: {display}");
+        assert!(
+            display.contains("8P/16L"),
+            "should contain core counts: {display}"
+        );
         assert!(display.contains("AVX2"), "should contain ISA: {display}");
-        assert!(display.contains("7700X"), "should contain model name: {display}");
+        assert!(
+            display.contains("7700X"),
+            "should contain model name: {display}"
+        );
     }
 
     // ── Test 35: HwInfo fingerprint includes cache sizes in KiB ──
@@ -1180,14 +1275,22 @@ mod tests {
             model_name: "TestModel".into(),
             physical_cores: 4,
             logical_cores: 8,
-            l1d_bytes: 48 * 1024,       // 48 KiB
-            l2_bytes: 512 * 1024,       // 512 KiB
-            l3_bytes: 8 * 1024 * 1024,  // 8192 KiB
+            l1d_bytes: 48 * 1024,      // 48 KiB
+            l2_bytes: 512 * 1024,      // 512 KiB
+            l3_bytes: 8 * 1024 * 1024, // 8192 KiB
             cacheline_bytes: 64,
             isa: hw_info::IsaFeatures {
-                avx2: true, fma: true, avx512f: false, avx512bw: false,
-                avx512vnni: false, avx512fp16: false, avx512bf16: false,
-                neon: false, sve: false, sve2: false, sve_vl_bytes: 0,
+                avx2: true,
+                fma: true,
+                avx512f: false,
+                avx512bw: false,
+                avx512vnni: false,
+                avx512fp16: false,
+                avx512bf16: false,
+                neon: false,
+                sve: false,
+                sve2: false,
+                sve_vl_bytes: 0,
             },
         };
 
@@ -1206,9 +1309,17 @@ mod tests {
     fn isa_features_display_neon_only() {
         // Arrange
         let isa = hw_info::IsaFeatures {
-            avx2: false, fma: false, avx512f: false, avx512bw: false,
-            avx512vnni: false, avx512fp16: false, avx512bf16: false,
-            neon: true, sve: false, sve2: false, sve_vl_bytes: 0,
+            avx2: false,
+            fma: false,
+            avx512f: false,
+            avx512bw: false,
+            avx512vnni: false,
+            avx512fp16: false,
+            avx512bf16: false,
+            neon: true,
+            sve: false,
+            sve2: false,
+            sve_vl_bytes: 0,
         };
 
         // Act
@@ -1225,9 +1336,17 @@ mod tests {
     fn isa_features_all_x86_features() {
         // Arrange
         let isa = hw_info::IsaFeatures {
-            avx2: true, fma: true, avx512f: true, avx512bw: true,
-            avx512vnni: true, avx512fp16: true, avx512bf16: true,
-            neon: false, sve: false, sve2: false, sve_vl_bytes: 0,
+            avx2: true,
+            fma: true,
+            avx512f: true,
+            avx512bw: true,
+            avx512vnni: true,
+            avx512fp16: true,
+            avx512bf16: true,
+            neon: false,
+            sve: false,
+            sve2: false,
+            sve_vl_bytes: 0,
         };
 
         // Act
@@ -1248,15 +1367,24 @@ mod tests {
     fn tuning_config_display_with_and_without_jit() {
         // Arrange: config without JIT
         let cfg_no_jit = TuningConfig {
-            kc: 256, mc: 96, nc: 1024, num_threads: 4, jit: None,
+            kc: 256,
+            mc: 96,
+            nc: 1024,
+            num_threads: 4,
+            jit: None,
         };
         // Arrange: config with JIT
         let cfg_with_jit = TuningConfig {
-            kc: 128, mc: 48, nc: 512, num_threads: 2,
+            kc: 128,
+            mc: 48,
+            nc: 512,
+            num_threads: 2,
             jit: Some(JitParams {
-                k_unroll: 4, prefetch_distance: 8,
+                k_unroll: 4,
+                prefetch_distance: 8,
                 reg_alloc_strategy: RegAllocStrategy::Balanced,
-                sw_pipeline_depth: 2, nr_variant: 16,
+                sw_pipeline_depth: 2,
+                nr_variant: 16,
             }),
         };
 
@@ -1266,11 +1394,23 @@ mod tests {
 
         // Assert: base params always present
         assert!(display_no.contains("KC=256"), "KC missing: {display_no}");
-        assert!(display_no.contains("threads=4"), "threads missing: {display_no}");
+        assert!(
+            display_no.contains("threads=4"),
+            "threads missing: {display_no}"
+        );
         // Assert: JIT params appended when present
-        assert!(!display_no.contains("k_unroll"), "JIT should not appear without jit: {display_no}");
-        assert!(display_yes.contains("k_unroll=4"), "JIT k_unroll missing: {display_yes}");
-        assert!(display_yes.contains("balanced"), "JIT reg_alloc missing: {display_yes}");
+        assert!(
+            !display_no.contains("k_unroll"),
+            "JIT should not appear without jit: {display_no}"
+        );
+        assert!(
+            display_yes.contains("k_unroll=4"),
+            "JIT k_unroll missing: {display_yes}"
+        );
+        assert!(
+            display_yes.contains("balanced"),
+            "JIT reg_alloc missing: {display_yes}"
+        );
     }
 
     // ── Test 39: BenchResult Display with gflops and bandwidth ──
@@ -1291,9 +1431,18 @@ mod tests {
         let display = format!("{result}");
 
         // Assert
-        assert!(display.contains("500.0us"), "median should be 500.0us: {display}");
-        assert!(display.contains("123.4GFLOPS"), "GFLOPS should appear: {display}");
-        assert!(display.contains("45.6GB/s"), "bandwidth should appear: {display}");
+        assert!(
+            display.contains("500.0us"),
+            "median should be 500.0us: {display}"
+        );
+        assert!(
+            display.contains("123.4GFLOPS"),
+            "GFLOPS should appear: {display}"
+        );
+        assert!(
+            display.contains("45.6GB/s"),
+            "bandwidth should appear: {display}"
+        );
     }
 
     // ── Test 40: BenchResult Display without optional metrics ──
@@ -1314,9 +1463,18 @@ mod tests {
         let display = format!("{result}");
 
         // Assert: no GFLOPS or GB/s when None
-        assert!(!display.contains("GFLOPS"), "GFLOPS should not appear when None: {display}");
-        assert!(!display.contains("GB/s"), "GB/s should not appear when None: {display}");
-        assert!(display.contains("median="), "median label should appear: {display}");
+        assert!(
+            !display.contains("GFLOPS"),
+            "GFLOPS should not appear when None: {display}"
+        );
+        assert!(
+            !display.contains("GB/s"),
+            "GB/s should not appear when None: {display}"
+        );
+        assert!(
+            display.contains("median="),
+            "median label should appear: {display}"
+        );
     }
 
     // ── Test 41: RegAllocStrategy Display and index roundtrip ──
@@ -1329,7 +1487,11 @@ mod tests {
         // Act & Assert: Display output and index roundtrip
         for &s in strategies {
             let display = format!("{s}");
-            assert!(!display.is_empty(), "Display should not be empty for {:?}", s);
+            assert!(
+                !display.is_empty(),
+                "Display should not be empty for {:?}",
+                s
+            );
             let idx = s.to_index();
             let recovered = RegAllocStrategy::from_index(idx);
             assert_eq!(s, recovered, "roundtrip failed for {:?}", s);
@@ -1358,7 +1520,11 @@ mod tests {
         // Act
         let result = TuneResult {
             config: TuningConfig {
-                kc: 64, mc: 32, nc: 128, num_threads: 1, jit: None,
+                kc: 64,
+                mc: 32,
+                nc: 128,
+                num_threads: 1,
+                jit: None,
             },
             perf: perf.clone(),
             from_cache: true,
@@ -1389,7 +1555,11 @@ mod tests {
         // Act
         let result = TuneResult {
             config: TuningConfig {
-                kc: 256, mc: 96, nc: 512, num_threads: 2, jit: None,
+                kc: 256,
+                mc: 96,
+                nc: 512,
+                num_threads: 2,
+                jit: None,
             },
             perf,
             from_cache: false,
@@ -1415,10 +1585,18 @@ mod tests {
             nr_variant: 16,
         };
         let cfg1 = TuningConfig {
-            kc: 128, mc: 48, nc: 256, num_threads: 4, jit: Some(jit.clone()),
+            kc: 128,
+            mc: 48,
+            nc: 256,
+            num_threads: 4,
+            jit: Some(jit.clone()),
         };
         let cfg2 = TuningConfig {
-            kc: 128, mc: 48, nc: 256, num_threads: 4, jit: Some(jit),
+            kc: 128,
+            mc: 48,
+            nc: 256,
+            num_threads: 4,
+            jit: Some(jit),
         };
 
         // Assert: configs are equal
@@ -1431,7 +1609,10 @@ mod tests {
     fn tuning_config_inequality_with_different_jit_params() {
         // Arrange: same base params, different JIT
         let cfg1 = TuningConfig {
-            kc: 128, mc: 48, nc: 256, num_threads: 4,
+            kc: 128,
+            mc: 48,
+            nc: 256,
+            num_threads: 4,
             jit: Some(JitParams {
                 k_unroll: 4,
                 prefetch_distance: 8,
@@ -1441,7 +1622,10 @@ mod tests {
             }),
         };
         let cfg2 = TuningConfig {
-            kc: 128, mc: 48, nc: 256, num_threads: 4,
+            kc: 128,
+            mc: 48,
+            nc: 256,
+            num_threads: 4,
             jit: Some(JitParams {
                 k_unroll: 2, // Different
                 prefetch_distance: 8,
@@ -1461,11 +1645,17 @@ mod tests {
     fn tuning_config_inequality_jit_vs_no_jit() {
         // Arrange: same base params, one with JIT, one without
         let cfg_with_jit = TuningConfig {
-            kc: 128, mc: 48, nc: 256, num_threads: 4,
+            kc: 128,
+            mc: 48,
+            nc: 256,
+            num_threads: 4,
             jit: Some(JitParams::default()),
         };
         let cfg_no_jit = TuningConfig {
-            kc: 128, mc: 48, nc: 256, num_threads: 4,
+            kc: 128,
+            mc: 48,
+            nc: 256,
+            num_threads: 4,
             jit: None,
         };
 
@@ -1530,7 +1720,11 @@ mod tests {
         // Arrange: search that only kept the best result
         let result = SearchResult {
             best_config: TuningConfig {
-                kc: 64, mc: 32, nc: 128, num_threads: 1, jit: None,
+                kc: 64,
+                mc: 32,
+                nc: 128,
+                num_threads: 1,
+                jit: None,
             },
             best_result: BenchResult {
                 median_ns: 500.0,
@@ -1542,7 +1736,7 @@ mod tests {
             },
             configs_evaluated: 1,
             search_time_ns: 100_000, // 100 us
-            all_results: vec![], // Empty — only best kept
+            all_results: vec![],     // Empty — only best kept
         };
 
         // Assert: single result handled correctly
@@ -1557,10 +1751,40 @@ mod tests {
     fn search_result_multiple_all_results_entries() {
         // Arrange: search with multiple candidates recorded
         let candidates = vec![
-            (TuningConfig { kc: 64, mc: 32, nc: 128, num_threads: 1, jit: None },
-             BenchResult { median_ns: 600.0, iqr_ns: 30.0, min_ns: 550.0, samples: 10, gflops: None, bandwidth_gbs: None }),
-            (TuningConfig { kc: 128, mc: 48, nc: 256, num_threads: 2, jit: None },
-             BenchResult { median_ns: 400.0, iqr_ns: 20.0, min_ns: 380.0, samples: 10, gflops: None, bandwidth_gbs: None }),
+            (
+                TuningConfig {
+                    kc: 64,
+                    mc: 32,
+                    nc: 128,
+                    num_threads: 1,
+                    jit: None,
+                },
+                BenchResult {
+                    median_ns: 600.0,
+                    iqr_ns: 30.0,
+                    min_ns: 550.0,
+                    samples: 10,
+                    gflops: None,
+                    bandwidth_gbs: None,
+                },
+            ),
+            (
+                TuningConfig {
+                    kc: 128,
+                    mc: 48,
+                    nc: 256,
+                    num_threads: 2,
+                    jit: None,
+                },
+                BenchResult {
+                    median_ns: 400.0,
+                    iqr_ns: 20.0,
+                    min_ns: 380.0,
+                    samples: 10,
+                    gflops: None,
+                    bandwidth_gbs: None,
+                },
+            ),
         ];
         let result = SearchResult {
             best_config: candidates[1].0.clone(),
@@ -1602,10 +1826,30 @@ mod tests {
     fn param_range_count_matches_values_length() {
         // Arrange
         let ranges = [
-            crate::autotuning::search_space::ParamRange { name: "a", min: 0, max: 100, step: 10 },
-            crate::autotuning::search_space::ParamRange { name: "b", min: 8, max: 64, step: 8 },
-            crate::autotuning::search_space::ParamRange { name: "c", min: 1, max: 1, step: 1 },
-            crate::autotuning::search_space::ParamRange { name: "d", min: 100, max: 50, step: 5 },
+            crate::autotuning::search_space::ParamRange {
+                name: "a",
+                min: 0,
+                max: 100,
+                step: 10,
+            },
+            crate::autotuning::search_space::ParamRange {
+                name: "b",
+                min: 8,
+                max: 64,
+                step: 8,
+            },
+            crate::autotuning::search_space::ParamRange {
+                name: "c",
+                min: 1,
+                max: 1,
+                step: 1,
+            },
+            crate::autotuning::search_space::ParamRange {
+                name: "d",
+                min: 100,
+                max: 50,
+                step: 5,
+            },
         ];
 
         for r in &ranges {
@@ -1615,9 +1859,12 @@ mod tests {
 
             // Assert: count() and values().len() must always agree
             assert_eq!(
-                count, values.len(),
+                count,
+                values.len(),
                 "count() = {} but values().len() = {} for range {:?}",
-                count, values.len(), r
+                count,
+                values.len(),
+                r
             );
         }
     }
@@ -1635,18 +1882,21 @@ mod tests {
         assert!(
             fast.min_iters < default.min_iters,
             "fast.min_iters ({}) should be < default ({})",
-            fast.min_iters, default.min_iters,
+            fast.min_iters,
+            default.min_iters,
         );
         assert!(
             default.min_iters < precise.min_iters,
             "default.min_iters ({}) should be < precise ({})",
-            default.min_iters, precise.min_iters,
+            default.min_iters,
+            precise.min_iters,
         );
         // Warmup also increases with precision
         assert!(
             fast.warmup_iters <= default.warmup_iters,
             "fast.warmup_iters ({}) should be <= default ({})",
-            fast.warmup_iters, default.warmup_iters,
+            fast.warmup_iters,
+            default.warmup_iters,
         );
     }
 
@@ -1657,7 +1907,11 @@ mod tests {
         // Arrange
         let result = SearchResult {
             best_config: TuningConfig {
-                kc: 512, mc: 96, nc: 1024, num_threads: 8, jit: None,
+                kc: 512,
+                mc: 96,
+                nc: 1024,
+                num_threads: 8,
+                jit: None,
             },
             best_result: BenchResult {
                 median_ns: 10_000_000.0, // 10 ms
@@ -1676,10 +1930,19 @@ mod tests {
         let display = format!("{}", result);
 
         // Assert: contains the best config and search metadata
-        assert!(display.contains("KC=512"), "should contain KC=512: {display}");
+        assert!(
+            display.contains("KC=512"),
+            "should contain KC=512: {display}"
+        );
         assert!(display.contains("MC=96"), "should contain MC=96: {display}");
-        assert!(display.contains("evaluated 100 configs"), "should contain evaluated count: {display}");
-        assert!(display.contains("5000.0ms"), "should contain search time: {display}");
+        assert!(
+            display.contains("evaluated 100 configs"),
+            "should contain evaluated count: {display}"
+        );
+        assert!(
+            display.contains("5000.0ms"),
+            "should contain search time: {display}"
+        );
     }
 
     // ── Test 55: SearchSpace for_gemm respects problem shape bounds ────────
@@ -1688,7 +1951,13 @@ mod tests {
     fn search_space_gemm_respects_problem_shape_bounds() {
         // Arrange: very small problem
         let hw = hw_info();
-        let shape = ProblemShape { m: 32, n: 32, k: 32, elem_bytes: 4, dtype_id: 0 };
+        let shape = ProblemShape {
+            m: 32,
+            n: 32,
+            k: 32,
+            elem_bytes: 4,
+            dtype_id: 0,
+        };
         let (tm, tn) = microkernel_geometry(hw, 4);
 
         // Act
@@ -1725,9 +1994,18 @@ mod tests {
         let display = format!("{}", params);
 
         // Assert: all five JIT parameter values appear
-        assert!(display.contains("k_unroll=8"), "k_unroll missing: {display}");
-        assert!(display.contains("prefetch=12"), "prefetch missing: {display}");
-        assert!(display.contains("min_spill"), "reg_alloc missing: {display}");
+        assert!(
+            display.contains("k_unroll=8"),
+            "k_unroll missing: {display}"
+        );
+        assert!(
+            display.contains("prefetch=12"),
+            "prefetch missing: {display}"
+        );
+        assert!(
+            display.contains("min_spill"),
+            "reg_alloc missing: {display}"
+        );
         assert!(display.contains("swp=2"), "sw_pipeline missing: {display}");
         assert!(display.contains("nr=32"), "nr_variant missing: {display}");
     }
@@ -1746,7 +2024,10 @@ mod tests {
             nr_variant: 8,
         };
         let config = TuningConfig {
-            kc: 256, mc: 96, nc: 1024, num_threads: 4,
+            kc: 256,
+            mc: 96,
+            nc: 1024,
+            num_threads: 4,
             jit: Some(jit.clone()),
         };
 
@@ -1765,7 +2046,10 @@ mod tests {
         let retrieved_jit = c.config.jit.as_ref().unwrap();
         assert_eq!(retrieved_jit.k_unroll, 2);
         assert_eq!(retrieved_jit.prefetch_distance, 4);
-        assert_eq!(retrieved_jit.reg_alloc_strategy, RegAllocStrategy::MaxAccumulators);
+        assert_eq!(
+            retrieved_jit.reg_alloc_strategy,
+            RegAllocStrategy::MaxAccumulators
+        );
         assert_eq!(retrieved_jit.sw_pipeline_depth, 1);
         assert_eq!(retrieved_jit.nr_variant, 8);
         assert!((c.median_ns - 750.0).abs() < f64::EPSILON);
@@ -1791,9 +2075,18 @@ mod tests {
         let debug_mem = format!("{:?}", mem);
 
         // Assert: Debug output contains variant names
-        assert!(debug_gemm.contains("Gemm"), "Debug should contain 'Gemm': {debug_gemm}");
-        assert!(debug_gemv.contains("Gemv"), "Debug should contain 'Gemv': {debug_gemv}");
-        assert!(debug_mem.contains("MemoryBound"), "Debug should contain 'MemoryBound': {debug_mem}");
+        assert!(
+            debug_gemm.contains("Gemm"),
+            "Debug should contain 'Gemm': {debug_gemm}"
+        );
+        assert!(
+            debug_gemv.contains("Gemv"),
+            "Debug should contain 'Gemv': {debug_gemv}"
+        );
+        assert!(
+            debug_mem.contains("MemoryBound"),
+            "Debug should contain 'MemoryBound': {debug_mem}"
+        );
     }
 
     // ── Test 59: GpuGemmConfig equality distinguishes all fields ───────────
@@ -1802,25 +2095,49 @@ mod tests {
     fn gpu_gemm_config_equality_distinguishes_each_field() {
         // Arrange: base config
         let base = GpuGemmConfig {
-            cta_m: 128, cta_n: 64, cta_k: 32,
-            warp_m: 32, warp_n: 16,
+            cta_m: 128,
+            cta_n: 64,
+            cta_k: 32,
+            warp_m: 32,
+            warp_n: 16,
             pipeline_depth: 2,
         };
 
         // Assert: changing any single field makes it unequal
-        let diff_cta_m = GpuGemmConfig { cta_m: 64, ..base.clone() };
-        let diff_cta_n = GpuGemmConfig { cta_n: 128, ..base.clone() };
-        let diff_cta_k = GpuGemmConfig { cta_k: 64, ..base.clone() };
-        let diff_warp_m = GpuGemmConfig { warp_m: 64, ..base.clone() };
-        let diff_warp_n = GpuGemmConfig { warp_n: 32, ..base.clone() };
-        let diff_pipe = GpuGemmConfig { pipeline_depth: 3, ..base.clone() };
+        let diff_cta_m = GpuGemmConfig {
+            cta_m: 64,
+            ..base.clone()
+        };
+        let diff_cta_n = GpuGemmConfig {
+            cta_n: 128,
+            ..base.clone()
+        };
+        let diff_cta_k = GpuGemmConfig {
+            cta_k: 64,
+            ..base.clone()
+        };
+        let diff_warp_m = GpuGemmConfig {
+            warp_m: 64,
+            ..base.clone()
+        };
+        let diff_warp_n = GpuGemmConfig {
+            warp_n: 32,
+            ..base.clone()
+        };
+        let diff_pipe = GpuGemmConfig {
+            pipeline_depth: 3,
+            ..base.clone()
+        };
 
         assert_ne!(base, diff_cta_m, "cta_m difference should be detected");
         assert_ne!(base, diff_cta_n, "cta_n difference should be detected");
         assert_ne!(base, diff_cta_k, "cta_k difference should be detected");
         assert_ne!(base, diff_warp_m, "warp_m difference should be detected");
         assert_ne!(base, diff_warp_n, "warp_n difference should be detected");
-        assert_ne!(base, diff_pipe, "pipeline_depth difference should be detected");
+        assert_ne!(
+            base, diff_pipe,
+            "pipeline_depth difference should be detected"
+        );
 
         // Assert: identical clone is equal
         assert_eq!(base, base.clone());
@@ -1866,8 +2183,14 @@ mod tests {
         assert_eq!(cloned.iqr_ns, 100.0);
         assert_eq!(cloned.min_ns, 2300.0);
         assert_eq!(cloned.samples, 15);
-        assert!(cloned.gflops.is_none(), "gflops should remain None after clone");
-        assert!(cloned.bandwidth_gbs.is_none(), "bandwidth_gbs should remain None after clone");
+        assert!(
+            cloned.gflops.is_none(),
+            "gflops should remain None after clone"
+        );
+        assert!(
+            cloned.bandwidth_gbs.is_none(),
+            "bandwidth_gbs should remain None after clone"
+        );
     }
 }
 
@@ -1896,7 +2219,13 @@ pub fn tune_gpu_gemm(
     // Check cache
     {
         let db = wisdom_db().lock().unwrap_or_else(|e| e.into_inner());
-        let shape = ProblemShape { m, n, k, elem_bytes, dtype_id: 0 };
+        let shape = ProblemShape {
+            m,
+            n,
+            k,
+            elem_bytes,
+            dtype_id: 0,
+        };
         let cache_key = cache::op_key(&op_key, &shape);
         if let Some(cached) = db.get(&fp, &cache_key) {
             // Reconstruct GpuGemmConfig from cached TuningConfig
@@ -1936,7 +2265,13 @@ pub fn tune_gpu_gemm(
     // Cache the result
     {
         let mut db = wisdom_db().lock().unwrap_or_else(|e| e.into_inner());
-        let shape = ProblemShape { m, n, k, elem_bytes, dtype_id: 0 };
+        let shape = ProblemShape {
+            m,
+            n,
+            k,
+            elem_bytes,
+            dtype_id: 0,
+        };
         let cache_key = cache::op_key(&op_key, &shape);
         let config = TuningConfig {
             kc: best.cta_m,
@@ -1961,10 +2296,38 @@ pub fn tune_gpu_gemm(
 /// Get hardware profile default GPU GEMM config for a given SM version.
 fn default_gpu_config(sm_version: u32) -> GpuGemmConfig {
     match sm_version {
-        100.. => GpuGemmConfig { cta_m: 128, cta_n: 256, cta_k: 64, warp_m: 64, warp_n: 32, pipeline_depth: 3 },
-        90..=99 => GpuGemmConfig { cta_m: 128, cta_n: 128, cta_k: 64, warp_m: 64, warp_n: 16, pipeline_depth: 3 },
-        80..=89 => GpuGemmConfig { cta_m: 128, cta_n: 128, cta_k: 32, warp_m: 64, warp_n: 16, pipeline_depth: 2 },
-        _ => GpuGemmConfig { cta_m: 64, cta_n: 64, cta_k: 32, warp_m: 32, warp_n: 16, pipeline_depth: 1 },
+        100.. => GpuGemmConfig {
+            cta_m: 128,
+            cta_n: 256,
+            cta_k: 64,
+            warp_m: 64,
+            warp_n: 32,
+            pipeline_depth: 3,
+        },
+        90..=99 => GpuGemmConfig {
+            cta_m: 128,
+            cta_n: 128,
+            cta_k: 64,
+            warp_m: 64,
+            warp_n: 16,
+            pipeline_depth: 3,
+        },
+        80..=89 => GpuGemmConfig {
+            cta_m: 128,
+            cta_n: 128,
+            cta_k: 32,
+            warp_m: 64,
+            warp_n: 16,
+            pipeline_depth: 2,
+        },
+        _ => GpuGemmConfig {
+            cta_m: 64,
+            cta_n: 64,
+            cta_k: 32,
+            warp_m: 32,
+            warp_n: 16,
+            pipeline_depth: 1,
+        },
     }
 }
 
@@ -2032,11 +2395,11 @@ pub fn extract_model_gemm_shapes() -> Vec<(usize, usize, usize)> {
     // This is a placeholder that returns common LLM GEMM shapes.
     // In production, it would inspect the CompilerGraph to extract actual shapes.
     vec![
-        (0, 4096, 4096),     // QKV proj (M=symbolic)
-        (0, 4096, 4096),     // Attn out
-        (0, 4096, 11008),    // FFN gate
-        (0, 4096, 11008),    // FFN up
-        (0, 11008, 4096),    // FFN down
+        (0, 4096, 4096),  // QKV proj (M=symbolic)
+        (0, 4096, 4096),  // Attn out
+        (0, 4096, 11008), // FFN gate
+        (0, 4096, 11008), // FFN up
+        (0, 11008, 4096), // FFN down
     ]
 }
 

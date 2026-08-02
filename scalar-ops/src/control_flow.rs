@@ -12,11 +12,7 @@
 /// Scalar: pass-through (identity). JIT handles the actual buffer write.
 #[no_mangle]
 #[inline(never)]
-pub unsafe extern "C" fn scalar_store_token(
-    input: *const f32,
-    output: *mut f32,
-    _len: usize,
-) {
+pub unsafe extern "C" fn scalar_store_token(input: *const f32, output: *mut f32, _len: usize) {
     if input.is_null() || output.is_null() || _len == 0 {
         return;
     }
@@ -31,10 +27,7 @@ pub unsafe extern "C" fn scalar_store_token(
 /// Scalar: always returns [0.0] (not stopped). JIT handles the real check.
 #[no_mangle]
 #[inline(never)]
-pub unsafe extern "C" fn scalar_check_stop_condition(
-    _input: *const f32,
-    output: *mut f32,
-) {
+pub unsafe extern "C" fn scalar_check_stop_condition(_input: *const f32, output: *mut f32) {
     if output.is_null() {
         return;
     }
@@ -47,11 +40,7 @@ pub unsafe extern "C" fn scalar_check_stop_condition(
 /// Scalar: pass-through (identity copy).
 #[no_mangle]
 #[inline(never)]
-pub unsafe extern "C" fn scalar_write_logits(
-    input: *const f32,
-    output: *mut f32,
-    len: usize,
-) {
+pub unsafe extern "C" fn scalar_write_logits(input: *const f32, output: *mut f32, len: usize) {
     if input.is_null() || output.is_null() || len == 0 {
         return;
     }
@@ -66,11 +55,7 @@ pub unsafe extern "C" fn scalar_write_logits(
 /// Scalar: pass-through (hidden state unchanged).
 #[no_mangle]
 #[inline(never)]
-pub unsafe extern "C" fn scalar_early_exit(
-    input: *const f32,
-    output: *mut f32,
-    len: usize,
-) {
+pub unsafe extern "C" fn scalar_early_exit(input: *const f32, output: *mut f32, len: usize) {
     if input.is_null() || output.is_null() || len == 0 {
         return;
     }
@@ -85,11 +70,7 @@ pub unsafe extern "C" fn scalar_early_exit(
 /// Scalar: pass-through (hidden state unchanged). JIT handles veto logic.
 #[no_mangle]
 #[inline(never)]
-pub unsafe extern "C" fn scalar_guardrail_check(
-    input: *const f32,
-    output: *mut f32,
-    len: usize,
-) {
+pub unsafe extern "C" fn scalar_guardrail_check(input: *const f32, output: *mut f32, len: usize) {
     if input.is_null() || output.is_null() || len == 0 {
         return;
     }
@@ -104,11 +85,7 @@ pub unsafe extern "C" fn scalar_guardrail_check(
 /// Scalar: pass-through (hidden state unchanged). JIT handles the ADD.
 #[no_mangle]
 #[inline(never)]
-pub unsafe extern "C" fn scalar_sg_inject(
-    input: *const f32,
-    output: *mut f32,
-    len: usize,
-) {
+pub unsafe extern "C" fn scalar_sg_inject(input: *const f32, output: *mut f32, len: usize) {
     if input.is_null() || output.is_null() || len == 0 {
         return;
     }
@@ -123,10 +100,7 @@ pub unsafe extern "C" fn scalar_sg_inject(
 /// Scalar: output = [0.0] (not detected). JIT copies hidden to shared memory.
 #[no_mangle]
 #[inline(never)]
-pub unsafe extern "C" fn scalar_sg_detect(
-    _input: *const f32,
-    output: *mut f32,
-) {
+pub unsafe extern "C" fn scalar_sg_detect(_input: *const f32, output: *mut f32) {
     if output.is_null() {
         return;
     }
@@ -139,10 +113,7 @@ pub unsafe extern "C" fn scalar_sg_detect(
 /// Scalar: output = [0.0] (continue). JIT reads shared memory for real check.
 #[no_mangle]
 #[inline(never)]
-pub unsafe extern "C" fn scalar_cot_step_check(
-    _input: *const f32,
-    output: *mut f32,
-) {
+pub unsafe extern "C" fn scalar_cot_step_check(_input: *const f32, output: *mut f32) {
     if output.is_null() {
         return;
     }
@@ -174,11 +145,7 @@ pub unsafe extern "C" fn scalar_session_kv_restore(
 /// Scalar: pass-through (embedding unchanged). JIT handles the ADD.
 #[no_mangle]
 #[inline(never)]
-pub unsafe extern "C" fn scalar_mm_hidden_inject(
-    input: *const f32,
-    output: *mut f32,
-    len: usize,
-) {
+pub unsafe extern "C" fn scalar_mm_hidden_inject(input: *const f32, output: *mut f32, len: usize) {
     if input.is_null() || output.is_null() || len == 0 {
         return;
     }

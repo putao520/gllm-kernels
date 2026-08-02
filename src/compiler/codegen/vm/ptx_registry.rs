@@ -37,13 +37,19 @@ pub struct SmRange {
 impl SmRange {
     /// Create a bounded SM range [min_sm, max_sm).
     pub fn new(min_sm: u32, max_sm: u32) -> Self {
-        assert!(min_sm < max_sm, "SmRange: min_sm ({min_sm}) must be < max_sm ({max_sm})");
+        assert!(
+            min_sm < max_sm,
+            "SmRange: min_sm ({min_sm}) must be < max_sm ({max_sm})"
+        );
         Self { min_sm, max_sm }
     }
 
     /// Create an unbounded-above SM range [min_sm, ∞).
     pub fn from(min_sm: u32) -> Self {
-        Self { min_sm, max_sm: u32::MAX }
+        Self {
+            min_sm,
+            max_sm: u32::MAX,
+        }
     }
 
     /// Check whether this range contains the given SM version.
@@ -109,9 +115,17 @@ impl PtxKernelRegistry {
                      existing [{},{}) vs new [{},{})",
                     algorithm,
                     existing.range.min_sm,
-                    if existing.range.max_sm == u32::MAX { u32::MAX } else { existing.range.max_sm },
+                    if existing.range.max_sm == u32::MAX {
+                        u32::MAX
+                    } else {
+                        existing.range.max_sm
+                    },
                     range.min_sm,
-                    if range.max_sm == u32::MAX { u32::MAX } else { range.max_sm },
+                    if range.max_sm == u32::MAX {
+                        u32::MAX
+                    } else {
+                        range.max_sm
+                    },
                 )));
             }
         }
@@ -166,8 +180,15 @@ impl PtxKernelRegistry {
                 algorithm,
                 entries
                     .iter()
-                    .map(|e| format!("[{},{})", e.range.min_sm,
-                        if e.range.max_sm == u32::MAX { "MAX".to_string() } else { e.range.max_sm.to_string() }))
+                    .map(|e| format!(
+                        "[{},{})",
+                        e.range.min_sm,
+                        if e.range.max_sm == u32::MAX {
+                            "MAX".to_string()
+                        } else {
+                            e.range.max_sm.to_string()
+                        }
+                    ))
                     .collect::<Vec<_>>()
                     .join(", ")
             ))
@@ -305,7 +326,12 @@ fn emit_gemv_sm90(name: &str, _m: usize, n: usize, k: usize) -> Result<String, C
 // FlashAttention Emitter Stubs
 // ---------------------------------------------------------------------------
 
-fn emit_flash_attn_sm70(name: &str, _m: usize, n: usize, k: usize) -> Result<String, CompilerError> {
+fn emit_flash_attn_sm70(
+    name: &str,
+    _m: usize,
+    n: usize,
+    k: usize,
+) -> Result<String, CompilerError> {
     // FA v1: WMMA 16×16×16, tiled online softmax
     Ok(format!(
         "// FlashAttention SM70: {name} N={n} K={k}\n\
@@ -313,7 +339,12 @@ fn emit_flash_attn_sm70(name: &str, _m: usize, n: usize, k: usize) -> Result<Str
     ))
 }
 
-fn emit_flash_attn_sm80(name: &str, _m: usize, n: usize, k: usize) -> Result<String, CompilerError> {
+fn emit_flash_attn_sm80(
+    name: &str,
+    _m: usize,
+    n: usize,
+    k: usize,
+) -> Result<String, CompilerError> {
     // FA v2: mma.sync + cp.async, Split-Q parallel
     Ok(format!(
         "// FlashAttention SM80: {name} N={n} K={k}\n\
@@ -321,7 +352,12 @@ fn emit_flash_attn_sm80(name: &str, _m: usize, n: usize, k: usize) -> Result<Str
     ))
 }
 
-fn emit_flash_attn_sm90(name: &str, _m: usize, n: usize, k: usize) -> Result<String, CompilerError> {
+fn emit_flash_attn_sm90(
+    name: &str,
+    _m: usize,
+    n: usize,
+    k: usize,
+) -> Result<String, CompilerError> {
     // FA v3: WGMMA + TMA, warp specialization
     Ok(format!(
         "// FlashAttention SM90+: {name} N={n} K={k}\n\
@@ -372,10 +408,12 @@ mod tests {
         let mut reg = PtxKernelRegistry::new();
         reg.register("gemm", SmRange::new(70, 80), |_, m, n, k| {
             Ok(format!("sm70 M={m} N={n} K={k}"))
-        }).unwrap();
+        })
+        .unwrap();
         reg.register("gemm", SmRange::new(80, 90), |_, m, n, k| {
             Ok(format!("sm80 M={m} N={n} K={k}"))
-        }).unwrap();
+        })
+        .unwrap();
 
         let result = reg.dispatch("gemm", 80, 1, 1024, 4096).unwrap();
         assert_eq!(result, "sm80 M=1 N=1024 K=4096");
@@ -395,7 +433,8 @@ mod tests {
         let mut reg = PtxKernelRegistry::new();
         reg.register("gemm", SmRange::new(80, 90), |_, _, _, _| {
             Ok("sm80".to_string())
-        }).unwrap();
+        })
+        .unwrap();
 
         // SM70 is not covered
         let result = reg.dispatch("gemm", 70, 1, 1, 1);
@@ -409,7 +448,8 @@ mod tests {
         let mut reg = PtxKernelRegistry::new();
         reg.register("gemm", SmRange::new(70, 85), |_, _, _, _| {
             Ok("a".to_string())
-        }).unwrap();
+        })
+        .unwrap();
 
         let result = reg.register("gemm", SmRange::new(80, 90), |_, _, _, _| {
             Ok("b".to_string())
@@ -422,14 +462,17 @@ mod tests {
         let mut reg = PtxKernelRegistry::new();
         reg.register("gemm", SmRange::new(70, 80), |_, _, _, _| {
             Ok("a".to_string())
-        }).unwrap();
+        })
+        .unwrap();
         reg.register("gemm", SmRange::new(80, 90), |_, _, _, _| {
             Ok("b".to_string())
-        }).unwrap();
+        })
+        .unwrap();
         // Different algorithm — no conflict
         reg.register("flash_attn", SmRange::new(70, 90), |_, _, _, _| {
             Ok("c".to_string())
-        }).unwrap();
+        })
+        .unwrap();
 
         assert_eq!(reg.algorithms().len(), 2);
     }
@@ -509,7 +552,8 @@ mod tests {
         // Register a generic range and a more specific one
         reg.register("test", SmRange::new(70, 100), |_, _, _, _| {
             Ok("generic".to_string())
-        }).unwrap();
+        })
+        .unwrap();
         // This should fail due to overlap — verify the invariant
         let result = reg.register("test", SmRange::new(80, 90), |_, _, _, _| {
             Ok("specialized".to_string())

@@ -112,7 +112,7 @@ impl GllmWeightField {
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct GllmModelConfig {
-    pub arch: i32,           // 0=Llama, 1=Gpt2, 2=Mistral, 3=Phi, 4=Qwen, 5=Gemma
+    pub arch: i32, // 0=Llama, 1=Gpt2, 2=Mistral, 3=Phi, 4=Qwen, 5=Gemma
     pub hidden_size: u32,
     pub num_heads: u32,
     pub num_kv_heads: u32,
@@ -123,9 +123,9 @@ pub struct GllmModelConfig {
     pub max_seq_len: u32,
     pub rope_theta: f64,
     pub norm_eps: f32,
-    pub dtype: i32,          // 0=F32, 1=F16, 2=BF16
-    pub quant_type: i32,     // -1=None, 0=Q4_0, 1=Q4_1, 2=Q8_0
-    pub has_qkv_bias: i32,   // 0=false, 1=true
+    pub dtype: i32,                 // 0=F32, 1=F16, 2=BF16
+    pub quant_type: i32,            // -1=None, 0=Q4_0, 1=Q4_1, 2=Q8_0
+    pub has_qkv_bias: i32,          // 0=false, 1=true
     pub partial_rotary_factor: f32, // 0.0..=1.0
 }
 
@@ -201,9 +201,18 @@ mod tests {
     #[test]
     fn status_from_inference_error() {
         use crate::types::InferenceError;
-        assert_eq!(GllmStatus::from(InferenceError::InvalidConfig("x".into())), GllmStatus::InvalidArg);
-        assert_eq!(GllmStatus::from(InferenceError::CompileError("x".into())), GllmStatus::CompileError);
-        assert_eq!(GllmStatus::from(InferenceError::Unsupported("x".into())), GllmStatus::Unsupported);
+        assert_eq!(
+            GllmStatus::from(InferenceError::InvalidConfig("x".into())),
+            GllmStatus::InvalidArg
+        );
+        assert_eq!(
+            GllmStatus::from(InferenceError::CompileError("x".into())),
+            GllmStatus::CompileError
+        );
+        assert_eq!(
+            GllmStatus::from(InferenceError::Unsupported("x".into())),
+            GllmStatus::Unsupported
+        );
     }
 
     // ── GllmWeightField ──
@@ -307,12 +316,24 @@ mod tests {
     fn weight_field_all_variants() {
         assert_eq!(GllmWeightField::from_i32(13), Some(GllmWeightField::Wv));
         assert_eq!(GllmWeightField::from_i32(14), Some(GllmWeightField::Wo));
-        assert_eq!(GllmWeightField::from_i32(15), Some(GllmWeightField::FfnNorm));
+        assert_eq!(
+            GllmWeightField::from_i32(15),
+            Some(GllmWeightField::FfnNorm)
+        );
         assert_eq!(GllmWeightField::from_i32(16), Some(GllmWeightField::WGate));
         assert_eq!(GllmWeightField::from_i32(17), Some(GllmWeightField::WUp));
-        assert_eq!(GllmWeightField::from_i32(19), Some(GllmWeightField::QkvBias));
-        assert_eq!(GllmWeightField::from_i32(20), Some(GllmWeightField::AttnNormBias));
-        assert_eq!(GllmWeightField::from_i32(21), Some(GllmWeightField::FfnNormBias));
+        assert_eq!(
+            GllmWeightField::from_i32(19),
+            Some(GllmWeightField::QkvBias)
+        );
+        assert_eq!(
+            GllmWeightField::from_i32(20),
+            Some(GllmWeightField::AttnNormBias)
+        );
+        assert_eq!(
+            GllmWeightField::from_i32(21),
+            Some(GllmWeightField::FfnNormBias)
+        );
     }
 
     // ── Test 10: GllmWeightField Debug format ──
@@ -329,11 +350,21 @@ mod tests {
     #[test]
     fn model_config_all_arch_variants() {
         let base = GllmModelConfig {
-            arch: 0, hidden_size: 256, num_heads: 4, num_kv_heads: 4,
-            head_dim: 64, intermediate_size: 512, num_layers: 4,
-            vocab_size: 1000, max_seq_len: 512, rope_theta: 10000.0,
-            norm_eps: 1e-5, dtype: 0, quant_type: -1,
-            has_qkv_bias: 0, partial_rotary_factor: 1.0,
+            arch: 0,
+            hidden_size: 256,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 64,
+            intermediate_size: 512,
+            num_layers: 4,
+            vocab_size: 1000,
+            max_seq_len: 512,
+            rope_theta: 10000.0,
+            norm_eps: 1e-5,
+            dtype: 0,
+            quant_type: -1,
+            has_qkv_bias: 0,
+            partial_rotary_factor: 1.0,
         };
         for arch in [0, 1, 2, 3, 4, 5] {
             let mut c = base.clone();
@@ -347,11 +378,21 @@ mod tests {
     #[test]
     fn model_config_with_quant_type() {
         let mut c = GllmModelConfig {
-            arch: 0, hidden_size: 256, num_heads: 4, num_kv_heads: 4,
-            head_dim: 64, intermediate_size: 512, num_layers: 4,
-            vocab_size: 1000, max_seq_len: 512, rope_theta: 10000.0,
-            norm_eps: 1e-5, dtype: 0, quant_type: 0,
-            has_qkv_bias: 0, partial_rotary_factor: 1.0,
+            arch: 0,
+            hidden_size: 256,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 64,
+            intermediate_size: 512,
+            num_layers: 4,
+            vocab_size: 1000,
+            max_seq_len: 512,
+            rope_theta: 10000.0,
+            norm_eps: 1e-5,
+            dtype: 0,
+            quant_type: 0,
+            has_qkv_bias: 0,
+            partial_rotary_factor: 1.0,
         };
         let mc = c.to_model_config().unwrap();
         assert!(mc.quant_type.is_some());
@@ -365,11 +406,21 @@ mod tests {
     #[test]
     fn model_config_has_qkv_bias() {
         let mut c = GllmModelConfig {
-            arch: 0, hidden_size: 256, num_heads: 4, num_kv_heads: 4,
-            head_dim: 64, intermediate_size: 512, num_layers: 4,
-            vocab_size: 1000, max_seq_len: 512, rope_theta: 10000.0,
-            norm_eps: 1e-5, dtype: 0, quant_type: -1,
-            has_qkv_bias: 1, partial_rotary_factor: 1.0,
+            arch: 0,
+            hidden_size: 256,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 64,
+            intermediate_size: 512,
+            num_layers: 4,
+            vocab_size: 1000,
+            max_seq_len: 512,
+            rope_theta: 10000.0,
+            norm_eps: 1e-5,
+            dtype: 0,
+            quant_type: -1,
+            has_qkv_bias: 1,
+            partial_rotary_factor: 1.0,
         };
         assert!(c.to_model_config().unwrap().has_qkv_bias);
         c.has_qkv_bias = 0;

@@ -35,7 +35,11 @@ impl std::fmt::Display for RegConflict {
             PhysReg::Mask(m) => format!("MASK({})", m.0),
             PhysReg::Spilled(slot) => format!("SPILLED(slot {})", slot),
         };
-        let vreg_list: Vec<String> = self.vregs.iter().map(|v| format!("VRegId({})", v.0)).collect();
+        let vreg_list: Vec<String> = self
+            .vregs
+            .iter()
+            .map(|v| format!("VRegId({})", v.0))
+            .collect();
         write!(
             f,
             "reg conflict at instr[{}]: physical register {} is occupied by {}",
@@ -84,14 +88,14 @@ pub fn detect_reg_conflicts(
     }
 
     // 构建 VRegId → LiveInterval 的查找表
-    let interval_map: HashMap<VRegId, &LiveInterval> = intervals.iter()
-        .map(|iv| (iv.vreg, iv))
-        .collect();
+    let interval_map: HashMap<VRegId, &LiveInterval> =
+        intervals.iter().map(|iv| (iv.vreg, iv)).collect();
 
     // 对每个程序点（指令索引）检查活跃 VReg 的物理寄存器冲突
     for i in 0..prog.instrs.len() {
         // 找出在此程序点活跃的所有 VReg（def_point <= i <= last_use）
-        let active_at_point: Vec<VRegId> = interval_map.values()
+        let active_at_point: Vec<VRegId> = interval_map
+            .values()
             .filter(|iv| iv.def_point <= i && i <= iv.last_use)
             .map(|iv| iv.vreg)
             .collect();
@@ -135,8 +139,8 @@ fn deduplicate_conflicts(conflicts: &mut Vec<RegConflict>) {
 
 #[cfg(test)]
 mod tests {
-    use crate::compiler::trace::QuantPrecision;
     use super::super::instr::VecOp;
+    use crate::compiler::trace::QuantPrecision;
 
     use super::super::reg_alloc::RegAllocator;
     use super::*;
@@ -146,14 +150,15 @@ mod tests {
     /// instrs: [DeclareVReg v0, DeclareVReg v1, VecLoad v1 ← [v0, 0]]
     fn build_simple_prog() -> VmProgram {
         let mut prog = VmProgram::new();
-        let v0 = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);  // VRegId(0)
-        let v1 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);     // VRegId(1)
+        let v0 = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar); // VRegId(0)
+        let v1 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256); // VRegId(1)
         prog.emit(VmInstr::VecLoad {
             dst: v1,
             base: v0,
             offset: OffsetExpr::Const(0),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32, predicate: None,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         prog
     }
@@ -175,7 +180,11 @@ mod tests {
         };
 
         let conflicts = detect_reg_conflicts(&prog, &alloc, &intervals);
-        assert!(conflicts.is_empty(), "expected no conflicts, got: {:?}", conflicts);
+        assert!(
+            conflicts.is_empty(),
+            "expected no conflicts, got: {:?}",
+            conflicts
+        );
     }
 
     /// 两个 VReg 映射到同一物理寄存器且活跃区间重叠 → 应检出冲突。
@@ -208,8 +217,8 @@ mod tests {
     #[test]
     fn test_non_overlapping_no_conflict() {
         let mut prog = VmProgram::new();
-        let v0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);  // VRegId(0)
-        let v1 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);  // VRegId(1)
+        let v0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256); // VRegId(0)
+        let v1 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256); // VRegId(1)
         let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar); // VRegId(2)
 
         // v0 先使用再释放（通过最后一个 use 在 VecLoad 之后）
@@ -218,7 +227,8 @@ mod tests {
             base,
             offset: OffsetExpr::Const(0),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32, predicate: None,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         // v0 最后使用点 = 此 Mov
         prog.emit(VmInstr::Mov {
@@ -233,7 +243,8 @@ mod tests {
             base,
             offset: OffsetExpr::Const(32),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32, predicate: None,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
 
         let intervals = RegAllocator::compute_intervals(&prog);
@@ -252,7 +263,11 @@ mod tests {
         let conflicts = detect_reg_conflicts(&prog, &alloc, &intervals);
         // v0: def=2, last_use=3; v1: def=4, last_use=4
         // 没有程序点同时活跃 v0 和 v1 → 无冲突
-        assert!(conflicts.is_empty(), "expected no conflicts for non-overlapping intervals, got: {:?}", conflicts);
+        assert!(
+            conflicts.is_empty(),
+            "expected no conflicts for non-overlapping intervals, got: {:?}",
+            conflicts
+        );
     }
 
     /// 冲突报告应包含正确的程序点索引。
@@ -260,8 +275,8 @@ mod tests {
     fn test_conflict_reports_correct_position() {
         let mut prog = VmProgram::new();
         let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar); // VRegId(0)
-        let v0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);    // VRegId(1)
-        let v1 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);    // VRegId(2)
+        let v0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256); // VRegId(1)
+        let v1 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256); // VRegId(2)
 
         // instr[2]: VecLoad v0 (v0 live starts here)
         prog.emit(VmInstr::VecLoad {
@@ -269,7 +284,8 @@ mod tests {
             base,
             offset: OffsetExpr::Const(0),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32, predicate: None,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         // instr[3]: VecLoad v1 (v1 live starts here, v0 still live)
         prog.emit(VmInstr::VecLoad {
@@ -277,7 +293,8 @@ mod tests {
             base,
             offset: OffsetExpr::Const(32),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32, predicate: None,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         // instr[4]: VecBinOp uses v0 — extends v0's last_use past v1's def,
         // creating a true overlap when both map to the same physical register.
@@ -332,7 +349,8 @@ mod tests {
             base,
             offset: OffsetExpr::Const(0),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32, predicate: None,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
 
         let intervals = RegAllocator::compute_intervals(&prog);
@@ -415,12 +433,28 @@ mod tests {
     #[test]
     fn deduplicate_removes_duplicates() {
         let mut conflicts = vec![
-            RegConflict { phys_reg: PhysReg::Gpr(PhysGpr(0)), vregs: vec![VRegId(0), VRegId(1)], program_point: 5 },
-            RegConflict { phys_reg: PhysReg::Gpr(PhysGpr(0)), vregs: vec![VRegId(0), VRegId(1)], program_point: 5 },
-            RegConflict { phys_reg: PhysReg::Vec(PhysVec(0)), vregs: vec![VRegId(2)], program_point: 5 },
+            RegConflict {
+                phys_reg: PhysReg::Gpr(PhysGpr(0)),
+                vregs: vec![VRegId(0), VRegId(1)],
+                program_point: 5,
+            },
+            RegConflict {
+                phys_reg: PhysReg::Gpr(PhysGpr(0)),
+                vregs: vec![VRegId(0), VRegId(1)],
+                program_point: 5,
+            },
+            RegConflict {
+                phys_reg: PhysReg::Vec(PhysVec(0)),
+                vregs: vec![VRegId(2)],
+                program_point: 5,
+            },
         ];
         super::deduplicate_conflicts(&mut conflicts);
-        assert_eq!(conflicts.len(), 2, "should remove exact duplicate (same phys_reg + program_point)");
+        assert_eq!(
+            conflicts.len(),
+            2,
+            "should remove exact duplicate (same phys_reg + program_point)"
+        );
     }
 
     // ── 12. detect_reg_conflicts — empty intervals ───────────────────
@@ -428,7 +462,11 @@ mod tests {
     #[test]
     fn detect_empty_intervals_returns_empty() {
         let prog = VmProgram::new();
-        let alloc = RegAllocation { mapping: HashMap::new(), spills: vec![], callee_saved_used: vec![] };
+        let alloc = RegAllocation {
+            mapping: HashMap::new(),
+            spills: vec![],
+            callee_saved_used: vec![],
+        };
         let result = detect_reg_conflicts(&prog, &alloc, &[]);
         assert!(result.is_empty());
     }
@@ -442,16 +480,29 @@ mod tests {
         let v1 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
-        prog.emit(VmInstr::VecBinOp { dst: v0, a: v1, b: v1, op: VecOp::Add, dtype: QuantPrecision::F32 });
+        prog.emit(VmInstr::VecBinOp {
+            dst: v0,
+            a: v1,
+            b: v1,
+            op: VecOp::Add,
+            dtype: QuantPrecision::F32,
+        });
 
         let intervals = RegAllocator::compute_intervals(&prog);
         // v0 mapped but v1 not in mapping → v1 ignored, no conflict
         let mut mapping = HashMap::new();
         mapping.insert(v0, PhysReg::Vec(PhysVec(0)));
-        let alloc = RegAllocation { mapping, spills: vec![], callee_saved_used: vec![] };
+        let alloc = RegAllocation {
+            mapping,
+            spills: vec![],
+            callee_saved_used: vec![],
+        };
 
         let conflicts = detect_reg_conflicts(&prog, &alloc, &intervals);
-        assert!(conflicts.is_empty(), "unmapped vregs should not cause conflicts");
+        assert!(
+            conflicts.is_empty(),
+            "unmapped vregs should not cause conflicts"
+        );
     }
 
     // ── 14. RegConflict clone preserves fields ───────────────────────
@@ -480,7 +531,13 @@ mod tests {
         let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         // All three used in one op → overlap
-        prog.emit(VmInstr::VecBinOp { dst: v2, a: v0, b: v1, op: VecOp::Mul, dtype: QuantPrecision::F32 });
+        prog.emit(VmInstr::VecBinOp {
+            dst: v2,
+            a: v0,
+            b: v1,
+            op: VecOp::Mul,
+            dtype: QuantPrecision::F32,
+        });
 
         let intervals = RegAllocator::compute_intervals(&prog);
         let mut mapping = HashMap::new();
@@ -488,12 +545,22 @@ mod tests {
         mapping.insert(v1, PhysReg::Vec(PhysVec(0)));
         mapping.insert(v2, PhysReg::Vec(PhysVec(1)));
         mapping.insert(base, PhysReg::Gpr(PhysGpr(0)));
-        let alloc = RegAllocation { mapping, spills: vec![], callee_saved_used: vec![] };
+        let alloc = RegAllocation {
+            mapping,
+            spills: vec![],
+            callee_saved_used: vec![],
+        };
 
         let conflicts = detect_reg_conflicts(&prog, &alloc, &intervals);
         // v0 and v1 both on Vec(0) and active at the same point
-        let vec0_conflicts: Vec<_> = conflicts.iter().filter(|c| c.phys_reg == PhysReg::Vec(PhysVec(0))).collect();
-        assert!(!vec0_conflicts.is_empty(), "should detect v0/v1 conflict on Vec(0)");
+        let vec0_conflicts: Vec<_> = conflicts
+            .iter()
+            .filter(|c| c.phys_reg == PhysReg::Vec(PhysVec(0)))
+            .collect();
+        assert!(
+            !vec0_conflicts.is_empty(),
+            "should detect v0/v1 conflict on Vec(0)"
+        );
     }
 
     // ── 16. PhysReg equality across variants ─────────────────────────
@@ -519,17 +586,31 @@ mod tests {
         let mut prog = VmProgram::new();
         let v0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        prog.emit(VmInstr::VecLoad { dst: v0, base, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32 , predicate: None,});
+        prog.emit(VmInstr::VecLoad {
+            dst: v0,
+            base,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
+        });
 
         let intervals = RegAllocator::compute_intervals(&prog);
         // Only one vec vreg (v0) mapped to Vec(0) — can't conflict with itself
         let mut mapping = HashMap::new();
         mapping.insert(v0, PhysReg::Vec(PhysVec(0)));
         mapping.insert(base, PhysReg::Gpr(PhysGpr(0)));
-        let alloc = RegAllocation { mapping, spills: vec![], callee_saved_used: vec![] };
+        let alloc = RegAllocation {
+            mapping,
+            spills: vec![],
+            callee_saved_used: vec![],
+        };
 
         let conflicts = detect_reg_conflicts(&prog, &alloc, &intervals);
-        assert!(conflicts.is_empty(), "single vreg on its own phys_reg should not conflict");
+        assert!(
+            conflicts.is_empty(),
+            "single vreg on its own phys_reg should not conflict"
+        );
     }
 
     // ── 18. RegConflict with zero program_point ──────────────────────
@@ -558,7 +639,10 @@ mod tests {
         let pos10 = s.find("VRegId(10)").unwrap();
         let pos20 = s.find("VRegId(20)").unwrap();
         let pos30 = s.find("VRegId(30)").unwrap();
-        assert!(pos10 < pos20 && pos20 < pos30, "vregs should appear in order");
+        assert!(
+            pos10 < pos20 && pos20 < pos30,
+            "vregs should appear in order"
+        );
     }
 
     // ── 20. Additional tests ─────────────────────────────────────────
@@ -571,8 +655,14 @@ mod tests {
             program_point: 99,
         };
         let debug_str = format!("{:?}", conflict);
-        assert!(debug_str.contains("RegConflict"), "Debug output should contain struct name");
-        assert!(debug_str.contains("Gpr"), "Debug output should contain Gpr variant");
+        assert!(
+            debug_str.contains("RegConflict"),
+            "Debug output should contain struct name"
+        );
+        assert!(
+            debug_str.contains("Gpr"),
+            "Debug output should contain Gpr variant"
+        );
     }
 
     #[test]
@@ -619,15 +709,31 @@ mod tests {
 
         // instr[2]: VecLoad v0
         prog.emit(VmInstr::VecLoad {
-            dst: v0, base, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            dst: v0,
+            base,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         // instr[3]: VecLoad v1 (v0 still live)
         prog.emit(VmInstr::VecLoad {
-            dst: v1, base, offset: OffsetExpr::Const(32), width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            dst: v1,
+            base,
+            offset: OffsetExpr::Const(32),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         // instr[4]: VecBinOp uses both v0 and v1 — they overlap here
         let v2 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        prog.emit(VmInstr::VecBinOp { dst: v2, a: v0, b: v1, op: VecOp::Add, dtype: QuantPrecision::F32 });
+        prog.emit(VmInstr::VecBinOp {
+            dst: v2,
+            a: v0,
+            b: v1,
+            op: VecOp::Add,
+            dtype: QuantPrecision::F32,
+        });
 
         let intervals = RegAllocator::compute_intervals(&prog);
         let mut mapping = HashMap::new();
@@ -635,7 +741,11 @@ mod tests {
         mapping.insert(v1, PhysReg::Vec(PhysVec(0))); // conflict: same phys reg
         mapping.insert(v2, PhysReg::Vec(PhysVec(1)));
         mapping.insert(base, PhysReg::Gpr(PhysGpr(0)));
-        let alloc = RegAllocation { mapping, spills: vec![], callee_saved_used: vec![] };
+        let alloc = RegAllocation {
+            mapping,
+            spills: vec![],
+            callee_saved_used: vec![],
+        };
 
         let conflicts = detect_reg_conflicts(&prog, &alloc, &intervals);
         // Should detect at least one conflict at program point where both v0 and v1 are live
@@ -649,9 +759,21 @@ mod tests {
     #[test]
     fn deduplicate_preserves_distinct_conflicts() {
         let mut conflicts = vec![
-            RegConflict { phys_reg: PhysReg::Gpr(PhysGpr(0)), vregs: vec![VRegId(0), VRegId(1)], program_point: 5 },
-            RegConflict { phys_reg: PhysReg::Vec(PhysVec(0)), vregs: vec![VRegId(2), VRegId(3)], program_point: 5 },
-            RegConflict { phys_reg: PhysReg::Gpr(PhysGpr(0)), vregs: vec![VRegId(0), VRegId(1)], program_point: 10 },
+            RegConflict {
+                phys_reg: PhysReg::Gpr(PhysGpr(0)),
+                vregs: vec![VRegId(0), VRegId(1)],
+                program_point: 5,
+            },
+            RegConflict {
+                phys_reg: PhysReg::Vec(PhysVec(0)),
+                vregs: vec![VRegId(2), VRegId(3)],
+                program_point: 5,
+            },
+            RegConflict {
+                phys_reg: PhysReg::Gpr(PhysGpr(0)),
+                vregs: vec![VRegId(0), VRegId(1)],
+                program_point: 10,
+            },
         ];
         super::deduplicate_conflicts(&mut conflicts);
         // GPR(0)@5 is deduplicated to 1, VEC(0)@5 kept, GPR(0)@10 kept → 3
@@ -665,17 +787,30 @@ mod tests {
         let v1 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
-        prog.emit(VmInstr::VecBinOp { dst: v0, a: v1, b: v1, op: VecOp::Add, dtype: QuantPrecision::F32 });
+        prog.emit(VmInstr::VecBinOp {
+            dst: v0,
+            a: v1,
+            b: v1,
+            op: VecOp::Add,
+            dtype: QuantPrecision::F32,
+        });
 
         let intervals = RegAllocator::compute_intervals(&prog);
         let mut mapping = HashMap::new();
         mapping.insert(v0, PhysReg::Vec(PhysVec(0)));
         mapping.insert(v1, PhysReg::Vec(PhysVec(1))); // different phys reg
         mapping.insert(base, PhysReg::Gpr(PhysGpr(0)));
-        let alloc = RegAllocation { mapping, spills: vec![], callee_saved_used: vec![] };
+        let alloc = RegAllocation {
+            mapping,
+            spills: vec![],
+            callee_saved_used: vec![],
+        };
 
         let conflicts = detect_reg_conflicts(&prog, &alloc, &intervals);
-        assert!(conflicts.is_empty(), "different phys regs should not conflict");
+        assert!(
+            conflicts.is_empty(),
+            "different phys regs should not conflict"
+        );
     }
 
     #[test]
@@ -686,8 +821,14 @@ mod tests {
             program_point: 20,
         };
         let s = format!("{}", conflict);
-        assert!(s.contains("occupied by"), "display should mention 'occupied by'");
-        assert!(s.contains("instr[20]"), "display should contain program point");
+        assert!(
+            s.contains("occupied by"),
+            "display should mention 'occupied by'"
+        );
+        assert!(
+            s.contains("instr[20]"),
+            "display should contain program point"
+        );
     }
 
     #[test]
@@ -698,17 +839,30 @@ mod tests {
         let v1 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
-        prog.emit(VmInstr::VecBinOp { dst: v0, a: v1, b: v1, op: VecOp::Add, dtype: QuantPrecision::F32 });
+        prog.emit(VmInstr::VecBinOp {
+            dst: v0,
+            a: v1,
+            b: v1,
+            op: VecOp::Add,
+            dtype: QuantPrecision::F32,
+        });
 
         let intervals = RegAllocator::compute_intervals(&prog);
         let mut mapping = HashMap::new();
         mapping.insert(v0, PhysReg::Spilled(3));
         mapping.insert(v1, PhysReg::Spilled(3)); // same spill slot — conflict
         mapping.insert(base, PhysReg::Gpr(PhysGpr(0)));
-        let alloc = RegAllocation { mapping, spills: vec![], callee_saved_used: vec![] };
+        let alloc = RegAllocation {
+            mapping,
+            spills: vec![],
+            callee_saved_used: vec![],
+        };
 
         let conflicts = detect_reg_conflicts(&prog, &alloc, &intervals);
-        assert!(!conflicts.is_empty(), "same spill slot should be detected as conflict");
+        assert!(
+            !conflicts.is_empty(),
+            "same spill slot should be detected as conflict"
+        );
         assert_eq!(conflicts[0].phys_reg, PhysReg::Spilled(3));
     }
 

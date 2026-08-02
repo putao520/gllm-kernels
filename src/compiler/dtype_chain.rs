@@ -4,9 +4,9 @@
 //! to codegen, detects breakpoints, selects dequantization paths, links to kernel selection,
 //! and gates compilation on chain validity.
 
-use crate::types::{CompilerError, DType, InferenceError};
 use crate::compiler::graph::{CompilerGraph, Op, OpId, TensorId, TensorMeta};
 use crate::dispatch::device_profile::{DeviceProfile, DotProductCap};
+use crate::types::{CompilerError, DType, InferenceError};
 
 // ── REQ-DTYPE-CHAIN-001: DType chain end-to-end tracking ─────────────
 
@@ -45,17 +45,21 @@ pub fn validate_dtype_conversion(
     if source == target {
         return Ok(LegalDtypeConversion::WideAccumulate); // identity
     }
-    Err(InferenceError::CompileError(CompilerError::InvalidGraph(format!(
-        "DTYPE-CHAIN-001: Illegal dtype conversion {:?} -> {:?} in context '{}'. \
+    Err(InferenceError::CompileError(CompilerError::InvalidGraph(
+        format!(
+            "DTYPE-CHAIN-001: Illegal dtype conversion {:?} -> {:?} in context '{}'. \
          Only QuantDequant/WideAccumulate/NarrowWriteback are permitted.",
-        source, target, context
-    ))))
+            source, target, context
+        ),
+    )))
 }
 
 /// Check if a DType represents a quantized format.
 fn is_quantized_dtype(dt: DType) -> bool {
-    matches!(dt, DType::U8 | DType::F8E4M3 | DType::F8E5M2
-        | DType::F6E3M2 | DType::F6E2M3 | DType::F4E2M1)
+    matches!(
+        dt,
+        DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::F6E3M2 | DType::F6E2M3 | DType::F4E2M1
+    )
 }
 
 // ── REQ-DTYPE-CHAIN-002: DType chain breakpoint detection ───────────
@@ -89,7 +93,9 @@ pub fn detect_dtype_breakpoints(graph: &CompilerGraph) -> Vec<DtypeBreakpoint> {
         let expected = op_expected_dtype(op, graph);
 
         for &input_tid in &op.inputs {
-            let Some(tensor) = graph.tensor(input_tid) else { continue };
+            let Some(tensor) = graph.tensor(input_tid) else {
+                continue;
+            };
             let Some(exp) = &expected else { continue };
 
             if tensor.dtype != *exp && !is_legal_chain_transition(tensor.dtype, *exp) {
@@ -112,14 +118,19 @@ pub fn detect_dtype_breakpoints(graph: &CompilerGraph) -> Vec<DtypeBreakpoint> {
 }
 
 /// Derive the expected dtype for an op from its OpKind.
-fn op_expected_dtype(op: &crate::compiler::graph::CompilerOp, graph: &CompilerGraph) -> Option<DType> {
+fn op_expected_dtype(
+    op: &crate::compiler::graph::CompilerOp,
+    graph: &CompilerGraph,
+) -> Option<DType> {
     match op.op_resolved(graph) {
         Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) => op.op_gemm_dtype(graph),
         Some(Op::QuantGemm(_)) => {
             // BCE-PHASE2 v2 D5a (K4): QuantGemm 输出 dtype 顺输出张量 TensorMeta,
             // 非硬编码 F32 (违宪). 当前输出张量 dtype = act_dt = F32 → 零回归.
             // 未来 act_dt 顺配置后, QuantGemm 输出跟随 (如 BF16 量化权重 + BF16 输出).
-            op.outputs.first().copied()
+            op.outputs
+                .first()
+                .copied()
                 .and_then(|tid| graph.tensor(tid))
                 .map(|t| t.dtype)
         }
@@ -156,25 +167,36 @@ pub enum DequantStrategy {
 /// - Norm/bias tensors (1D, consumed by non-GEMM ops) → Immediate
 /// - GEMM weight tensors (2D, consumed by Gemm/QuantGemm) → DeferredInKernel
 /// - Other tensors → DeferredInKernel (safe default)
-pub fn select_dequant_path(
-    tensor: &TensorMeta,
-    graph: &CompilerGraph,
-) -> DequantStrategy {
+pub fn select_dequant_path(tensor: &TensorMeta, graph: &CompilerGraph) -> DequantStrategy {
     // 1D tensors consumed by norm/bias ops → immediate dequant
     if tensor.shape.len() == 1 {
         // ARCH-JIT-DATA-YIELDS: use tensor.consumers index instead of graph.ops.iter()
-        let consumed_by_norm = tensor.consumers.iter()
+        let consumed_by_norm = tensor
+            .consumers
+            .iter()
             .filter_map(|&op_id| graph.op(op_id))
-            .any(|op| matches!(op.op_resolved(graph), Some(Op::RmsNorm(_)) | Some(Op::LayerNorm(_))));
+            .any(|op| {
+                matches!(
+                    op.op_resolved(graph),
+                    Some(Op::RmsNorm(_)) | Some(Op::LayerNorm(_))
+                )
+            });
         if consumed_by_norm {
             return DequantStrategy::Immediate;
         }
     }
 
     // 2D tensors consumed by GEMM ops → deferred dequant
-    let consumed_by_gemm = tensor.consumers.iter()
+    let consumed_by_gemm = tensor
+        .consumers
+        .iter()
         .filter_map(|&op_id| graph.op(op_id))
-        .any(|op| matches!(op.op_resolved(graph), Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_))));
+        .any(|op| {
+            matches!(
+                op.op_resolved(graph),
+                Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_))
+            )
+        });
 
     if consumed_by_gemm {
         return DequantStrategy::DeferredInKernel;
@@ -208,11 +230,26 @@ pub fn derive_compute_dtype(storage_dtype: DType, device: &DeviceProfile) -> DTy
     match device.dot_product_cap() {
         // 原生 BF16 dot-product（x86 VDPBF16PS / ARM BFMMLA / GPU HMMA bf16，FP32 accumulate）
         // → 保留 BF16/F16 计算，不在 loader 层降级。
-        DotProductCap::NativeBf16 if matches!(storage_dtype, DType::BF16 | DType::F16) => storage_dtype,
+        DotProductCap::NativeBf16 if matches!(storage_dtype, DType::BF16 | DType::F16) => {
+            storage_dtype
+        }
         // 原生 FP4 tensor core（NVIDIA SM100+ tcgen05）→ 保留 FP4-class 量化 dtype 原生计算
-        DotProductCap::NativeFp4 if matches!(storage_dtype, DType::F8E4M3 | DType::F6E3M2 | DType::F6E2M3 | DType::F4E2M1) => storage_dtype,
+        DotProductCap::NativeFp4
+            if matches!(
+                storage_dtype,
+                DType::F8E4M3 | DType::F6E3M2 | DType::F6E2M3 | DType::F4E2M1
+            ) =>
+        {
+            storage_dtype
+        }
         // 原生 INT8 dot-product（VNNI / ARM SDOT / GPU IMMA / AMX）→ 保留 U8 原生计算
-        DotProductCap::NativeInt8Simd | DotProductCap::NativeInt8Tc | DotProductCap::NativeInt8Tile if matches!(storage_dtype, DType::U8) => storage_dtype,
+        DotProductCap::NativeInt8Simd
+        | DotProductCap::NativeInt8Tc
+        | DotProductCap::NativeInt8Tile
+            if matches!(storage_dtype, DType::U8) =>
+        {
+            storage_dtype
+        }
         // 兜底：无原生累加支持 → F32 widen（数值安全，非精度预设）
         _ => DType::F32,
     }
@@ -236,7 +273,10 @@ impl KernelDtypeKey {
     pub fn from_graph(graph: &CompilerGraph, device: &DeviceProfile) -> Self {
         let storage_dtype = derive_storage_dtype_from_graph(graph);
         let compute_dtype = derive_compute_dtype(storage_dtype, device);
-        Self { storage_dtype, compute_dtype }
+        Self {
+            storage_dtype,
+            compute_dtype,
+        }
     }
 }
 
@@ -300,7 +340,9 @@ impl DtypeChainValidation {
         let breakpoints = detect_dtype_breakpoints(graph);
 
         // Compute per-tensor dequant strategies
-        let dequant_strategies: Vec<(TensorId, DequantStrategy)> = graph.tensors.iter()
+        let dequant_strategies: Vec<(TensorId, DequantStrategy)> = graph
+            .tensors
+            .iter()
             .filter(|t| is_quantized_dtype(t.dtype))
             .map(|t| (t.id, select_dequant_path(t, graph)))
             .collect();
@@ -322,7 +364,10 @@ impl DtypeChainValidation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::graph::{CompilerGraph, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+    use crate::compiler::graph::{
+        AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+        DualRopeSpec, GemmSpec, MlaSpec, NormSpec, Op, QuantGemmSpec, RopeSpec, SinksSpec, SymDim,
+    };
 
     // ── REQ-DTYPE-CHAIN-001 tests ────────────────────────────────
 
@@ -390,11 +435,24 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 64], dt);
         let b = g.add_tensor_concrete("b", &[64, 128], dt);
         let c = g.add_tensor_concrete("c", &[1, 128], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, dtype: dt, trans_b: false, has_bias: false }),
-            vec![a, b], vec![c], "gemm"
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 128,
+                k: 64,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, b],
+            vec![c],
+            "gemm",
         );
         let breakpoints = detect_dtype_breakpoints(&g);
-        assert!(breakpoints.is_empty(), "Consistent dtype should have no breakpoints");
+        assert!(
+            breakpoints.is_empty(),
+            "Consistent dtype should have no breakpoints"
+        );
     }
 
     #[test]
@@ -404,12 +462,25 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 64], DType::BF16);
         let b = g.add_tensor_concrete("b", &[64, 128], DType::BF16);
         let c = g.add_tensor_concrete("c", &[1, 128], DType::F32);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, b], vec![c], "gemm"
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 128,
+                k: 64,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, b],
+            vec![c],
+            "gemm",
         );
         // BF16→F32 is a legal WideAccumulate transition — should not be a breakpoint
         let breakpoints = detect_dtype_breakpoints(&g);
-        assert!(breakpoints.is_empty(), "Legal BF16→F32 transition should not be a breakpoint");
+        assert!(
+            breakpoints.is_empty(),
+            "Legal BF16→F32 transition should not be a breakpoint"
+        );
     }
 
     // ── REQ-DTYPE-CHAIN-003 tests ────────────────────────────────
@@ -421,11 +492,25 @@ mod tests {
         let x = g.add_tensor_concrete("x", &[1, 64], DType::F32);
         let norm_w = g.add_tensor_concrete("norm_w", &[64], DType::U8);
         let out = g.add_tensor_concrete("out", &[1, 64], DType::F32);
-        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }), vec![x, norm_w], vec![out], "norm");
+        g.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-6,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![x, norm_w],
+            vec![out],
+            "norm",
+        );
 
         let tensor = g.tensor(norm_w).unwrap();
         let strategy = select_dequant_path(tensor, &g);
-        assert_eq!(strategy, DequantStrategy::Immediate, "1D tensor consumed by norm → Immediate");
+        assert_eq!(
+            strategy,
+            DequantStrategy::Immediate,
+            "1D tensor consumed by norm → Immediate"
+        );
     }
 
     #[test]
@@ -434,13 +519,25 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 64], DType::F32);
         let b = g.add_tensor_concrete("b", &[64, 128], DType::U8);
         let c = g.add_tensor_concrete("c", &[1, 128], DType::F32);
-        g.add_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, quant_type: crate::quant::QuantType::Q4K }),
-            vec![a, b], vec![c], "qgemm"
+        g.add_op(
+            Op::QuantGemm(QuantGemmSpec {
+                m: SymDim::Concrete(1),
+                n: 128,
+                k: 64,
+                quant_type: crate::quant::QuantType::Q4K,
+            }),
+            vec![a, b],
+            vec![c],
+            "qgemm",
         );
 
         let tensor = g.tensor(b).unwrap();
         let strategy = select_dequant_path(tensor, &g);
-        assert_eq!(strategy, DequantStrategy::DeferredInKernel, "2D weight consumed by GEMM → DeferredInKernel");
+        assert_eq!(
+            strategy,
+            DequantStrategy::DeferredInKernel,
+            "2D weight consumed by GEMM → DeferredInKernel"
+        );
     }
 
     #[test]
@@ -451,13 +548,27 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 64], DType::F32);
         let b = g.add_tensor_concrete("b", &[64, 128], DType::BF16);
         let c = g.add_tensor_concrete("c", &[1, 128], DType::F32);
-        g.add_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, dtype: DType::F32, trans_b: false, has_bias: true }),
-            vec![a, b, bias], vec![c], "gemm_bias"
+        g.add_op(
+            Op::GemmBias(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 128,
+                k: 64,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: true,
+            }),
+            vec![a, b, bias],
+            vec![c],
+            "gemm_bias",
         );
 
         let tensor = g.tensor(bias).unwrap();
         let strategy = select_dequant_path(tensor, &g);
-        assert_eq!(strategy, DequantStrategy::DeferredInKernel, "1D tensor consumed by GEMM → DeferredInKernel");
+        assert_eq!(
+            strategy,
+            DequantStrategy::DeferredInKernel,
+            "1D tensor consumed by GEMM → DeferredInKernel"
+        );
     }
 
     // ── REQ-DTYPE-CHAIN-004 tests ────────────────────────────────
@@ -496,8 +607,18 @@ mod tests {
         let w = g.add_tensor_concrete("weight", &[512, 512], dt);
         let out = g.add_tensor_concrete("out", &[1, 512], DType::F32);
         g.inputs = vec![a, w];
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![out], "gemm"
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![out],
+            "gemm",
         );
 
         let device = DeviceProfile::detect();
@@ -516,8 +637,18 @@ mod tests {
         let w = g.add_tensor_concrete("weight", &[64, 128], dt);
         let out = g.add_tensor_concrete("out", &[1, 128], dt);
         g.inputs = vec![a, w];
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, dtype: dt, trans_b: false, has_bias: false }),
-            vec![a, w], vec![out], "gemm"
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 128,
+                k: 64,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![out],
+            "gemm",
         );
 
         let device = DeviceProfile::detect();
@@ -535,19 +666,35 @@ mod tests {
         let w = g.add_tensor_concrete("weight", &[512, 512], DType::BF16);
         let out = g.add_tensor_concrete("out", &[1, 512], DType::F32);
         g.inputs = vec![a, w];
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![out], "gemm"
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![out],
+            "gemm",
         );
 
         let device = DeviceProfile::detect();
         let validation = DtypeChainValidation::validate(&g, &device);
-        assert!(validation.is_valid, "BF16 model with F32 compute should be valid");
+        assert!(
+            validation.is_valid,
+            "BF16 model with F32 compute should be valid"
+        );
         assert_eq!(validation.compute_dtype, DType::F32);
         assert_eq!(validation.storage_dtype, DType::BF16);
-        assert_eq!(validation.kernel_key, KernelDtypeKey {
-            storage_dtype: DType::BF16,
-            compute_dtype: DType::F32,
-        });
+        assert_eq!(
+            validation.kernel_key,
+            KernelDtypeKey {
+                storage_dtype: DType::BF16,
+                compute_dtype: DType::F32,
+            }
+        );
     }
 
     #[test]
@@ -560,17 +707,48 @@ mod tests {
         g.inputs = vec![input, norm_w, gemm_w];
 
         let normed = g.add_tensor_concrete("normed", &[1, 512], DType::F32);
-        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }), vec![input, norm_w], vec![normed], "norm");
+        g.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-6,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![input, norm_w],
+            vec![normed],
+            "norm",
+        );
 
         let out = g.add_tensor_concrete("out", &[1, 2048], DType::F32);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 2048, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![normed, gemm_w], vec![out], "gemm"
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 2048,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![normed, gemm_w],
+            vec![out],
+            "gemm",
         );
 
         let device = DeviceProfile::detect();
         let validation = DtypeChainValidation::validate(&g, &device);
-        assert!(validation.is_valid, "Mixed F32 norm + BF16 GEMM should be valid");
-        assert_eq!(validation.storage_dtype, DType::BF16, "BF16 GEMM weight dominates storage_dtype");
-        assert_eq!(validation.compute_dtype, DType::F32, "compute_dtype derived from (BF16, DeviceProfile)");
+        assert!(
+            validation.is_valid,
+            "Mixed F32 norm + BF16 GEMM should be valid"
+        );
+        assert_eq!(
+            validation.storage_dtype,
+            DType::BF16,
+            "BF16 GEMM weight dominates storage_dtype"
+        );
+        assert_eq!(
+            validation.compute_dtype,
+            DType::F32,
+            "compute_dtype derived from (BF16, DeviceProfile)"
+        );
     }
 }

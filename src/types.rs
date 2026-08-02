@@ -4,8 +4,8 @@
 //! by the compiler layer as well. Extracting them here avoids a dependency
 //! from `compiler` → `inference`.
 
-use std::fmt;
 use crate::quant::QuantType;
+use std::fmt;
 
 /// Data type for tensor elements.
 ///
@@ -243,8 +243,8 @@ impl ModelConfig {
         let kv_dim = self.num_kv_heads * self.head_dim;
         // QKV projections: Q is h*q_dim, K and V are each h*kv_dim
         let qkv = h * q_dim + 2 * h * kv_dim;
-        let per_layer = (qkv + h * h + 2 * h * inter + inter * h) * elem
-            + 2 * h * self.dtype.size_bytes(); // norm weights
+        let per_layer =
+            (qkv + h * h + 2 * h * inter + inter * h) * elem + 2 * h * self.dtype.size_bytes(); // norm weights
         let embedding = self.vocab_size * h * self.dtype.size_bytes();
         per_layer * self.num_layers + 2 * embedding
     }
@@ -380,7 +380,11 @@ impl ModelConfig {
 #[derive(Debug, Clone)]
 pub enum CompilerError {
     /// Register overflow: too many accumulators/scratch registers needed
-    RegisterOverflow { needed: usize, available: usize, context: String },
+    RegisterOverflow {
+        needed: usize,
+        available: usize,
+        context: String,
+    },
     /// Unsupported DType for the target ISA
     UnsupportedDType { dtype: DType, isa: String },
     /// Invalid graph structure (cycle, disconnected output, etc.)
@@ -453,8 +457,15 @@ pub enum CompilerError {
 impl fmt::Display for CompilerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::RegisterOverflow { needed, available, context } => {
-                write!(f, "register overflow: need {needed}, have {available} ({context})")
+            Self::RegisterOverflow {
+                needed,
+                available,
+                context,
+            } => {
+                write!(
+                    f,
+                    "register overflow: need {needed}, have {available} ({context})"
+                )
             }
             Self::UnsupportedDType { dtype, isa } => {
                 write!(f, "unsupported dtype {dtype:?} for ISA {isa}")
@@ -463,29 +474,68 @@ impl fmt::Display for CompilerError {
             Self::CodegenViolation(s) => write!(f, "codegen violation: {s}"),
             Self::FeatureDisabled(s) => write!(f, "feature disabled: {s}"),
             Self::Internal(s) => write!(f, "internal: {s}"),
-            Self::IrLayer { precondition, position, expected, actual } => {
-                write!(f, "IR-ERR: precondition '{}' violated at {}: expected '{}', actual '{}'",
-                    precondition, position, expected, actual)
+            Self::IrLayer {
+                precondition,
+                position,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "IR-ERR: precondition '{}' violated at {}: expected '{}', actual '{}'",
+                    precondition, position, expected, actual
+                )
             }
-            Self::PassLayer { invariant, pass_name, input_diff, output_diff } => {
-                write!(f, "PASS-ERR: invariant '{}' violated in pass '{}': input='{}', output='{}'",
-                    invariant, pass_name, input_diff, output_diff)
+            Self::PassLayer {
+                invariant,
+                pass_name,
+                input_diff,
+                output_diff,
+            } => {
+                write!(
+                    f,
+                    "PASS-ERR: invariant '{}' violated in pass '{}': input='{}', output='{}'",
+                    invariant, pass_name, input_diff, output_diff
+                )
             }
-            Self::CodegenLayer { vminstr, source_op, device_profile, register_state } => {
-                write!(f, "CG-ERR: vminstr='{}', source_op='{}', device_profile='{}'",
-                    vminstr, source_op, device_profile)?;
+            Self::CodegenLayer {
+                vminstr,
+                source_op,
+                device_profile,
+                register_state,
+            } => {
+                write!(
+                    f,
+                    "CG-ERR: vminstr='{}', source_op='{}', device_profile='{}'",
+                    vminstr, source_op, device_profile
+                )?;
                 if let Some(rs) = register_state {
                     write!(f, ", registers=[{}]", rs)?;
                 }
                 Ok(())
             }
-            Self::UnauthorizedFallback { trigger, attempted_path, suggestion } => {
-                write!(f, "UNAUTHORIZED-FALLBACK: trigger='{}', attempted='{}', fix='{}'",
-                    trigger, attempted_path, suggestion)
+            Self::UnauthorizedFallback {
+                trigger,
+                attempted_path,
+                suggestion,
+            } => {
+                write!(
+                    f,
+                    "UNAUTHORIZED-FALLBACK: trigger='{}', attempted='{}', fix='{}'",
+                    trigger, attempted_path, suggestion
+                )
             }
-            Self::CapabilityUnsupported { op_kind, device_profile, strategy, reason } => {
-                write!(f, "CAP-ERR: OpKind '{}' unsupported on DeviceProfile '{}' (strategy={}): {}",
-                    op_kind, device_profile, strategy, reason)
+            Self::CapabilityUnsupported {
+                op_kind,
+                device_profile,
+                strategy,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "CAP-ERR: OpKind '{}' unsupported on DeviceProfile '{}' (strategy={}): {}",
+                    op_kind, device_profile, strategy, reason
+                )
             }
         }
     }
@@ -528,7 +578,10 @@ impl fmt::Display for InferenceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidConfig(s) => write!(f, "invalid config: {s}"),
-            Self::OutOfMemory { requested, available } => {
+            Self::OutOfMemory {
+                requested,
+                available,
+            } => {
                 write!(f, "out of memory: need {requested} bytes, have {available}")
             }
             Self::CompileError(e) => write!(f, "compile error: {e}"),
@@ -580,9 +633,19 @@ mod tests {
     #[test]
     fn dtype_elem_id_unique() {
         let ids: Vec<u8> = vec![
-            DType::F32, DType::F16, DType::BF16, DType::U8,
-            DType::F8E4M3, DType::F8E5M2, DType::F6E3M2, DType::F6E2M3, DType::F4E2M1,
-        ].iter().map(|d| d.elem_id()).collect();
+            DType::F32,
+            DType::F16,
+            DType::BF16,
+            DType::U8,
+            DType::F8E4M3,
+            DType::F8E5M2,
+            DType::F6E3M2,
+            DType::F6E2M3,
+            DType::F4E2M1,
+        ]
+        .iter()
+        .map(|d| d.elem_id())
+        .collect();
         let mut sorted = ids.clone();
         sorted.sort();
         sorted.dedup();
@@ -732,18 +795,28 @@ mod tests {
         let bytes = cfg.approx_weight_bytes();
         assert!(bytes > 0, "weight bytes should be positive");
         // LLaMA-7B is ~13GB in FP32, check order of magnitude
-        assert!(bytes > 1_000_000_000, "LLaMA-7B FP32 should be >1GB, got {bytes}");
+        assert!(
+            bytes > 1_000_000_000,
+            "LLaMA-7B FP32 should be >1GB, got {bytes}"
+        );
     }
 
     // ── CompilerError Display ──
 
     #[test]
     fn compiler_error_display() {
-        let e = CompilerError::RegisterOverflow { needed: 32, available: 16, context: "GEMM acc".into() };
+        let e = CompilerError::RegisterOverflow {
+            needed: 32,
+            available: 16,
+            context: "GEMM acc".into(),
+        };
         let msg = format!("{e}");
         assert!(msg.contains("32") && msg.contains("16") && msg.contains("GEMM acc"));
 
-        let e = CompilerError::UnsupportedDType { dtype: DType::F6E3M2, isa: "AVX2".into() };
+        let e = CompilerError::UnsupportedDType {
+            dtype: DType::F6E3M2,
+            isa: "AVX2".into(),
+        };
         let msg = format!("{e}");
         assert!(msg.contains("F6E3M2") && msg.contains("AVX2"));
 
@@ -767,11 +840,17 @@ mod tests {
 
     #[test]
     fn inference_error_display() {
-        let e = InferenceError::OutOfMemory { requested: 1024, available: 512 };
+        let e = InferenceError::OutOfMemory {
+            requested: 1024,
+            available: 512,
+        };
         let msg = format!("{e}");
         assert!(msg.contains("1024") && msg.contains("512"));
 
-        let e = InferenceError::ShapeMismatch { expected: "[2,3]".into(), got: "[4,5]".into() };
+        let e = InferenceError::ShapeMismatch {
+            expected: "[2,3]".into(),
+            got: "[4,5]".into(),
+        };
         let msg = format!("{e}");
         assert!(msg.contains("[2,3]") && msg.contains("[4,5]"));
     }
@@ -789,9 +868,19 @@ mod tests {
     fn dtype_elem_id_range_and_ordering() {
         // elem_id values should be sequential 0..=8.
         let ids: Vec<u8> = vec![
-            DType::F32, DType::F16, DType::BF16, DType::U8,
-            DType::F8E4M3, DType::F8E5M2, DType::F6E3M2, DType::F6E2M3, DType::F4E2M1,
-        ].iter().map(|d| d.elem_id()).collect();
+            DType::F32,
+            DType::F16,
+            DType::BF16,
+            DType::U8,
+            DType::F8E4M3,
+            DType::F8E5M2,
+            DType::F6E3M2,
+            DType::F6E2M3,
+            DType::F4E2M1,
+        ]
+        .iter()
+        .map(|d| d.elem_id())
+        .collect();
         assert_eq!(*ids.iter().min().unwrap(), 0);
         assert_eq!(*ids.iter().max().unwrap(), 8);
     }
@@ -869,7 +958,10 @@ mod tests {
     fn compiler_error_feature_disabled_display() {
         let e = CompilerError::FeatureDisabled("nccl".into());
         let msg = format!("{e}");
-        assert!(msg.contains("feature disabled"), "Display should contain 'feature disabled'");
+        assert!(
+            msg.contains("feature disabled"),
+            "Display should contain 'feature disabled'"
+        );
         assert!(msg.contains("nccl"), "Display should contain 'nccl'");
     }
 
@@ -877,15 +969,24 @@ mod tests {
     fn inference_error_unsupported_display() {
         let e = InferenceError::Unsupported("MoE routing".into());
         let msg = format!("{e}");
-        assert!(msg.contains("unsupported"), "Display should contain 'unsupported'");
-        assert!(msg.contains("MoE routing"), "Display should contain 'MoE routing'");
+        assert!(
+            msg.contains("unsupported"),
+            "Display should contain 'unsupported'"
+        );
+        assert!(
+            msg.contains("MoE routing"),
+            "Display should contain 'MoE routing'"
+        );
     }
 
     #[test]
     fn inference_error_invalid_config_display() {
         let e = InferenceError::InvalidConfig("negative vocab_size".into());
         let msg = format!("{e}");
-        assert!(msg.contains("invalid config"), "Display should contain 'invalid config'");
+        assert!(
+            msg.contains("invalid config"),
+            "Display should contain 'invalid config'"
+        );
         assert!(msg.contains("negative vocab_size"));
     }
 
@@ -902,19 +1003,31 @@ mod tests {
         let cfg = ModelConfig::llama_7b();
         // Cross-check: kv_dim = num_kv_heads * head_dim = 32 * 128 = 4096
         let kv_dim = cfg.num_kv_heads * cfg.head_dim;
-        assert_eq!(kv_dim, cfg.hidden_size, "LLaMA-7B should have kv_dim == hidden_size (MHA)");
+        assert_eq!(
+            kv_dim, cfg.hidden_size,
+            "LLaMA-7B should have kv_dim == hidden_size (MHA)"
+        );
         // 2 * 4096 * 4 * 32 = 1,048,576
-        assert_eq!(cfg.kv_cache_bytes_per_token(), 2 * kv_dim * 4 * cfg.num_layers);
+        assert_eq!(
+            cfg.kv_cache_bytes_per_token(),
+            2 * kv_dim * 4 * cfg.num_layers
+        );
     }
 
     #[test]
     fn model_config_mistral_gqa_ratio() {
         let cfg = ModelConfig::mistral_7b();
         // Mistral-7B uses GQA: num_kv_heads=8, num_heads=32, ratio=4:1
-        assert_eq!(cfg.num_heads / cfg.num_kv_heads, 4,
-            "Mistral GQA ratio should be 4:1");
+        assert_eq!(
+            cfg.num_heads / cfg.num_kv_heads,
+            4,
+            "Mistral GQA ratio should be 4:1"
+        );
         // kv_dim should be smaller than hidden_size due to GQA
         let kv_dim = cfg.num_kv_heads * cfg.head_dim;
-        assert!(kv_dim < cfg.hidden_size, "GQA kv_dim should be < hidden_size");
+        assert!(
+            kv_dim < cfg.hidden_size,
+            "GQA kv_dim should be < hidden_size"
+        );
     }
 }

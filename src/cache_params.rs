@@ -51,7 +51,7 @@ fn detect_x86_cache() -> Option<(usize, usize, usize)> {
         let size = line_size as usize * partitions as usize * ways as usize * sets as usize;
 
         match (level, cache_type) {
-            (1, 1) => l1d = Some(size),       // Level 1, Data cache
+            (1, 1) => l1d = Some(size),         // Level 1, Data cache
             (2, 3) | (2, 2) => l2 = Some(size), // Level 2, Unified or Data
             (3, 3) | (3, 2) => l3 = Some(size), // Level 3, Unified or Data
             _ => {}
@@ -205,7 +205,11 @@ pub fn compute_nc_with_l3(kc: usize, tn: usize, elem_bytes: usize, node_l3: usiz
 /// Compute NUMA-aware blocking parameters for a specific node.
 /// Uses the node's local L3 cache size for NC computation.
 pub fn blocking_params_for_node(
-    tm: usize, nv: usize, lanes: usize, elem_bytes: usize, node_l3: usize,
+    tm: usize,
+    nv: usize,
+    lanes: usize,
+    elem_bytes: usize,
+    node_l3: usize,
 ) -> BlockingParams {
     let kc = compute_kc(tm, nv, lanes, elem_bytes);
     let mc = compute_mc(kc, tm, elem_bytes);
@@ -238,24 +242,38 @@ impl<T> AlignedVec<T> {
 
     #[inline]
     pub fn new() -> Self {
-        Self { ptr: std::ptr::null_mut(), len: 0, cap: 0 }
+        Self {
+            ptr: std::ptr::null_mut(),
+            len: 0,
+            cap: 0,
+        }
     }
 
     #[inline]
-    pub fn capacity(&self) -> usize { self.cap }
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
 
     #[inline]
-    pub fn len(&self) -> usize { self.len }
+    pub fn len(&self) -> usize {
+        self.len
+    }
 
     #[inline]
-    pub fn as_ptr(&self) -> *const T { self.ptr }
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr
+    }
 
     #[inline]
-    pub fn as_mut_ptr(&mut self) -> *mut T { self.ptr }
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.ptr
+    }
 
     /// Grow to at least `new_cap` elements, preserving existing data.
     pub fn reserve(&mut self, new_cap: usize) {
-        if new_cap <= self.cap { return; }
+        if new_cap <= self.cap {
+            return;
+        }
         let elem_size = std::mem::size_of::<T>();
         assert!(elem_size > 0, "ZST not supported");
         let byte_size = new_cap * elem_size;
@@ -268,12 +286,16 @@ impl<T> AlignedVec<T> {
         // Hint transparent huge pages for large buffers (≥2MB)
         #[cfg(target_os = "linux")]
         if byte_size >= 2 * 1024 * 1024 {
-            unsafe { libc::madvise(new_ptr as *mut libc::c_void, byte_size, libc::MADV_HUGEPAGE); }
+            unsafe {
+                libc::madvise(new_ptr as *mut libc::c_void, byte_size, libc::MADV_HUGEPAGE);
+            }
         }
         if self.len > 0 && !self.ptr.is_null() {
             // SAFETY: src (self.ptr) and dst (new_ptr) are non-overlapping heap allocations,
             // both valid for self.len elements. new_cap >= self.len is guaranteed.
-            unsafe { std::ptr::copy_nonoverlapping(self.ptr, new_ptr, self.len); }
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.ptr, new_ptr, self.len);
+            }
         }
         self.dealloc();
         self.ptr = new_ptr;
@@ -314,7 +336,9 @@ impl<T> AlignedVec<T> {
             let byte_size = self.cap * elem_size;
             if let Ok(layout) = std::alloc::Layout::from_size_align(byte_size, Self::ALIGN) {
                 // SAFETY: ptr was allocated with this exact layout in reserve().
-                unsafe { std::alloc::dealloc(self.ptr as *mut u8, layout); }
+                unsafe {
+                    std::alloc::dealloc(self.ptr as *mut u8, layout);
+                }
             }
         }
     }
@@ -327,7 +351,9 @@ impl<T> Drop for AlignedVec<T> {
 }
 
 impl<T> Default for AlignedVec<T> {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -356,7 +382,7 @@ mod tests {
         assert!(p.kc >= 64 && p.kc <= 768);
         assert!(p.mc >= 16);
         assert!(p.nc >= 32); // at least TN
-        // B panel strip must fit in L1D: TN*KC*elem_bytes <= L1D
+                             // B panel strip must fit in L1D: TN*KC*elem_bytes <= L1D
         let b_panel = 32 * p.kc * 4;
         assert!(b_panel <= l1d_size() + 512, "B panel {b_panel} exceeds L1D");
     }
@@ -388,8 +414,10 @@ mod tests {
         let tn = 2 * 8;
         let nc_budget = p.nc * p.kc * 4;
         let l3_budget = l3_size() / 2;
-        assert!(nc_budget <= l3_budget + tn * p.kc * 4,
-            "NC budget {nc_budget} exceeds L3 budget {l3_budget}");
+        assert!(
+            nc_budget <= l3_budget + tn * p.kc * 4,
+            "NC budget {nc_budget} exceeds L3 budget {l3_budget}"
+        );
         // NC must be multiple of TN
         assert!(p.nc % tn == 0, "NC {} not multiple of TN {}", p.nc, tn);
     }
@@ -401,18 +429,30 @@ mod tests {
         v.reserve(1024);
         assert!(v.capacity() >= 1024);
         assert_eq!(v.as_ptr() as usize % 64, 0, "not 64-byte aligned");
-        unsafe { v.set_len(1024); }
+        unsafe {
+            v.set_len(1024);
+        }
         // Write and read back
         unsafe {
-            for i in 0..1024 { *v.as_mut_ptr().add(i) = i as f32; }
-            for i in 0..1024 { assert_eq!(*v.as_ptr().add(i), i as f32); }
+            for i in 0..1024 {
+                *v.as_mut_ptr().add(i) = i as f32;
+            }
+            for i in 0..1024 {
+                assert_eq!(*v.as_ptr().add(i), i as f32);
+            }
         }
         // Re-reserve should preserve data
         v.reserve(2048);
         assert!(v.capacity() >= 2048);
-        assert_eq!(v.as_ptr() as usize % 64, 0, "not 64-byte aligned after re-reserve");
+        assert_eq!(
+            v.as_ptr() as usize % 64,
+            0,
+            "not 64-byte aligned after re-reserve"
+        );
         unsafe {
-            for i in 0..1024 { assert_eq!(*v.as_ptr().add(i), i as f32); }
+            for i in 0..1024 {
+                assert_eq!(*v.as_ptr().add(i), i as f32);
+            }
         }
     }
 
@@ -424,7 +464,11 @@ mod tests {
             for &lanes in &[8, 16] {
                 for &elem_bytes in &[2, 4] {
                     let kc = compute_kc(16, nv, lanes, elem_bytes);
-                    assert_eq!(kc % 8, 0, "KC={kc} not multiple of 8 (nv={nv}, lanes={lanes}, elem={elem_bytes})");
+                    assert_eq!(
+                        kc % 8,
+                        0,
+                        "KC={kc} not multiple of 8 (nv={nv}, lanes={lanes}, elem={elem_bytes})"
+                    );
                     assert!(kc >= 64, "KC={kc} below lower clamp");
                     assert!(kc <= 768, "KC={kc} above upper clamp");
                 }
@@ -467,8 +511,10 @@ mod tests {
         let small_l3 = 1024 * 1024; // 1 MB
         let nc_custom = compute_nc_with_l3(kc, tn, 4, small_l3);
         let nc_global = compute_nc(kc, tn, 4);
-        assert!(nc_custom <= nc_global,
-            "NC with 1MB L3 ({nc_custom}) should be <= global NC ({nc_global})");
+        assert!(
+            nc_custom <= nc_global,
+            "NC with 1MB L3 ({nc_custom}) should be <= global NC ({nc_global})"
+        );
         assert_eq!(nc_custom % tn, 0, "NC must be multiple of TN");
         assert!(nc_custom >= tn, "NC must be >= TN");
     }
@@ -487,7 +533,10 @@ mod tests {
         let tn = nv * lanes;
         let nc_direct = compute_nc_with_l3(p_node.kc, tn, elem_bytes, node_l3);
 
-        assert_eq!(p_node.nc, nc_direct, "NC mismatch with direct compute_nc_with_l3");
+        assert_eq!(
+            p_node.nc, nc_direct,
+            "NC mismatch with direct compute_nc_with_l3"
+        );
         assert!(p_node.kc >= 64 && p_node.kc <= 768);
         assert!(p_node.mc >= tm);
     }
@@ -504,8 +553,10 @@ mod tests {
         let p_node = blocking_params_for_node(tm, nv, lanes, elem_bytes, 0);
         let p_global = blocking_params(tm, nv, lanes, elem_bytes);
 
-        assert_eq!(p_node.nc, p_global.nc,
-            "NC should match global when node_l3=0");
+        assert_eq!(
+            p_node.nc, p_global.nc,
+            "NC should match global when node_l3=0"
+        );
         assert_eq!(p_node.kc, p_global.kc);
         assert_eq!(p_node.mc, p_global.mc);
     }
@@ -542,17 +593,20 @@ mod tests {
         // resize_zeroed should zero-fill all bytes.
         let mut v = AlignedVec::<u64>::new();
         v.reserve(32);
-        unsafe { v.set_len(32); }
+        unsafe {
+            v.set_len(32);
+        }
         // Fill with non-zero
         for i in 0..32 {
-            unsafe { *v.as_mut_ptr().add(i) = 0xDEADBEEFu64; }
+            unsafe {
+                *v.as_mut_ptr().add(i) = 0xDEADBEEFu64;
+            }
         }
         // resize_zeroed to same length — should overwrite with zeros
         v.resize_zeroed(32);
         assert_eq!(v.len(), 32);
         for i in 0..32 {
-            assert_eq!(unsafe { *v.as_ptr().add(i) }, 0,
-                "element {i} not zeroed");
+            assert_eq!(unsafe { *v.as_ptr().add(i) }, 0, "element {i} not zeroed");
         }
     }
 
@@ -609,17 +663,23 @@ mod tests {
         assert!(!ptr_after_first.is_null());
         // reserve same or smaller — should not reallocate
         v.reserve(100);
-        assert_eq!(v.as_ptr(), ptr_after_first,
-            "reserve should not reallocate when capacity suffices");
-        assert_eq!(v.capacity(), cap_after_first,
-            "capacity should not change");
+        assert_eq!(
+            v.as_ptr(),
+            ptr_after_first,
+            "reserve should not reallocate when capacity suffices"
+        );
+        assert_eq!(v.capacity(), cap_after_first, "capacity should not change");
     }
 
     // @trace TEST-CP-20 [req:REQ-LC] [level:unit]
     #[test]
     fn test_blocking_params_copy_clone_debug() {
         // Arrange
-        let p = BlockingParams { kc: 128, mc: 256, nc: 512 };
+        let p = BlockingParams {
+            kc: 128,
+            mc: 256,
+            nc: 512,
+        };
         // Act — Clone
         let p2 = p.clone();
         // Assert
@@ -662,8 +722,11 @@ mod tests {
         v.resize_zeroed(16);
         assert_eq!(v.len(), 16);
         for i in 0..16 {
-            assert_eq!(unsafe { *v.as_ptr().add(i) }, 0,
-                "element {i} not zeroed after grow");
+            assert_eq!(
+                unsafe { *v.as_ptr().add(i) },
+                0,
+                "element {i} not zeroed after grow"
+            );
         }
     }
 
@@ -674,9 +737,13 @@ mod tests {
         {
             let mut v = AlignedVec::<f64>::new();
             v.reserve(64);
-            unsafe { v.set_len(64); }
+            unsafe {
+                v.set_len(64);
+            }
             for i in 0..64 {
-                unsafe { *v.as_mut_ptr().add(i) = i as f64; }
+                unsafe {
+                    *v.as_mut_ptr().add(i) = i as f64;
+                }
             }
             // v dropped here
         }
@@ -699,7 +766,9 @@ mod tests {
                 *v.as_mut_ptr().add(i) = (i * 10) as i32;
             }
         }
-        unsafe { v.set_len(8); }
+        unsafe {
+            v.set_len(8);
+        }
         let slice = v.as_slice();
         assert_eq!(slice[0], 0);
         assert_eq!(slice[3], 30);
@@ -740,9 +809,9 @@ mod tests {
     #[test]
     fn test_nc_upper_clamp() {
         // NC should never exceed 8192 even with tiny KC and elem_bytes.
-        let kc = 64;  // minimal KC
+        let kc = 64; // minimal KC
         let tn = 8;
-        let elem_bytes = 1;  // smallest element
+        let elem_bytes = 1; // smallest element
         let nc = compute_nc(kc, tn, elem_bytes);
         assert!(nc <= 8192, "NC should be clamped to 8192, got {nc}");
         assert!(nc >= tn, "NC should be at least TN={tn}, got {nc}");
@@ -765,8 +834,11 @@ mod tests {
         let mut v = AlignedVec::<u8>::new();
         for size in [64, 128, 512, 4096] {
             v.reserve(size);
-            assert_eq!(v.as_ptr() as usize % 64, 0,
-                "alignment lost after reserve({size})");
+            assert_eq!(
+                v.as_ptr() as usize % 64,
+                0,
+                "alignment lost after reserve({size})"
+            );
         }
     }
 

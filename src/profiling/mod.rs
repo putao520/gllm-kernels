@@ -38,16 +38,16 @@
 //! println!("Bandwidth: {:.1} GB/s", metrics.bandwidth_gbs);
 //! ```
 
-pub mod timer;
-pub mod perf_events;
 pub mod counters;
+pub mod perf_events;
 pub mod report;
+pub mod timer;
 
-use timer::CycleTimer;
-use perf_events::PerfEventGroup;
-use counters::{OpWorkload, PerfMetrics, HwPeak, compute_metrics};
-use report::{ProfileReport, ProfileEntry};
 use crate::cpu_kernels::get_isa_level;
+use counters::{compute_metrics, HwPeak, OpWorkload, PerfMetrics};
+use perf_events::PerfEventGroup;
+use report::{ProfileEntry, ProfileReport};
+use timer::CycleTimer;
 
 /// High-level profiler that collects timing + HW counters for kernel runs.
 pub struct Profiler {
@@ -110,14 +110,27 @@ impl Profiler {
     /// Panics if called without a prior `begin()` call (API contract violation).
     pub fn end(&mut self) -> PerfMetrics {
         // SAFETY: these panics enforce the begin/end pairing API contract
-        let mut timer = self.active_timer.take().expect("end() called without begin()");
+        let mut timer = self
+            .active_timer
+            .take()
+            .expect("end() called without begin()");
         timer.stop();
         let hw = self.perf_group.stop();
-        let workload = self.active_workload.take().expect("end() called without begin()");
-        let name = self.active_name.take().expect("end() called without begin()");
+        let workload = self
+            .active_workload
+            .take()
+            .expect("end() called without begin()");
+        let name = self
+            .active_name
+            .take()
+            .expect("end() called without begin()");
 
         let metrics = compute_metrics(workload, &timer, Some(&self.peak));
-        let hw_counters = if self.perf_group.is_available() { Some(hw) } else { None };
+        let hw_counters = if self.perf_group.is_available() {
+            Some(hw)
+        } else {
+            None
+        };
 
         self.entries.push(ProfileEntry {
             name,
@@ -141,7 +154,13 @@ impl Profiler {
     }
 
     /// Profile a closure N times, returning the median metrics.
-    pub fn measure_median<F>(&mut self, name: &str, workload: OpWorkload, iterations: usize, mut f: F) -> PerfMetrics
+    pub fn measure_median<F>(
+        &mut self,
+        name: &str,
+        workload: OpWorkload,
+        iterations: usize,
+        mut f: F,
+    ) -> PerfMetrics
     where
         F: FnMut(),
     {
@@ -228,7 +247,9 @@ impl Profiler {
         s.push_str(&format!("{:-<90}\n", ""));
 
         for e in &self.entries {
-            let ipc_str = e.hw_counters.as_ref()
+            let ipc_str = e
+                .hw_counters
+                .as_ref()
                 .map(|h| format!("{:.2}", h.ipc()))
                 .unwrap_or_else(|| "-".to_string());
             s.push_str(&format!(
@@ -342,10 +363,18 @@ mod tests {
 
         // Assert
         let hw = profiler.hw_peak();
-        assert!((hw.gflops - peak_gflops).abs() < 1e-6,
-            "hw_peak.gflops should be {}, got {}", peak_gflops, hw.gflops);
-        assert!((hw.bandwidth_gbs - peak_bw).abs() < 1e-6,
-            "hw_peak.bandwidth_gbs should be {}, got {}", peak_bw, hw.bandwidth_gbs);
+        assert!(
+            (hw.gflops - peak_gflops).abs() < 1e-6,
+            "hw_peak.gflops should be {}, got {}",
+            peak_gflops,
+            hw.gflops
+        );
+        assert!(
+            (hw.bandwidth_gbs - peak_bw).abs() < 1e-6,
+            "hw_peak.bandwidth_gbs should be {}, got {}",
+            peak_bw,
+            hw.bandwidth_gbs
+        );
     }
 
     #[test]
@@ -355,8 +384,16 @@ mod tests {
 
         // Assert: auto-detect should always produce positive values
         let hw = profiler.hw_peak();
-        assert!(hw.gflops > 0.0, "auto-detected GFLOPS must be positive, got {}", hw.gflops);
-        assert!(hw.bandwidth_gbs > 0.0, "auto-detected bandwidth must be positive, got {}", hw.bandwidth_gbs);
+        assert!(
+            hw.gflops > 0.0,
+            "auto-detected GFLOPS must be positive, got {}",
+            hw.gflops
+        );
+        assert!(
+            hw.bandwidth_gbs > 0.0,
+            "auto-detected bandwidth must be positive, got {}",
+            hw.bandwidth_gbs
+        );
     }
 
     #[test]
@@ -366,13 +403,21 @@ mod tests {
         let workload = counters::gemm_workload(64, 64, 64);
         profiler.measure("entry_1", workload, || {});
         profiler.measure("entry_2", workload, || {});
-        assert_eq!(profiler.entry_count(), 2, "should have 2 entries before clear");
+        assert_eq!(
+            profiler.entry_count(),
+            2,
+            "should have 2 entries before clear"
+        );
 
         // Act
         profiler.clear();
 
         // Assert
-        assert_eq!(profiler.entry_count(), 0, "entries should be empty after clear");
+        assert_eq!(
+            profiler.entry_count(),
+            0,
+            "entries should be empty after clear"
+        );
     }
 
     #[test]
@@ -387,7 +432,10 @@ mod tests {
         let report = profiler.report();
 
         // Assert
-        assert!(report.entries.is_empty(), "report should have no entries after clear");
+        assert!(
+            report.entries.is_empty(),
+            "report should have no entries after clear"
+        );
     }
 
     #[test]
@@ -406,9 +454,18 @@ mod tests {
         });
 
         // Assert
-        assert!(metrics.elapsed_secs > 0.0, "median elapsed_secs must be positive");
-        assert!(metrics.elapsed_cycles > 0, "median elapsed_cycles must be positive");
-        assert!(metrics.gflops > 0.0, "median gflops must be positive for compute workload");
+        assert!(
+            metrics.elapsed_secs > 0.0,
+            "median elapsed_secs must be positive"
+        );
+        assert!(
+            metrics.elapsed_cycles > 0,
+            "median elapsed_cycles must be positive"
+        );
+        assert!(
+            metrics.gflops > 0.0,
+            "median gflops must be positive for compute workload"
+        );
     }
 
     #[test]
@@ -421,8 +478,12 @@ mod tests {
         profiler.measure_median("median_entry", workload, 3, || {});
 
         // Assert: measure_median should leave exactly 1 entry (the median result)
-        assert_eq!(profiler.entry_count(), 1,
-            "measure_median should store exactly 1 entry, got {}", profiler.entry_count());
+        assert_eq!(
+            profiler.entry_count(),
+            1,
+            "measure_median should store exactly 1 entry, got {}",
+            profiler.entry_count()
+        );
     }
 
     #[test]
@@ -437,9 +498,15 @@ mod tests {
         });
 
         // Assert: compute workload should have gflops > 0, bandwidth = 0
-        assert!(metrics.gflops >= 0.0, "compute workload gflops should be >= 0");
-        assert!((metrics.bandwidth_gbs - 0.0).abs() < 1e-10,
-            "compute workload bandwidth should be 0, got {}", metrics.bandwidth_gbs);
+        assert!(
+            metrics.gflops >= 0.0,
+            "compute workload gflops should be >= 0"
+        );
+        assert!(
+            (metrics.bandwidth_gbs - 0.0).abs() < 1e-10,
+            "compute workload bandwidth should be 0, got {}",
+            metrics.bandwidth_gbs
+        );
     }
 
     #[test]
@@ -454,9 +521,15 @@ mod tests {
         });
 
         // Assert: memory workload should have bandwidth > 0, gflops = 0
-        assert!((metrics.gflops - 0.0).abs() < 1e-10,
-            "memory workload gflops should be 0, got {}", metrics.gflops);
-        assert!(metrics.bandwidth_gbs >= 0.0, "memory workload bandwidth should be >= 0");
+        assert!(
+            (metrics.gflops - 0.0).abs() < 1e-10,
+            "memory workload gflops should be 0, got {}",
+            metrics.gflops
+        );
+        assert!(
+            metrics.bandwidth_gbs >= 0.0,
+            "memory workload bandwidth should be >= 0"
+        );
     }
 
     #[test]
@@ -476,8 +549,14 @@ mod tests {
 
         // Assert: mixed workload should have both gflops and bandwidth
         assert!(metrics.elapsed_secs > 0.0, "elapsed_secs must be positive");
-        assert!(metrics.gflops >= 0.0, "mixed workload gflops should be >= 0");
-        assert!(metrics.bandwidth_gbs >= 0.0, "mixed workload bandwidth should be >= 0");
+        assert!(
+            metrics.gflops >= 0.0,
+            "mixed workload gflops should be >= 0"
+        );
+        assert!(
+            metrics.bandwidth_gbs >= 0.0,
+            "mixed workload bandwidth should be >= 0"
+        );
     }
 
     #[test]
@@ -491,9 +570,15 @@ mod tests {
         let summary = profiler.summary_string();
 
         // Assert: summary should always contain the IPC column header
-        assert!(summary.contains("IPC"), "summary must include IPC column header");
+        assert!(
+            summary.contains("IPC"),
+            "summary must include IPC column header"
+        );
         // The IPC value is either a number or "-"
-        assert!(summary.contains("ipc_check"), "summary must include kernel name");
+        assert!(
+            summary.contains("ipc_check"),
+            "summary must include kernel name"
+        );
     }
 
     #[test]
@@ -507,9 +592,22 @@ mod tests {
         let report = profiler.report();
 
         // Assert: report ISA string should be one of the known levels
-        let valid_isa = ["avx512amx", "avx512fp16", "avx512", "avx2", "neon", "neon_amx", "sve", "sve2", "scalar"];
-        assert!(valid_isa.contains(&report.isa.as_str()),
-            "report.isa should be a known ISA level, got '{}'", report.isa);
+        let valid_isa = [
+            "avx512amx",
+            "avx512fp16",
+            "avx512",
+            "avx2",
+            "neon",
+            "neon_amx",
+            "sve",
+            "sve2",
+            "scalar",
+        ];
+        assert!(
+            valid_isa.contains(&report.isa.as_str()),
+            "report.isa should be a known ISA level, got '{}'",
+            report.isa
+        );
     }
 
     #[test]
@@ -547,6 +645,10 @@ mod tests {
 
         // Assert: second measurement should work correctly and accumulate
         assert!(metrics2.elapsed_secs >= 0.0);
-        assert_eq!(profiler.entry_count(), 2, "should have 2 entries after two begin/end cycles");
+        assert_eq!(
+            profiler.entry_count(),
+            2,
+            "should have 2 entries after two begin/end cycles"
+        );
     }
 }

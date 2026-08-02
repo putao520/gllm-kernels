@@ -6,10 +6,10 @@
 //!
 //! ActivationSwap(ptr_a, ptr_b): 层循环末尾交换 ptr，零数据拷贝。
 
-use std::collections::HashMap;
-use crate::compiler::graph::{CompilerGraph, TensorId};
 use crate::compiler::fusion::FusionPlan;
+use crate::compiler::graph::{CompilerGraph, TensorId};
 use crate::types::DType;
+use std::collections::HashMap;
 
 /// 激活 buffer 角色标识
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -63,10 +63,7 @@ impl VirtualActivationMap {
     /// 分析激活流并生成虚拟激活映射
     ///
     /// 识别层间 activation tensor，将它们映射到 2 个 ping-pong buffer。
-    pub fn analyze(
-        graph: &CompilerGraph,
-        plan: &FusionPlan,
-    ) -> Self {
+    pub fn analyze(graph: &CompilerGraph, plan: &FusionPlan) -> Self {
         // Standard/hetero path reads graph.layer_loop_config / hetero_layer_loop_config;
         // mixed-quant path reads graph.mixed_quant_layer_loop_config (single activation_alias,
         // same in-place residual flow as the standard path — see types.inc.rs §314-317).
@@ -74,12 +71,27 @@ impl VirtualActivationMap {
         // graphs (layer_loop_config=None) returned empty → activation_buffer_size=0 → no
         // ping-pong sentinel slots → Norm op input failed to materialize (TensorPtrSource mapped
         // to a too-short-lifetime Intermediate). Add mixed_quant fallback, mirroring topology.rs:253-256.
-        let mq_alias = graph.mixed_quant_layer_loop_config.as_ref().and_then(|c| c.activation_alias);
-        let alias = graph.layer_loop_config.as_ref().and_then(|c| c.activation_alias).or(mq_alias);
-        eprintln!("[VAM] analyze: layer_loop_config={:?} mixed_quant={:?} activation_alias={:?}",
-            graph.layer_loop_config.as_ref().map(|c| (c.num_layers, c.weight_stride)),
-            graph.mixed_quant_layer_loop_config.as_ref().map(|c| (c.num_layers, c.num_groups)),
-            alias);
+        let mq_alias = graph
+            .mixed_quant_layer_loop_config
+            .as_ref()
+            .and_then(|c| c.activation_alias);
+        let alias = graph
+            .layer_loop_config
+            .as_ref()
+            .and_then(|c| c.activation_alias)
+            .or(mq_alias);
+        eprintln!(
+            "[VAM] analyze: layer_loop_config={:?} mixed_quant={:?} activation_alias={:?}",
+            graph
+                .layer_loop_config
+                .as_ref()
+                .map(|c| (c.num_layers, c.weight_stride)),
+            graph
+                .mixed_quant_layer_loop_config
+                .as_ref()
+                .map(|c| (c.num_layers, c.num_groups)),
+            alias
+        );
         let mut activation_assignments = HashMap::new();
         let mut swap_sequence = Vec::new();
 
@@ -104,13 +116,21 @@ impl VirtualActivationMap {
         // elem_bytes is dtype-aware (ARCH-DTYPE-JIT-TYPED): intermediates follow
         // the DT2 F32-accumulator invariant today, and will track the accumulator
         // dtype automatically if it ever moves off F32 — no hardcoded `* 4`.
-        let max_activation_bytes = layer_activations.iter()
+        let max_activation_bytes = layer_activations
+            .iter()
             .map(|(tid, _)| {
-                let elem_bytes = graph.tensor(*tid)
+                let elem_bytes = graph
+                    .tensor(*tid)
                     .map(|t| t.elem_bytes())
                     .unwrap_or(DType::F32.size_bytes());
                 // BCE-20260728-SCRATCHPAD-MISMATCH: 限制编译期分配上界（同 buffer_alloc.rs）
-                graph.tensor_numel_for_alloc(*tid, graph.max_seq_len.min(crate::compiler::buffer_alloc::ALLOC_SEQ_CAP))
+                graph
+                    .tensor_numel_for_alloc(
+                        *tid,
+                        graph
+                            .max_seq_len
+                            .min(crate::compiler::buffer_alloc::ALLOC_SEQ_CAP),
+                    )
                     .map(|numel| numel * elem_bytes)
                     .unwrap_or(0)
             })
@@ -122,12 +142,19 @@ impl VirtualActivationMap {
         // 奇数层: input → pong(1), output → ping(0)
         for (idx, (tid, layer_idx)) in layer_activations.iter().enumerate() {
             let buffer_idx = idx % 2;
-            let role = if idx % 2 == 0 { ActivationRole::Input } else { ActivationRole::Output };
-            activation_assignments.insert(*tid, ActivationSlot {
-                buffer_idx,
-                role,
-                byte_offset: 0,
-            });
+            let role = if idx % 2 == 0 {
+                ActivationRole::Input
+            } else {
+                ActivationRole::Output
+            };
+            activation_assignments.insert(
+                *tid,
+                ActivationSlot {
+                    buffer_idx,
+                    role,
+                    byte_offset: 0,
+                },
+            );
 
             // 每层结束生成 swap
             if idx > 0 && idx % 2 == 0 {
@@ -164,19 +191,19 @@ impl VirtualActivationMap {
 /// 这两个 tensor 共享 ping-pong buffer，层循环每轮迭代后 ActivationSwap 交换指针。
 /// 其他 "layer." 组的中间 tensor (q_proj, k_proj, attn_out 等) 是层内临时变量，
 /// 需要通过正常 lifetime coloring 获取独立 buffer slot，不能放入 ping-pong buffer。
-fn find_layer_activations(
-    graph: &CompilerGraph,
-    _plan: &FusionPlan,
-) -> Vec<(TensorId, usize)> {
+fn find_layer_activations(graph: &CompilerGraph, _plan: &FusionPlan) -> Vec<(TensorId, usize)> {
     use std::collections::HashSet;
     // BCE-20260629-005: 排除 Gather/QuantGather 输出（如 embedding）。
     // Gather 输出是数据加载（写入），不是层间激活交换（in-place 读写）。
     // 如果 Gather 输出被当作 activation tensor，VAM 会把它分配到 ping/pong buffer，
     // 而 resolver materialize 会返回 activation_ping_ptr → gather 写到 ping buffer
     // 而非 scratchpad → DIAG 读 scratchpad offset 0 读不到 → NaN。
-    let gather_output_tids: HashSet<TensorId> = graph.ops.iter()
+    let gather_output_tids: HashSet<TensorId> = graph
+        .ops
+        .iter()
         .filter_map(|op| match &op.op {
-            crate::compiler::graph::Op::Gather { .. } | crate::compiler::graph::Op::QuantGather { .. } => op.outputs.first().copied(),
+            crate::compiler::graph::Op::Gather { .. }
+            | crate::compiler::graph::Op::QuantGather { .. } => op.outputs.first().copied(),
             _ => None,
         })
         .collect();
@@ -261,7 +288,11 @@ mod tests {
         let mut set = HashSet::new();
         set.insert(ActivationRole::Input);
         set.insert(ActivationRole::Output);
-        assert_eq!(set.len(), 2, "Input and Output should hash to distinct entries");
+        assert_eq!(
+            set.len(),
+            2,
+            "Input and Output should hash to distinct entries"
+        );
         assert!(set.contains(&ActivationRole::Input));
         assert!(set.contains(&ActivationRole::Output));
     }
@@ -454,7 +485,10 @@ mod tests {
         let vam = VirtualActivationMap::analyze(&graph, &plan);
 
         // Assert — VAM recognizes the mixed-quant activation_alias and assigns ping-pong slots
-        assert_eq!(vam.num_buffers, 2, "mixed_quant activation_alias must drive ping-pong");
+        assert_eq!(
+            vam.num_buffers, 2,
+            "mixed_quant activation_alias must drive ping-pong"
+        );
         assert!(!vam.activation_assignments.is_empty());
         assert!(vam.activation_assignments.contains_key(&in_tid));
         assert!(vam.activation_assignments.contains_key(&out_tid));
@@ -520,11 +554,14 @@ mod tests {
     fn virtual_activation_map_manual_with_assignments() {
         // Arrange — manually construct a map with one assignment
         let mut assignments = HashMap::new();
-        assignments.insert(TensorId(10), ActivationSlot {
-            buffer_idx: 0,
-            role: ActivationRole::Input,
-            byte_offset: 0,
-        });
+        assignments.insert(
+            TensorId(10),
+            ActivationSlot {
+                buffer_idx: 0,
+                role: ActivationRole::Input,
+                byte_offset: 0,
+            },
+        );
         let vam = VirtualActivationMap {
             activation_assignments: assignments,
             swap_sequence: vec![],

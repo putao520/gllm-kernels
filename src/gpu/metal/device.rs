@@ -67,7 +67,9 @@ impl GpuStream for MetalStream {
             let cmd_buf_sel = objc_runtime::sel("commandBuffer");
             let cmd_buf: Id = objc_runtime::objc_msgSend(self.raw, cmd_buf_sel);
             if cmd_buf.is_null() {
-                return Err(GpuError::Driver("failed to create command buffer for sync".into()));
+                return Err(GpuError::Driver(
+                    "failed to create command buffer for sync".into(),
+                ));
             }
 
             let commit_sel = objc_runtime::sel("commit");
@@ -125,7 +127,9 @@ impl MetalDevice {
 
         let raw = unsafe { (framework.create_default_device)() };
         if raw.is_null() {
-            return Err(GpuError::DeviceNotFound("MTLCreateSystemDefaultDevice returned nil".into()));
+            return Err(GpuError::DeviceNotFound(
+                "MTLCreateSystemDefaultDevice returned nil".into(),
+            ));
         }
 
         // Read device name: [device name] -> NSString
@@ -141,7 +145,9 @@ impl MetalDevice {
             objc_runtime::objc_msgSend(raw, sel)
         };
         if queue.is_null() {
-            return Err(GpuError::Driver("failed to create default command queue".into()));
+            return Err(GpuError::Driver(
+                "failed to create default command queue".into(),
+            ));
         }
 
         let framework = Arc::new(framework);
@@ -239,12 +245,8 @@ impl MetalDevice {
             // Note: Metal expects dispatch_data_t, but NSData toll-free bridges to it.
             let lib_sel = objc_runtime::sel("newLibraryWithData:error:");
             let mut error: Id = NIL;
-            let library: Id = objc_runtime::objc_msgSend(
-                self.raw,
-                lib_sel,
-                nsdata,
-                &mut error as *mut Id,
-            );
+            let library: Id =
+                objc_runtime::objc_msgSend(self.raw, lib_sel, nsdata, &mut error as *mut Id);
 
             if library.is_null() {
                 let err_msg = if !error.is_null() {
@@ -300,9 +302,8 @@ impl MetalDevice {
             let pipeline: Id = {
                 let sel = objc_runtime::sel("newComputePipelineStateWithFunction:error:");
                 let mut error: Id = NIL;
-                let ps: Id = objc_runtime::objc_msgSend(
-                    self.raw, sel, ns_name, &mut error as *mut Id,
-                );
+                let ps: Id =
+                    objc_runtime::objc_msgSend(self.raw, sel, ns_name, &mut error as *mut Id);
                 if ps.is_null() {
                     return Err(GpuError::ShaderCompilation(
                         "failed to create compute pipeline".into(),
@@ -341,8 +342,16 @@ impl MetalDevice {
 
             // [encoder dispatchThreadgroups:threadsPerThreadgroup:]
             let tg_sel = objc_runtime::sel("dispatchThreadgroups:threadsPerThreadgroup:");
-            let tg = MTLSize { width: grid.0, height: grid.1, depth: grid.2 };
-            let tp = MTLSize { width: threadgroup.0, height: threadgroup.1, depth: threadgroup.2 };
+            let tg = MTLSize {
+                width: grid.0,
+                height: grid.1,
+                depth: grid.2,
+            };
+            let tp = MTLSize {
+                width: threadgroup.0,
+                height: threadgroup.1,
+                depth: threadgroup.2,
+            };
             objc_runtime::objc_msgSend(encoder, tg_sel, tg, tp);
 
             // [encoder endEncoding]
@@ -428,7 +437,10 @@ impl GpuDevice for MetalDevice {
                     available: self.free_memory(),
                 });
             }
-            Ok(MetalBuffer { raw: buf, len: bytes })
+            Ok(MetalBuffer {
+                raw: buf,
+                len: bytes,
+            })
         }
     }
 

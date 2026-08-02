@@ -90,8 +90,11 @@ pub enum StrategyFamily {
 impl AlgoStrategy {
     pub fn family(&self) -> StrategyFamily {
         match self {
-            Self::GemmNaive | Self::GemmBlis | Self::GemmGpuTiled
-            | Self::GemmGpuPipelined | Self::GemmHardwareTile => StrategyFamily::Gemm,
+            Self::GemmNaive
+            | Self::GemmBlis
+            | Self::GemmGpuTiled
+            | Self::GemmGpuPipelined
+            | Self::GemmHardwareTile => StrategyFamily::Gemm,
 
             Self::AttnMha | Self::AttnGqa | Self::AttnMla => StrategyFamily::Attention,
 
@@ -101,8 +104,12 @@ impl AlgoStrategy {
 
             Self::RopeStandard | Self::RopePartial => StrategyFamily::Rope,
 
-            Self::SamplingArgmax | Self::SamplingTemperature | Self::SamplingSoftmax
-            | Self::SamplingTopK | Self::SamplingTopP | Self::SamplingMultinomial => StrategyFamily::Sampling,
+            Self::SamplingArgmax
+            | Self::SamplingTemperature
+            | Self::SamplingSoftmax
+            | Self::SamplingTopK
+            | Self::SamplingTopP
+            | Self::SamplingMultinomial => StrategyFamily::Sampling,
 
             Self::EmbeddingGather => StrategyFamily::Embedding,
 
@@ -121,7 +128,6 @@ impl AlgoStrategy {
 #[derive(Debug, Clone)]
 pub enum AlgoStep {
     // Control structure
-
     /// Sequential execution of a group of steps.
     Seq(&'static [AlgoStep]),
 
@@ -140,7 +146,6 @@ pub enum AlgoStep {
     },
 
     // Memory operations (map to TraceOp variants)
-
     /// Load matrix panel → TraceOp::PanelLoad.
     LoadPanel {
         matrix: MatrixRole,
@@ -166,7 +171,6 @@ pub enum AlgoStep {
     },
 
     // GPU-specific (map to TraceOp extensions)
-
     /// TraceOp::SharedMemDeclare
     SharedMemDeclare {
         name: &'static str,
@@ -186,9 +190,11 @@ pub enum AlgoStep {
     Barrier { barrier_name: &'static str },
 
     // Tile/Matrix specific
-
     /// TraceOp::TileConfig
-    TileConfig { rows: &'static str, cols: &'static str },
+    TileConfig {
+        rows: &'static str,
+        cols: &'static str,
+    },
 
     /// TraceOp::TileMma
     TileMma,
@@ -197,7 +203,6 @@ pub enum AlgoStep {
     TileRelease,
 
     // Computation steps (directly produce TraceOp)
-
     /// Embed existing TraceOp sequence (from SymExec trace or manual definition).
     TraceBody(&'static [AlgoTraceStep]),
 
@@ -255,36 +260,78 @@ pub enum AlgoTraceStep {
     /// Falls back to 0.0 if the parameter is not set in the ParamTable.
     LoadParam { name: &'static str },
     /// Arithmetic → TraceOp::Add/Sub/Mul/Div/Fma/etc.
-    BinOp { op: TraceBinOp, dst: &'static str, a: &'static str, b: &'static str },
+    BinOp {
+        op: TraceBinOp,
+        dst: &'static str,
+        a: &'static str,
+        b: &'static str,
+    },
     /// Unary → TraceOp::Exp/Sqrt/Rsqrt/Tanh/Sigmoid/etc.
-    UnaryOp { op: TraceUnaryOp, dst: &'static str, src: &'static str },
+    UnaryOp {
+        op: TraceUnaryOp,
+        dst: &'static str,
+        src: &'static str,
+    },
     /// Multiply-accumulate: dst += a * b
-    Fma { acc: &'static str, a: &'static str, b: &'static str },
+    Fma {
+        acc: &'static str,
+        a: &'static str,
+        b: &'static str,
+    },
     /// Horizontal reduce → TraceOp::HReduce
     HReduce { src: &'static str, op: ReduceKind },
     /// Broadcast scalar → TraceOp::BroadcastScalar
-    Broadcast { src: &'static str, dst: &'static str },
+    Broadcast {
+        src: &'static str,
+        dst: &'static str,
+    },
     /// Vec load indexed → TraceOp::VecLoadIndexed
-    VecLoadIndexed { base: &'static str, offset: &'static str },
+    VecLoadIndexed {
+        base: &'static str,
+        offset: &'static str,
+    },
     /// Vec store indexed → TraceOp::VecStoreIndexed
-    VecStoreIndexed { base: &'static str, offset: &'static str, src: &'static str },
+    VecStoreIndexed {
+        base: &'static str,
+        offset: &'static str,
+        src: &'static str,
+    },
     /// Cast → TraceOp::Cast
-    Cast { src: &'static str, from: QuantPrecision, to: QuantPrecision },
+    Cast {
+        src: &'static str,
+        from: QuantPrecision,
+        to: QuantPrecision,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum TraceBinOp {
-    Add, Sub, Mul, Div, Max, Min,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Max,
+    Min,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum TraceUnaryOp {
-    Exp, Sqrt, Rsqrt, Tanh, Sigmoid, Neg, Abs, Recip, Log,
+    Exp,
+    Sqrt,
+    Rsqrt,
+    Tanh,
+    Sigmoid,
+    Neg,
+    Abs,
+    Recip,
+    Log,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum ReduceKind {
-    Sum, Max, Min,
+    Sum,
+    Max,
+    Min,
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -324,7 +371,11 @@ pub enum ParamArith {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum MatrixRole { A, B, C }
+pub enum MatrixRole {
+    A,
+    B,
+    C,
+}
 
 /// Device requirement — minimum device capability for a template.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -393,13 +444,26 @@ pub enum EpilogueOp {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum ActivationKind { Relu, Silu, Gelu, Tanh, Sigmoid }
+pub enum ActivationKind {
+    Relu,
+    Silu,
+    Gelu,
+    Tanh,
+    Sigmoid,
+}
 
 #[derive(Debug, Clone, Copy)]
-pub enum ReduceOp { Sum, Max, Min }
+pub enum ReduceOp {
+    Sum,
+    Max,
+    Min,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum PackLayout { RowMajor, ColMajor }
+pub enum PackLayout {
+    RowMajor,
+    ColMajor,
+}
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // MicroKernelDef
@@ -497,8 +561,13 @@ mod tests {
         ];
         // Act & Assert
         for (strategy, expected_family) in cases {
-            assert_eq!(strategy.family(), *expected_family,
-                "{:?} should belong to {:?} family", strategy, expected_family);
+            assert_eq!(
+                strategy.family(),
+                *expected_family,
+                "{:?} should belong to {:?} family",
+                strategy,
+                expected_family
+            );
         }
     }
 
@@ -519,10 +588,22 @@ mod tests {
         let derived_dbg = format!("{:?}", derived);
 
         // Assert
-        assert!(max_dbg.contains("Const"), "Const variant debug must contain 'Const'");
-        assert!(zero_dbg.contains("Const"), "zero-value Const must still be Const");
-        assert!(derived_dbg.contains("Derived"), "Derived variant debug must contain 'Derived'");
-        assert!(derived_dbg.contains("CeilDiv"), "Derived debug must include ParamArith");
+        assert!(
+            max_dbg.contains("Const"),
+            "Const variant debug must contain 'Const'"
+        );
+        assert!(
+            zero_dbg.contains("Const"),
+            "zero-value Const must still be Const"
+        );
+        assert!(
+            derived_dbg.contains("Derived"),
+            "Derived variant debug must contain 'Derived'"
+        );
+        assert!(
+            derived_dbg.contains("CeilDiv"),
+            "Derived debug must include ParamArith"
+        );
     }
 
     #[test]
@@ -586,7 +667,11 @@ mod tests {
         for (i, mode) in modes.iter().enumerate() {
             let orig_dbg = format!("{:?}", mode);
             let clone_dbg = format!("{:?}", cloned[i]);
-            assert_eq!(orig_dbg, clone_dbg, "cloned BlockUnpackMode {:?} must match", mode);
+            assert_eq!(
+                orig_dbg, clone_dbg,
+                "cloned BlockUnpackMode {:?} must match",
+                mode
+            );
         }
         assert_eq!(modes.len(), 14, "all 14 BlockUnpackMode variants covered");
     }
@@ -680,8 +765,12 @@ mod tests {
         let zero = AlgoTraceStep::LoadConst { value: 0.0_f64 };
         let tiny = AlgoTraceStep::LoadConst { value: 1e-300_f64 };
         let large = AlgoTraceStep::LoadConst { value: 1e300_f64 };
-        let neg = AlgoTraceStep::LoadConst { value: -3.141592653589793_f64 };
-        let subnormal = AlgoTraceStep::LoadConst { value: f64::MIN_POSITIVE };
+        let neg = AlgoTraceStep::LoadConst {
+            value: -3.141592653589793_f64,
+        };
+        let subnormal = AlgoTraceStep::LoadConst {
+            value: f64::MIN_POSITIVE,
+        };
 
         // Act & Assert: extract values back
         if let AlgoTraceStep::LoadConst { value } = zero {
@@ -695,7 +784,10 @@ mod tests {
             assert!(value.is_finite(), "1e300 must be finite");
         }
         if let AlgoTraceStep::LoadConst { value } = neg {
-            assert!((value - (-std::f64::consts::PI)).abs() < 1e-10, "negative PI must roundtrip");
+            assert!(
+                (value - (-std::f64::consts::PI)).abs() < 1e-10,
+                "negative PI must roundtrip"
+            );
         }
         if let AlgoTraceStep::LoadConst { value } = subnormal {
             assert!(value > 0.0);
@@ -707,14 +799,24 @@ mod tests {
     fn algo_trace_step_binop_unaryop_variants() {
         // Arrange: all TraceBinOp variants
         let bin_ops: Vec<TraceBinOp> = vec![
-            TraceBinOp::Add, TraceBinOp::Sub, TraceBinOp::Mul,
-            TraceBinOp::Div, TraceBinOp::Max, TraceBinOp::Min,
+            TraceBinOp::Add,
+            TraceBinOp::Sub,
+            TraceBinOp::Mul,
+            TraceBinOp::Div,
+            TraceBinOp::Max,
+            TraceBinOp::Min,
         ];
         // Arrange: all TraceUnaryOp variants
         let unary_ops: Vec<TraceUnaryOp> = vec![
-            TraceUnaryOp::Exp, TraceUnaryOp::Sqrt, TraceUnaryOp::Rsqrt,
-            TraceUnaryOp::Tanh, TraceUnaryOp::Sigmoid, TraceUnaryOp::Neg,
-            TraceUnaryOp::Abs, TraceUnaryOp::Recip, TraceUnaryOp::Log,
+            TraceUnaryOp::Exp,
+            TraceUnaryOp::Sqrt,
+            TraceUnaryOp::Rsqrt,
+            TraceUnaryOp::Tanh,
+            TraceUnaryOp::Sigmoid,
+            TraceUnaryOp::Neg,
+            TraceUnaryOp::Abs,
+            TraceUnaryOp::Recip,
+            TraceUnaryOp::Log,
         ];
         // Assert: Debug clone round-trip
         for op in &bin_ops {
@@ -834,8 +936,13 @@ mod tests {
             size_param: "COPY_BYTES",
         };
         let async_wait = AlgoStep::AsyncWait { group: 2 };
-        let barrier = AlgoStep::Barrier { barrier_name: "sync1" };
-        let tile_cfg = AlgoStep::TileConfig { rows: "16", cols: "16" };
+        let barrier = AlgoStep::Barrier {
+            barrier_name: "sync1",
+        };
+        let tile_cfg = AlgoStep::TileConfig {
+            rows: "16",
+            cols: "16",
+        };
         let tile_mma = AlgoStep::TileMma;
         let tile_release = AlgoStep::TileRelease;
 
@@ -855,7 +962,12 @@ mod tests {
 
         // Assert: each Debug output contains its variant name
         for (name, dbg_str) in &cases {
-            assert!(dbg_str.contains(name), "{} debug must contain variant name, got: {}", name, dbg_str);
+            assert!(
+                dbg_str.contains(name),
+                "{} debug must contain variant name, got: {}",
+                name,
+                dbg_str
+            );
         }
     }
 
@@ -863,21 +975,91 @@ mod tests {
     fn algo_step_computation_variants_construction() {
         // Arrange: construct computation AlgoStep variants
         let cases: Vec<(&str, String)> = vec![
-            ("Reduce", format!("{:?}", AlgoStep::Reduce { op: ReduceOp::Sum })),
-            ("Activation", format!("{:?}", AlgoStep::Activation { kind: ActivationKind::Silu })),
+            (
+                "Reduce",
+                format!("{:?}", AlgoStep::Reduce { op: ReduceOp::Sum }),
+            ),
+            (
+                "Activation",
+                format!(
+                    "{:?}",
+                    AlgoStep::Activation {
+                        kind: ActivationKind::Silu
+                    }
+                ),
+            ),
             ("Softmax", format!("{:?}", AlgoStep::Softmax)),
-            ("Dequantize", format!("{:?}", AlgoStep::Dequantize { mode: BlockUnpackMode::Awq4 })),
-            ("EmbeddingGather", format!("{:?}", AlgoStep::EmbeddingGather)),
-            ("MoeRouterGemv", format!("{:?}", AlgoStep::MoeRouterGemv { num_experts: "E", hidden: "H" })),
-            ("MoeTopK", format!("{:?}", AlgoStep::MoeTopK { num_experts: "E", top_k: "K" })),
-            ("Epilogue", format!("{:?}", AlgoStep::Epilogue { ops: &[EpilogueOp::BiasAdd, EpilogueOp::Silu] })),
-            ("ZeroFill", format!("{:?}", AlgoStep::ZeroFill { bytes_param: "N_BYTES" })),
-            ("RowCopy", format!("{:?}", AlgoStep::RowCopy { rows_param: "M", cols_param: "N" })),
+            (
+                "Dequantize",
+                format!(
+                    "{:?}",
+                    AlgoStep::Dequantize {
+                        mode: BlockUnpackMode::Awq4
+                    }
+                ),
+            ),
+            (
+                "EmbeddingGather",
+                format!("{:?}", AlgoStep::EmbeddingGather),
+            ),
+            (
+                "MoeRouterGemv",
+                format!(
+                    "{:?}",
+                    AlgoStep::MoeRouterGemv {
+                        num_experts: "E",
+                        hidden: "H"
+                    }
+                ),
+            ),
+            (
+                "MoeTopK",
+                format!(
+                    "{:?}",
+                    AlgoStep::MoeTopK {
+                        num_experts: "E",
+                        top_k: "K"
+                    }
+                ),
+            ),
+            (
+                "Epilogue",
+                format!(
+                    "{:?}",
+                    AlgoStep::Epilogue {
+                        ops: &[EpilogueOp::BiasAdd, EpilogueOp::Silu]
+                    }
+                ),
+            ),
+            (
+                "ZeroFill",
+                format!(
+                    "{:?}",
+                    AlgoStep::ZeroFill {
+                        bytes_param: "N_BYTES"
+                    }
+                ),
+            ),
+            (
+                "RowCopy",
+                format!(
+                    "{:?}",
+                    AlgoStep::RowCopy {
+                        rows_param: "M",
+                        cols_param: "N"
+                    }
+                ),
+            ),
         ];
 
         // Assert: each Debug output contains its variant name
         for (name, dbg_str) in &cases {
-            assert!(dbg_str.contains(name), "{} debug must contain variant name, got: {}", name, dbg_str);
+            assert!(
+                dbg_str.contains(name),
+                "{} debug must contain variant name, got: {}",
+                name,
+                dbg_str
+            );
         }
     }
 
@@ -885,7 +1067,9 @@ mod tests {
     fn algo_step_control_flow_seq_and_conditional() {
         // Arrange: &'static slices from promoted constants
         let seq = AlgoStep::Seq(&[
-            AlgoStep::ZeroFill { bytes_param: "SIZE" },
+            AlgoStep::ZeroFill {
+                bytes_param: "SIZE",
+            },
             AlgoStep::MicroKernel,
         ]);
         let conditional = AlgoStep::Conditional {
@@ -899,11 +1083,26 @@ mod tests {
 
         // Assert: variant names present
         assert!(seq_dbg.contains("Seq"), "Seq debug must contain 'Seq'");
-        assert!(seq_dbg.contains("ZeroFill"), "Seq body must contain 'ZeroFill'");
-        assert!(seq_dbg.contains("MicroKernel"), "Seq body must contain 'MicroKernel'");
-        assert!(cond_dbg.contains("Conditional"), "Conditional debug must contain 'Conditional'");
-        assert!(cond_dbg.contains("GpuSm80"), "Conditional must reference requirement");
-        assert!(cond_dbg.contains("TileMma"), "Conditional body must contain 'TileMma'");
+        assert!(
+            seq_dbg.contains("ZeroFill"),
+            "Seq body must contain 'ZeroFill'"
+        );
+        assert!(
+            seq_dbg.contains("MicroKernel"),
+            "Seq body must contain 'MicroKernel'"
+        );
+        assert!(
+            cond_dbg.contains("Conditional"),
+            "Conditional debug must contain 'Conditional'"
+        );
+        assert!(
+            cond_dbg.contains("GpuSm80"),
+            "Conditional must reference requirement"
+        );
+        assert!(
+            cond_dbg.contains("TileMma"),
+            "Conditional body must contain 'TileMma'"
+        );
     }
 
     #[test]
@@ -928,39 +1127,118 @@ mod tests {
 
         // Assert: each contains its variant identifier
         assert!(const_dbg.contains("42"), "Const debug must include value");
-        assert!(pressure_dbg.contains("FromPressureModel"), "must contain variant name");
+        assert!(
+            pressure_dbg.contains("FromPressureModel"),
+            "must contain variant name"
+        );
         assert!(pressure_dbg.contains("mc"), "must include param name");
-        assert!(device_dbg.contains("FromDeviceProfile"), "must contain variant name");
+        assert!(
+            device_dbg.contains("FromDeviceProfile"),
+            "must contain variant name"
+        );
         assert!(device_dbg.contains("simd_lanes"), "must include param name");
         assert!(graph_dbg.contains("FromGraph"), "must contain variant name");
         assert!(graph_dbg.contains("\"m\""), "must include param name");
         assert!(derived_dbg.contains("Derived"), "must contain variant name");
-        assert!(derived_dbg.contains("Mul"), "must include ParamArith variant");
+        assert!(
+            derived_dbg.contains("Mul"),
+            "must include ParamArith variant"
+        );
     }
 
     #[test]
     fn algo_trace_step_all_variants_construction() {
         // Arrange: construct one of each AlgoTraceStep variant
         let cases: Vec<(&str, String)> = vec![
-            ("LoadInput", format!("{:?}", AlgoTraceStep::LoadInput { name: "x" })),
-            ("BinOp", format!("{:?}", AlgoTraceStep::BinOp {
-                op: TraceBinOp::Add, dst: "out", a: "x", b: "y",
-            })),
-            ("UnaryOp", format!("{:?}", AlgoTraceStep::UnaryOp {
-                op: TraceUnaryOp::Exp, dst: "exp_x", src: "x",
-            })),
-            ("Fma", format!("{:?}", AlgoTraceStep::Fma { acc: "acc", a: "a_val", b: "b_val" })),
-            ("HReduce", format!("{:?}", AlgoTraceStep::HReduce { src: "vec", op: ReduceKind::Sum })),
-            ("Broadcast", format!("{:?}", AlgoTraceStep::Broadcast { src: "scalar", dst: "vec" })),
-            ("VecLoadIndexed", format!("{:?}", AlgoTraceStep::VecLoadIndexed { base: "table", offset: "idx" })),
-            ("VecStoreIndexed", format!("{:?}", AlgoTraceStep::VecStoreIndexed {
-                base: "out_buf", offset: "idx", src: "val",
-            })),
+            (
+                "LoadInput",
+                format!("{:?}", AlgoTraceStep::LoadInput { name: "x" }),
+            ),
+            (
+                "BinOp",
+                format!(
+                    "{:?}",
+                    AlgoTraceStep::BinOp {
+                        op: TraceBinOp::Add,
+                        dst: "out",
+                        a: "x",
+                        b: "y",
+                    }
+                ),
+            ),
+            (
+                "UnaryOp",
+                format!(
+                    "{:?}",
+                    AlgoTraceStep::UnaryOp {
+                        op: TraceUnaryOp::Exp,
+                        dst: "exp_x",
+                        src: "x",
+                    }
+                ),
+            ),
+            (
+                "Fma",
+                format!(
+                    "{:?}",
+                    AlgoTraceStep::Fma {
+                        acc: "acc",
+                        a: "a_val",
+                        b: "b_val"
+                    }
+                ),
+            ),
+            (
+                "HReduce",
+                format!(
+                    "{:?}",
+                    AlgoTraceStep::HReduce {
+                        src: "vec",
+                        op: ReduceKind::Sum
+                    }
+                ),
+            ),
+            (
+                "Broadcast",
+                format!(
+                    "{:?}",
+                    AlgoTraceStep::Broadcast {
+                        src: "scalar",
+                        dst: "vec"
+                    }
+                ),
+            ),
+            (
+                "VecLoadIndexed",
+                format!(
+                    "{:?}",
+                    AlgoTraceStep::VecLoadIndexed {
+                        base: "table",
+                        offset: "idx"
+                    }
+                ),
+            ),
+            (
+                "VecStoreIndexed",
+                format!(
+                    "{:?}",
+                    AlgoTraceStep::VecStoreIndexed {
+                        base: "out_buf",
+                        offset: "idx",
+                        src: "val",
+                    }
+                ),
+            ),
         ];
 
         // Assert: each debug string contains its variant name
         for (name, dbg_str) in &cases {
-            assert!(dbg_str.contains(name), "{} debug must contain variant name, got: {}", name, dbg_str);
+            assert!(
+                dbg_str.contains(name),
+                "{} debug must contain variant name, got: {}",
+                name,
+                dbg_str
+            );
         }
     }
 
@@ -982,8 +1260,16 @@ mod tests {
 
         // Assert: extract fields back via pattern match
         if let AlgoTraceStep::Cast { from, to, .. } = cast_step {
-            assert_eq!(from, QuantPrecision::BF16, "from QuantPrecision::F32 must be BF16");
-            assert_eq!(to, QuantPrecision::F32, "to QuantPrecision::F32 must be F32");
+            assert_eq!(
+                from,
+                QuantPrecision::BF16,
+                "from QuantPrecision::F32 must be BF16"
+            );
+            assert_eq!(
+                to,
+                QuantPrecision::F32,
+                "to QuantPrecision::F32 must be F32"
+            );
         } else {
             panic!("expected Cast variant");
         }
@@ -1008,7 +1294,11 @@ mod tests {
             assert_eq!(*fam, families[i], "same index must be equal");
             for (j, other) in families.iter().enumerate() {
                 if i != j {
-                    assert_ne!(*fam, *other, "different indices must not be equal: {:?} vs {:?}", fam, other);
+                    assert_ne!(
+                        *fam, *other,
+                        "different indices must not be equal: {:?} vs {:?}",
+                        fam, other
+                    );
                 }
             }
         }
@@ -1028,11 +1318,19 @@ mod tests {
 
         // Act & Assert: exact boundary satisfies, one below does not
         for (req, priority) in &cases {
-            assert!(req.is_satisfied_by(*priority),
-                "{:?} must be satisfied by its own priority {}", req, priority);
+            assert!(
+                req.is_satisfied_by(*priority),
+                "{:?} must be satisfied by its own priority {}",
+                req,
+                priority
+            );
             if *priority > 0 {
-                assert!(!req.is_satisfied_by(priority - 1),
-                    "{:?} must NOT be satisfied by priority one below ({})", req, priority - 1);
+                assert!(
+                    !req.is_satisfied_by(priority - 1),
+                    "{:?} must NOT be satisfied by priority one below ({})",
+                    req,
+                    priority - 1
+                );
             }
         }
     }
@@ -1067,8 +1365,11 @@ mod tests {
 
         // Assert: clone round-trip
         let cloned = trace_body.clone();
-        assert_eq!(format!("{:?}", trace_body), format!("{:?}", cloned),
-            "cloned TraceBody must produce identical Debug output");
+        assert_eq!(
+            format!("{:?}", trace_body),
+            format!("{:?}", cloned),
+            "cloned TraceBody must produce identical Debug output"
+        );
     }
 
     #[test]
@@ -1096,14 +1397,20 @@ mod tests {
 
         // Assert: nesting structure visible in debug output
         assert!(dbg_str.contains("Loop"), "must contain Loop");
-        assert!(dbg_str.contains("LoadPanel"), "must contain inner LoadPanel");
+        assert!(
+            dbg_str.contains("LoadPanel"),
+            "must contain inner LoadPanel"
+        );
         assert!(dbg_str.contains("MicroKernel"), "must contain MicroKernel");
         assert!(dbg_str.contains("StoreResult"), "must contain StoreResult");
 
         // Assert: clone round-trip preserves entire tree
         let cloned = kc_loop.clone();
-        assert_eq!(dbg_str, format!("{:?}", cloned),
-            "nested loop clone must preserve full tree structure");
+        assert_eq!(
+            dbg_str,
+            format!("{:?}", cloned),
+            "nested loop clone must preserve full tree structure"
+        );
     }
 
     // ── 10 additional edge-case tests ────────────────────────────────
@@ -1122,8 +1429,15 @@ mod tests {
 
         // Assert: empty collections are valid
         assert_eq!(empty.steps.len(), 0, "empty template must have zero steps");
-        assert_eq!(empty.params.len(), 0, "empty template must have zero params");
-        assert!(empty.micro_kernel.is_none(), "empty template has no micro-kernel");
+        assert_eq!(
+            empty.params.len(),
+            0,
+            "empty template must have zero params"
+        );
+        assert!(
+            empty.micro_kernel.is_none(),
+            "empty template has no micro-kernel"
+        );
         assert_eq!(empty.name, "empty");
     }
 
@@ -1156,15 +1470,25 @@ mod tests {
         assert!(dbg_str.contains("Loop"), "must contain Loop variants");
         // Count occurrences of "bound" to verify nesting depth
         let bound_count = dbg_str.matches("bound").count();
-        assert!(bound_count >= 3, "3-level nesting must have at least 3 bound fields, got {}", bound_count);
+        assert!(
+            bound_count >= 3,
+            "3-level nesting must have at least 3 bound fields, got {}",
+            bound_count
+        );
     }
 
     #[test]
     fn multi_step_seq_with_mixed_variants() {
         // Arrange: Seq containing diverse AlgoStep variants
         let seq = AlgoStep::Seq(&[
-            AlgoStep::LoadPanel { matrix: MatrixRole::B, rows_param: "NC", cols_param: "KC" },
-            AlgoStep::Activation { kind: ActivationKind::Gelu },
+            AlgoStep::LoadPanel {
+                matrix: MatrixRole::B,
+                rows_param: "NC",
+                cols_param: "KC",
+            },
+            AlgoStep::Activation {
+                kind: ActivationKind::Gelu,
+            },
             AlgoStep::Reduce { op: ReduceOp::Max },
             AlgoStep::Softmax,
             AlgoStep::ZeroFill { bytes_param: "PAD" },
@@ -1175,11 +1499,18 @@ mod tests {
 
         // Assert: all five step types appear
         assert!(dbg_str.contains("LoadPanel"), "Seq must contain LoadPanel");
-        assert!(dbg_str.contains("Activation"), "Seq must contain Activation");
+        assert!(
+            dbg_str.contains("Activation"),
+            "Seq must contain Activation"
+        );
         assert!(dbg_str.contains("Reduce"), "Seq must contain Reduce");
         assert!(dbg_str.contains("Softmax"), "Seq must contain Softmax");
         assert!(dbg_str.contains("ZeroFill"), "Seq must contain ZeroFill");
-        assert_eq!(dbg_str.matches("Gelu").count(), 1, "Gelu appears exactly once");
+        assert_eq!(
+            dbg_str.matches("Gelu").count(),
+            1,
+            "Gelu appears exactly once"
+        );
     }
 
     #[test]
@@ -1195,10 +1526,19 @@ mod tests {
 
         // Act & Assert: each arith variant produces debug containing its name
         for (arith, expected_name) in &cases {
-            let param = AlgoParam::Derived { base: "X", op: *arith, operand: 4 };
+            let param = AlgoParam::Derived {
+                base: "X",
+                op: *arith,
+                operand: 4,
+            };
             let dbg_str = format!("{:?}", param);
-            assert!(dbg_str.contains(expected_name),
-                "Derived with {:?} must contain '{}' in debug, got: {}", arith, expected_name, dbg_str);
+            assert!(
+                dbg_str.contains(expected_name),
+                "Derived with {:?} must contain '{}' in debug, got: {}",
+                arith,
+                expected_name,
+                dbg_str
+            );
         }
     }
 
@@ -1210,28 +1550,48 @@ mod tests {
         let max_val = AlgoParam::Const(usize::MAX);
 
         // Act & Assert: debug output contains numeric value
-        assert!(format!("{:?}", zero).contains("0"), "Const(0) must contain '0'");
-        assert!(format!("{:?}", one).contains("1"), "Const(1) must contain '1'");
+        assert!(
+            format!("{:?}", zero).contains("0"),
+            "Const(0) must contain '0'"
+        );
+        assert!(
+            format!("{:?}", one).contains("1"),
+            "Const(1) must contain '1'"
+        );
         let max_dbg = format!("{:?}", max_val);
-        assert!(max_dbg.contains(&usize::MAX.to_string()),
-            "Const(MAX) must contain max value, got: {}", max_dbg);
+        assert!(
+            max_dbg.contains(&usize::MAX.to_string()),
+            "Const(MAX) must contain max value, got: {}",
+            max_dbg
+        );
     }
 
     #[test]
     fn algo_strategy_debug_trait_all_variants() {
         // Arrange: all AlgoStrategy variants
         let strategies: Vec<AlgoStrategy> = vec![
-            AlgoStrategy::GemmNaive, AlgoStrategy::GemmBlis,
-            AlgoStrategy::GemmGpuTiled, AlgoStrategy::GemmGpuPipelined,
+            AlgoStrategy::GemmNaive,
+            AlgoStrategy::GemmBlis,
+            AlgoStrategy::GemmGpuTiled,
+            AlgoStrategy::GemmGpuPipelined,
             AlgoStrategy::GemmHardwareTile,
-            AlgoStrategy::AttnMha, AlgoStrategy::AttnGqa, AlgoStrategy::AttnMla,
-            AlgoStrategy::MoeRouterTopk, AlgoStrategy::MoePackedDispatch,
-            AlgoStrategy::NormRms, AlgoStrategy::NormLayer,
-            AlgoStrategy::RopeStandard, AlgoStrategy::RopePartial,
-            AlgoStrategy::SamplingArgmax, AlgoStrategy::SamplingTemperature,
-            AlgoStrategy::SamplingSoftmax, AlgoStrategy::SamplingTopK,
-            AlgoStrategy::SamplingTopP, AlgoStrategy::SamplingMultinomial,
-            AlgoStrategy::EmbeddingGather, AlgoStrategy::QuantGather,
+            AlgoStrategy::AttnMha,
+            AlgoStrategy::AttnGqa,
+            AlgoStrategy::AttnMla,
+            AlgoStrategy::MoeRouterTopk,
+            AlgoStrategy::MoePackedDispatch,
+            AlgoStrategy::NormRms,
+            AlgoStrategy::NormLayer,
+            AlgoStrategy::RopeStandard,
+            AlgoStrategy::RopePartial,
+            AlgoStrategy::SamplingArgmax,
+            AlgoStrategy::SamplingTemperature,
+            AlgoStrategy::SamplingSoftmax,
+            AlgoStrategy::SamplingTopK,
+            AlgoStrategy::SamplingTopP,
+            AlgoStrategy::SamplingMultinomial,
+            AlgoStrategy::EmbeddingGather,
+            AlgoStrategy::QuantGather,
         ];
 
         // Act: format each with Debug
@@ -1245,8 +1605,11 @@ mod tests {
         // Verify pairwise distinctness
         for i in 0..debug_strs.len() {
             for j in (i + 1)..debug_strs.len() {
-                assert_ne!(debug_strs[i], debug_strs[j],
-                    "AlgoStrategy variants {} and {} must have distinct debug output", i, j);
+                assert_ne!(
+                    debug_strs[i], debug_strs[j],
+                    "AlgoStrategy variants {} and {} must have distinct debug output",
+                    i, j
+                );
             }
         }
     }
@@ -1263,9 +1626,8 @@ mod tests {
         ];
 
         // Act: copy (Copy trait) and format
-        let copies: Vec<(MicroKernelStep, String)> = steps.iter()
-            .map(|&s| (s, format!("{:?}", s)))
-            .collect();
+        let copies: Vec<(MicroKernelStep, String)> =
+            steps.iter().map(|&s| (s, format!("{:?}", s))).collect();
 
         // Assert: debug output contains variant name and copies match
         assert_eq!(copies.len(), 5, "5 MicroKernelStep variants");
@@ -1279,8 +1641,12 @@ mod tests {
     #[test]
     fn epilogue_op_rms_norm_with_different_eps_params() {
         // Arrange: two RmsNorm with different eps_param values
-        let eps_small = EpilogueOp::RmsNorm { eps_param: "EPS_1e5" };
-        let eps_large = EpilogueOp::RmsNorm { eps_param: "EPS_1e3" };
+        let eps_small = EpilogueOp::RmsNorm {
+            eps_param: "EPS_1e5",
+        };
+        let eps_large = EpilogueOp::RmsNorm {
+            eps_param: "EPS_1e3",
+        };
 
         // Act: extract params
         let small_param = match eps_small {
@@ -1293,8 +1659,10 @@ mod tests {
         };
 
         // Assert: params are distinct
-        assert_ne!(small_param, large_param,
-            "different eps_param values must not be equal");
+        assert_ne!(
+            small_param, large_param,
+            "different eps_param values must not be equal"
+        );
         assert_eq!(small_param, "EPS_1e5");
         assert_eq!(large_param, "EPS_1e3");
     }
@@ -1312,21 +1680,34 @@ mod tests {
 
         // Assert: debug references both the requirement and body steps
         assert!(dbg_str.contains("Conditional"), "must contain Conditional");
-        assert!(dbg_str.contains("GpuSm80"), "must contain device requirement");
+        assert!(
+            dbg_str.contains("GpuSm80"),
+            "must contain device requirement"
+        );
         assert!(dbg_str.contains("TileMma"), "body must contain TileMma");
-        assert!(dbg_str.contains("TileRelease"), "body must contain TileRelease");
+        assert!(
+            dbg_str.contains("TileRelease"),
+            "body must contain TileRelease"
+        );
 
         // Assert: is_satisfied_by works for the requirement
-        assert!(!DeviceReq::GpuSm80.is_satisfied_by(DeviceReq::GpuSm70.priority()),
-            "SM70 must not satisfy SM80 requirement");
-        assert!(DeviceReq::GpuSm80.is_satisfied_by(DeviceReq::GpuSm90.priority()),
-            "SM90 must satisfy SM80 requirement");
+        assert!(
+            !DeviceReq::GpuSm80.is_satisfied_by(DeviceReq::GpuSm70.priority()),
+            "SM70 must not satisfy SM80 requirement"
+        );
+        assert!(
+            DeviceReq::GpuSm80.is_satisfied_by(DeviceReq::GpuSm90.priority()),
+            "SM90 must satisfy SM80 requirement"
+        );
     }
 
     #[test]
     fn algo_step_row_copy_and_embedding_gather_clone() {
         // Arrange
-        let row_copy = AlgoStep::RowCopy { rows_param: "M", cols_param: "N" };
+        let row_copy = AlgoStep::RowCopy {
+            rows_param: "M",
+            cols_param: "N",
+        };
         let gather = AlgoStep::EmbeddingGather;
 
         // Act: clone both
@@ -1381,14 +1762,20 @@ mod tests {
         };
 
         // Assert: Some variant is present and fields are accessible
-        assert!(with_mk.micro_kernel.is_some(), "template with micro-kernel must be Some");
+        assert!(
+            with_mk.micro_kernel.is_some(),
+            "template with micro-kernel must be Some"
+        );
         let mk_ref = with_mk.micro_kernel.unwrap();
         assert_eq!(mk_ref.mr, "MR");
         assert_eq!(mk_ref.nr, "NR");
         assert_eq!(mk_ref.steps.len(), 2, "micro-kernel must have 2 steps");
 
         // Assert: None variant
-        assert!(without_mk.micro_kernel.is_none(), "template without micro-kernel must be None");
+        assert!(
+            without_mk.micro_kernel.is_none(),
+            "template without micro-kernel must be None"
+        );
         assert_eq!(without_mk.params.len(), 0, "no-params template");
     }
 
@@ -1408,18 +1795,39 @@ mod tests {
         let debug_strs: Vec<String> = params.iter().map(|p| format!("{:?}", p)).collect();
 
         // Assert: each debug string contains its string parameter name
-        assert!(debug_strs[0].contains("mc"), "FromPressureModel(mc) must contain 'mc'");
-        assert!(debug_strs[1].contains("nr"), "FromPressureModel(nr) must contain 'nr'");
-        assert!(debug_strs[2].contains("gemm_mr"), "FromDeviceProfile must contain param name");
-        assert!(debug_strs[3].contains("cache_l1"), "FromDeviceProfile must contain param name");
-        assert!(debug_strs[4].contains("m"), "FromGraph must contain param name");
-        assert!(debug_strs[5].contains("hidden_dim"), "FromGraph must contain param name");
+        assert!(
+            debug_strs[0].contains("mc"),
+            "FromPressureModel(mc) must contain 'mc'"
+        );
+        assert!(
+            debug_strs[1].contains("nr"),
+            "FromPressureModel(nr) must contain 'nr'"
+        );
+        assert!(
+            debug_strs[2].contains("gemm_mr"),
+            "FromDeviceProfile must contain param name"
+        );
+        assert!(
+            debug_strs[3].contains("cache_l1"),
+            "FromDeviceProfile must contain param name"
+        );
+        assert!(
+            debug_strs[4].contains("m"),
+            "FromGraph must contain param name"
+        );
+        assert!(
+            debug_strs[5].contains("hidden_dim"),
+            "FromGraph must contain param name"
+        );
 
         // Assert: all debug strings are pairwise distinct (different param names)
         for i in 0..debug_strs.len() {
             for j in (i + 1)..debug_strs.len() {
-                assert_ne!(debug_strs[i], debug_strs[j],
-                    "params with different names must have different debug output: {} vs {}", i, j);
+                assert_ne!(
+                    debug_strs[i], debug_strs[j],
+                    "params with different names must have different debug output: {} vs {}",
+                    i, j
+                );
             }
         }
     }
@@ -1430,18 +1838,38 @@ mod tests {
         let loop_step = AlgoStep::Loop {
             bound: "TOTAL_SEQ",
             step: "CHUNK_SIZE",
-            body: &[AlgoStep::Softmax, AlgoStep::Activation { kind: ActivationKind::Relu }],
+            body: &[
+                AlgoStep::Softmax,
+                AlgoStep::Activation {
+                    kind: ActivationKind::Relu,
+                },
+            ],
         };
 
         // Act
         let dbg_str = format!("{:?}", loop_step);
 
         // Assert: parameter names appear in debug output
-        assert!(dbg_str.contains("TOTAL_SEQ"), "bound parameter name must appear in debug");
-        assert!(dbg_str.contains("CHUNK_SIZE"), "step parameter name must appear in debug");
-        assert!(dbg_str.contains("Softmax"), "body step must appear in debug");
-        assert!(dbg_str.contains("Activation"), "body step must appear in debug");
-        assert!(dbg_str.contains("Relu"), "activation kind must appear in debug");
+        assert!(
+            dbg_str.contains("TOTAL_SEQ"),
+            "bound parameter name must appear in debug"
+        );
+        assert!(
+            dbg_str.contains("CHUNK_SIZE"),
+            "step parameter name must appear in debug"
+        );
+        assert!(
+            dbg_str.contains("Softmax"),
+            "body step must appear in debug"
+        );
+        assert!(
+            dbg_str.contains("Activation"),
+            "body step must appear in debug"
+        );
+        assert!(
+            dbg_str.contains("Relu"),
+            "activation kind must appear in debug"
+        );
     }
 
     #[test]
@@ -1458,7 +1886,10 @@ mod tests {
 
         // Act: extract fields via pattern match
         let (ne_gemv, h) = match &gemv {
-            AlgoStep::MoeRouterGemv { num_experts, hidden } => (*num_experts, *hidden),
+            AlgoStep::MoeRouterGemv {
+                num_experts,
+                hidden,
+            } => (*num_experts, *hidden),
             _ => panic!("expected MoeRouterGemv"),
         };
         let (ne_topk, tk) = match &topk {
@@ -1478,8 +1909,12 @@ mod tests {
         // Arrange: LoadConst with negative, infinity, and NaN-edge values
         let neg_one = AlgoTraceStep::LoadConst { value: -1.0 };
         let large_neg = AlgoTraceStep::LoadConst { value: -f64::MAX };
-        let inf = AlgoTraceStep::LoadConst { value: f64::INFINITY };
-        let neg_inf = AlgoTraceStep::LoadConst { value: f64::NEG_INFINITY };
+        let inf = AlgoTraceStep::LoadConst {
+            value: f64::INFINITY,
+        };
+        let neg_inf = AlgoTraceStep::LoadConst {
+            value: f64::NEG_INFINITY,
+        };
 
         // Act & Assert: extract and verify values
         if let AlgoTraceStep::LoadConst { value } = neg_one {
@@ -1491,18 +1926,30 @@ mod tests {
             assert!(value.is_finite(), "f64::MAX must be finite");
         }
         if let AlgoTraceStep::LoadConst { value } = inf {
-            assert!(value.is_infinite() && value > 0.0, "must be positive infinity");
+            assert!(
+                value.is_infinite() && value > 0.0,
+                "must be positive infinity"
+            );
         }
         if let AlgoTraceStep::LoadConst { value } = neg_inf {
-            assert!(value.is_infinite() && value < 0.0, "must be negative infinity");
+            assert!(
+                value.is_infinite() && value < 0.0,
+                "must be negative infinity"
+            );
         }
     }
 
     #[test]
     fn algo_trace_step_hreduce_and_broadcast_field_access() {
         // Arrange: AlgoTraceStep with HReduce and Broadcast
-        let hreduce = AlgoTraceStep::HReduce { src: "attention_scores", op: ReduceKind::Max };
-        let broadcast = AlgoTraceStep::Broadcast { src: "scalar_max", dst: "broadcast_max" };
+        let hreduce = AlgoTraceStep::HReduce {
+            src: "attention_scores",
+            op: ReduceKind::Max,
+        };
+        let broadcast = AlgoTraceStep::Broadcast {
+            src: "scalar_max",
+            dst: "broadcast_max",
+        };
 
         // Act: extract fields
         let (src, op) = match &hreduce {
@@ -1524,16 +1971,31 @@ mod tests {
     #[test]
     fn device_req_cpu_families_lower_priority_than_gpu() {
         // Arrange: collect CPU and GPU priorities
-        let cpu_reqs = [DeviceReq::CpuAny, DeviceReq::CpuAvx2, DeviceReq::CpuAvx512, DeviceReq::CpuAmx, DeviceReq::CpuSme2];
-        let gpu_reqs = [DeviceReq::GpuSm70, DeviceReq::GpuSm80, DeviceReq::GpuSm90, DeviceReq::GpuSm100];
+        let cpu_reqs = [
+            DeviceReq::CpuAny,
+            DeviceReq::CpuAvx2,
+            DeviceReq::CpuAvx512,
+            DeviceReq::CpuAmx,
+            DeviceReq::CpuSme2,
+        ];
+        let gpu_reqs = [
+            DeviceReq::GpuSm70,
+            DeviceReq::GpuSm80,
+            DeviceReq::GpuSm90,
+            DeviceReq::GpuSm100,
+        ];
 
         // Act: get max CPU priority and min GPU priority
         let max_cpu = cpu_reqs.iter().map(|r| r.priority()).max().unwrap();
         let min_gpu = gpu_reqs.iter().map(|r| r.priority()).min().unwrap();
 
         // Assert: all CPU priorities are strictly below all GPU priorities
-        assert!(max_cpu < min_gpu,
-            "max CPU priority ({}) must be below min GPU priority ({})", max_cpu, min_gpu);
+        assert!(
+            max_cpu < min_gpu,
+            "max CPU priority ({}) must be below min GPU priority ({})",
+            max_cpu,
+            min_gpu
+        );
     }
 
     #[test]
@@ -1543,7 +2005,9 @@ mod tests {
             ops: &[
                 EpilogueOp::BiasAdd,
                 EpilogueOp::ResidualAdd,
-                EpilogueOp::RmsNorm { eps_param: "EPS_1e6" },
+                EpilogueOp::RmsNorm {
+                    eps_param: "EPS_1e6",
+                },
                 EpilogueOp::Silu,
             ],
         };
@@ -1552,7 +2016,10 @@ mod tests {
         let dbg_str = format!("{:?}", epilogue);
 
         // Assert: all epilogue ops appear in debug
-        assert!(dbg_str.contains("Epilogue"), "must contain Epilogue wrapper");
+        assert!(
+            dbg_str.contains("Epilogue"),
+            "must contain Epilogue wrapper"
+        );
         assert!(dbg_str.contains("BiasAdd"), "must contain BiasAdd");
         assert!(dbg_str.contains("ResidualAdd"), "must contain ResidualAdd");
         assert!(dbg_str.contains("RmsNorm"), "must contain RmsNorm");
@@ -1569,23 +2036,36 @@ mod tests {
     fn algo_step_dequantize_all_block_unpack_modes() {
         // Arrange: construct Dequantize step for each BlockUnpackMode variant
         let modes: Vec<BlockUnpackMode> = vec![
-            BlockUnpackMode::Q4_0, BlockUnpackMode::Q4_1,
-            BlockUnpackMode::Q8_0, BlockUnpackMode::Q8_1,
-            BlockUnpackMode::Q2K, BlockUnpackMode::Q3K,
-            BlockUnpackMode::Q4K, BlockUnpackMode::Q5K,
-            BlockUnpackMode::Q6K, BlockUnpackMode::Mxfp4,
-            BlockUnpackMode::Nvfp4, BlockUnpackMode::Awq4,
-            BlockUnpackMode::Gptq4, BlockUnpackMode::IqSqueeze,
+            BlockUnpackMode::Q4_0,
+            BlockUnpackMode::Q4_1,
+            BlockUnpackMode::Q8_0,
+            BlockUnpackMode::Q8_1,
+            BlockUnpackMode::Q2K,
+            BlockUnpackMode::Q3K,
+            BlockUnpackMode::Q4K,
+            BlockUnpackMode::Q5K,
+            BlockUnpackMode::Q6K,
+            BlockUnpackMode::Mxfp4,
+            BlockUnpackMode::Nvfp4,
+            BlockUnpackMode::Awq4,
+            BlockUnpackMode::Gptq4,
+            BlockUnpackMode::IqSqueeze,
         ];
 
         // Act & Assert: each mode can be used in a Dequantize step and produces valid debug
         for mode in &modes {
             let step = AlgoStep::Dequantize { mode: *mode };
             let dbg_str = format!("{:?}", step);
-            assert!(dbg_str.contains("Dequantize"),
-                "Dequantize with {:?} must contain 'Dequantize' in debug", mode);
-            assert!(!dbg_str.is_empty(),
-                "debug for {:?} must not be empty", mode);
+            assert!(
+                dbg_str.contains("Dequantize"),
+                "Dequantize with {:?} must contain 'Dequantize' in debug",
+                mode
+            );
+            assert!(
+                !dbg_str.is_empty(),
+                "debug for {:?} must not be empty",
+                mode
+            );
         }
         assert_eq!(modes.len(), 14, "all 14 BlockUnpackMode variants tested");
     }
@@ -1599,7 +2079,14 @@ mod tests {
             ("K", AlgoParam::FromGraph("k")),
             ("MR", AlgoParam::FromPressureModel("mr")),
             ("NR", AlgoParam::FromPressureModel("nr")),
-            ("KC", AlgoParam::Derived { base: "K", op: ParamArith::CeilDiv, operand: 4 }),
+            (
+                "KC",
+                AlgoParam::Derived {
+                    base: "K",
+                    op: ParamArith::CeilDiv,
+                    operand: 4,
+                },
+            ),
             ("TILE_SIZE", AlgoParam::Const(256)),
         ];
         let template = AlgoTemplate {
@@ -1614,8 +2101,14 @@ mod tests {
         // Act: look up parameters by name
         let m_param = template.params.iter().find(|(name, _)| *name == "M");
         let kc_param = template.params.iter().find(|(name, _)| *name == "KC");
-        let tile_param = template.params.iter().find(|(name, _)| *name == "TILE_SIZE");
-        let missing = template.params.iter().find(|(name, _)| *name == "NONEXISTENT");
+        let tile_param = template
+            .params
+            .iter()
+            .find(|(name, _)| *name == "TILE_SIZE");
+        let missing = template
+            .params
+            .iter()
+            .find(|(name, _)| *name == "NONEXISTENT");
 
         // Assert: found parameters have correct values
         assert!(m_param.is_some(), "M parameter must exist");

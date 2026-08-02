@@ -16,10 +16,18 @@ use crate::types::{CompilerError, DType};
 pub struct GemmScalar;
 
 impl OpImpl<GemmOpLayout> for GemmScalar {
-    fn requires(&self) -> FeatureSet { FeatureSet::EMPTY }
-    fn throughput_class(&self) -> u8 { 1 }
-    fn supports_dtype(&self, _dt: QuantPrecision) -> bool { true }
-    fn name(&self) -> &'static str { "GemmScalar" }
+    fn requires(&self) -> FeatureSet {
+        FeatureSet::EMPTY
+    }
+    fn throughput_class(&self) -> u8 {
+        1
+    }
+    fn supports_dtype(&self, _dt: QuantPrecision) -> bool {
+        true
+    }
+    fn name(&self) -> &'static str {
+        "GemmScalar"
+    }
 
     fn emit(&self, ctx: &mut EmitCtx<'_, '_>, lo: &GemmOpLayout) -> Result<(), CompilerError> {
         // Naive scalar GEMM: emit_gemm_inline_with_epilogue with mr=1, nr=1
@@ -27,9 +35,22 @@ impl OpImpl<GemmOpLayout> for GemmScalar {
         let sym_map = SymDimSlotMap::mega_kernel_abi();
         let m_dim = crate::compiler::graph::SymDim::Concrete(lo.m);
         emit_gemm_inline_with_epilogue(
-            ctx.prog, &m_dim, lo.n, lo.k, ctx.width,
-            lo.a_ptr, lo.b_ptr, lo.c_ptr,
-            &[], &sym_map, false, Some(&lo.m_bound), lo.a_dtype, lo.b_dtype, lo.c_dtype, lo.trans_b,
+            ctx.prog,
+            &m_dim,
+            lo.n,
+            lo.k,
+            ctx.width,
+            lo.a_ptr,
+            lo.b_ptr,
+            lo.c_ptr,
+            &[],
+            &sym_map,
+            false,
+            Some(&lo.m_bound),
+            lo.a_dtype,
+            lo.b_dtype,
+            lo.c_dtype,
+            lo.trans_b,
             lo.epilogue,
         )
     }
@@ -44,12 +65,18 @@ impl OpImpl<GemmOpLayout> for GemmScalar {
 pub struct GemmFmaBlis;
 
 impl OpImpl<GemmOpLayout> for GemmFmaBlis {
-    fn requires(&self) -> FeatureSet { FeatureSet::FMA }
-    fn throughput_class(&self) -> u8 { 10 }
+    fn requires(&self) -> FeatureSet {
+        FeatureSet::FMA
+    }
+    fn throughput_class(&self) -> u8 {
+        10
+    }
     fn supports_dtype(&self, dt: QuantPrecision) -> bool {
         dt == QuantPrecision::F32 || dt == QuantPrecision::BF16 || dt == QuantPrecision::F16
     }
-    fn name(&self) -> &'static str { "GemmFmaBlis" }
+    fn name(&self) -> &'static str {
+        "GemmFmaBlis"
+    }
 
     fn emit(&self, ctx: &mut EmitCtx<'_, '_>, lo: &GemmOpLayout) -> Result<(), CompilerError> {
         let lanes = ctx.width.f32_lanes().max(1);
@@ -68,19 +95,44 @@ impl OpImpl<GemmOpLayout> for GemmFmaBlis {
             && lo.k >= 16;
         if can_blis {
             emit_gemm_blis_inline(
-                ctx.prog, lo.m, lo.n, lo.k, ctx.width,
-                lo.a_ptr, lo.b_ptr, lo.c_ptr,
-                lo.mr, lo.nr, ctx.pack_map, ctx.k_unroll,
-                lo.a_dtype, lo.b_dtype, lo.c_dtype, lo.trans_b,
+                ctx.prog,
+                lo.m,
+                lo.n,
+                lo.k,
+                ctx.width,
+                lo.a_ptr,
+                lo.b_ptr,
+                lo.c_ptr,
+                lo.mr,
+                lo.nr,
+                ctx.pack_map,
+                ctx.k_unroll,
+                lo.a_dtype,
+                lo.b_dtype,
+                lo.c_dtype,
+                lo.trans_b,
             )
         } else {
             // BCE-20260629-001: 用 lo.m_bound 作 seq_bound_override (禁止 Concrete(lo.m) 退化为大循环)
             let sym_map = SymDimSlotMap::mega_kernel_abi();
             let m_dim = crate::compiler::graph::SymDim::Concrete(lo.m);
             emit_gemm_inline_with_epilogue(
-                ctx.prog, &m_dim, lo.n, lo.k, ctx.width,
-                lo.a_ptr, lo.b_ptr, lo.c_ptr,
-                &[], &sym_map, false, Some(&lo.m_bound), lo.a_dtype, lo.b_dtype, lo.c_dtype, lo.trans_b,
+                ctx.prog,
+                &m_dim,
+                lo.n,
+                lo.k,
+                ctx.width,
+                lo.a_ptr,
+                lo.b_ptr,
+                lo.c_ptr,
+                &[],
+                &sym_map,
+                false,
+                Some(&lo.m_bound),
+                lo.a_dtype,
+                lo.b_dtype,
+                lo.c_dtype,
+                lo.trans_b,
                 lo.epilogue,
             )
         }
@@ -95,24 +147,64 @@ macro_rules! impl_gemm_amx_tile {
     ($name:ident, $requires:expr, $tput:expr, $supports:expr, $k_depth:expr, $tile_dtype:expr) => {
         pub struct $name;
         impl OpImpl<GemmOpLayout> for $name {
-            fn requires(&self) -> FeatureSet { $requires }
-            fn throughput_class(&self) -> u8 { $tput }
-            fn supports_dtype(&self, dt: QuantPrecision) -> bool { $supports(dt) }
-            fn name(&self) -> &'static str { stringify!($name) }
-            fn emit(&self, ctx: &mut EmitCtx<'_, '_>, lo: &GemmOpLayout) -> Result<(), CompilerError> {
-                emit_tile_gemm(ctx.prog, ctx.width, 16, 16, $k_depth, lo.k, $tile_dtype,
-                    lo.a_ptr, lo.b_ptr, lo.c_ptr)
+            fn requires(&self) -> FeatureSet {
+                $requires
+            }
+            fn throughput_class(&self) -> u8 {
+                $tput
+            }
+            fn supports_dtype(&self, dt: QuantPrecision) -> bool {
+                $supports(dt)
+            }
+            fn name(&self) -> &'static str {
+                stringify!($name)
+            }
+            fn emit(
+                &self,
+                ctx: &mut EmitCtx<'_, '_>,
+                lo: &GemmOpLayout,
+            ) -> Result<(), CompilerError> {
+                emit_tile_gemm(
+                    ctx.prog,
+                    ctx.width,
+                    16,
+                    16,
+                    $k_depth,
+                    lo.k,
+                    $tile_dtype,
+                    lo.a_ptr,
+                    lo.b_ptr,
+                    lo.c_ptr,
+                )
             }
         }
     };
 }
 
-impl_gemm_amx_tile!(GemmAmxBf16Tile, FeatureSet::TILE_GEMM, 60,
-    |dt: QuantPrecision| dt == QuantPrecision::BF16, 32, DType::BF16);
-impl_gemm_amx_tile!(GemmAmxFp16Tile, FeatureSet::AMX_FP16, 70,
-    |dt: QuantPrecision| dt == QuantPrecision::F16, 32, DType::F16);
-impl_gemm_amx_tile!(GemmAmxFp8Tile, FeatureSet::AMX_FP8, 80,
-    |dt: QuantPrecision| dt == QuantPrecision::FP8E4M3 || dt == QuantPrecision::FP8E5M2, 64, DType::F8E4M3);
+impl_gemm_amx_tile!(
+    GemmAmxBf16Tile,
+    FeatureSet::TILE_GEMM,
+    60,
+    |dt: QuantPrecision| dt == QuantPrecision::BF16,
+    32,
+    DType::BF16
+);
+impl_gemm_amx_tile!(
+    GemmAmxFp16Tile,
+    FeatureSet::AMX_FP16,
+    70,
+    |dt: QuantPrecision| dt == QuantPrecision::F16,
+    32,
+    DType::F16
+);
+impl_gemm_amx_tile!(
+    GemmAmxFp8Tile,
+    FeatureSet::AMX_FP8,
+    80,
+    |dt: QuantPrecision| dt == QuantPrecision::FP8E4M3 || dt == QuantPrecision::FP8E5M2,
+    64,
+    DType::F8E4M3
+);
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // §6 GemmWgmma — SM90 Hopper WGMMA (requires=WGMMA|TMA, tput=85)
@@ -121,18 +213,34 @@ impl_gemm_amx_tile!(GemmAmxFp8Tile, FeatureSet::AMX_FP8, 80,
 pub struct GemmWgmma;
 
 impl OpImpl<GemmOpLayout> for GemmWgmma {
-    fn requires(&self) -> FeatureSet { FeatureSet::WGMMA.union(FeatureSet::TMA) }
-    fn throughput_class(&self) -> u8 { 85 }
+    fn requires(&self) -> FeatureSet {
+        FeatureSet::WGMMA.union(FeatureSet::TMA)
+    }
+    fn throughput_class(&self) -> u8 {
+        85
+    }
     fn supports_dtype(&self, dt: QuantPrecision) -> bool {
         dt == QuantPrecision::BF16 || dt == QuantPrecision::F16
     }
-    fn name(&self) -> &'static str { "GemmWgmma" }
+    fn name(&self) -> &'static str {
+        "GemmWgmma"
+    }
 
     fn emit(&self, ctx: &mut EmitCtx<'_, '_>, lo: &GemmOpLayout) -> Result<(), CompilerError> {
         let kd = lo.tile.map(|t| t.k_depth).unwrap_or(64);
         let tile_dt = lo.tile.map(|t| t.dtype).unwrap_or(QuantPrecision::BF16);
-        emit_tile_gemm(ctx.prog, ctx.width, 64, lo.n.min(32), kd, lo.k, tile_dt.to_dtype(),
-            lo.a_ptr, lo.b_ptr, lo.c_ptr)
+        emit_tile_gemm(
+            ctx.prog,
+            ctx.width,
+            64,
+            lo.n.min(32),
+            kd,
+            lo.k,
+            tile_dt.to_dtype(),
+            lo.a_ptr,
+            lo.b_ptr,
+            lo.c_ptr,
+        )
     }
 }
 
@@ -143,18 +251,34 @@ impl OpImpl<GemmOpLayout> for GemmWgmma {
 pub struct GemmTcgen05;
 
 impl OpImpl<GemmOpLayout> for GemmTcgen05 {
-    fn requires(&self) -> FeatureSet { FeatureSet::TMEM.union(FeatureSet::BLOCK_SCALED) }
-    fn throughput_class(&self) -> u8 { 95 }
+    fn requires(&self) -> FeatureSet {
+        FeatureSet::TMEM.union(FeatureSet::BLOCK_SCALED)
+    }
+    fn throughput_class(&self) -> u8 {
+        95
+    }
     fn supports_dtype(&self, dt: QuantPrecision) -> bool {
         dt == QuantPrecision::F16 || dt == QuantPrecision::FP8E4M3
     }
-    fn name(&self) -> &'static str { "GemmTcgen05" }
+    fn name(&self) -> &'static str {
+        "GemmTcgen05"
+    }
 
     fn emit(&self, ctx: &mut EmitCtx<'_, '_>, lo: &GemmOpLayout) -> Result<(), CompilerError> {
         let kd = lo.tile.map(|t| t.k_depth).unwrap_or(64);
         let tile_dt = lo.tile.map(|t| t.dtype).unwrap_or(QuantPrecision::F16);
-        emit_tile_gemm(ctx.prog, ctx.width, 64, lo.n.min(64), kd, lo.k, tile_dt.to_dtype(),
-            lo.a_ptr, lo.b_ptr, lo.c_ptr)
+        emit_tile_gemm(
+            ctx.prog,
+            ctx.width,
+            64,
+            lo.n.min(64),
+            kd,
+            lo.k,
+            tile_dt.to_dtype(),
+            lo.a_ptr,
+            lo.b_ptr,
+            lo.c_ptr,
+        )
     }
 }
 
@@ -166,22 +290,58 @@ macro_rules! impl_mfma {
     ($name:ident, $requires:expr, $tput:expr, $m:expr, $n:expr, $kd:expr, $supports:expr) => {
         pub struct $name;
         impl OpImpl<GemmOpLayout> for $name {
-            fn requires(&self) -> FeatureSet { $requires }
-            fn throughput_class(&self) -> u8 { $tput }
-            fn supports_dtype(&self, dt: QuantPrecision) -> bool { $supports(dt) }
-            fn name(&self) -> &'static str { stringify!($name) }
-            fn emit(&self, ctx: &mut EmitCtx<'_, '_>, lo: &GemmOpLayout) -> Result<(), CompilerError> {
-                emit_tile_gemm(ctx.prog, ctx.width, $m, $n, $kd, lo.k, lo.dtype.to_dtype(),
-                    lo.a_ptr, lo.b_ptr, lo.c_ptr)
+            fn requires(&self) -> FeatureSet {
+                $requires
+            }
+            fn throughput_class(&self) -> u8 {
+                $tput
+            }
+            fn supports_dtype(&self, dt: QuantPrecision) -> bool {
+                $supports(dt)
+            }
+            fn name(&self) -> &'static str {
+                stringify!($name)
+            }
+            fn emit(
+                &self,
+                ctx: &mut EmitCtx<'_, '_>,
+                lo: &GemmOpLayout,
+            ) -> Result<(), CompilerError> {
+                emit_tile_gemm(
+                    ctx.prog,
+                    ctx.width,
+                    $m,
+                    $n,
+                    $kd,
+                    lo.k,
+                    lo.dtype.to_dtype(),
+                    lo.a_ptr,
+                    lo.b_ptr,
+                    lo.c_ptr,
+                )
             }
         }
     };
 }
 
-impl_mfma!(GemmMfmaV1, FeatureSet::MFMA, 75, 16, 16, 16,
-    |dt: QuantPrecision| dt == QuantPrecision::F16 || dt == QuantPrecision::BF16);
-impl_mfma!(GemmMfmaV2, FeatureSet::MFMA_V2, 85, 32, 32, 16,
-    |dt: QuantPrecision| dt == QuantPrecision::BF16 || dt == QuantPrecision::FP8E4M3);
+impl_mfma!(
+    GemmMfmaV1,
+    FeatureSet::MFMA,
+    75,
+    16,
+    16,
+    16,
+    |dt: QuantPrecision| dt == QuantPrecision::F16 || dt == QuantPrecision::BF16
+);
+impl_mfma!(
+    GemmMfmaV2,
+    FeatureSet::MFMA_V2,
+    85,
+    32,
+    32,
+    16,
+    |dt: QuantPrecision| dt == QuantPrecision::BF16 || dt == QuantPrecision::FP8E4M3
+);
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // §10 GemmSmeTile — ARM SME (requires=SME_TILE, tput=65)
@@ -190,18 +350,37 @@ impl_mfma!(GemmMfmaV2, FeatureSet::MFMA_V2, 85, 32, 32, 16,
 pub struct GemmSmeTile;
 
 impl OpImpl<GemmOpLayout> for GemmSmeTile {
-    fn requires(&self) -> FeatureSet { FeatureSet::SME_TILE }
-    fn throughput_class(&self) -> u8 { 65 }
+    fn requires(&self) -> FeatureSet {
+        FeatureSet::SME_TILE
+    }
+    fn throughput_class(&self) -> u8 {
+        65
+    }
     fn supports_dtype(&self, dt: QuantPrecision) -> bool {
         dt == QuantPrecision::F32 || dt == QuantPrecision::BF16
     }
-    fn name(&self) -> &'static str { "GemmSmeTile" }
+    fn name(&self) -> &'static str {
+        "GemmSmeTile"
+    }
 
     fn emit(&self, ctx: &mut EmitCtx<'_, '_>, lo: &GemmOpLayout) -> Result<(), CompilerError> {
         // SME tile 尺寸由 ZA tile VL 决定, 从 GemmOpLayout.tile 获取。
-        let (rows, cols, kd) = lo.tile.map(|t| (t.rows, t.cols, t.k_depth)).unwrap_or((16, 16, 4));
-        emit_tile_gemm(ctx.prog, ctx.width, rows, cols, kd, lo.k, lo.dtype.to_dtype(),
-            lo.a_ptr, lo.b_ptr, lo.c_ptr)
+        let (rows, cols, kd) = lo
+            .tile
+            .map(|t| (t.rows, t.cols, t.k_depth))
+            .unwrap_or((16, 16, 4));
+        emit_tile_gemm(
+            ctx.prog,
+            ctx.width,
+            rows,
+            cols,
+            kd,
+            lo.k,
+            lo.dtype.to_dtype(),
+            lo.a_ptr,
+            lo.b_ptr,
+            lo.c_ptr,
+        )
     }
 }
 
@@ -213,22 +392,45 @@ macro_rules! impl_tc_tile_mma {
     ($name:ident, $tput:expr, $m:expr, $n:expr, $kd:expr, $supports:expr) => {
         pub struct $name;
         impl OpImpl<GemmOpLayout> for $name {
-            fn requires(&self) -> FeatureSet { FeatureSet::TILE_GEMM }
-            fn throughput_class(&self) -> u8 { $tput }
-            fn supports_dtype(&self, dt: QuantPrecision) -> bool { $supports(dt) }
-            fn name(&self) -> &'static str { stringify!($name) }
-            fn emit(&self, ctx: &mut EmitCtx<'_, '_>, lo: &GemmOpLayout) -> Result<(), CompilerError> {
-                emit_tile_gemm(ctx.prog, ctx.width, $m, $n, $kd, lo.k, lo.dtype.to_dtype(),
-                    lo.a_ptr, lo.b_ptr, lo.c_ptr)
+            fn requires(&self) -> FeatureSet {
+                FeatureSet::TILE_GEMM
+            }
+            fn throughput_class(&self) -> u8 {
+                $tput
+            }
+            fn supports_dtype(&self, dt: QuantPrecision) -> bool {
+                $supports(dt)
+            }
+            fn name(&self) -> &'static str {
+                stringify!($name)
+            }
+            fn emit(
+                &self,
+                ctx: &mut EmitCtx<'_, '_>,
+                lo: &GemmOpLayout,
+            ) -> Result<(), CompilerError> {
+                emit_tile_gemm(
+                    ctx.prog,
+                    ctx.width,
+                    $m,
+                    $n,
+                    $kd,
+                    lo.k,
+                    lo.dtype.to_dtype(),
+                    lo.a_ptr,
+                    lo.b_ptr,
+                    lo.c_ptr,
+                )
             }
         }
     };
 }
 
-impl_tc_tile_mma!(GemmTcSm70, 65, 16, 16, 16,
-    |dt: QuantPrecision| dt == QuantPrecision::F16);
-impl_tc_tile_mma!(GemmTcSm80, 70, 16, 8, 16,
-    |dt: QuantPrecision| dt == QuantPrecision::BF16 || dt == QuantPrecision::F16);
+impl_tc_tile_mma!(GemmTcSm70, 65, 16, 16, 16, |dt: QuantPrecision| dt
+    == QuantPrecision::F16);
+impl_tc_tile_mma!(GemmTcSm80, 70, 16, 8, 16, |dt: QuantPrecision| dt
+    == QuantPrecision::BF16
+    || dt == QuantPrecision::F16);
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // §13 注册表 + select_gemm_impl
@@ -237,18 +439,18 @@ impl_tc_tile_mma!(GemmTcSm80, 70, 16, 8, 16,
 /// GEMM-FMA 全局扁平注册表 (CR-001 验收点 4: filter + rank, 无手写 match)。
 // @trace REQ-HW-TIER-003 [req:GEMM-FMA-13backends] 13 后端 GEMM-FMA OpImpl 全量注册
 static GEMM_IMPL_REGISTRY: &[&dyn OpImpl<GemmOpLayout>] = &[
-    &GemmFmaBlis,        // requires=FMA,      tput=10
-    &GemmAmxBf16Tile,    // requires=TILE_GEMM, tput=60
-    &GemmAmxFp16Tile,    // requires=AMX_FP16,  tput=70
-    &GemmAmxFp8Tile,     // requires=AMX_FP8,   tput=80
-    &GemmWgmma,          // requires=WGMMA|TMA, tput=85
-    &GemmTcgen05,        // requires=TMEM|BLOCK_SCALED, tput=95
-    &GemmMfmaV1,         // requires=MFMA,      tput=75
-    &GemmMfmaV2,         // requires=MFMA_V2,   tput=85
-    &GemmSmeTile,        // requires=SME_TILE,  tput=65
-    &GemmTcSm70,         // requires=TILE_GEMM, tput=65 (SM70 wmma)
-    &GemmTcSm80,         // requires=TILE_GEMM, tput=70 (SM80 mma.sync)
-    &GemmScalar,         // requires=EMPTY,     tput=1  —— 永远保底
+    &GemmFmaBlis,     // requires=FMA,      tput=10
+    &GemmAmxBf16Tile, // requires=TILE_GEMM, tput=60
+    &GemmAmxFp16Tile, // requires=AMX_FP16,  tput=70
+    &GemmAmxFp8Tile,  // requires=AMX_FP8,   tput=80
+    &GemmWgmma,       // requires=WGMMA|TMA, tput=85
+    &GemmTcgen05,     // requires=TMEM|BLOCK_SCALED, tput=95
+    &GemmMfmaV1,      // requires=MFMA,      tput=75
+    &GemmMfmaV2,      // requires=MFMA_V2,   tput=85
+    &GemmSmeTile,     // requires=SME_TILE,  tput=65
+    &GemmTcSm70,      // requires=TILE_GEMM, tput=65 (SM70 wmma)
+    &GemmTcSm80,      // requires=TILE_GEMM, tput=70 (SM80 mma.sync)
+    &GemmScalar,      // requires=EMPTY,     tput=1  —— 永远保底
 ];
 
 /// select 阶段：dtype × ISA 折叠在 emit 之外 (CR-001 后置)。
@@ -265,12 +467,13 @@ pub fn select_gemm_impl(
     dtype: QuantPrecision,
     _shape: (usize, usize, usize),
 ) -> &'static dyn OpImpl<GemmOpLayout> {
-    GEMM_IMPL_REGISTRY.iter()
-        .filter(|im| im.supports_dtype(dtype))          // ① dtype 维
-        .filter(|im| feats.contains(im.requires()))      // ② requires ⊆ features
-        .max_by_key(|im| im.throughput_class())          // ③ 吞吐粗排
+    GEMM_IMPL_REGISTRY
+        .iter()
+        .filter(|im| im.supports_dtype(dtype)) // ① dtype 维
+        .filter(|im| feats.contains(im.requires())) // ② requires ⊆ features
+        .max_by_key(|im| im.throughput_class()) // ③ 吞吐粗排
         .copied()
-        .unwrap_or(&GemmScalar)                          // 保底, 绝不报 unsupported
+        .unwrap_or(&GemmScalar) // 保底, 绝不报 unsupported
 }
 
 /// 从 IsaProfile.features 派生 FeatureSet。
@@ -294,25 +497,25 @@ pub fn derive_feature_set(features: &[super::isa_profile::IsaFeature]) -> Featur
     for feat in features {
         match feat {
             // ── ① ~ ⑱ 有消费方: 每个 OpImpl 的 requires() 声明需要的精确能力位 ──
-            IsaFeature::Fma => fs = fs.union(FeatureSet::FMA),                       // GemmFmaBlis
-            IsaFeature::NativeBf16 => fs = fs.union(FeatureSet::NATIVE_BF16),        // dtype 维 (supports_dtype)
-            IsaFeature::NativeFp16 => fs = fs.union(FeatureSet::NATIVE_FP16),        // dtype 维
-            IsaFeature::NativeFp8 => fs = fs.union(FeatureSet::NATIVE_FP8),          // dtype 维
-            IsaFeature::TileGemm { .. } => fs = fs.union(FeatureSet::TILE_GEMM),     // GemmAmxBf16Tile/GemmTcSm70/GemmTcSm80
-            IsaFeature::AmxFp16 => fs = fs.union(FeatureSet::AMX_FP16),              // GemmAmxFp16Tile
-            IsaFeature::AmxFp8 => fs = fs.union(FeatureSet::AMX_FP8),                // GemmAmxFp8Tile
-            IsaFeature::Wgmma => fs = fs.union(FeatureSet::WGMMA),                   // GemmWgmma
-            IsaFeature::Tma => fs = fs.union(FeatureSet::TMA),                       // GemmWgmma
-            IsaFeature::Tmem => fs = fs.union(FeatureSet::TMEM),                     // GemmTcgen05
-            IsaFeature::BlockScaled => fs = fs.union(FeatureSet::BLOCK_SCALED),      // GemmTcgen05
-            IsaFeature::TwoCta => fs = fs.union(FeatureSet::TWO_CTA),                // (预留: 2-CTA GEMM OpImpl)
-            IsaFeature::Mfma => fs = fs.union(FeatureSet::MFMA),                     // GemmMfmaV1
-            IsaFeature::MfmaV2 => fs = fs.union(FeatureSet::MFMA_V2),                // GemmMfmaV2
-            IsaFeature::Fp8Mfma => fs = fs.union(FeatureSet::FP8_MFMA),              // (预留: FP8 MFMA OpImpl)
-            IsaFeature::Sve2 => fs = fs.union(FeatureSet::SVE2),                     // (预留: SVE2 GEMM OpImpl)
-            IsaFeature::SmeTileOp => fs = fs.union(FeatureSet::SME_TILE),            // GemmSmeTile
+            IsaFeature::Fma => fs = fs.union(FeatureSet::FMA), // GemmFmaBlis
+            IsaFeature::NativeBf16 => fs = fs.union(FeatureSet::NATIVE_BF16), // dtype 维 (supports_dtype)
+            IsaFeature::NativeFp16 => fs = fs.union(FeatureSet::NATIVE_FP16), // dtype 维
+            IsaFeature::NativeFp8 => fs = fs.union(FeatureSet::NATIVE_FP8),   // dtype 维
+            IsaFeature::TileGemm { .. } => fs = fs.union(FeatureSet::TILE_GEMM), // GemmAmxBf16Tile/GemmTcSm70/GemmTcSm80
+            IsaFeature::AmxFp16 => fs = fs.union(FeatureSet::AMX_FP16),          // GemmAmxFp16Tile
+            IsaFeature::AmxFp8 => fs = fs.union(FeatureSet::AMX_FP8),            // GemmAmxFp8Tile
+            IsaFeature::Wgmma => fs = fs.union(FeatureSet::WGMMA),               // GemmWgmma
+            IsaFeature::Tma => fs = fs.union(FeatureSet::TMA),                   // GemmWgmma
+            IsaFeature::Tmem => fs = fs.union(FeatureSet::TMEM),                 // GemmTcgen05
+            IsaFeature::BlockScaled => fs = fs.union(FeatureSet::BLOCK_SCALED),  // GemmTcgen05
+            IsaFeature::TwoCta => fs = fs.union(FeatureSet::TWO_CTA), // (预留: 2-CTA GEMM OpImpl)
+            IsaFeature::Mfma => fs = fs.union(FeatureSet::MFMA),      // GemmMfmaV1
+            IsaFeature::MfmaV2 => fs = fs.union(FeatureSet::MFMA_V2), // GemmMfmaV2
+            IsaFeature::Fp8Mfma => fs = fs.union(FeatureSet::FP8_MFMA), // (预留: FP8 MFMA OpImpl)
+            IsaFeature::Sve2 => fs = fs.union(FeatureSet::SVE2),      // (预留: SVE2 GEMM OpImpl)
+            IsaFeature::SmeTileOp => fs = fs.union(FeatureSet::SME_TILE), // GemmSmeTile
             IsaFeature::HardwareTranscendental => fs = fs.union(FeatureSet::HW_TRANSCEND),
-            IsaFeature::F16c => fs = fs.union(FeatureSet::F16C),                      // F16↔F32 转换 (Task5 BF16 OpImpl 消费)
+            IsaFeature::F16c => fs = fs.union(FeatureSet::F16C), // F16↔F32 转换 (Task5 BF16 OpImpl 消费)
 
             // ── 无消费方: 显式标注为何不映射到 FeatureSet 位 (审计完整性) ──
             //
@@ -350,9 +553,7 @@ pub fn derive_feature_set(features: &[super::isa_profile::IsaFeature]) -> Featur
             IsaFeature::Fp4Mfma => {}
             // ARM SME 子能力 (Sme2MultiVec/SmeF16F16/SmeI16I64): GemmSmeTile 仅要求 SME_TILE
             //   (SmeTileOp); 这些 SME2 细分精度不影响当前 GEMM requires 谓词。
-            IsaFeature::Sme2MultiVec
-            | IsaFeature::SmeF16F16
-            | IsaFeature::SmeI16I64 => {}
+            IsaFeature::Sme2MultiVec | IsaFeature::SmeF16F16 | IsaFeature::SmeI16I64 => {}
             // ARM 计算能力别名 (ArmBf16/ArmDotProd/ArmI8mm): ArmBf16 已与 NativeBf16 同推
             //   (aarch64() 构造器: has_bf16 → ArmBf16 + NativeBf16), NativeBf16 是统一计算能力位;
             //   ArmDotProd/ArmI8mm 是 INT8 路径, 无 INT8 GEMM OpImpl 消费。
@@ -395,19 +596,30 @@ mod tests {
             debug_jit: false,
         };
         let lo = GemmOpLayout {
-            m, n, k,
+            m,
+            n,
+            k,
             m_bound: BoundExpr::Const(m),
             dtype,
-            a_dtype: dtype, b_dtype: dtype, c_dtype: dtype,
+            a_dtype: dtype,
+            b_dtype: dtype,
+            c_dtype: dtype,
             trans_b: false,
-            mr: 4, nr: 2,
-            a_ptr, b_ptr, c_ptr,
+            mr: 4,
+            nr: 2,
+            a_ptr,
+            b_ptr,
+            c_ptr,
             epilogue: super::super::isa_hook::EpiloguePlace::OnAccumulators,
             tile: None,
         };
         let result = im.emit(&mut ectx, &lo);
         assert!(result.is_ok(), "{} emit failed: {:?}", im.name(), result);
-        assert!(!prog.instrs.is_empty(), "{} produced no instructions", im.name());
+        assert!(
+            !prog.instrs.is_empty(),
+            "{} produced no instructions",
+            im.name()
+        );
         prog
     }
 
@@ -430,9 +642,18 @@ mod tests {
     fn gemm_amx_bf16_tile_produces_instrs() {
         let im = &GemmAmxBf16Tile as &dyn OpImpl<GemmOpLayout>;
         let prog = verify_produces_instrs(im, QuantPrecision::BF16, 16, 16, 32);
-        let has_tile_config = prog.instrs.iter().any(|i| matches!(i, VmInstr::TileConfig { .. }));
-        let has_tile_mma = prog.instrs.iter().any(|i| matches!(i, VmInstr::TileMma { .. }));
-        let has_tile_release = prog.instrs.iter().any(|i| matches!(i, VmInstr::TileRelease));
+        let has_tile_config = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::TileConfig { .. }));
+        let has_tile_mma = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::TileMma { .. }));
+        let has_tile_release = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::TileRelease));
         assert!(has_tile_config, "GemmAmxBf16Tile should emit TileConfig");
         assert!(has_tile_mma, "GemmAmxBf16Tile should emit TileMma");
         assert!(has_tile_release, "GemmAmxBf16Tile should emit TileRelease");
@@ -454,7 +675,10 @@ mod tests {
     fn gemm_wgmma_produces_instrs() {
         let im = &GemmWgmma as &dyn OpImpl<GemmOpLayout>;
         let prog = verify_produces_instrs(im, QuantPrecision::BF16, 64, 32, 64);
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::TileConfig { .. })));
+        assert!(prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::TileConfig { .. })));
     }
 
     #[test]
@@ -479,7 +703,10 @@ mod tests {
     fn gemm_sme_tile_produces_instrs() {
         let im = &GemmSmeTile as &dyn OpImpl<GemmOpLayout>;
         let prog = verify_produces_instrs(im, QuantPrecision::F32, 16, 16, 4);
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::TileConfig { .. })));
+        assert!(prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::TileConfig { .. })));
     }
 
     #[test]
@@ -526,17 +753,24 @@ mod tests {
         let feats = FeatureSet::FMA.union(FeatureSet::TILE_GEMM);
         let im = select_gemm_impl(feats, QuantPrecision::BF16, (16, 16, 32));
         let tput = im.throughput_class();
-        assert!(tput >= 60,
+        assert!(
+            tput >= 60,
             "with TILE_GEMM + BF16, expected throughput >= 60, got {} (tput={})",
-            im.name(), tput);
+            im.name(),
+            tput
+        );
     }
 
     #[test]
     fn select_gemm_impl_wgmma_requires_wgmma_and_tma() {
         let feats = FeatureSet::FMA.union(FeatureSet::WGMMA); // missing TMA
         let im = select_gemm_impl(feats, QuantPrecision::BF16, (64, 32, 64));
-        assert_ne!(im.name(), "GemmWgmma",
-            "GemmWgmma requires WGMMA|TMA, but TMA missing; got {}", im.name());
+        assert_ne!(
+            im.name(),
+            "GemmWgmma",
+            "GemmWgmma requires WGMMA|TMA, but TMA missing; got {}",
+            im.name()
+        );
     }
 
     #[test]
@@ -547,22 +781,36 @@ mod tests {
         let b_ptr = prog.alloc_vreg(VRegKind::Ptr, width);
         let c_ptr = prog.alloc_vreg(VRegKind::Ptr, width);
         let mut ectx = EmitCtx {
-            prog: &mut prog, width,
-            pack_map: None, k_unroll: 1, debug_jit: false,
+            prog: &mut prog,
+            width,
+            pack_map: None,
+            k_unroll: 1,
+            debug_jit: false,
         };
         let lo = GemmOpLayout {
-            m: 8, n: 8, k: 4,
+            m: 8,
+            n: 8,
+            k: 4,
             m_bound: BoundExpr::Const(8),
             dtype: QuantPrecision::F32,
-            a_dtype: QuantPrecision::F32, b_dtype: QuantPrecision::F32, c_dtype: QuantPrecision::F32,
-            trans_b: false, mr: 4, nr: 2,
-            a_ptr, b_ptr, c_ptr,
+            a_dtype: QuantPrecision::F32,
+            b_dtype: QuantPrecision::F32,
+            c_dtype: QuantPrecision::F32,
+            trans_b: false,
+            mr: 4,
+            nr: 2,
+            a_ptr,
+            b_ptr,
+            c_ptr,
             epilogue: super::super::isa_hook::EpiloguePlace::OnAccumulators,
             tile: None,
         };
         let result = GemmFmaBlis.emit(&mut ectx, &lo);
         assert!(result.is_ok(), "GemmFmaBlis small-k should succeed");
-        assert!(!prog.instrs.is_empty(), "should produce instructions for small k");
+        assert!(
+            !prog.instrs.is_empty(),
+            "should produce instructions for small k"
+        );
     }
 
     #[test]
@@ -605,8 +853,12 @@ mod tests {
         assert!(feats.contains(FeatureSet::TMA));
         assert!(feats.contains(FeatureSet::NATIVE_BF16));
         let im = select_gemm_impl(feats, QuantPrecision::BF16, (64, 32, 64));
-        assert_eq!(im.name(), "GemmWgmma",
-            "SM90 + BF16 should route to GemmWgmma (got {})", im.name());
+        assert_eq!(
+            im.name(),
+            "GemmWgmma",
+            "SM90 + BF16 should route to GemmWgmma (got {})",
+            im.name()
+        );
     }
 
     #[test]
@@ -617,8 +869,12 @@ mod tests {
         assert!(feats.contains(FeatureSet::TMEM));
         assert!(feats.contains(FeatureSet::BLOCK_SCALED));
         let im = select_gemm_impl(feats, QuantPrecision::F16, (64, 64, 64));
-        assert_eq!(im.name(), "GemmTcgen05",
-            "SM100 + F16 should route to GemmTcgen05 (got {})", im.name());
+        assert_eq!(
+            im.name(),
+            "GemmTcgen05",
+            "SM100 + F16 should route to GemmTcgen05 (got {})",
+            im.name()
+        );
     }
 
     #[test]
@@ -632,8 +888,12 @@ mod tests {
         assert!(feats.contains(FeatureSet::NATIVE_BF16));
         assert!(!feats.contains(FeatureSet::WGMMA));
         let im = select_gemm_impl(feats, QuantPrecision::BF16, (16, 8, 16));
-        assert_eq!(im.name(), "GemmTcSm80",
-            "SM80 + BF16 should route to GemmTcSm80 (got {})", im.name());
+        assert_eq!(
+            im.name(),
+            "GemmTcSm80",
+            "SM80 + BF16 should route to GemmTcSm80 (got {})",
+            im.name()
+        );
     }
 
     #[test]
@@ -651,13 +911,19 @@ mod tests {
         assert!(feats.contains(FeatureSet::TILE_GEMM));
         assert!(!feats.contains(FeatureSet::NATIVE_BF16));
         let im = select_gemm_impl(feats, QuantPrecision::F16, (16, 16, 16));
-        assert!(im.throughput_class() >= 65,
+        assert!(
+            im.throughput_class() >= 65,
             "SM70 + F16 should select a TILE_GEMM TC impl (tput>=65), got {} (tput={})",
-            im.name(), im.throughput_class());
+            im.name(),
+            im.throughput_class()
+        );
         // 它必须是 TILE_GEMM 类 TC 后端 (GemmTcSm70 或 GemmTcSm80), 不能是 scalar/FMA
         let name = im.name();
-        assert!(name == "GemmTcSm70" || name == "GemmTcSm80",
-            "SM70 + F16 should route to a TC tile impl, got {}", name);
+        assert!(
+            name == "GemmTcSm70" || name == "GemmTcSm80",
+            "SM70 + F16 should route to a TC tile impl, got {}",
+            name
+        );
     }
 
     #[test]
@@ -668,8 +934,12 @@ mod tests {
         assert!(feats.contains(FeatureSet::MFMA));
         assert!(feats.contains(FeatureSet::MFMA_V2));
         let im = select_gemm_impl(feats, QuantPrecision::BF16, (32, 32, 16));
-        assert_eq!(im.name(), "GemmMfmaV2",
-            "gfx950 + BF16 should route to GemmMfmaV2 (got {})", im.name());
+        assert_eq!(
+            im.name(),
+            "GemmMfmaV2",
+            "gfx950 + BF16 should route to GemmMfmaV2 (got {})",
+            im.name()
+        );
     }
 
     #[test]
@@ -680,8 +950,12 @@ mod tests {
         assert!(feats.contains(FeatureSet::MFMA));
         assert!(!feats.contains(FeatureSet::MFMA_V2));
         let im = select_gemm_impl(feats, QuantPrecision::F16, (16, 16, 16));
-        assert_eq!(im.name(), "GemmMfmaV1",
-            "gfx908 + F16 should route to GemmMfmaV1 (got {})", im.name());
+        assert_eq!(
+            im.name(),
+            "GemmMfmaV1",
+            "gfx908 + F16 should route to GemmMfmaV1 (got {})",
+            im.name()
+        );
     }
 
     #[test]
@@ -689,13 +963,18 @@ mod tests {
         // AArch64 SME = SME_TILE + TileGemm + NativeBf16。
         // F32: 只有 GemmSmeTile (supports F32, requires SME_TILE) 合法,
         // AMX 路径不支持 F32, GPU TILE_GEMM 后端不支持 F32 → GemmSmeTile 唯一。
-        let profile = super::super::isa_profile::IsaProfile::aarch64(true, true, 64, true, true, true);
+        let profile =
+            super::super::isa_profile::IsaProfile::aarch64(true, true, 64, true, true, true);
         let feats = profile.feature_set();
         assert!(feats.contains(FeatureSet::SME_TILE));
         assert!(feats.contains(FeatureSet::TILE_GEMM));
         let im = select_gemm_impl(feats, QuantPrecision::F32, (16, 16, 4));
-        assert_eq!(im.name(), "GemmSmeTile",
-            "SME + F32 should route to GemmSmeTile (got {})", im.name());
+        assert_eq!(
+            im.name(),
+            "GemmSmeTile",
+            "SME + F32 should route to GemmSmeTile (got {})",
+            im.name()
+        );
     }
 
     #[test]
@@ -708,9 +987,12 @@ mod tests {
             .union(FeatureSet::TILE_GEMM)
             .union(FeatureSet::NATIVE_BF16);
         let im = select_gemm_impl(feats, QuantPrecision::BF16, (16, 16, 32));
-        assert!(im.throughput_class() >= 60,
+        assert!(
+            im.throughput_class() >= 60,
             "AMX-BF16 features should select tput>=60 impl, got {} (tput={})",
-            im.name(), im.throughput_class());
+            im.name(),
+            im.throughput_class()
+        );
     }
 
     #[test]
@@ -731,7 +1013,11 @@ mod tests {
             IsaFeature::NativeBf16,
             IsaFeature::NativeFp16,
             IsaFeature::NativeFp8,
-            IsaFeature::TileGemm { m: 16, n: 16, k: 32 },
+            IsaFeature::TileGemm {
+                m: 16,
+                n: 16,
+                k: 32,
+            },
             IsaFeature::AmxFp16,
             IsaFeature::AmxFp8,
             IsaFeature::Wgmma,
@@ -778,7 +1064,10 @@ mod tests {
             IsaFeature::NativeFp6,
             IsaFeature::AsyncCopy,
             IsaFeature::PredicatedExec,
-            IsaFeature::ScalableVector { min_vl: 16, max_vl: 256 },
+            IsaFeature::ScalableVector {
+                min_vl: 16,
+                max_vl: 256,
+            },
             IsaFeature::WarpShuffle,
             IsaFeature::Vnni,
             IsaFeature::AmxTranspose,
@@ -804,8 +1093,12 @@ mod tests {
         let fs = derive_feature_set(&features);
         // 这些变体全无 FeatureSet 位 → 派生结果 = EMPTY
         // (ArmBf16 不映射: NativeBf16 才是统一计算能力位, ArmBf16 是架构别名)
-        assert_eq!(fs, FeatureSet::EMPTY,
-            "无消费方 IsaFeature 变体不应派生任何 FeatureSet 位, got {:?}", fs);
+        assert_eq!(
+            fs,
+            FeatureSet::EMPTY,
+            "无消费方 IsaFeature 变体不应派生任何 FeatureSet 位, got {:?}",
+            fs
+        );
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -818,14 +1111,16 @@ mod tests {
 
     use crate::compiler::codegen::vm::instr::VRegId;
     use crate::compiler::codegen::vm::numerical_sim::{
-        verify_op_impl_aligns_scalar, scalar_gemm_reference, tolerance_for,
+        scalar_gemm_reference, tolerance_for, verify_op_impl_aligns_scalar,
     };
 
     /// 构造 GemmOpLayout + 执行 emit, 返回 VmProgram (供解释器验证)。
     fn emit_program_for_impl(
         im: &dyn OpImpl<GemmOpLayout>,
         dtype: QuantPrecision,
-        m: usize, n: usize, k: usize,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> VmProgram {
         let width = SimdWidth::W256;
         let mut prog = VmProgram::new();
@@ -833,11 +1128,27 @@ mod tests {
         let b_ptr = prog.alloc_vreg(VRegKind::Ptr, width);
         let c_ptr = prog.alloc_vreg(VRegKind::Ptr, width);
         let mut ectx = EmitCtx {
-            prog: &mut prog, width, pack_map: None, k_unroll: 1, debug_jit: false,
+            prog: &mut prog,
+            width,
+            pack_map: None,
+            k_unroll: 1,
+            debug_jit: false,
         };
         let lo = GemmOpLayout {
-            m, n, k, m_bound: BoundExpr::Const(m), dtype, a_dtype: dtype, b_dtype: dtype, c_dtype: dtype, trans_b: false, mr: 4, nr: 2,
-            a_ptr, b_ptr, c_ptr,
+            m,
+            n,
+            k,
+            m_bound: BoundExpr::Const(m),
+            dtype,
+            a_dtype: dtype,
+            b_dtype: dtype,
+            c_dtype: dtype,
+            trans_b: false,
+            mr: 4,
+            nr: 2,
+            a_ptr,
+            b_ptr,
+            c_ptr,
             epilogue: super::super::isa_hook::EpiloguePlace::OnAccumulators,
             tile: None,
         };
@@ -850,8 +1161,8 @@ mod tests {
     /// 用 `StdRng::seed_from_u64` 保证跨等级等价测试**可复现**: 每次跑同样的矩阵,
     /// 避免随机扰动导致 BF16 容差边界抖动 (CR-TIER-SOVEREIGNTY-004 数值验证需确定性)。
     fn seeded_test_matrix(rows: usize, cols: usize, seed: u64) -> Vec<f32> {
-        use rand::SeedableRng;
         use rand::Rng;
+        use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         (0..rows * cols).map(|_| rng.gen_range(-1.0..1.0)).collect()
     }
@@ -867,14 +1178,26 @@ mod tests {
         let a = seeded_test_matrix(2, 8, 42);
         let b = seeded_test_matrix(8, 4, 43);
         // ptr bindings: emit_program_for_impl allocs a_ptr=0, b_ptr=1, c_ptr=2 sequentially
-        let ptr_bindings: [(VRegId, &str); 3] = [
-            (VRegId(0), "a"), (VRegId(1), "b"), (VRegId(2), "c"),
-        ];
+        let ptr_bindings: [(VRegId, &str); 3] =
+            [(VRegId(0), "a"), (VRegId(1), "b"), (VRegId(2), "c")];
         let (max_diff, passed) = verify_op_impl_aligns_scalar(
-            &prog, &a, &b, 2, 4, 8, dtype, SimdWidth::W256, &ptr_bindings,
-        ).expect("interpreter should run");
+            &prog,
+            &a,
+            &b,
+            2,
+            4,
+            8,
+            dtype,
+            SimdWidth::W256,
+            &ptr_bindings,
+        )
+        .expect("interpreter should run");
         let tol = tolerance_for(dtype);
-        assert!(passed, "BF16 GemmFmaBlis 2x4x8 vs scalar: max_diff={} > tol={}", max_diff, tol);
+        assert!(
+            passed,
+            "BF16 GemmFmaBlis 2x4x8 vs scalar: max_diff={} > tol={}",
+            max_diff, tol
+        );
         assert!(max_diff <= tol, "BF16 容差 {} 超标: {}", tol, max_diff);
     }
 
@@ -886,14 +1209,26 @@ mod tests {
         let prog = emit_program_for_impl(im, dtype, 4, 8, 16);
         let a = seeded_test_matrix(4, 16, 44);
         let b = seeded_test_matrix(16, 8, 45);
-        let ptr_bindings: [(VRegId, &str); 3] = [
-            (VRegId(0), "a"), (VRegId(1), "b"), (VRegId(2), "c"),
-        ];
+        let ptr_bindings: [(VRegId, &str); 3] =
+            [(VRegId(0), "a"), (VRegId(1), "b"), (VRegId(2), "c")];
         let (max_diff, passed) = verify_op_impl_aligns_scalar(
-            &prog, &a, &b, 4, 8, 16, dtype, SimdWidth::W256, &ptr_bindings,
-        ).expect("interpreter should run");
+            &prog,
+            &a,
+            &b,
+            4,
+            8,
+            16,
+            dtype,
+            SimdWidth::W256,
+            &ptr_bindings,
+        )
+        .expect("interpreter should run");
         let tol = tolerance_for(dtype);
-        assert!(passed, "BF16 GemmFmaBlis 4x8x16 vs scalar: max_diff={} > tol={}", max_diff, tol);
+        assert!(
+            passed,
+            "BF16 GemmFmaBlis 4x8x16 vs scalar: max_diff={} > tol={}",
+            max_diff, tol
+        );
     }
 
     #[test]
@@ -904,14 +1239,26 @@ mod tests {
         let prog = emit_program_for_impl(im, dtype, 3, 5, 12);
         let a = seeded_test_matrix(3, 12, 46);
         let b = seeded_test_matrix(12, 5, 47);
-        let ptr_bindings: [(VRegId, &str); 3] = [
-            (VRegId(0), "a"), (VRegId(1), "b"), (VRegId(2), "c"),
-        ];
+        let ptr_bindings: [(VRegId, &str); 3] =
+            [(VRegId(0), "a"), (VRegId(1), "b"), (VRegId(2), "c")];
         let (max_diff, passed) = verify_op_impl_aligns_scalar(
-            &prog, &a, &b, 3, 5, 12, dtype, SimdWidth::W256, &ptr_bindings,
-        ).expect("interpreter should run");
+            &prog,
+            &a,
+            &b,
+            3,
+            5,
+            12,
+            dtype,
+            SimdWidth::W256,
+            &ptr_bindings,
+        )
+        .expect("interpreter should run");
         let tol = tolerance_for(dtype);
-        assert!(passed, "BF16 GemmScalar 3x5x12 vs scalar: max_diff={} > tol={}", max_diff, tol);
+        assert!(
+            passed,
+            "BF16 GemmScalar 3x5x12 vs scalar: max_diff={} > tol={}",
+            max_diff, tol
+        );
     }
 
     // ── F32 跨等级等价测试 (≥ 2 组) ──
@@ -924,14 +1271,26 @@ mod tests {
         let prog = emit_program_for_impl(im, dtype, 6, 10, 20);
         let a = seeded_test_matrix(6, 20, 48);
         let b = seeded_test_matrix(20, 10, 49);
-        let ptr_bindings: [(VRegId, &str); 3] = [
-            (VRegId(0), "a"), (VRegId(1), "b"), (VRegId(2), "c"),
-        ];
+        let ptr_bindings: [(VRegId, &str); 3] =
+            [(VRegId(0), "a"), (VRegId(1), "b"), (VRegId(2), "c")];
         let (max_diff, passed) = verify_op_impl_aligns_scalar(
-            &prog, &a, &b, 6, 10, 20, dtype, SimdWidth::W256, &ptr_bindings,
-        ).expect("interpreter should run");
+            &prog,
+            &a,
+            &b,
+            6,
+            10,
+            20,
+            dtype,
+            SimdWidth::W256,
+            &ptr_bindings,
+        )
+        .expect("interpreter should run");
         let tol = tolerance_for(dtype);
-        assert!(passed, "F32 GemmFmaBlis 6x10x20 vs scalar: max_diff={} > tol={}", max_diff, tol);
+        assert!(
+            passed,
+            "F32 GemmFmaBlis 6x10x20 vs scalar: max_diff={} > tol={}",
+            max_diff, tol
+        );
         assert!(max_diff <= 1e-5, "F32 容差 1e-5 超标: {}", max_diff);
     }
 
@@ -943,14 +1302,26 @@ mod tests {
         let prog = emit_program_for_impl(im, dtype, 2, 3, 6);
         let a = seeded_test_matrix(2, 6, 50);
         let b = seeded_test_matrix(6, 3, 51);
-        let ptr_bindings: [(VRegId, &str); 3] = [
-            (VRegId(0), "a"), (VRegId(1), "b"), (VRegId(2), "c"),
-        ];
+        let ptr_bindings: [(VRegId, &str); 3] =
+            [(VRegId(0), "a"), (VRegId(1), "b"), (VRegId(2), "c")];
         let (max_diff, passed) = verify_op_impl_aligns_scalar(
-            &prog, &a, &b, 2, 3, 6, dtype, SimdWidth::W256, &ptr_bindings,
-        ).expect("interpreter should run");
+            &prog,
+            &a,
+            &b,
+            2,
+            3,
+            6,
+            dtype,
+            SimdWidth::W256,
+            &ptr_bindings,
+        )
+        .expect("interpreter should run");
         let tol = tolerance_for(dtype);
-        assert!(passed, "F32 GemmScalar 2x3x6 vs scalar: max_diff={} > tol={}", max_diff, tol);
+        assert!(
+            passed,
+            "F32 GemmScalar 2x3x6 vs scalar: max_diff={} > tol={}",
+            max_diff, tol
+        );
     }
 
     // ── Scalar oracle 自验证 (已知答案矩阵) ──
@@ -960,19 +1331,19 @@ mod tests {
         // 已知答案: A = [[1,2,3,4],[5,6,7,8],[9,10,11,12]] (3×4)
         //           B = [[1,0,0,0,1],[0,1,0,1,0],[0,0,1,0,0],[1,1,1,1,1]] (4×5)
         //           C = Σ_p A[m][p] * B[p][n]
-        let a: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let a: Vec<f32> = vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ];
         let b: Vec<f32> = vec![
-            1.0, 0.0, 0.0, 0.0, 1.0,
-            0.0, 1.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 1.0, 0.0, 0.0,
-            1.0, 1.0, 1.0, 1.0, 1.0,
+            1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0,
+            1.0, 1.0, 1.0,
         ];
         let golden = scalar_gemm_reference(&a, &b, 3, 5, 4);
         // 预期: C[0][0] = 1*1 + 2*0 + 3*0 + 4*1 = 5; C[0][1] = 1*0 + 2*1 + 3*0 + 4*1 = 6
         assert_eq!(golden[0], 5.0);
         assert_eq!(golden[1], 6.0);
         assert_eq!(golden[2], 3.0 + 4.0); // C[0][2] = 3*1 + 4*1 = 7
-        // C[1][4] = 5*1 + 6*0 + 7*0 + 8*1 = 13 (row-major index = 1*5+4 = 9)
+                                          // C[1][4] = 5*1 + 6*0 + 7*0 + 8*1 = 13 (row-major index = 1*5+4 = 9)
         assert_eq!(golden[9], 13.0);
         // C[2][4] = 9*1 + 10*0 + 11*0 + 12*1 = 21 (row-major index = 2*5+4 = 14)
         assert_eq!(golden[14], 21.0);
@@ -992,43 +1363,74 @@ mod tests {
     fn assert_tile_impl_aligns_scalar(
         im: &dyn OpImpl<GemmOpLayout>,
         dtype: QuantPrecision,
-        m: usize, n: usize, k: usize,
-        seed_a: u64, seed_b: u64,
+        m: usize,
+        n: usize,
+        k: usize,
+        seed_a: u64,
+        seed_b: u64,
     ) {
         let prog = emit_program_for_impl(im, dtype, m, n, k);
         let a = seeded_test_matrix(m, k, seed_a);
         let b = seeded_test_matrix(k, n, seed_b);
-        let ptr_bindings: [(VRegId, &str); 3] = [
-            (VRegId(0), "a"), (VRegId(1), "b"), (VRegId(2), "c"),
-        ];
+        let ptr_bindings: [(VRegId, &str); 3] =
+            [(VRegId(0), "a"), (VRegId(1), "b"), (VRegId(2), "c")];
         let (max_diff, passed) = verify_op_impl_aligns_scalar(
-            &prog, &a, &b, m, n, k, dtype, SimdWidth::W256, &ptr_bindings,
-        ).expect("interpreter should run");
+            &prog,
+            &a,
+            &b,
+            m,
+            n,
+            k,
+            dtype,
+            SimdWidth::W256,
+            &ptr_bindings,
+        )
+        .expect("interpreter should run");
         let tol = tolerance_for(dtype);
-        assert!(passed,
+        assert!(
+            passed,
             "{} {}x{}x{} vs scalar: max_diff={} > tol={}",
-            im.name(), m, n, k, max_diff, tol);
+            im.name(),
+            m,
+            n,
+            k,
+            max_diff,
+            tol
+        );
     }
 
     // 1. GemmAmxBf16Tile — Intel AMX BF16 (16×16 tile, kd=32)
     #[test]
     fn bf16_gemm_amx_bf16_tile_aligns_scalar_oracle_16x16x64() {
         assert_tile_impl_aligns_scalar(
-            &GemmAmxBf16Tile, QuantPrecision::BF16, 16, 16, 64, 101, 102);
+            &GemmAmxBf16Tile,
+            QuantPrecision::BF16,
+            16,
+            16,
+            64,
+            101,
+            102,
+        );
     }
 
     // 2. GemmAmxFp16Tile — Intel AMX FP16 (16×16 tile, kd=32)
     #[test]
     fn f16_gemm_amx_fp16_tile_aligns_scalar_oracle_16x16x64() {
-        assert_tile_impl_aligns_scalar(
-            &GemmAmxFp16Tile, QuantPrecision::F16, 16, 16, 64, 103, 104);
+        assert_tile_impl_aligns_scalar(&GemmAmxFp16Tile, QuantPrecision::F16, 16, 16, 64, 103, 104);
     }
 
     // 3. GemmAmxFp8Tile — Intel AMX FP8 (16×16 tile, kd=64)
     #[test]
     fn fp8e4m3_gemm_amx_fp8_tile_aligns_scalar_oracle_16x16x128() {
         assert_tile_impl_aligns_scalar(
-            &GemmAmxFp8Tile, QuantPrecision::FP8E4M3, 16, 16, 128, 105, 106);
+            &GemmAmxFp8Tile,
+            QuantPrecision::FP8E4M3,
+            16,
+            16,
+            128,
+            105,
+            106,
+        );
     }
 
     // 4. GemmWgmma — SM90 Hopper WGMMA (64×n.min(32) tile, kd=64, tile=None→tile_dt=BF16)
@@ -1036,50 +1438,43 @@ mod tests {
     //    故测 BF16 以保证 buffer 编码 dtype 与 tile load dtype 一致。
     #[test]
     fn bf16_gemm_wgmma_aligns_scalar_oracle_64x32x128() {
-        assert_tile_impl_aligns_scalar(
-            &GemmWgmma, QuantPrecision::BF16, 64, 32, 128, 107, 108);
+        assert_tile_impl_aligns_scalar(&GemmWgmma, QuantPrecision::BF16, 64, 32, 128, 107, 108);
     }
 
     // 5. GemmTcgen05 — SM100 Blackwell tcgen05 (64×n.min(64) tile, kd=64, tile=None→F16)
     #[test]
     fn f16_gemm_tcgen05_aligns_scalar_oracle_64x64x128() {
-        assert_tile_impl_aligns_scalar(
-            &GemmTcgen05, QuantPrecision::F16, 64, 64, 128, 109, 110);
+        assert_tile_impl_aligns_scalar(&GemmTcgen05, QuantPrecision::F16, 64, 64, 128, 109, 110);
     }
 
     // 6. GemmMfmaV1 — AMD CDNA2 MFMA (16×16 tile, kd=16)
     #[test]
     fn f16_gemm_mfma_v1_aligns_scalar_oracle_16x16x32() {
-        assert_tile_impl_aligns_scalar(
-            &GemmMfmaV1, QuantPrecision::F16, 16, 16, 32, 111, 112);
+        assert_tile_impl_aligns_scalar(&GemmMfmaV1, QuantPrecision::F16, 16, 16, 32, 111, 112);
     }
 
     // 7. GemmMfmaV2 — AMD CDNA4 MFMA (32×32 tile, kd=16)
     #[test]
     fn bf16_gemm_mfma_v2_aligns_scalar_oracle_32x32x32() {
-        assert_tile_impl_aligns_scalar(
-            &GemmMfmaV2, QuantPrecision::BF16, 32, 32, 32, 113, 114);
+        assert_tile_impl_aligns_scalar(&GemmMfmaV2, QuantPrecision::BF16, 32, 32, 32, 113, 114);
     }
 
     // 8. GemmSmeTile — ARM SME (16×16 tile, kd=4, F32)
     #[test]
     fn f32_gemm_sme_tile_aligns_scalar_oracle_16x16x8() {
-        assert_tile_impl_aligns_scalar(
-            &GemmSmeTile, QuantPrecision::F32, 16, 16, 8, 115, 116);
+        assert_tile_impl_aligns_scalar(&GemmSmeTile, QuantPrecision::F32, 16, 16, 8, 115, 116);
     }
 
     // 9. GemmTcSm70 — NVIDIA Volta wmma (16×16 tile, kd=16, F16)
     #[test]
     fn f16_gemm_tc_sm70_aligns_scalar_oracle_16x16x32() {
-        assert_tile_impl_aligns_scalar(
-            &GemmTcSm70, QuantPrecision::F16, 16, 16, 32, 117, 118);
+        assert_tile_impl_aligns_scalar(&GemmTcSm70, QuantPrecision::F16, 16, 16, 32, 117, 118);
     }
 
     // 10. GemmTcSm80 — NVIDIA Ampere mma.sync (16×8 tile, kd=16, BF16)
     #[test]
     fn bf16_gemm_tc_sm80_aligns_scalar_oracle_16x8x32() {
-        assert_tile_impl_aligns_scalar(
-            &GemmTcSm80, QuantPrecision::BF16, 16, 8, 32, 119, 120);
+        assert_tile_impl_aligns_scalar(&GemmTcSm80, QuantPrecision::BF16, 16, 8, 32, 119, 120);
     }
 
     // 11. GemmMfmaV1 (BF16) — AMD CDNA2 MFMA BF16 路径 (16×16 tile, kd=16)
@@ -1091,8 +1486,7 @@ mod tests {
     //      映射正确。AmxFp8Tile 用宏字面量 DType::F8E4M3 (不经 to_dtype) 故 #3 FP8 可测。)
     #[test]
     fn bf16_gemm_mfma_v1_aligns_scalar_oracle_16x16x32() {
-        assert_tile_impl_aligns_scalar(
-            &GemmMfmaV1, QuantPrecision::BF16, 16, 16, 32, 121, 122);
+        assert_tile_impl_aligns_scalar(&GemmMfmaV1, QuantPrecision::BF16, 16, 16, 32, 121, 122);
     }
 
     #[test]
@@ -1101,7 +1495,11 @@ mod tests {
         let bf16_tol = tolerance_for(QuantPrecision::BF16);
         let f32_tol = tolerance_for(QuantPrecision::F32);
         assert!(bf16_tol >= 1e-2, "BF16 容差应 ≥ 1e-2, got {}", bf16_tol);
-        assert!(bf16_tol <= 1e-1, "BF16 容差应 ≤ 1e-1 (保守), got {}", bf16_tol);
+        assert!(
+            bf16_tol <= 1e-1,
+            "BF16 容差应 ≤ 1e-1 (保守), got {}",
+            bf16_tol
+        );
         assert!(f32_tol <= 1e-5, "F32 容差应 ≤ 1e-5, got {}", f32_tol);
     }
 }

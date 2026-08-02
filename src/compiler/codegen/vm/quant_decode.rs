@@ -29,10 +29,11 @@
 //! the `Vec<TraceOp>` at the time of emission.  `push_op` appends and returns the
 //! slot index of the newly-pushed op.
 
-use crate::compiler::trace::{TraceOp, ValueId, Fp8Format, ScaleSelector};
+use crate::compiler::trace::{Fp8Format, ScaleSelector, TraceOp, ValueId};
 use crate::quant::QuantType;
 use crate::quant_format::{
-    DataLayout, PackedScaleAlgorithm, QuantDataKind, QuantFormatDescriptor, ScaleDType, ScaleLayout, ZeroLayout,
+    DataLayout, PackedScaleAlgorithm, QuantDataKind, QuantFormatDescriptor, ScaleDType,
+    ScaleLayout, ZeroLayout,
 };
 
 // ── helper ───────────────────────────────────────────────────────────────────
@@ -109,11 +110,12 @@ pub struct DecodeTraceBuilder<'a> {
 }
 
 impl<'a> DecodeTraceBuilder<'a> {
-    pub fn new(
-        desc: &'a QuantFormatDescriptor,
-        output_lanes: usize,
-    ) -> Self {
-        Self { desc, output_lanes, nibble_phase: NibblePhase::Lo }
+    pub fn new(desc: &'a QuantFormatDescriptor, output_lanes: usize) -> Self {
+        Self {
+            desc,
+            output_lanes,
+            nibble_phase: NibblePhase::Lo,
+        }
     }
 
     /// Set NibblePhase for two-phase SPLIT decode (PackedNibbles only).
@@ -133,8 +135,7 @@ impl<'a> DecodeTraceBuilder<'a> {
     /// embed mostly zero/garbage → overflow → logits=30. Exclude Q4_K (and any
     /// format with a dedicated monolithic path) from two-phase.
     pub fn needs_two_phase_split(&self) -> bool {
-        matches!(&self.desc.data_layout, DataLayout::PackedNibbles { .. })
-            && !self.is_q4k_format()
+        matches!(&self.desc.data_layout, DataLayout::PackedNibbles { .. }) && !self.is_q4k_format()
     }
 
     /// Whether the trace requires a lane_offset input (inputs[2]).
@@ -142,32 +143,35 @@ impl<'a> DecodeTraceBuilder<'a> {
     pub fn needs_lane_offset(&self) -> bool {
         matches!(
             &self.desc.scale_layout,
-            ScaleLayout::Hierarchical { .. } | ScaleLayout::Q6KScales { .. }
-                | ScaleLayout::ExternalArray { .. } | ScaleLayout::SubBlockScalars { .. }
-        ) || matches!(
-            &self.desc.zero_layout,
-            ZeroLayout::Hierarchical { .. }
-        ) || matches!(
-            &self.desc.data_layout,
-            // BCE-20260710: 单片 decode (Q6K/Q5_0/Q5_1) 需 lane_offset (元素在 block 内位置)
-            DataLayout::NibbleWithHighBits { .. }
-        )
+            ScaleLayout::Hierarchical { .. }
+                | ScaleLayout::Q6KScales { .. }
+                | ScaleLayout::ExternalArray { .. }
+                | ScaleLayout::SubBlockScalars { .. }
+        ) || matches!(&self.desc.zero_layout, ZeroLayout::Hierarchical { .. })
+            || matches!(
+                &self.desc.data_layout,
+                // BCE-20260710: 单片 decode (Q6K/Q5_0/Q5_1) 需 lane_offset (元素在 block 内位置)
+                DataLayout::NibbleWithHighBits { .. }
+            )
     }
 
     /// Whether the trace requires a high_bits_ptr input (Input(3)).
     /// NibbleWithHighBits (Q6_K, Q5_0, Q5_1) uses a separate pointer for the
     /// high bit-plane, advanced independently from the low data pointer.
     pub fn needs_high_bits_ptr(&self) -> bool {
-        matches!(&self.desc.data_layout, DataLayout::NibbleWithHighBits { .. })
+        matches!(
+            &self.desc.data_layout,
+            DataLayout::NibbleWithHighBits { .. }
+        )
     }
 
     /// Byte stride for the high_bits_ptr per ei iteration.
     /// For NibbleWithHighBits with 2 bits/elem: 8 elements * 2 bits / 8 = 2 bytes.
     pub fn high_bits_stride(&self) -> usize {
         match &self.desc.data_layout {
-            DataLayout::NibbleWithHighBits { high_bits_per_elem, .. } => {
-                (self.output_lanes * (*high_bits_per_elem as usize) + 7) / 8
-            }
+            DataLayout::NibbleWithHighBits {
+                high_bits_per_elem, ..
+            } => (self.output_lanes * (*high_bits_per_elem as usize) + 7) / 8,
             _ => 0,
         }
     }
@@ -256,34 +260,55 @@ impl<'a> DecodeTraceBuilder<'a> {
         let scale_result = self.emit_scale_load(trace, block_base_slot, lane_offset_slot);
         let zero_result = self.emit_zero_load(trace, block_base_slot, lane_offset_slot);
         let quant_data_slot = self.emit_data_load(trace, data_ptr_slot);
-        let unpacked_slot = self.emit_unpack(trace, quant_data_slot, block_base_slot, high_bits_ptr_slot);
+        let unpacked_slot =
+            self.emit_unpack(trace, quant_data_slot, block_base_slot, high_bits_ptr_slot);
         self.emit_dequant_algebra(trace, unpacked_slot, scale_result, zero_result)
     }
 
     /// Whether this format uses E2M1 LUT decode (FP4 data kinds).
     fn is_e2m1_format(&self) -> bool {
         use crate::quant_format::QuantDataKind;
-        matches!(self.desc.data_kind, QuantDataKind::Float4 | QuantDataKind::Nvfp4)
+        matches!(
+            self.desc.data_kind,
+            QuantDataKind::Float4 | QuantDataKind::Nvfp4
+        )
     }
 
     /// Whether this format uses Q3_K monolithic decode (TwoBitConditionalBias layout).
     fn is_q3k_format(&self) -> bool {
-        matches!(&self.desc.data_layout, DataLayout::TwoBitConditionalBias { .. })
+        matches!(
+            &self.desc.data_layout,
+            DataLayout::TwoBitConditionalBias { .. }
+        )
     }
 
     /// Whether this format uses Q6_K monolithic decode (BCE-20260710-Q6K-HIGHBITS).
     /// Q6_K quarter 结构需位置相关高 2 bit 提取, 旧 NibbleWithHighBits qh<<6 & 0x30 丢高 bit.
     fn is_q6k_format(&self) -> bool {
         // Q6_K: quant_type 匹配 + NibbleWithHighBits(high_bits=2) layout
-        matches!(&self.desc.data_layout, DataLayout::NibbleWithHighBits { high_bits_per_elem: 2, .. })
+        matches!(
+            &self.desc.data_layout,
+            DataLayout::NibbleWithHighBits {
+                high_bits_per_elem: 2,
+                ..
+            }
+        )
     }
 
     /// Whether this format uses Q5_0/Q5_1 monolithic decode (BCE-20260710-Q5_0-HIGHBITS 同类).
     /// Q5_0/Q5_1 高1bit 是 bit-index plane (位置相关), 旧 NibbleWithHighBits qh<<7 & 0x10 丢高 bit + phase 无关.
     /// 仅 Classic Q5_0/Q5_1 (BlockScalar/BlockScalarWithMin); Q5_K (Hierarchical) 不在此, 走 build_q5k_decode.
     fn is_q5_format(&self) -> bool {
-        matches!(self.desc.quant_type, crate::quant::QuantType::Q5_0 | crate::quant::QuantType::Q5_1)
-            && matches!(&self.desc.data_layout, DataLayout::NibbleWithHighBits { high_bits_per_elem: 1, .. })
+        matches!(
+            self.desc.quant_type,
+            crate::quant::QuantType::Q5_0 | crate::quant::QuantType::Q5_1
+        ) && matches!(
+            &self.desc.data_layout,
+            DataLayout::NibbleWithHighBits {
+                high_bits_per_elem: 1,
+                ..
+            }
+        )
     }
 
     /// Whether this format uses Q5_K monolithic decode (BCE-20260710-Q5_K-HIGHBITS, Q5_0/Q6_K 同类).
@@ -291,7 +316,13 @@ impl<'a> DecodeTraceBuilder<'a> {
     /// Q5_K: Hierarchical scale + Hierarchical zero + NibbleWithHighBits(high_bits=1) + QuantType::Q5K.
     fn is_q5k_format(&self) -> bool {
         matches!(self.desc.quant_type, crate::quant::QuantType::Q5K)
-            && matches!(&self.desc.data_layout, DataLayout::NibbleWithHighBits { high_bits_per_elem: 1, .. })
+            && matches!(
+                &self.desc.data_layout,
+                DataLayout::NibbleWithHighBits {
+                    high_bits_per_elem: 1,
+                    ..
+                }
+            )
     }
 
     /// Whether this format uses Q4_K monolithic decode (BCE-20260731-Q4K-MONOLITHIC-DECODE).
@@ -313,7 +344,10 @@ impl<'a> DecodeTraceBuilder<'a> {
         lane_offset_slot: ValueId,
     ) -> ValueId {
         let (qs_offset, hmask_offset) = match &self.desc.data_layout {
-            DataLayout::TwoBitConditionalBias { qs_offset, hmask_offset } => (*qs_offset, *hmask_offset),
+            DataLayout::TwoBitConditionalBias {
+                qs_offset,
+                hmask_offset,
+            } => (*qs_offset, *hmask_offset),
             _ => unreachable!("is_q3k_format guarantees TwoBitConditionalBias"),
         };
 
@@ -322,20 +356,32 @@ impl<'a> DecodeTraceBuilder<'a> {
             ScaleLayout::Hierarchical { block_d_offset, .. } => *block_d_offset,
             _ => 0,
         };
-        let d_ptr = push_op(trace, TraceOp::QuantPtrAddOffset {
-            base: block_base_slot,
-            offset_bytes: d_offset as i64,
-        });
-        let d_slot = push_op(trace, TraceOp::QuantLoadF16toF32 { ptr: d_ptr, offset_bytes: 0 });
+        let d_ptr = push_op(
+            trace,
+            TraceOp::QuantPtrAddOffset {
+                base: block_base_slot,
+                offset_bytes: d_offset as i64,
+            },
+        );
+        let d_slot = push_op(
+            trace,
+            TraceOp::QuantLoadF16toF32 {
+                ptr: d_ptr,
+                offset_bytes: 0,
+            },
+        );
 
         // Emit the monolithic Q3_K decode TraceOp
-        push_op(trace, TraceOp::QuantQ3KDecode {
-            block_base: block_base_slot,
-            lane_offset: lane_offset_slot,
-            d_slot,
-            qs_offset,
-            hmask_offset,
-        })
+        push_op(
+            trace,
+            TraceOp::QuantQ3KDecode {
+                block_base: block_base_slot,
+                lane_offset: lane_offset_slot,
+                d_slot,
+                qs_offset,
+                hmask_offset,
+            },
+        )
     }
 
     /// Q6_K combined decode (BCE-20260710-Q6K-HIGHBITS): loads d (f16), delegates to
@@ -347,7 +393,11 @@ impl<'a> DecodeTraceBuilder<'a> {
         lane_offset_slot: ValueId,
     ) -> ValueId {
         let (qs_offset, qh_offset) = match &self.desc.data_layout {
-            DataLayout::NibbleWithHighBits { low_offset, high_offset, .. } => (*low_offset, *high_offset),
+            DataLayout::NibbleWithHighBits {
+                low_offset,
+                high_offset,
+                ..
+            } => (*low_offset, *high_offset),
             _ => unreachable!("is_q6k_format guarantees NibbleWithHighBits high_bits=2"),
         };
 
@@ -356,20 +406,32 @@ impl<'a> DecodeTraceBuilder<'a> {
             ScaleLayout::Q6KScales { block_d_offset, .. } => *block_d_offset,
             _ => 0,
         };
-        let d_ptr = push_op(trace, TraceOp::QuantPtrAddOffset {
-            base: block_base_slot,
-            offset_bytes: d_offset as i64,
-        });
-        let d_slot = push_op(trace, TraceOp::QuantLoadF16toF32 { ptr: d_ptr, offset_bytes: 0 });
+        let d_ptr = push_op(
+            trace,
+            TraceOp::QuantPtrAddOffset {
+                base: block_base_slot,
+                offset_bytes: d_offset as i64,
+            },
+        );
+        let d_slot = push_op(
+            trace,
+            TraceOp::QuantLoadF16toF32 {
+                ptr: d_ptr,
+                offset_bytes: 0,
+            },
+        );
 
         // Emit the monolithic Q6_K decode TraceOp
-        push_op(trace, TraceOp::QuantQ6KDecode {
-            block_base: block_base_slot,
-            lane_offset: lane_offset_slot,
-            d_slot,
-            qs_offset,
-            qh_offset,
-        })
+        push_op(
+            trace,
+            TraceOp::QuantQ6KDecode {
+                block_base: block_base_slot,
+                lane_offset: lane_offset_slot,
+                d_slot,
+                qs_offset,
+                qh_offset,
+            },
+        )
     }
 
     /// Q5_0/Q5_1 combined decode (BCE-20260710-Q5_0-HIGHBITS 同类横扫).
@@ -382,27 +444,46 @@ impl<'a> DecodeTraceBuilder<'a> {
         lane_offset_slot: ValueId,
     ) -> ValueId {
         let (qs_offset, qh_offset) = match &self.desc.data_layout {
-            DataLayout::NibbleWithHighBits { low_offset, high_offset, .. } => (*low_offset, *high_offset),
+            DataLayout::NibbleWithHighBits {
+                low_offset,
+                high_offset,
+                ..
+            } => (*low_offset, *high_offset),
             _ => unreachable!("is_q5_format guarantees NibbleWithHighBits high_bits=1"),
         };
         // d (f16) at block+0 (Q5_0/Q5_1 都在 offset 0)
-        let d_ptr = push_op(trace, TraceOp::QuantPtrAddOffset {
-            base: block_base_slot,
-            offset_bytes: 0,
-        });
-        let d_slot = push_op(trace, TraceOp::QuantLoadF16toF32 { ptr: d_ptr, offset_bytes: 0 });
+        let d_ptr = push_op(
+            trace,
+            TraceOp::QuantPtrAddOffset {
+                base: block_base_slot,
+                offset_bytes: 0,
+            },
+        );
+        let d_slot = push_op(
+            trace,
+            TraceOp::QuantLoadF16toF32 {
+                ptr: d_ptr,
+                offset_bytes: 0,
+            },
+        );
 
         // has_min: Q5_1 (BlockScalarWithMin) vs Q5_0 (BlockScalar + StaticBias)
-        let has_min = matches!(&self.desc.scale_layout, ScaleLayout::BlockScalarWithMin { .. });
+        let has_min = matches!(
+            &self.desc.scale_layout,
+            ScaleLayout::BlockScalarWithMin { .. }
+        );
 
-        push_op(trace, TraceOp::QuantQ5Decode {
-            block_base: block_base_slot,
-            lane_offset: lane_offset_slot,
-            d_slot,
-            qs_offset,
-            qh_offset,
-            has_min,
-        })
+        push_op(
+            trace,
+            TraceOp::QuantQ5Decode {
+                block_base: block_base_slot,
+                lane_offset: lane_offset_slot,
+                d_slot,
+                qs_offset,
+                qh_offset,
+                has_min,
+            },
+        )
     }
 
     /// Q5_K combined decode (BCE-20260710-Q5_K-HIGHBITS, Q5_0/Q6_K 同类高 bit plane bug).
@@ -416,7 +497,11 @@ impl<'a> DecodeTraceBuilder<'a> {
         lane_offset_slot: ValueId,
     ) -> ValueId {
         let (qs_offset, qh_offset) = match &self.desc.data_layout {
-            DataLayout::NibbleWithHighBits { low_offset, high_offset, .. } => (*low_offset, *high_offset),
+            DataLayout::NibbleWithHighBits {
+                low_offset,
+                high_offset,
+                ..
+            } => (*low_offset, *high_offset),
             _ => unreachable!("is_q5k_format guarantees NibbleWithHighBits high_bits=1"),
         };
         // d (f16) at block+0 (Hierarchical block_d_offset for Q5_K = 0)
@@ -424,19 +509,31 @@ impl<'a> DecodeTraceBuilder<'a> {
             ScaleLayout::Hierarchical { block_d_offset, .. } => *block_d_offset,
             _ => 0,
         };
-        let d_ptr = push_op(trace, TraceOp::QuantPtrAddOffset {
-            base: block_base_slot,
-            offset_bytes: d_offset as i64,
-        });
-        let d_slot = push_op(trace, TraceOp::QuantLoadF16toF32 { ptr: d_ptr, offset_bytes: 0 });
+        let d_ptr = push_op(
+            trace,
+            TraceOp::QuantPtrAddOffset {
+                base: block_base_slot,
+                offset_bytes: d_offset as i64,
+            },
+        );
+        let d_slot = push_op(
+            trace,
+            TraceOp::QuantLoadF16toF32 {
+                ptr: d_ptr,
+                offset_bytes: 0,
+            },
+        );
 
-        push_op(trace, TraceOp::QuantQ5KDecode {
-            block_base: block_base_slot,
-            lane_offset: lane_offset_slot,
-            d_slot,
-            qs_offset,
-            qh_offset,
-        })
+        push_op(
+            trace,
+            TraceOp::QuantQ5KDecode {
+                block_base: block_base_slot,
+                lane_offset: lane_offset_slot,
+                d_slot,
+                qs_offset,
+                qh_offset,
+            },
+        )
     }
 
     /// Q4_K combined decode (BCE-20260731-Q4K-MONOLITHIC-DECODE).
@@ -456,17 +553,29 @@ impl<'a> DecodeTraceBuilder<'a> {
             ScaleLayout::Hierarchical { block_d_offset, .. } => *block_d_offset,
             _ => unreachable!("is_q4k_format guarantees Hierarchical scale layout"),
         };
-        let d_ptr = push_op(trace, TraceOp::QuantPtrAddOffset {
-            base: block_base_slot,
-            offset_bytes: d_offset as i64,
-        });
-        let d_slot = push_op(trace, TraceOp::QuantLoadF16toF32 { ptr: d_ptr, offset_bytes: 0 });
-        push_op(trace, TraceOp::QuantQ4KDecode {
-            block_base: block_base_slot,
-            lane_offset: lane_offset_slot,
-            d_slot,
-            qs_offset,
-        })
+        let d_ptr = push_op(
+            trace,
+            TraceOp::QuantPtrAddOffset {
+                base: block_base_slot,
+                offset_bytes: d_offset as i64,
+            },
+        );
+        let d_slot = push_op(
+            trace,
+            TraceOp::QuantLoadF16toF32 {
+                ptr: d_ptr,
+                offset_bytes: 0,
+            },
+        );
+        push_op(
+            trace,
+            TraceOp::QuantQ4KDecode {
+                block_base: block_base_slot,
+                lane_offset: lane_offset_slot,
+                d_slot,
+                qs_offset,
+            },
+        )
     }
 
     /// E2M1 LUT decode path for MXFP4/NVFP4: load raw scale byte + data pointer
@@ -478,13 +587,11 @@ impl<'a> DecodeTraceBuilder<'a> {
         data_ptr_slot: ValueId,
         lane_offset_slot: ValueId,
     ) -> ValueId {
-        let nvfp4_mode = matches!(
-            self.desc.scale_layout,
-            ScaleLayout::SubBlockScalars { .. }
-        );
+        let nvfp4_mode = matches!(self.desc.scale_layout, ScaleLayout::SubBlockScalars { .. });
 
         // 1. Compute scale byte address and load it as raw byte
-        let scale_byte_slot = self.emit_raw_scale_byte_load(trace, block_base_slot, lane_offset_slot);
+        let scale_byte_slot =
+            self.emit_raw_scale_byte_load(trace, block_base_slot, lane_offset_slot);
 
         // 2. Compute packed data pointer (offset from data_ptr)
         let data_offset = match &self.desc.data_layout {
@@ -492,20 +599,26 @@ impl<'a> DecodeTraceBuilder<'a> {
             _ => 0,
         };
         let packed_data_ptr_slot = if data_offset != 0 {
-            push_op(trace, TraceOp::QuantPtrAddOffset {
-                base: data_ptr_slot,
-                offset_bytes: data_offset,
-            })
+            push_op(
+                trace,
+                TraceOp::QuantPtrAddOffset {
+                    base: data_ptr_slot,
+                    offset_bytes: data_offset,
+                },
+            )
         } else {
             data_ptr_slot
         };
 
         // 3. Combined E2M1 LUT decode
-        push_op(trace, TraceOp::QuantE2m1LutDecode {
-            packed_data_ptr: packed_data_ptr_slot,
-            scale_byte: scale_byte_slot,
-            nvfp4_mode,
-        })
+        push_op(
+            trace,
+            TraceOp::QuantE2m1LutDecode {
+                packed_data_ptr: packed_data_ptr_slot,
+                scale_byte: scale_byte_slot,
+                nvfp4_mode,
+            },
+        )
     }
 
     /// Load the raw scale byte (not decoded to F32) for E2M1 formats.
@@ -519,69 +632,113 @@ impl<'a> DecodeTraceBuilder<'a> {
         match &self.desc.scale_layout {
             ScaleLayout::BlockScalar { offset_bytes, .. } => {
                 // MXFP4 inline: scale at block_base + offset_bytes
-                let scale_ptr = push_op(trace, TraceOp::QuantPtrAddOffset {
-                    base: block_ptr_slot,
-                    offset_bytes: *offset_bytes as i64,
-                });
-                push_op(trace, TraceOp::QuantScalarLoad {
-                    ptr: scale_ptr,
-                    offset_bytes: 0,
-                })
+                let scale_ptr = push_op(
+                    trace,
+                    TraceOp::QuantPtrAddOffset {
+                        base: block_ptr_slot,
+                        offset_bytes: *offset_bytes as i64,
+                    },
+                );
+                push_op(
+                    trace,
+                    TraceOp::QuantScalarLoad {
+                        ptr: scale_ptr,
+                        offset_bytes: 0,
+                    },
+                )
             }
 
             ScaleLayout::ExternalArray { .. } => {
                 // MXFP4 external: scale from external array
                 // Use block_ptr as scale pointer (ABI input 0 holds scales base)
                 // The caller must set up the block_ptr to point to the correct scale.
-                push_op(trace, TraceOp::QuantScalarLoad {
+                push_op(
+                    trace,
+                    TraceOp::QuantScalarLoad {
+                        ptr: block_ptr_slot,
+                        offset_bytes: 0,
+                    },
+                )
+            }
+
+            ScaleLayout::SubBlockScalars {
+                offset_bytes,
+                sub_block_size,
+                ..
+            } => {
+                // NVFP4: sub_idx = lane_offset / sub_block_size
+                let sub_idx_slot = push_op(
+                    trace,
+                    TraceOp::QuantIntDivConst {
+                        src: lane_offset_slot,
+                        divisor: *sub_block_size as i64,
+                    },
+                );
+                let scales_base = push_op(
+                    trace,
+                    TraceOp::QuantPtrAddOffset {
+                        base: block_ptr_slot,
+                        offset_bytes: *offset_bytes as i64,
+                    },
+                );
+                let final_ptr = push_op(
+                    trace,
+                    TraceOp::QuantPtrAddDynamic {
+                        base: scales_base,
+                        index: sub_idx_slot,
+                    },
+                );
+                push_op(
+                    trace,
+                    TraceOp::QuantScalarLoad {
+                        ptr: final_ptr,
+                        offset_bytes: 0,
+                    },
+                )
+            }
+
+            _ => push_op(
+                trace,
+                TraceOp::QuantScalarLoad {
                     ptr: block_ptr_slot,
                     offset_bytes: 0,
-                })
-            }
-
-            ScaleLayout::SubBlockScalars { offset_bytes, sub_block_size, .. } => {
-                // NVFP4: sub_idx = lane_offset / sub_block_size
-                let sub_idx_slot = push_op(trace, TraceOp::QuantIntDivConst {
-                    src: lane_offset_slot,
-                    divisor: *sub_block_size as i64,
-                });
-                let scales_base = push_op(trace, TraceOp::QuantPtrAddOffset {
-                    base: block_ptr_slot,
-                    offset_bytes: *offset_bytes as i64,
-                });
-                let final_ptr = push_op(trace, TraceOp::QuantPtrAddDynamic {
-                    base: scales_base,
-                    index: sub_idx_slot,
-                });
-                push_op(trace, TraceOp::QuantScalarLoad {
-                    ptr: final_ptr,
-                    offset_bytes: 0,
-                })
-            }
-
-            _ => push_op(trace, TraceOp::QuantScalarLoad {
-                ptr: block_ptr_slot,
-                offset_bytes: 0,
-            }),
+                },
+            ),
         }
     }
 
     // ── §3.2 Scale load ──────────────────────────────────────────────────────
 
-    fn emit_scale_load(&self, trace: &mut Vec<TraceOp>, block_ptr_slot: ValueId, lane_offset_slot: ValueId) -> ScaleResult {
+    fn emit_scale_load(
+        &self,
+        trace: &mut Vec<TraceOp>,
+        block_ptr_slot: ValueId,
+        lane_offset_slot: ValueId,
+    ) -> ScaleResult {
         match &self.desc.scale_layout {
-            ScaleLayout::None => {
-                ScaleResult { scale_slot: push_op(trace, TraceOp::Const(1.0)) }
+            ScaleLayout::None => ScaleResult {
+                scale_slot: push_op(trace, TraceOp::Const(1.0)),
+            },
+
+            ScaleLayout::BlockScalar {
+                offset_bytes,
+                dtype,
+            } => {
+                let f32_slot =
+                    self.load_and_cast_scalar(trace, block_ptr_slot, *offset_bytes as i64, *dtype);
+                ScaleResult {
+                    scale_slot: f32_slot,
+                }
             }
 
-            ScaleLayout::BlockScalar { offset_bytes, dtype } => {
-                let f32_slot = self.load_and_cast_scalar(trace, block_ptr_slot, *offset_bytes as i64, *dtype);
-                ScaleResult { scale_slot: f32_slot }
-            }
-
-            ScaleLayout::BlockScalarWithMin { d_offset, dtype, .. } => {
-                let f32_slot = self.load_and_cast_scalar(trace, block_ptr_slot, *d_offset as i64, *dtype);
-                ScaleResult { scale_slot: f32_slot }
+            ScaleLayout::BlockScalarWithMin {
+                d_offset, dtype, ..
+            } => {
+                let f32_slot =
+                    self.load_and_cast_scalar(trace, block_ptr_slot, *d_offset as i64, *dtype);
+                ScaleResult {
+                    scale_slot: f32_slot,
+                }
             }
 
             ScaleLayout::Hierarchical {
@@ -626,7 +783,9 @@ impl<'a> DecodeTraceBuilder<'a> {
 
                 // 4. final_scale = block_d * sub_scale
                 let final_scale = push_op(trace, TraceOp::Mul(block_d_f32, sub_scale_slot));
-                ScaleResult { scale_slot: final_scale }
+                ScaleResult {
+                    scale_slot: final_scale,
+                }
             }
 
             ScaleLayout::Q6KScales {
@@ -680,7 +839,9 @@ impl<'a> DecodeTraceBuilder<'a> {
 
                 // final_scale = block_d * sub_scale
                 let final_scale = push_op(trace, TraceOp::Mul(block_d_f32, sub_scale_f32));
-                ScaleResult { scale_slot: final_scale }
+                ScaleResult {
+                    scale_slot: final_scale,
+                }
             }
 
             ScaleLayout::ExternalArray { stride, dtype } => {
@@ -706,14 +867,32 @@ impl<'a> DecodeTraceBuilder<'a> {
                 // QuantIntMul above; the actual load uses the accumulated pointer.
                 let _ = byte_offset_slot;
                 let f32_slot = match *dtype {
-                    ScaleDType::F16 => push_op(trace, TraceOp::QuantLoadF16toF32 { ptr: scales_ptr_slot, offset_bytes: 0 }),
-                    ScaleDType::I8Range => push_op(trace, TraceOp::QuantLoadI8toF32 { ptr: scales_ptr_slot, offset_bytes: 0 }),
+                    ScaleDType::F16 => push_op(
+                        trace,
+                        TraceOp::QuantLoadF16toF32 {
+                            ptr: scales_ptr_slot,
+                            offset_bytes: 0,
+                        },
+                    ),
+                    ScaleDType::I8Range => push_op(
+                        trace,
+                        TraceOp::QuantLoadI8toF32 {
+                            ptr: scales_ptr_slot,
+                            offset_bytes: 0,
+                        },
+                    ),
                     _ => self.cast_scale_to_f32(trace, scale_raw, *dtype),
                 };
-                ScaleResult { scale_slot: f32_slot }
+                ScaleResult {
+                    scale_slot: f32_slot,
+                }
             }
 
-            ScaleLayout::SubBlockScalars { offset_bytes, sub_block_size, dtype } => {
+            ScaleLayout::SubBlockScalars {
+                offset_bytes,
+                sub_block_size,
+                dtype,
+            } => {
                 // NVFP4: sub-block scale at block_base + offset_bytes + sub_block_idx
                 // sub_block_idx = lane_offset / sub_block_size
                 let sub_idx_slot = push_op(
@@ -741,32 +920,50 @@ impl<'a> DecodeTraceBuilder<'a> {
                     },
                 );
                 let f32_slot = self.load_and_cast_scalar(trace, final_ptr, 0, *dtype);
-                ScaleResult { scale_slot: f32_slot }
+                ScaleResult {
+                    scale_slot: f32_slot,
+                }
             }
         }
     }
 
     // ── §3.2 Zero / min load ─────────────────────────────────────────────────
 
-    fn emit_zero_load(&self, trace: &mut Vec<TraceOp>, block_ptr_slot: ValueId, lane_offset_slot: ValueId) -> ZeroResult {
+    fn emit_zero_load(
+        &self,
+        trace: &mut Vec<TraceOp>,
+        block_ptr_slot: ValueId,
+        lane_offset_slot: ValueId,
+    ) -> ZeroResult {
         match &self.desc.zero_layout {
             ZeroLayout::None => ZeroResult::None,
 
             ZeroLayout::StaticBias { value } => ZeroResult::StaticBias(*value),
 
             // AWQ4/GPTQ4: `value = (unpacked - zp) × scale` — pre-scale subtraction
-            ZeroLayout::BlockScalar { offset_bytes, dtype } => {
-                let f32_slot = self.load_and_cast_scalar(trace, block_ptr_slot, *offset_bytes as i64, *dtype);
+            ZeroLayout::BlockScalar {
+                offset_bytes,
+                dtype,
+            } => {
+                let f32_slot =
+                    self.load_and_cast_scalar(trace, block_ptr_slot, *offset_bytes as i64, *dtype);
                 ZeroResult::PreScaleSubtract(f32_slot)
             }
 
             // Q4_1/Q5_1/Q8_1: `value = d × quantized + m` — post-scale addition
-            ZeroLayout::BlockMin { offset_bytes, dtype } => {
-                let f32_slot = self.load_and_cast_scalar(trace, block_ptr_slot, *offset_bytes as i64, *dtype);
+            ZeroLayout::BlockMin {
+                offset_bytes,
+                dtype,
+            } => {
+                let f32_slot =
+                    self.load_and_cast_scalar(trace, block_ptr_slot, *offset_bytes as i64, *dtype);
                 ZeroResult::PostScaleAdd(f32_slot)
             }
 
-            ZeroLayout::Hierarchical { dmin_offset, sub_m_offset } => {
+            ZeroLayout::Hierarchical {
+                dmin_offset,
+                sub_m_offset,
+            } => {
                 // block_dmin × sub_m   (both f16-derived)
                 let dmin_f32 = push_op(
                     trace,
@@ -860,22 +1057,24 @@ impl<'a> DecodeTraceBuilder<'a> {
                     },
                 );
                 if matches!(self.desc.data_kind, QuantDataKind::Float8) {
-                    let format = if matches!(self.desc.quant_type, QuantType::Fp8E4M3) { Fp8Format::E4M3 } else { Fp8Format::E5M2 };
+                    let format = if matches!(self.desc.quant_type, QuantType::Fp8E4M3) {
+                        Fp8Format::E4M3
+                    } else {
+                        Fp8Format::E5M2
+                    };
                     push_op(trace, TraceOp::QuantCastFp8toF32 { src: raw, format })
                 } else {
                     push_op(trace, TraceOp::QuantCastI8toF32 { src: raw })
                 }
             }
 
-            DataLayout::CodebookIndex { offset, .. } => {
-                push_op(
-                    trace,
-                    TraceOp::QuantScalarLoad {
-                        ptr: block_ptr_slot,
-                        offset_bytes: *offset as i64,
-                    },
-                )
-            }
+            DataLayout::CodebookIndex { offset, .. } => push_op(
+                trace,
+                TraceOp::QuantScalarLoad {
+                    ptr: block_ptr_slot,
+                    offset_bytes: *offset as i64,
+                },
+            ),
 
             DataLayout::TwoBitConditionalBias { .. } => {
                 // Q3_K uses build_q3k_decode instead of the standard data_load→unpack→dequant pipeline.
@@ -887,7 +1086,13 @@ impl<'a> DecodeTraceBuilder<'a> {
 
     // ── §3.3 Unpack ───────────────────────────────────────────────────────────
 
-    fn emit_unpack(&self, trace: &mut Vec<TraceOp>, raw_data_slot: ValueId, block_ptr_slot: ValueId, high_bits_ptr_slot: ValueId) -> ValueId {
+    fn emit_unpack(
+        &self,
+        trace: &mut Vec<TraceOp>,
+        raw_data_slot: ValueId,
+        block_ptr_slot: ValueId,
+        high_bits_ptr_slot: ValueId,
+    ) -> ValueId {
         match &self.desc.data_layout {
             DataLayout::PackedNibbles { low_first, .. } => {
                 // 两阶段 SPLIT (BCE-20260709-Q4_0-SPLIT): 按 phase 产纯 lo 或纯 hi
@@ -897,25 +1102,36 @@ impl<'a> DecodeTraceBuilder<'a> {
                     // lo = raw & 0x0F
                     push_op(
                         trace,
-                        TraceOp::QuantAndMask { src: raw_data_slot, mask: 0x0F },
+                        TraceOp::QuantAndMask {
+                            src: raw_data_slot,
+                            mask: 0x0F,
+                        },
                     )
                 } else {
                     // hi = (raw >> 4) & 0x0F
                     let shifted = push_op(
                         trace,
-                        TraceOp::QuantShiftRight { src: raw_data_slot, amount: 4 },
+                        TraceOp::QuantShiftRight {
+                            src: raw_data_slot,
+                            amount: 4,
+                        },
                     );
                     push_op(
                         trace,
-                        TraceOp::QuantAndMask { src: shifted, mask: 0x0F },
+                        TraceOp::QuantAndMask {
+                            src: shifted,
+                            mask: 0x0F,
+                        },
                     )
                 };
                 let _ = low_first; // low_first 语义由 phase 表达 (Lo pass 先, Hi pass 后)
-                // Concat output is integer (i32 lanes) — convert to f32 before arithmetic.
+                                   // Concat output is integer (i32 lanes) — convert to f32 before arithmetic.
                 push_op(trace, TraceOp::QuantCastI8toF32 { src: nibbles })
             }
 
-            DataLayout::NibbleWithHighBits { high_bits_per_elem, .. } => {
+            DataLayout::NibbleWithHighBits {
+                high_bits_per_elem, ..
+            } => {
                 // High bits are loaded from high_bits_ptr (Input 3), which is
                 // independently advanced by the GEMV ei loop at its own stride.
                 // This fixes the Q6_K SIGSEGV where block_ptr+high_offset was a
@@ -942,10 +1158,19 @@ impl<'a> DecodeTraceBuilder<'a> {
                 let high_mask_val = (((1u32 << *high_bits_per_elem) - 1) << 4) as u64;
                 let qh_masked = push_op(
                     trace,
-                    TraceOp::QuantAndMask { src: qh_shifted, mask: high_mask_val },
+                    TraceOp::QuantAndMask {
+                        src: qh_shifted,
+                        mask: high_mask_val,
+                    },
                 );
                 // merged = qs | qh_masked
-                let merged = push_op(trace, TraceOp::QuantBitOr { lhs: raw_data_slot, rhs: qh_masked });
+                let merged = push_op(
+                    trace,
+                    TraceOp::QuantBitOr {
+                        lhs: raw_data_slot,
+                        rhs: qh_masked,
+                    },
+                );
                 // Output is integer — convert to f32 before arithmetic.
                 push_op(trace, TraceOp::QuantCastI8toF32 { src: merged })
             }
@@ -1018,7 +1243,10 @@ impl<'a> DecodeTraceBuilder<'a> {
             ZeroResult::PreScaleSubtract(zp_slot) => {
                 let zp_broadcast = push_op(
                     trace,
-                    TraceOp::QuantBroadcast { src: *zp_slot, lanes: self.output_lanes },
+                    TraceOp::QuantBroadcast {
+                        src: *zp_slot,
+                        lanes: self.output_lanes,
+                    },
                 );
                 push_op(trace, TraceOp::Sub(unpacked_slot, zp_broadcast))
             }
@@ -1028,14 +1256,21 @@ impl<'a> DecodeTraceBuilder<'a> {
         // 2. Broadcast scale to all output lanes
         let scale_broadcast = push_op(
             trace,
-            TraceOp::QuantBroadcast { src: scale.scale_slot, lanes: self.output_lanes },
+            TraceOp::QuantBroadcast {
+                src: scale.scale_slot,
+                lanes: self.output_lanes,
+            },
         );
 
         // 3. acc = 0; value = biased * scale
         let zero_acc = push_op(trace, TraceOp::Const(0.0));
         let scaled_slot = push_op(
             trace,
-            TraceOp::QuantDequantFma { acc: zero_acc, a: biased_slot, b: scale_broadcast },
+            TraceOp::QuantDequantFma {
+                acc: zero_acc,
+                a: biased_slot,
+                b: scale_broadcast,
+            },
         );
 
         // 4. Post-scale zero-point correction
@@ -1044,7 +1279,10 @@ impl<'a> DecodeTraceBuilder<'a> {
                 // Q4_1/Q5_1 (BlockMin): value = d*quantized + m
                 let min_broadcast = push_op(
                     trace,
-                    TraceOp::QuantBroadcast { src: min_slot, lanes: self.output_lanes },
+                    TraceOp::QuantBroadcast {
+                        src: min_slot,
+                        lanes: self.output_lanes,
+                    },
                 );
                 push_op(trace, TraceOp::Add(scaled_slot, min_broadcast))
             }
@@ -1053,7 +1291,10 @@ impl<'a> DecodeTraceBuilder<'a> {
                 // (BCE-20260730-Q4K-MIN-SIGN: llama.cpp uses subtraction)
                 let min_broadcast = push_op(
                     trace,
-                    TraceOp::QuantBroadcast { src: min_slot, lanes: self.output_lanes },
+                    TraceOp::QuantBroadcast {
+                        src: min_slot,
+                        lanes: self.output_lanes,
+                    },
                 );
                 push_op(trace, TraceOp::Sub(scaled_slot, min_broadcast))
             }
@@ -1085,7 +1326,11 @@ impl<'a> DecodeTraceBuilder<'a> {
             TraceOp::QuantKQuantPackedScaleLookup {
                 scales_base: sub_scales_base_slot,
                 sub_block_idx: sub_idx_slot,
-                scale_algo: if is_q3k { PackedScaleAlgorithm::Q3KExtended } else { PackedScaleAlgorithm::KQuant6Bit },
+                scale_algo: if is_q3k {
+                    PackedScaleAlgorithm::Q3KExtended
+                } else {
+                    PackedScaleAlgorithm::KQuant6Bit
+                },
                 selector: ScaleSelector::Scale,
             },
         )
@@ -1106,16 +1351,25 @@ impl<'a> DecodeTraceBuilder<'a> {
         match dtype {
             ScaleDType::F16 => push_op(
                 trace,
-                TraceOp::QuantLoadF16toF32 { ptr: block_ptr_slot, offset_bytes },
+                TraceOp::QuantLoadF16toF32 {
+                    ptr: block_ptr_slot,
+                    offset_bytes,
+                },
             ),
             ScaleDType::I8Range => push_op(
                 trace,
-                TraceOp::QuantLoadI8toF32 { ptr: block_ptr_slot, offset_bytes },
+                TraceOp::QuantLoadI8toF32 {
+                    ptr: block_ptr_slot,
+                    offset_bytes,
+                },
             ),
             // F32 and others: plain scalar load, no cast needed
             _ => push_op(
                 trace,
-                TraceOp::QuantScalarLoad { ptr: block_ptr_slot, offset_bytes },
+                TraceOp::QuantScalarLoad {
+                    ptr: block_ptr_slot,
+                    offset_bytes,
+                },
             ),
         }
     }
@@ -1123,7 +1377,12 @@ impl<'a> DecodeTraceBuilder<'a> {
     /// Cast a raw slot (loaded bits) to f32 based on dtype.
     /// raw_slot comes from QuantScalarLoad (Ptr VReg holding a byte value).
     /// For F16/I8/E8M0, we use load_and_cast_scalar to avoid GPR→Vec broadcast issues.
-    fn cast_scale_to_f32(&self, trace: &mut Vec<TraceOp>, raw_slot: ValueId, dtype: ScaleDType) -> ValueId {
+    fn cast_scale_to_f32(
+        &self,
+        trace: &mut Vec<TraceOp>,
+        raw_slot: ValueId,
+        dtype: ScaleDType,
+    ) -> ValueId {
         raw_slot
     }
 
@@ -1131,8 +1390,12 @@ impl<'a> DecodeTraceBuilder<'a> {
     /// (mirrors the scale layout's sub_block_elements when available).
     fn sub_block_elements_for_zero(&self) -> usize {
         match &self.desc.scale_layout {
-            ScaleLayout::Hierarchical { sub_block_elements, .. } => *sub_block_elements,
-            ScaleLayout::Q6KScales { sub_block_elements, .. } => *sub_block_elements,
+            ScaleLayout::Hierarchical {
+                sub_block_elements, ..
+            } => *sub_block_elements,
+            ScaleLayout::Q6KScales {
+                sub_block_elements, ..
+            } => *sub_block_elements,
             _ => self.desc.block_size,
         }
     }
@@ -1145,8 +1408,8 @@ impl<'a> DecodeTraceBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quant_format::registry;
     use crate::quant::QuantType;
+    use crate::quant_format::registry;
 
     /// Check that the trace is non-empty and ends with a slot that comes from
     /// one of the dequant-algebra Quant* ops (QuantDequantFma / Add / Sub).
@@ -1177,13 +1440,14 @@ mod tests {
         let r = registry();
         let desc = r.get(&QuantType::Q4_0).expect("Q4_0 must be registered");
         let mut trace = Vec::new();
-        let final_slot = DecodeTraceBuilder::new(desc, 8)
-            .build(&mut trace);
+        let final_slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
         assert_trace_valid(&trace);
         assert!(final_slot.0 < trace.len() as u32);
         // Q4_0: ZeroLayout::None (bias already handled in GgufInt4Load), no Sub expected
         // Should have QuantLoadF16toF32 for the f16 scale load
-        let has_cast = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
+        let has_cast = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
         assert!(has_cast, "Q4_0 should load f16 scale to f32");
     }
 
@@ -1192,16 +1456,25 @@ mod tests {
         let r = registry();
         let desc = r.get(&QuantType::Q4_1).expect("Q4_1 must be registered");
         let mut trace = Vec::new();
-        let final_slot = DecodeTraceBuilder::new(desc, 8)
-            .build(&mut trace);
+        let final_slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
         assert_trace_valid(&trace);
         assert!(final_slot.0 < trace.len() as u32);
         // Q4_1: PackedNibbles 两阶段 SPLIT (BCE-20260709-Q4_0-SPLIT) — 不再用 QuantConcatSeq 拼接,
         // 改为按 phase 产纯 lo/hi. Lo phase (默认) 应有 QuantAndMask(0x0F) 提 lo nibble.
-        let has_concat = trace.iter().any(|op| matches!(op, TraceOp::QuantConcatSeq { .. }));
-        assert!(!has_concat, "Q4_1 should NOT have QuantConcatSeq (two-phase SPLIT replaces concat)");
-        let has_lo_mask = trace.iter().any(|op| matches!(op, TraceOp::QuantAndMask { mask, .. } if *mask == 0x0F));
-        assert!(has_lo_mask, "Q4_1 Lo phase should have QuantAndMask(0x0F) for low nibble");
+        let has_concat = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantConcatSeq { .. }));
+        assert!(
+            !has_concat,
+            "Q4_1 should NOT have QuantConcatSeq (two-phase SPLIT replaces concat)"
+        );
+        let has_lo_mask = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantAndMask { mask, .. } if *mask == 0x0F));
+        assert!(
+            has_lo_mask,
+            "Q4_1 Lo phase should have QuantAndMask(0x0F) for low nibble"
+        );
     }
 
     #[test]
@@ -1209,15 +1482,24 @@ mod tests {
         let r = registry();
         let desc = r.get(&QuantType::Q8_0).expect("Q8_0 must be registered");
         let mut trace = Vec::new();
-        let final_slot = DecodeTraceBuilder::new(desc, 8)
-            .build(&mut trace);
+        let final_slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
         assert_trace_valid(&trace);
         assert!(final_slot.0 < trace.len() as u32);
         // Q8_0: signed bytes → QuantLoadBytesVec(signed=true) + QuantCastI8toF32
-        let has_bytes_vec = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadBytesVec { signed: true, .. }));
-        let has_i8_to_f32 = trace.iter().any(|op| matches!(op, TraceOp::QuantCastI8toF32 { .. }));
-        assert!(has_bytes_vec, "Q8_0 should use QuantLoadBytesVec with signed=true");
-        assert!(has_i8_to_f32, "Q8_0 should have QuantCastI8toF32 for i8→f32 conversion");
+        let has_bytes_vec = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantLoadBytesVec { signed: true, .. }));
+        let has_i8_to_f32 = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantCastI8toF32 { .. }));
+        assert!(
+            has_bytes_vec,
+            "Q8_0 should use QuantLoadBytesVec with signed=true"
+        );
+        assert!(
+            has_i8_to_f32,
+            "Q8_0 should have QuantCastI8toF32 for i8→f32 conversion"
+        );
     }
 
     #[test]
@@ -1225,8 +1507,7 @@ mod tests {
         let r = registry();
         let desc = r.get(&QuantType::Q8_1).expect("Q8_1 must be registered");
         let mut trace = Vec::new();
-        let final_slot = DecodeTraceBuilder::new(desc, 8)
-            .build(&mut trace);
+        let final_slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
         assert_trace_valid(&trace);
         assert!(final_slot.0 < trace.len() as u32);
     }
@@ -1236,13 +1517,17 @@ mod tests {
         let r = registry();
         let desc = r.get(&QuantType::Q4K).expect("Q4_K must be registered");
         let mut trace = Vec::new();
-        let final_slot = DecodeTraceBuilder::new(desc, 8)
-            .build(&mut trace);
+        let final_slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
         assert_trace_valid(&trace);
         assert!(final_slot.0 < trace.len() as u32);
         // Q4_K: Hierarchical scale → QuantIntDivConst present
-        let has_div = trace.iter().any(|op| matches!(op, TraceOp::QuantIntDivConst { .. }));
-        assert!(has_div, "Q4_K hierarchical should have QuantIntDivConst for sub_block_idx");
+        let has_div = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantIntDivConst { .. }));
+        assert!(
+            has_div,
+            "Q4_K hierarchical should have QuantIntDivConst for sub_block_idx"
+        );
     }
 
     #[test]
@@ -1250,22 +1535,32 @@ mod tests {
         let r = registry();
         let desc = r.get(&QuantType::Q6K).expect("Q6_K must be registered");
         let mut trace = Vec::new();
-        let final_slot = DecodeTraceBuilder::new(desc, 8)
-            .build(&mut trace);
+        let final_slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
         assert_trace_valid(&trace);
         assert!(final_slot.0 < trace.len() as u32);
         // BCE-20260710-Q6K-HIGHBITS: Q6_K 用整体式 QuantQ6KDecode (非旧 NibbleWithHighBits qh<<6&0x30).
         // trace 应含 QuantQ6KDecode (处理 quarter 位置相关高 2 bit 提取).
-        let has_q6k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
+        let has_q6k_decode = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
         assert!(has_q6k_decode, "Q6_K should emit QuantQ6KDecode monolithic TraceOp (replaces buggy NibbleWithHighBits unpack)");
         // 结构断言 (防抽象回退): Q6_K 禁止走旧 NibbleWithHighBits 通用 shift+mask 路径.
         // 旧 buggy 路径 emit QuantShiftLeft(amount=6) + QuantAndMask(0x30) — 见 BCE-20260710-Q6K-HIGHBITS.
-        let has_old_shift6 = trace.iter().any(|op| matches!(op, TraceOp::QuantShiftLeft { amount: 6, .. }));
+        let has_old_shift6 = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantShiftLeft { amount: 6, .. }));
         assert!(!has_old_shift6, "Q6_K must NOT use old NibbleWithHighBits QuantShiftLeft(amount=6) — use QuantQ6KDecode");
-        let has_old_mask30 = trace.iter().any(|op| matches!(op, TraceOp::QuantAndMask { mask: 0x30, .. }));
-        assert!(!has_old_mask30, "Q6_K must NOT use old NibbleWithHighBits QuantAndMask(0x30) — use QuantQ6KDecode");
+        let has_old_mask30 = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantAndMask { mask: 0x30, .. }));
+        assert!(
+            !has_old_mask30,
+            "Q6_K must NOT use old NibbleWithHighBits QuantAndMask(0x30) — use QuantQ6KDecode"
+        );
         // d (f16→f32) 加载仍应在 trace
-        let has_d_load = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
+        let has_d_load = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
         assert!(has_d_load, "Q6_K should load block d (f16→f32)");
     }
 
@@ -1273,40 +1568,53 @@ mod tests {
     fn test_trace_slot_indices_in_range() {
         let r = registry();
         for qt in &[
-            QuantType::Q4_0, QuantType::Q4_1, QuantType::Q5_0, QuantType::Q5_1,
-            QuantType::Q8_0, QuantType::Q8_1, QuantType::Q2K, QuantType::Q3K,
-            QuantType::Q4K, QuantType::Q5K, QuantType::Q6K,
-            QuantType::AWQ4, QuantType::GPTQ4,
+            QuantType::Q4_0,
+            QuantType::Q4_1,
+            QuantType::Q5_0,
+            QuantType::Q5_1,
+            QuantType::Q8_0,
+            QuantType::Q8_1,
+            QuantType::Q2K,
+            QuantType::Q3K,
+            QuantType::Q4K,
+            QuantType::Q5K,
+            QuantType::Q6K,
+            QuantType::AWQ4,
+            QuantType::GPTQ4,
         ] {
             let desc = match r.get(qt) {
                 Some(d) => d,
                 None => continue,
             };
             let mut trace = Vec::new();
-            let final_slot = DecodeTraceBuilder::new(desc, 8)
-                .build(&mut trace);
+            let final_slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
             let len = trace.len();
             assert!(
                 final_slot.0 < len as u32,
                 "final_slot {} out of range [0, {}) for {:?}",
-                final_slot, len, qt
+                final_slot,
+                len,
+                qt
             );
             // Validate all slot references within each op are in range
             for (pos, op) in trace.iter().enumerate() {
                 let refs: Vec<ValueId> = match op {
-                    TraceOp::QuantBitAnd { lhs, rhs } |
-                    TraceOp::QuantBitOr { lhs, rhs } => vec![*lhs, *rhs],
-                    TraceOp::QuantBroadcast { src, .. } |
-                    TraceOp::QuantCastF16toF32 { src } |
-                    TraceOp::QuantCastI8toF32 { src } |
-                    TraceOp::QuantExtractBits { src, .. } |
-                    TraceOp::QuantIntDivConst { src, .. } |
-                    TraceOp::QuantIntMul { src, .. } |
-                    TraceOp::QuantShiftLeft { src, .. } |
-                    TraceOp::QuantShiftRight { src, .. } => vec![*src],
+                    TraceOp::QuantBitAnd { lhs, rhs } | TraceOp::QuantBitOr { lhs, rhs } => {
+                        vec![*lhs, *rhs]
+                    }
+                    TraceOp::QuantBroadcast { src, .. }
+                    | TraceOp::QuantCastF16toF32 { src }
+                    | TraceOp::QuantCastI8toF32 { src }
+                    | TraceOp::QuantExtractBits { src, .. }
+                    | TraceOp::QuantIntDivConst { src, .. }
+                    | TraceOp::QuantIntMul { src, .. }
+                    | TraceOp::QuantShiftLeft { src, .. }
+                    | TraceOp::QuantShiftRight { src, .. } => vec![*src],
                     TraceOp::QuantCodebookLookup { indices, .. } => vec![*indices],
                     TraceOp::QuantDequantFma { acc, a, b } => vec![*acc, *a, *b],
-                    TraceOp::QuantInterleave { lo, hi } | TraceOp::QuantConcatSeq { lo, hi } => vec![*lo, *hi],
+                    TraceOp::QuantInterleave { lo, hi } | TraceOp::QuantConcatSeq { lo, hi } => {
+                        vec![*lo, *hi]
+                    }
                     TraceOp::QuantScalarLoad { ptr, .. } => vec![*ptr],
                     TraceOp::Add(a, b) | TraceOp::Sub(a, b) | TraceOp::Mul(a, b) => vec![*a, *b],
                     _ => vec![],
@@ -1315,7 +1623,9 @@ mod tests {
                     assert!(
                         (r.0 as usize) < pos,
                         "Op at slot {} refs future slot {} ({:?})",
-                        pos, r, op
+                        pos,
+                        r,
+                        op
                     );
                 }
             }
@@ -1325,39 +1635,66 @@ mod tests {
     #[test]
     fn test_fp8_e4m3_trace() {
         let r = registry();
-        let desc = r.get(&QuantType::Fp8E4M3).expect("Fp8E4M3 must be registered");
+        let desc = r
+            .get(&QuantType::Fp8E4M3)
+            .expect("Fp8E4M3 must be registered");
         let mut trace = Vec::new();
-        let final_slot = DecodeTraceBuilder::new(desc, 8)
-            .build(&mut trace);
+        let final_slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
         assert_trace_valid(&trace);
         assert!(final_slot.0 < trace.len() as u32);
-        let has_fp8_cast = trace.iter().any(|op| matches!(op, TraceOp::QuantCastFp8toF32 { format: Fp8Format::E4M3, .. }));
+        let has_fp8_cast = trace.iter().any(|op| {
+            matches!(
+                op,
+                TraceOp::QuantCastFp8toF32 {
+                    format: Fp8Format::E4M3,
+                    ..
+                }
+            )
+        });
         assert!(has_fp8_cast, "FP8 E4M3 should use QuantCastFp8toF32");
-        let has_i8_cast = trace.iter().any(|op| matches!(op, TraceOp::QuantCastI8toF32 { .. }));
+        let has_i8_cast = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantCastI8toF32 { .. }));
         assert!(!has_i8_cast, "FP8 E4M3 should NOT use QuantCastI8toF32");
     }
 
     #[test]
     fn test_fp8_e5m2_trace() {
         let r = registry();
-        let desc = r.get(&QuantType::Fp8E5M2).expect("Fp8E5M2 must be registered");
+        let desc = r
+            .get(&QuantType::Fp8E5M2)
+            .expect("Fp8E5M2 must be registered");
         let mut trace = Vec::new();
-        let final_slot = DecodeTraceBuilder::new(desc, 8)
-            .build(&mut trace);
+        let final_slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
         assert_trace_valid(&trace);
         assert!(final_slot.0 < trace.len() as u32);
-        let has_fp8_cast = trace.iter().any(|op| matches!(op, TraceOp::QuantCastFp8toF32 { format: Fp8Format::E5M2, .. }));
-        assert!(has_fp8_cast, "FP8 E5M2 should use QuantCastFp8toF32 with is_e4m3=false");
+        let has_fp8_cast = trace.iter().any(|op| {
+            matches!(
+                op,
+                TraceOp::QuantCastFp8toF32 {
+                    format: Fp8Format::E5M2,
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_fp8_cast,
+            "FP8 E5M2 should use QuantCastFp8toF32 with is_e4m3=false"
+        );
     }
 
     #[test]
     fn test_fp8_e4m3_no_scale_no_zero() {
         let r = registry();
-        let desc = r.get(&QuantType::Fp8E4M3).expect("Fp8E4M3 must be registered");
+        let desc = r
+            .get(&QuantType::Fp8E4M3)
+            .expect("Fp8E4M3 must be registered");
         let mut trace = Vec::new();
         DecodeTraceBuilder::new(desc, 8).build(&mut trace);
         // FP8 has ScaleLayout::None → should use Const(1.0), no QuantLoadF16toF32
-        let has_f16_load = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
+        let has_f16_load = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
         assert!(!has_f16_load, "FP8 should not load f16 scales");
     }
 
@@ -1366,29 +1703,44 @@ mod tests {
         let r = registry();
         let desc = r.get(&QuantType::AWQ4).expect("AWQ4 must be registered");
         let mut trace = Vec::new();
-        let final_slot = DecodeTraceBuilder::new(desc, 8)
-            .build(&mut trace);
+        let final_slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
         assert_trace_valid(&trace);
         assert!(final_slot.0 < trace.len() as u32);
 
         // AWQ4: `value = (qw - zero_point) × scale` — Sub must appear BEFORE FMA
         // 1. Should have a Sub (unpacked - zero_point) — pre-scale subtraction
         let has_sub = trace.iter().any(|op| matches!(op, TraceOp::Sub(_, _)));
-        assert!(has_sub, "AWQ4 must have Sub for pre-scale zero-point subtraction");
+        assert!(
+            has_sub,
+            "AWQ4 must have Sub for pre-scale zero-point subtraction"
+        );
 
         // 2. Should NOT have a post-scale Add (only Sub + FMA)
         let has_add = trace.iter().any(|op| matches!(op, TraceOp::Add(_, _)));
-        assert!(!has_add, "AWQ4 must NOT have post-scale Add; formula is (qw-zp)×scale");
+        assert!(
+            !has_add,
+            "AWQ4 must NOT have post-scale Add; formula is (qw-zp)×scale"
+        );
 
         // 3. Verify FMA exists
-        let has_fma = trace.iter().any(|op| matches!(op, TraceOp::QuantDequantFma { .. }));
-        assert!(has_fma, "AWQ4 must have QuantDequantFma for scale multiplication");
+        let has_fma = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantDequantFma { .. }));
+        assert!(
+            has_fma,
+            "AWQ4 must have QuantDequantFma for scale multiplication"
+        );
 
         // 4. Should load f16 scale and f16 zero-point
-        let f16_count = trace.iter()
+        let f16_count = trace
+            .iter()
             .filter(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }))
             .count();
-        assert!(f16_count >= 2, "AWQ4 should load at least 2 f16 values (scale + zero), got {}", f16_count);
+        assert!(
+            f16_count >= 2,
+            "AWQ4 should load at least 2 f16 values (scale + zero), got {}",
+            f16_count
+        );
     }
 
     #[test]
@@ -1396,17 +1748,22 @@ mod tests {
         let r = registry();
         let desc = r.get(&QuantType::GPTQ4).expect("GPTQ4 must be registered");
         let mut trace = Vec::new();
-        let final_slot = DecodeTraceBuilder::new(desc, 8)
-            .build(&mut trace);
+        let final_slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
         assert_trace_valid(&trace);
         assert!(final_slot.0 < trace.len() as u32);
 
         // GPTQ4: same formula as AWQ4: `value = (qw - zero_point) × scale`
         let has_sub = trace.iter().any(|op| matches!(op, TraceOp::Sub(_, _)));
-        assert!(has_sub, "GPTQ4 must have Sub for pre-scale zero-point subtraction");
+        assert!(
+            has_sub,
+            "GPTQ4 must have Sub for pre-scale zero-point subtraction"
+        );
 
         let has_add = trace.iter().any(|op| matches!(op, TraceOp::Add(_, _)));
-        assert!(!has_add, "GPTQ4 must NOT have post-scale Add; formula is (qw-zp)×scale");
+        assert!(
+            !has_add,
+            "GPTQ4 must NOT have post-scale Add; formula is (qw-zp)×scale"
+        );
     }
 
     /// REQ-QCG-007: Q2K trace must handle Hierarchical scale + Hierarchical zero.
@@ -1415,18 +1772,27 @@ mod tests {
         let r = registry();
         let desc = r.get(&QuantType::Q2K).expect("Q2_K must be registered");
         let mut trace = Vec::new();
-        let final_slot = DecodeTraceBuilder::new(desc, 8)
-            .build(&mut trace);
+        let final_slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
         assert_trace_valid(&trace);
         assert!(final_slot.0 < trace.len() as u32);
 
         // Q2K: Hierarchical scale (block_d + sub_scales) → QuantIntDivConst present
-        let has_div = trace.iter().any(|op| matches!(op, TraceOp::QuantIntDivConst { .. }));
-        assert!(has_div, "Q2K hierarchical scale should have QuantIntDivConst for sub_block_idx");
+        let has_div = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantIntDivConst { .. }));
+        assert!(
+            has_div,
+            "Q2K hierarchical scale should have QuantIntDivConst for sub_block_idx"
+        );
 
         // Q2K: Hierarchical zero (dmin + sub_m) → Sub present (dequant formula involves min)
-        let has_add_or_sub = trace.iter().any(|op| matches!(op, TraceOp::Add(_, _) | TraceOp::Sub(_, _)));
-        assert!(has_add_or_sub, "Q2K should have Add/Sub for hierarchical zero-point (min)");
+        let has_add_or_sub = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::Add(_, _) | TraceOp::Sub(_, _)));
+        assert!(
+            has_add_or_sub,
+            "Q2K should have Add/Sub for hierarchical zero-point (min)"
+        );
     }
 
     /// REQ-QCG-007: Q3K trace must handle Hierarchical scale + hmask-based unpack.
@@ -1435,37 +1801,53 @@ mod tests {
         let r = registry();
         let desc = r.get(&QuantType::Q3K).expect("Q3_K must be registered");
         let mut trace = Vec::new();
-        let final_slot = DecodeTraceBuilder::new(desc, 8)
-            .build(&mut trace);
+        let final_slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
         assert_trace_valid(&trace);
         assert!(final_slot.0 < trace.len() as u32);
 
         // Q3K uses monolithic QuantQ3KDecode TraceOp (assisted path)
-        let has_q3k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ3KDecode { .. }));
-        assert!(has_q3k_decode, "Q3K should emit QuantQ3KDecode monolithic TraceOp");
+        let has_q3k_decode = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantQ3KDecode { .. }));
+        assert!(
+            has_q3k_decode,
+            "Q3K should emit QuantQ3KDecode monolithic TraceOp"
+        );
 
         // Q3K: needs_lane_offset for hierarchical scale indexing
         let builder = DecodeTraceBuilder::new(desc, 8);
-        assert!(builder.needs_lane_offset(), "Q3K should need lane offset for sub-block indexing");
+        assert!(
+            builder.needs_lane_offset(),
+            "Q3K should need lane offset for sub-block indexing"
+        );
     }
 
     /// REQ-QCG-009: MXFP4 E2M1 LUT decode trace.
     #[test]
     fn test_mxfp4_trace() {
         let r = registry();
-        let desc = r.get(&QuantType::Mxfp4 { block_size: 32 }).expect("MXFP4 must be registered");
+        let desc = r
+            .get(&QuantType::Mxfp4 { block_size: 32 })
+            .expect("MXFP4 must be registered");
         let mut trace = Vec::new();
-        let final_slot = DecodeTraceBuilder::new(desc, 8)
-            .build(&mut trace);
+        let final_slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
         assert_trace_valid(&trace);
         assert!(final_slot.0 < trace.len() as u32);
 
         // MXFP4 uses QuantE2m1LutDecode with nvfp4_mode=false
-        let has_e2m1 = trace.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantE2m1LutDecode { nvfp4_mode: false, .. }
-        ));
-        assert!(has_e2m1, "MXFP4 should emit QuantE2m1LutDecode with nvfp4_mode=false");
+        let has_e2m1 = trace.iter().any(|op| {
+            matches!(
+                op,
+                TraceOp::QuantE2m1LutDecode {
+                    nvfp4_mode: false,
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_e2m1,
+            "MXFP4 should emit QuantE2m1LutDecode with nvfp4_mode=false"
+        );
     }
 
     /// REQ-QCG-009a: NVFP4 E2M1 LUT decode trace (nvfp4_mode=true).
@@ -1474,17 +1856,24 @@ mod tests {
         let r = registry();
         let desc = r.get(&QuantType::Nvfp4).expect("NVFP4 must be registered");
         let mut trace = Vec::new();
-        let final_slot = DecodeTraceBuilder::new(desc, 8)
-            .build(&mut trace);
+        let final_slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
         assert_trace_valid(&trace);
         assert!(final_slot.0 < trace.len() as u32);
 
         // NVFP4 uses QuantE2m1LutDecode with nvfp4_mode=true
-        let has_e2m1_nvfp4 = trace.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantE2m1LutDecode { nvfp4_mode: true, .. }
-        ));
-        assert!(has_e2m1_nvfp4, "NVFP4 should emit QuantE2m1LutDecode with nvfp4_mode=true");
+        let has_e2m1_nvfp4 = trace.iter().any(|op| {
+            matches!(
+                op,
+                TraceOp::QuantE2m1LutDecode {
+                    nvfp4_mode: true,
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_e2m1_nvfp4,
+            "NVFP4 should emit QuantE2m1LutDecode with nvfp4_mode=true"
+        );
     }
 
     // @trace TEST-QD-01 [req:REQ-QCG] [level:unit]
@@ -1498,7 +1887,10 @@ mod tests {
         let builder = DecodeTraceBuilder::new(desc, 8);
 
         // Assert: Q5_0 uses NibbleWithHighBits → needs high bits pointer
-        assert!(builder.needs_high_bits_ptr(), "Q5_0 should need high bits pointer for 5-bit unpack");
+        assert!(
+            builder.needs_high_bits_ptr(),
+            "Q5_0 should need high bits pointer for 5-bit unpack"
+        );
 
         // Act
         let mut trace = Vec::new();
@@ -1510,8 +1902,13 @@ mod tests {
 
         // BCE-20260710-Q5_0-HIGHBITS: Q5_0 走整体式 QuantQ5Decode (has_min=false).
         // 旧 NibbleWithHighBits Sub/QuantBitOr 已废.
-        let has_q5_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ5Decode { has_min: false, .. }));
-        assert!(has_q5_decode, "Q5_0 should emit QuantQ5Decode (has_min=false, replaces Sub/QuantBitOr)");
+        let has_q5_decode = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantQ5Decode { has_min: false, .. }));
+        assert!(
+            has_q5_decode,
+            "Q5_0 should emit QuantQ5Decode (has_min=false, replaces Sub/QuantBitOr)"
+        );
     }
 
     // @trace TEST-QD-02 [req:REQ-QCG] [level:unit]
@@ -1532,8 +1929,13 @@ mod tests {
         assert!(final_slot.0 < trace.len() as u32);
 
         // BCE-20260710-Q5_0-HIGHBITS: Q5_1 走整体式 QuantQ5Decode (has_min=true).
-        let has_q5_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ5Decode { has_min: true, .. }));
-        assert!(has_q5_decode, "Q5_1 should emit QuantQ5Decode (has_min=true)");
+        let has_q5_decode = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantQ5Decode { has_min: true, .. }));
+        assert!(
+            has_q5_decode,
+            "Q5_1 should emit QuantQ5Decode (has_min=true)"
+        );
     }
 
     // @trace TEST-QD-03 [req:REQ-QCG] [level:unit]
@@ -1547,8 +1949,14 @@ mod tests {
         let builder = DecodeTraceBuilder::new(desc, 8);
 
         // Assert: Q5_K has hierarchical scale + NibbleWithHighBits
-        assert!(builder.needs_lane_offset(), "Q5_K should need lane offset for hierarchical scale");
-        assert!(builder.needs_high_bits_ptr(), "Q5_K should need high bits pointer");
+        assert!(
+            builder.needs_lane_offset(),
+            "Q5_K should need lane offset for hierarchical scale"
+        );
+        assert!(
+            builder.needs_high_bits_ptr(),
+            "Q5_K should need high bits pointer"
+        );
 
         // Act
         let mut trace = Vec::new();
@@ -1559,12 +1967,19 @@ mod tests {
         assert!(final_slot.0 < trace.len() as u32);
 
         // BCE-20260710-Q5_K-HIGHBITS: Q5_K 走单片 QuantQ5KDecode (转置高位平面 + get_scale_min_k4).
-        let has_q5k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ5KDecode { .. }));
+        let has_q5k_decode = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantQ5KDecode { .. }));
         assert!(has_q5k_decode, "Q5_K should emit QuantQ5KDecode (monolithic, replaces 旧 QuantKQuantPackedScaleLookup+Add)");
 
         // 禁止旧路径残留: 不应再有 QuantKQuantPackedScaleLookup (旧 Hierarchical scale trace)
-        let has_packed_lookup = trace.iter().any(|op| matches!(op, TraceOp::QuantKQuantPackedScaleLookup { .. }));
-        assert!(!has_packed_lookup, "Q5_K monolithic 不应再 emit QuantKQuantPackedScaleLookup (旧 buggy 路径)");
+        let has_packed_lookup = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantKQuantPackedScaleLookup { .. }));
+        assert!(
+            !has_packed_lookup,
+            "Q5_K monolithic 不应再 emit QuantKQuantPackedScaleLookup (旧 buggy 路径)"
+        );
     }
 
     // @trace TEST-QD-04 [req:REQ-QCG] [level:unit]
@@ -1585,11 +2000,18 @@ mod tests {
         assert!(final_slot.0 < trace.len() as u32);
 
         // Q8_K: F32 scale → QuantScalarLoad (not QuantLoadF16toF32)
-        let has_f16_load = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
-        assert!(!has_f16_load, "Q8_K should NOT use QuantLoadF16toF32; scale is F32");
+        let has_f16_load = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
+        assert!(
+            !has_f16_load,
+            "Q8_K should NOT use QuantLoadF16toF32; scale is F32"
+        );
 
         // Q8_K: signed bytes → QuantLoadBytesVec(signed=true)
-        let has_signed_bytes = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadBytesVec { signed: true, .. }));
+        let has_signed_bytes = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantLoadBytesVec { signed: true, .. }));
         assert!(has_signed_bytes, "Q8_K should load signed bytes");
 
         // Q8_K: no zero → no Sub/Add for bias
@@ -1605,7 +2027,10 @@ mod tests {
         // Arrange
         let r = registry();
         let desc = r.get(&QuantType::IQ4NL).expect("IQ4_NL must be registered");
-        assert!(desc.codebook.is_some(), "IQ4_NL should have a static codebook");
+        assert!(
+            desc.codebook.is_some(),
+            "IQ4_NL should have a static codebook"
+        );
 
         // Act
         let mut trace = Vec::new();
@@ -1616,12 +2041,19 @@ mod tests {
         assert!(final_slot.0 < trace.len() as u32);
 
         // IQ4_NL: CodebookIndex → QuantExtractBits (extract 4-bit indices)
-        let has_extract = trace.iter().any(|op| matches!(op, TraceOp::QuantExtractBits { bit_width: 4, .. }));
+        let has_extract = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantExtractBits { bit_width: 4, .. }));
         assert!(has_extract, "IQ4_NL should extract 4-bit indices");
 
         // IQ4_NL: Has codebook → QuantCodebookLookup
-        let has_codebook = trace.iter().any(|op| matches!(op, TraceOp::QuantCodebookLookup { .. }));
-        assert!(has_codebook, "IQ4_NL should use QuantCodebookLookup for codebook decode");
+        let has_codebook = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantCodebookLookup { .. }));
+        assert!(
+            has_codebook,
+            "IQ4_NL should use QuantCodebookLookup for codebook decode"
+        );
     }
 
     // @trace TEST-QD-06 [req:REQ-QCG] [level:unit]
@@ -1632,7 +2064,10 @@ mod tests {
         // Arrange
         let r = registry();
         let desc = r.get(&QuantType::IQ1S).expect("IQ1_S must be registered");
-        assert!(desc.codebook.is_none(), "IQ1_S should NOT have a static codebook");
+        assert!(
+            desc.codebook.is_none(),
+            "IQ1_S should NOT have a static codebook"
+        );
 
         // Act
         let mut trace = Vec::new();
@@ -1643,12 +2078,19 @@ mod tests {
         assert!(final_slot.0 < trace.len() as u32);
 
         // IQ1_S: CodebookIndex with index_bits=1 → QuantExtractBits (1-bit)
-        let has_extract = trace.iter().any(|op| matches!(op, TraceOp::QuantExtractBits { bit_width: 1, .. }));
+        let has_extract = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantExtractBits { bit_width: 1, .. }));
         assert!(has_extract, "IQ1_S should extract 1-bit indices");
 
         // IQ1_S: No codebook → no QuantCodebookLookup
-        let has_codebook = trace.iter().any(|op| matches!(op, TraceOp::QuantCodebookLookup { .. }));
-        assert!(!has_codebook, "IQ1_S should NOT use QuantCodebookLookup (no codebook)");
+        let has_codebook = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantCodebookLookup { .. }));
+        assert!(
+            !has_codebook,
+            "IQ1_S should NOT use QuantCodebookLookup (no codebook)"
+        );
     }
 
     // @trace TEST-QD-07 [req:REQ-QCG] [level:unit]
@@ -1658,7 +2100,9 @@ mod tests {
     fn test_squeeze_trace() {
         // Arrange
         let r = registry();
-        let desc = r.get(&QuantType::Squeeze).expect("Squeeze must be registered");
+        let desc = r
+            .get(&QuantType::Squeeze)
+            .expect("Squeeze must be registered");
 
         // Act
         let mut trace = Vec::new();
@@ -1673,10 +2117,20 @@ mod tests {
         assert!(has_sub, "Squeeze should have Sub for static bias of 4");
 
         // Squeeze: PackedNibbles 两阶段 SPLIT — 不再 QuantConcatSeq, Lo phase 用 QuantAndMask(0x0F)
-        let has_concat = trace.iter().any(|op| matches!(op, TraceOp::QuantConcatSeq { .. }));
-        assert!(!has_concat, "Squeeze should NOT have QuantConcatSeq (two-phase SPLIT)");
-        let has_lo_mask = trace.iter().any(|op| matches!(op, TraceOp::QuantAndMask { mask, .. } if *mask == 0x0F));
-        assert!(has_lo_mask, "Squeeze Lo phase should have QuantAndMask(0x0F)");
+        let has_concat = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantConcatSeq { .. }));
+        assert!(
+            !has_concat,
+            "Squeeze should NOT have QuantConcatSeq (two-phase SPLIT)"
+        );
+        let has_lo_mask = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantAndMask { mask, .. } if *mask == 0x0F));
+        assert!(
+            has_lo_mask,
+            "Squeeze Lo phase should have QuantAndMask(0x0F)"
+        );
 
         // Squeeze: no post-scale add (only pre-scale sub)
         let has_add = trace.iter().any(|op| matches!(op, TraceOp::Add(_, _)));
@@ -1705,7 +2159,9 @@ mod tests {
         assert!(has_sub, "TQ1_0 should have Sub for static bias of 1");
 
         // TQ1_0: f16 scale → QuantLoadF16toF32
-        let has_f16 = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
+        let has_f16 = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
         assert!(has_f16, "TQ1_0 should load f16 scale");
     }
 
@@ -1727,19 +2183,34 @@ mod tests {
         assert!(final_slot.0 < trace.len() as u32);
 
         // BF16: ScaleLayout::None → Const(1.0) for scale
-        let has_const_one = trace.iter().any(|op| matches!(op, TraceOp::Const(v) if *v == 1.0_f64));
-        assert!(has_const_one, "BF16 should use Const(1.0) for identity scale");
+        let has_const_one = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::Const(v) if *v == 1.0_f64));
+        assert!(
+            has_const_one,
+            "BF16 should use Const(1.0) for identity scale"
+        );
 
         // BF16: no f16 scale load, no zero-point ops
-        let has_f16_load = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
-        assert!(!has_f16_load, "BF16 should NOT load f16 scales (ScaleLayout::None)");
+        let has_f16_load = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
+        assert!(
+            !has_f16_load,
+            "BF16 should NOT load f16 scales (ScaleLayout::None)"
+        );
 
         let has_sub = trace.iter().any(|op| matches!(op, TraceOp::Sub(_, _)));
         assert!(!has_sub, "BF16 should NOT have Sub (ZeroLayout::None)");
 
         // BF16: Bytes unsigned → QuantCastI8toF32 (unsigned bytes loaded)
-        let has_cast = trace.iter().any(|op| matches!(op, TraceOp::QuantCastI8toF32 { .. }));
-        assert!(has_cast, "BF16 should have QuantCastI8toF32 for byte→f32 conversion");
+        let has_cast = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantCastI8toF32 { .. }));
+        assert!(
+            has_cast,
+            "BF16 should have QuantCastI8toF32 for byte→f32 conversion"
+        );
     }
 
     // @trace TEST-QD-10 [req:REQ-QCG] [level:unit]
@@ -1752,25 +2223,35 @@ mod tests {
 
         // Assert: hierarchical formats need lane offset
         let q4k_desc = r.get(&QuantType::Q4K).expect("Q4K");
-        assert!(DecodeTraceBuilder::new(q4k_desc, 8).needs_lane_offset(),
-            "Q4K (Hierarchical scale) should need lane offset");
+        assert!(
+            DecodeTraceBuilder::new(q4k_desc, 8).needs_lane_offset(),
+            "Q4K (Hierarchical scale) should need lane offset"
+        );
 
         let q6k_desc = r.get(&QuantType::Q6K).expect("Q6K");
-        assert!(DecodeTraceBuilder::new(q6k_desc, 8).needs_lane_offset(),
-            "Q6K (Q6KScales) should need lane offset");
+        assert!(
+            DecodeTraceBuilder::new(q6k_desc, 8).needs_lane_offset(),
+            "Q6K (Q6KScales) should need lane offset"
+        );
 
         let nvfp4_desc = r.get(&QuantType::Nvfp4).expect("NVFP4");
-        assert!(DecodeTraceBuilder::new(nvfp4_desc, 8).needs_lane_offset(),
-            "NVFP4 (SubBlockScalars) should need lane offset");
+        assert!(
+            DecodeTraceBuilder::new(nvfp4_desc, 8).needs_lane_offset(),
+            "NVFP4 (SubBlockScalars) should need lane offset"
+        );
 
         // Assert: flat formats do NOT need lane offset
         let q4_0_desc = r.get(&QuantType::Q4_0).expect("Q4_0");
-        assert!(!DecodeTraceBuilder::new(q4_0_desc, 8).needs_lane_offset(),
-            "Q4_0 (BlockScalar scale) should NOT need lane offset");
+        assert!(
+            !DecodeTraceBuilder::new(q4_0_desc, 8).needs_lane_offset(),
+            "Q4_0 (BlockScalar scale) should NOT need lane offset"
+        );
 
         let bf16_desc = r.get(&QuantType::Bf16).expect("BF16");
-        assert!(!DecodeTraceBuilder::new(bf16_desc, 8).needs_lane_offset(),
-            "BF16 (None scale) should NOT need lane offset");
+        assert!(
+            !DecodeTraceBuilder::new(bf16_desc, 8).needs_lane_offset(),
+            "BF16 (None scale) should NOT need lane offset"
+        );
     }
 
     // @trace TEST-QD-11 [req:REQ-QCG] [level:unit]
@@ -1784,26 +2265,49 @@ mod tests {
         // Assert: NibbleWithHighBits formats need high bits pointer
         let q6k_desc = r.get(&QuantType::Q6K).expect("Q6K");
         let q6k_builder = DecodeTraceBuilder::new(q6k_desc, 8);
-        assert!(q6k_builder.needs_high_bits_ptr(), "Q6K should need high bits pointer");
+        assert!(
+            q6k_builder.needs_high_bits_ptr(),
+            "Q6K should need high bits pointer"
+        );
         // Q6_K: 2 bits/elem, 8 lanes → (8*2+7)/8 = 2 bytes stride
-        assert_eq!(q6k_builder.high_bits_stride(), 2, "Q6_K high bits stride should be 2 bytes");
+        assert_eq!(
+            q6k_builder.high_bits_stride(),
+            2,
+            "Q6_K high bits stride should be 2 bytes"
+        );
 
         let q5_0_desc = r.get(&QuantType::Q5_0).expect("Q5_0");
         let q5_0_builder = DecodeTraceBuilder::new(q5_0_desc, 8);
-        assert!(q5_0_builder.needs_high_bits_ptr(), "Q5_0 should need high bits pointer");
+        assert!(
+            q5_0_builder.needs_high_bits_ptr(),
+            "Q5_0 should need high bits pointer"
+        );
         // Q5_0: 1 bit/elem, 8 lanes → (8*1+7)/8 = 1 byte stride
-        assert_eq!(q5_0_builder.high_bits_stride(), 1, "Q5_0 high bits stride should be 1 byte");
+        assert_eq!(
+            q5_0_builder.high_bits_stride(),
+            1,
+            "Q5_0 high bits stride should be 1 byte"
+        );
 
         // Assert: PackedNibbles formats do NOT need high bits pointer
         let q4_0_desc = r.get(&QuantType::Q4_0).expect("Q4_0");
         let q4_0_builder = DecodeTraceBuilder::new(q4_0_desc, 8);
-        assert!(!q4_0_builder.needs_high_bits_ptr(), "Q4_0 should NOT need high bits pointer");
-        assert_eq!(q4_0_builder.high_bits_stride(), 0, "Q4_0 high bits stride should be 0");
+        assert!(
+            !q4_0_builder.needs_high_bits_ptr(),
+            "Q4_0 should NOT need high bits pointer"
+        );
+        assert_eq!(
+            q4_0_builder.high_bits_stride(),
+            0,
+            "Q4_0 high bits stride should be 0"
+        );
 
         // Assert: Bytes formats do NOT need high bits pointer
         let q8_0_desc = r.get(&QuantType::Q8_0).expect("Q8_0");
-        assert!(!DecodeTraceBuilder::new(q8_0_desc, 8).needs_high_bits_ptr(),
-            "Q8_0 should NOT need high bits pointer");
+        assert!(
+            !DecodeTraceBuilder::new(q8_0_desc, 8).needs_high_bits_ptr(),
+            "Q8_0 should NOT need high bits pointer"
+        );
     }
 
     // @trace TEST-QD-12 [req:REQ-QCG] [level:unit]
@@ -1822,11 +2326,13 @@ mod tests {
         assert!(slot_4.0 < trace_4.len() as u32);
 
         // Q4_0 with 4 lanes: 两阶段 SPLIT 每趟读 lanes=4 字节 (产 4 个同类型 nibble)
-        let has_4byte_load = trace_4.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantLoadBytesVec { count: 4, .. }
-        ));
-        assert!(has_4byte_load, "Q4_0 with 4 lanes should load 4 bytes (lanes, two-phase SPLIT)");
+        let has_4byte_load = trace_4
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantLoadBytesVec { count: 4, .. }));
+        assert!(
+            has_4byte_load,
+            "Q4_0 with 4 lanes should load 4 bytes (lanes, two-phase SPLIT)"
+        );
 
         // Act: 16 lanes (double the default)
         let mut trace_16 = Vec::new();
@@ -1835,11 +2341,13 @@ mod tests {
         assert!(slot_16.0 < trace_16.len() as u32);
 
         // Q4_0 with 16 lanes: 两阶段 SPLIT 每趟读 lanes=16 字节
-        let has_16byte_load = trace_16.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantLoadBytesVec { count: 16, .. }
-        ));
-        assert!(has_16byte_load, "Q4_0 with 16 lanes should load 16 bytes (lanes, two-phase SPLIT)");
+        let has_16byte_load = trace_16
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantLoadBytesVec { count: 16, .. }));
+        assert!(
+            has_16byte_load,
+            "Q4_0 with 16 lanes should load 16 bytes (lanes, two-phase SPLIT)"
+        );
 
         // Assert: trace size scales with lane count (more ops for broadcast etc.)
         assert!(
@@ -1856,11 +2364,17 @@ mod tests {
         // Arrange
         let r = registry();
         let desc = r.get(&QuantType::IQ4XS).expect("IQ4_XS must be registered");
-        assert!(desc.codebook.is_some(), "IQ4_XS should have a static codebook");
+        assert!(
+            desc.codebook.is_some(),
+            "IQ4_XS should have a static codebook"
+        );
         let builder = DecodeTraceBuilder::new(desc, 8);
 
         // Assert: IQ4_XS has hierarchical scale → needs lane offset
-        assert!(builder.needs_lane_offset(), "IQ4_XS should need lane offset for hierarchical scale");
+        assert!(
+            builder.needs_lane_offset(),
+            "IQ4_XS should need lane offset for hierarchical scale"
+        );
 
         // Act
         let mut trace = Vec::new();
@@ -1871,18 +2385,35 @@ mod tests {
         assert!(final_slot.0 < trace.len() as u32);
 
         // IQ4_XS: Hierarchical scale → QuantIntDivConst for sub_block_idx
-        let has_div = trace.iter().any(|op| matches!(op, TraceOp::QuantIntDivConst { .. }));
-        assert!(has_div, "IQ4_XS should have QuantIntDivConst for hierarchical scale");
+        let has_div = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantIntDivConst { .. }));
+        assert!(
+            has_div,
+            "IQ4_XS should have QuantIntDivConst for hierarchical scale"
+        );
 
         // IQ4_XS: Hierarchical scale → QuantKQuantPackedScaleLookup
-        let has_packed = trace.iter().any(|op| matches!(op, TraceOp::QuantKQuantPackedScaleLookup { .. }));
-        assert!(has_packed, "IQ4_XS should have QuantKQuantPackedScaleLookup");
+        let has_packed = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantKQuantPackedScaleLookup { .. }));
+        assert!(
+            has_packed,
+            "IQ4_XS should have QuantKQuantPackedScaleLookup"
+        );
 
         // IQ4_XS: CodebookIndex + codebook → QuantExtractBits + QuantCodebookLookup
-        let has_extract = trace.iter().any(|op| matches!(op, TraceOp::QuantExtractBits { .. }));
-        assert!(has_extract, "IQ4_XS should have QuantExtractBits for index extraction");
+        let has_extract = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantExtractBits { .. }));
+        assert!(
+            has_extract,
+            "IQ4_XS should have QuantExtractBits for index extraction"
+        );
 
-        let has_codebook = trace.iter().any(|op| matches!(op, TraceOp::QuantCodebookLookup { .. }));
+        let has_codebook = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantCodebookLookup { .. }));
         assert!(has_codebook, "IQ4_XS should use QuantCodebookLookup");
     }
 
@@ -1893,7 +2424,10 @@ mod tests {
         let r = registry();
         let desc = r.get(&QuantType::Q4_0).expect("Q4_0");
         let builder = DecodeTraceBuilder::new(desc, 8);
-        assert!(!builder.needs_lane_offset(), "Q4_0 should not need lane offset");
+        assert!(
+            !builder.needs_lane_offset(),
+            "Q4_0 should not need lane offset"
+        );
     }
 
     #[test]
@@ -1901,7 +2435,10 @@ mod tests {
         let r = registry();
         let desc = r.get(&QuantType::Q4_0).expect("Q4_0");
         let builder = DecodeTraceBuilder::new(desc, 8);
-        assert!(!builder.needs_high_bits_ptr(), "Q4_0 should not need high bits ptr");
+        assert!(
+            !builder.needs_high_bits_ptr(),
+            "Q4_0 should not need high bits ptr"
+        );
     }
 
     #[test]
@@ -1909,7 +2446,10 @@ mod tests {
         let r = registry();
         let desc = r.get(&QuantType::Q6K).expect("Q6_K");
         let builder = DecodeTraceBuilder::new(desc, 8);
-        assert!(builder.needs_lane_offset(), "Q6_K should need lane offset for Q6KScales");
+        assert!(
+            builder.needs_lane_offset(),
+            "Q6_K should need lane offset for Q6KScales"
+        );
     }
 
     #[test]
@@ -1917,7 +2457,10 @@ mod tests {
         let r = registry();
         let desc = r.get(&QuantType::Q5_0).expect("Q5_0");
         let builder = DecodeTraceBuilder::new(desc, 8);
-        assert!(builder.needs_high_bits_ptr(), "Q5_0 should need high bits ptr");
+        assert!(
+            builder.needs_high_bits_ptr(),
+            "Q5_0 should need high bits ptr"
+        );
     }
 
     #[test]
@@ -1925,7 +2468,10 @@ mod tests {
         let r = registry();
         let desc = r.get(&QuantType::Q5_1).expect("Q5_1");
         let builder = DecodeTraceBuilder::new(desc, 8);
-        assert!(builder.needs_high_bits_ptr(), "Q5_1 should need high bits ptr");
+        assert!(
+            builder.needs_high_bits_ptr(),
+            "Q5_1 should need high bits ptr"
+        );
     }
 
     #[test]
@@ -1934,7 +2480,10 @@ mod tests {
         let desc = r.get(&QuantType::Q5_0).expect("Q5_0");
         let builder = DecodeTraceBuilder::new(desc, 8);
         let stride = builder.high_bits_stride();
-        assert!(stride > 0, "Q5_0 high_bits_stride should be > 0, got {stride}");
+        assert!(
+            stride > 0,
+            "Q5_0 high_bits_stride should be > 0, got {stride}"
+        );
     }
 
     #[test]
@@ -1943,7 +2492,10 @@ mod tests {
         let desc = r.get(&QuantType::Q6K).expect("Q6_K");
         let builder = DecodeTraceBuilder::new(desc, 8);
         let stride = builder.high_bits_stride();
-        assert!(stride > 0, "Q6_K high_bits_stride should be > 0, got {stride}");
+        assert!(
+            stride > 0,
+            "Q6_K high_bits_stride should be > 0, got {stride}"
+        );
     }
 
     #[test]
@@ -1951,7 +2503,11 @@ mod tests {
         let r = registry();
         let desc = r.get(&QuantType::Q4_0).expect("Q4_0");
         let builder = DecodeTraceBuilder::new(desc, 8);
-        assert_eq!(builder.high_bits_stride(), 0, "Q4_0 should have zero high_bits_stride");
+        assert_eq!(
+            builder.high_bits_stride(),
+            0,
+            "Q4_0 should have zero high_bits_stride"
+        );
     }
 
     #[test]
@@ -1961,7 +2517,9 @@ mod tests {
         let mut trace = Vec::new();
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
         assert_trace_valid(&trace);
-        let has_packed = trace.iter().any(|op| matches!(op, TraceOp::QuantKQuantPackedScaleLookup { .. }));
+        let has_packed = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantKQuantPackedScaleLookup { .. }));
         assert!(has_packed, "Q4_K should have QuantKQuantPackedScaleLookup");
     }
 
@@ -1983,7 +2541,9 @@ mod tests {
         let slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
         assert_trace_valid(&trace);
         assert!(slot.0 < trace.len() as u32);
-        let has_e2m1 = trace.iter().any(|op| matches!(op, TraceOp::QuantE2m1LutDecode { .. }));
+        let has_e2m1 = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantE2m1LutDecode { .. }));
         assert!(has_e2m1, "MXFP4 should have QuantE2m1LutDecode");
     }
 
@@ -1995,18 +2555,29 @@ mod tests {
         let slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
         assert_trace_valid(&trace);
         assert!(slot.0 < trace.len() as u32);
-        let has_e2m1 = trace.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantE2m1LutDecode { nvfp4_mode: true, .. }
-        ));
-        assert!(has_e2m1, "NVFP4 should have QuantE2m1LutDecode with nvfp4_mode=true");
+        let has_e2m1 = trace.iter().any(|op| {
+            matches!(
+                op,
+                TraceOp::QuantE2m1LutDecode {
+                    nvfp4_mode: true,
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_e2m1,
+            "NVFP4 should have QuantE2m1LutDecode with nvfp4_mode=true"
+        );
     }
 
     #[test]
     fn bf16_trace_valid() {
         let r = registry();
         let desc = r.get(&QuantType::Bf16).expect("Bf16");
-        assert!(!builder_needs_lane_offset(desc), "BF16 should not need lane offset");
+        assert!(
+            !builder_needs_lane_offset(desc),
+            "BF16 should not need lane offset"
+        );
         let mut trace = Vec::new();
         let slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
         assert_trace_valid(&trace);
@@ -2037,18 +2608,27 @@ mod tests {
         assert!(final_slot.0 < trace.len() as u32);
 
         // FP16: ScaleLayout::None → Const(1.0) for identity scale
-        let has_const_one = trace.iter().any(|op| matches!(op, TraceOp::Const(v) if *v == 1.0_f64));
-        assert!(has_const_one, "FP16 should use Const(1.0) for identity scale");
+        let has_const_one = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::Const(v) if *v == 1.0_f64));
+        assert!(
+            has_const_one,
+            "FP16 should use Const(1.0) for identity scale"
+        );
 
         // FP16: no f16 scale load (ScaleLayout::None means no QuantLoadF16toF32)
-        let has_f16_load = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
-        assert!(!has_f16_load, "FP16 should NOT load f16 scales (ScaleLayout::None)");
+        let has_f16_load = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
+        assert!(
+            !has_f16_load,
+            "FP16 should NOT load f16 scales (ScaleLayout::None)"
+        );
 
         // FP16: Bytes unsigned → QuantLoadBytesVec(signed=false)
-        let has_unsigned_bytes = trace.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantLoadBytesVec { signed: false, .. }
-        ));
+        let has_unsigned_bytes = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantLoadBytesVec { signed: false, .. }));
         assert!(has_unsigned_bytes, "FP16 should load unsigned bytes");
     }
 
@@ -2070,18 +2650,30 @@ mod tests {
         assert!(final_slot.0 < trace.len() as u32);
 
         // F32: ScaleLayout::None → no scale loads at all
-        let has_f16_load = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
-        let has_scalar_load = trace.iter().any(|op| matches!(op, TraceOp::QuantScalarLoad { .. }));
+        let has_f16_load = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
+        let has_scalar_load = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantScalarLoad { .. }));
         assert!(!has_f16_load, "F32 should NOT have QuantLoadF16toF32");
-        assert!(!has_scalar_load, "F32 should NOT have QuantScalarLoad (ScaleLayout::None)");
+        assert!(
+            !has_scalar_load,
+            "F32 should NOT have QuantScalarLoad (ScaleLayout::None)"
+        );
 
         // F32: ZeroLayout::None → no Sub for bias
         let has_sub = trace.iter().any(|op| matches!(op, TraceOp::Sub(_, _)));
         assert!(!has_sub, "F32 should NOT have Sub (ZeroLayout::None)");
 
         // F32: still has FMA with Const(1.0) as scale
-        let has_fma = trace.iter().any(|op| matches!(op, TraceOp::QuantDequantFma { .. }));
-        assert!(has_fma, "F32 should have QuantDequantFma with Const(1.0) × data");
+        let has_fma = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantDequantFma { .. }));
+        assert!(
+            has_fma,
+            "F32 should have QuantDequantFma with Const(1.0) × data"
+        );
     }
 
     // @trace TEST-QD-16 [req:REQ-QCG] [level:unit]
@@ -2106,18 +2698,30 @@ mod tests {
         assert!(has_sub, "TQ2_0 should have Sub for StaticBias(1)");
 
         // TQ2_0: f16 scale load
-        let has_f16 = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
+        let has_f16 = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
         assert!(has_f16, "TQ2_0 should load f16 scale");
 
         // TQ2_0: PackedNibbles 两阶段 SPLIT — 不再 QuantConcatSeq, Lo phase 用 QuantAndMask(0x0F)
-        let has_concat = trace.iter().any(|op| matches!(op, TraceOp::QuantConcatSeq { .. }));
-        assert!(!has_concat, "TQ2_0 should NOT have QuantConcatSeq (two-phase SPLIT)");
-        let has_lo_mask = trace.iter().any(|op| matches!(op, TraceOp::QuantAndMask { mask, .. } if *mask == 0x0F));
+        let has_concat = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantConcatSeq { .. }));
+        assert!(
+            !has_concat,
+            "TQ2_0 should NOT have QuantConcatSeq (two-phase SPLIT)"
+        );
+        let has_lo_mask = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantAndMask { mask, .. } if *mask == 0x0F));
         assert!(has_lo_mask, "TQ2_0 Lo phase should have QuantAndMask(0x0F)");
 
         // TQ2_0: no high bits pointer needed
         let builder = DecodeTraceBuilder::new(desc, 8);
-        assert!(!builder.needs_high_bits_ptr(), "TQ2_0 should NOT need high bits ptr");
+        assert!(
+            !builder.needs_high_bits_ptr(),
+            "TQ2_0 should NOT need high bits ptr"
+        );
     }
 
     // @trace TEST-QD-17 [req:REQ-QCG] [level:unit]
@@ -2127,8 +2731,13 @@ mod tests {
     fn test_iq2xxs_trace() {
         // Arrange
         let r = registry();
-        let desc = r.get(&QuantType::IQ2XXS).expect("IQ2_XXS must be registered");
-        assert!(desc.codebook.is_none(), "IQ2_XXS should NOT have a static codebook");
+        let desc = r
+            .get(&QuantType::IQ2XXS)
+            .expect("IQ2_XXS must be registered");
+        assert!(
+            desc.codebook.is_none(),
+            "IQ2_XXS should NOT have a static codebook"
+        );
 
         // Act
         let mut trace = Vec::new();
@@ -2139,18 +2748,24 @@ mod tests {
         assert!(final_slot.0 < trace.len() as u32);
 
         // IQ2_XXS: CodebookIndex with index_bits=2 → QuantExtractBits (2-bit)
-        let has_extract = trace.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantExtractBits { bit_width: 2, .. }
-        ));
+        let has_extract = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantExtractBits { bit_width: 2, .. }));
         assert!(has_extract, "IQ2_XXS should extract 2-bit indices");
 
         // IQ2_XXS: No codebook → no QuantCodebookLookup
-        let has_codebook = trace.iter().any(|op| matches!(op, TraceOp::QuantCodebookLookup { .. }));
-        assert!(!has_codebook, "IQ2_XXS should NOT use QuantCodebookLookup (no codebook)");
+        let has_codebook = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantCodebookLookup { .. }));
+        assert!(
+            !has_codebook,
+            "IQ2_XXS should NOT use QuantCodebookLookup (no codebook)"
+        );
 
         // IQ2_XXS: f16 BlockScalar scale
-        let has_f16 = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
+        let has_f16 = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
         assert!(has_f16, "IQ2_XXS should load f16 scale");
     }
 
@@ -2161,8 +2776,13 @@ mod tests {
     fn test_iq3xxs_trace() {
         // Arrange
         let r = registry();
-        let desc = r.get(&QuantType::IQ3XXS).expect("IQ3_XXS must be registered");
-        assert!(desc.codebook.is_none(), "IQ3_XXS should NOT have a static codebook");
+        let desc = r
+            .get(&QuantType::IQ3XXS)
+            .expect("IQ3_XXS must be registered");
+        assert!(
+            desc.codebook.is_none(),
+            "IQ3_XXS should NOT have a static codebook"
+        );
 
         // Act
         let mut trace = Vec::new();
@@ -2173,19 +2793,26 @@ mod tests {
         assert!(final_slot.0 < trace.len() as u32);
 
         // IQ3_XXS: CodebookIndex with index_bits=3 → QuantExtractBits (3-bit)
-        let has_extract = trace.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantExtractBits { bit_width: 3, .. }
-        ));
+        let has_extract = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantExtractBits { bit_width: 3, .. }));
         assert!(has_extract, "IQ3_XXS should extract 3-bit indices");
 
         // IQ3_XXS: No codebook → no QuantCodebookLookup
-        let has_codebook = trace.iter().any(|op| matches!(op, TraceOp::QuantCodebookLookup { .. }));
-        assert!(!has_codebook, "IQ3_XXS should NOT use QuantCodebookLookup (no codebook)");
+        let has_codebook = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantCodebookLookup { .. }));
+        assert!(
+            !has_codebook,
+            "IQ3_XXS should NOT use QuantCodebookLookup (no codebook)"
+        );
 
         // IQ3_XXS: no lane offset needed (BlockScalar scale)
         let builder = DecodeTraceBuilder::new(desc, 8);
-        assert!(!builder.needs_lane_offset(), "IQ3_XXS should NOT need lane offset");
+        assert!(
+            !builder.needs_lane_offset(),
+            "IQ3_XXS should NOT need lane offset"
+        );
     }
 
     // @trace TEST-QD-19 [req:REQ-QCG] [level:unit]
@@ -2196,7 +2823,10 @@ mod tests {
         // Arrange
         let r = registry();
         let desc = r.get(&QuantType::IQ1M).expect("IQ1_M must be registered");
-        assert!(desc.codebook.is_none(), "IQ1_M should NOT have a static codebook");
+        assert!(
+            desc.codebook.is_none(),
+            "IQ1_M should NOT have a static codebook"
+        );
 
         // Act
         let mut trace = Vec::new();
@@ -2207,19 +2837,28 @@ mod tests {
         assert!(final_slot.0 < trace.len() as u32);
 
         // IQ1_M: CodebookIndex with index_bits=1 → QuantExtractBits (1-bit)
-        let has_extract = trace.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantExtractBits { bit_width: 1, .. }
-        ));
+        let has_extract = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantExtractBits { bit_width: 1, .. }));
         assert!(has_extract, "IQ1_M should extract 1-bit indices");
 
         // IQ1_M: No codebook → no QuantCodebookLookup
-        let has_codebook = trace.iter().any(|op| matches!(op, TraceOp::QuantCodebookLookup { .. }));
-        assert!(!has_codebook, "IQ1_M should NOT use QuantCodebookLookup (no codebook)");
+        let has_codebook = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantCodebookLookup { .. }));
+        assert!(
+            !has_codebook,
+            "IQ1_M should NOT use QuantCodebookLookup (no codebook)"
+        );
 
         // IQ1_M: U8Range scale → QuantScalarLoad (not F16 load)
-        let has_f16 = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
-        assert!(!has_f16, "IQ1_M should NOT use QuantLoadF16toF32 (U8Range scale)");
+        let has_f16 = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
+        assert!(
+            !has_f16,
+            "IQ1_M should NOT use QuantLoadF16toF32 (U8Range scale)"
+        );
     }
 
     // @trace TEST-QD-20 [req:REQ-QCG] [level:unit]
@@ -2240,26 +2879,39 @@ mod tests {
         assert!(final_slot.0 < trace.len() as u32);
 
         // Q8_1: BlockScalarWithMin → loads d via QuantLoadF16toF32
-        let has_f16_load = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
-        assert!(has_f16_load, "Q8_1 should load f16 scale via QuantLoadF16toF32");
+        let has_f16_load = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
+        assert!(
+            has_f16_load,
+            "Q8_1 should load f16 scale via QuantLoadF16toF32"
+        );
 
         // Q8_1: Bytes signed → QuantLoadBytesVec(signed=true)
-        let has_signed_bytes = trace.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantLoadBytesVec { signed: true, .. }
-        ));
+        let has_signed_bytes = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantLoadBytesVec { signed: true, .. }));
         assert!(has_signed_bytes, "Q8_1 should load signed bytes");
 
         // Q8_1: BlockMin zero layout → Add for min addition (value = d*quantized + m)
         let has_add = trace.iter().any(|op| matches!(op, TraceOp::Add(_, _)));
-        assert!(has_add, "Q8_1 should have Add for BlockMin post-scale addition");
+        assert!(
+            has_add,
+            "Q8_1 should have Add for BlockMin post-scale addition"
+        );
         // Q8_1: no pre-scale subtraction (no AWQ/GPTQ style zero-point)
         let has_sub = trace.iter().any(|op| matches!(op, TraceOp::Sub(_, _)));
-        assert!(!has_sub, "Q8_1 should NOT have Sub (no PreScaleSubtract zero-point)");
+        assert!(
+            !has_sub,
+            "Q8_1 should NOT have Sub (no PreScaleSubtract zero-point)"
+        );
 
         // Q8_1: no high bits pointer needed
         let builder = DecodeTraceBuilder::new(desc, 8);
-        assert!(!builder.needs_high_bits_ptr(), "Q8_1 should NOT need high bits ptr");
+        assert!(
+            !builder.needs_high_bits_ptr(),
+            "Q8_1 should NOT need high bits ptr"
+        );
     }
 
     // @trace TEST-QD-21 [req:REQ-QCG] [level:unit]
@@ -2273,24 +2925,36 @@ mod tests {
         // Assert: E2M1 formats return true
         let mxfp4 = r.get(&QuantType::Mxfp4 { block_size: 32 }).expect("MXFP4");
         let mxfp4_builder = DecodeTraceBuilder::new(mxfp4, 8);
-        assert!(mxfp4_builder.is_e2m1_format(), "MXFP4 should be E2M1 format");
+        assert!(
+            mxfp4_builder.is_e2m1_format(),
+            "MXFP4 should be E2M1 format"
+        );
 
         let nvfp4 = r.get(&QuantType::Nvfp4).expect("NVFP4");
         let nvfp4_builder = DecodeTraceBuilder::new(nvfp4, 8);
-        assert!(nvfp4_builder.is_e2m1_format(), "NVFP4 should be E2M1 format");
+        assert!(
+            nvfp4_builder.is_e2m1_format(),
+            "NVFP4 should be E2M1 format"
+        );
 
         // Assert: non-E2M1 formats return false
         let q4_0 = r.get(&QuantType::Q4_0).expect("Q4_0");
-        assert!(!DecodeTraceBuilder::new(q4_0, 8).is_e2m1_format(),
-            "Q4_0 should NOT be E2M1 format");
+        assert!(
+            !DecodeTraceBuilder::new(q4_0, 8).is_e2m1_format(),
+            "Q4_0 should NOT be E2M1 format"
+        );
 
         let q8_0 = r.get(&QuantType::Q8_0).expect("Q8_0");
-        assert!(!DecodeTraceBuilder::new(q8_0, 8).is_e2m1_format(),
-            "Q8_0 should NOT be E2M1 format");
+        assert!(
+            !DecodeTraceBuilder::new(q8_0, 8).is_e2m1_format(),
+            "Q8_0 should NOT be E2M1 format"
+        );
 
         let fp8 = r.get(&QuantType::Fp8E4M3).expect("FP8_E4M3");
-        assert!(!DecodeTraceBuilder::new(fp8, 8).is_e2m1_format(),
-            "FP8_E4M3 should NOT be E2M1 format");
+        assert!(
+            !DecodeTraceBuilder::new(fp8, 8).is_e2m1_format(),
+            "FP8_E4M3 should NOT be E2M1 format"
+        );
     }
 
     // @trace TEST-QD-22 [req:REQ-QCG] [level:unit]
@@ -2321,7 +2985,11 @@ mod tests {
             let mut trace = Vec::new();
             let slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
             assert_trace_valid(&trace);
-            assert!(slot.0 < trace.len() as u32, "{:?} trace slot out of range", qt);
+            assert!(
+                slot.0 < trace.len() as u32,
+                "{:?} trace slot out of range",
+                qt
+            );
         }
     }
 
@@ -2342,15 +3010,20 @@ mod tests {
         let slot = builder_16.build(&mut trace);
         assert_trace_valid(&trace);
         assert!(slot.0 < trace.len() as u32);
-        let has_q6k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
+        let has_q6k_decode = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
         assert!(has_q6k_decode, "Q6_K 16 lanes should emit QuantQ6KDecode");
 
         // Act & Assert: Q5_0 with 16 lanes (Q5_0 仍用 NibbleWithHighBits, high bit plane)
         // Q5_0: 1 bit/elem, 16 lanes → (16*1+7)/8 = 2 bytes
         let q5_0 = r.get(&QuantType::Q5_0).expect("Q5_0");
         let q5_0_builder_16 = DecodeTraceBuilder::new(q5_0, 16);
-        assert_eq!(q5_0_builder_16.high_bits_stride(), 2,
-            "Q5_0 with 16 lanes should have 2-byte high bits stride");
+        assert_eq!(
+            q5_0_builder_16.high_bits_stride(),
+            2,
+            "Q5_0 with 16 lanes should have 2-byte high bits stride"
+        );
     }
 
     // ── Wave 12kka: +10 additional tests ──
@@ -2363,7 +3036,10 @@ mod tests {
         // Arrange
         let r = registry();
         let desc = r.get(&QuantType::IQ2XS).expect("IQ2_XS must be registered");
-        assert!(desc.codebook.is_none(), "IQ2_XS should NOT have a static codebook");
+        assert!(
+            desc.codebook.is_none(),
+            "IQ2_XS should NOT have a static codebook"
+        );
 
         // Act
         let mut trace = Vec::new();
@@ -2374,18 +3050,24 @@ mod tests {
         assert!(final_slot.0 < trace.len() as u32);
 
         // IQ2_XS: CodebookIndex with index_bits=2 → QuantExtractBits (2-bit)
-        let has_extract = trace.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantExtractBits { bit_width: 2, .. }
-        ));
+        let has_extract = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantExtractBits { bit_width: 2, .. }));
         assert!(has_extract, "IQ2_XS should extract 2-bit indices");
 
         // IQ2_XS: No codebook → no QuantCodebookLookup
-        let has_codebook = trace.iter().any(|op| matches!(op, TraceOp::QuantCodebookLookup { .. }));
-        assert!(!has_codebook, "IQ2_XS should NOT use QuantCodebookLookup (no codebook)");
+        let has_codebook = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantCodebookLookup { .. }));
+        assert!(
+            !has_codebook,
+            "IQ2_XS should NOT use QuantCodebookLookup (no codebook)"
+        );
 
         // IQ2_XS: f16 BlockScalar scale
-        let has_f16 = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
+        let has_f16 = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
         assert!(has_f16, "IQ2_XS should load f16 scale");
     }
 
@@ -2397,7 +3079,10 @@ mod tests {
         // Arrange
         let r = registry();
         let desc = r.get(&QuantType::IQ2S).expect("IQ2_S must be registered");
-        assert!(desc.codebook.is_none(), "IQ2_S should NOT have a static codebook");
+        assert!(
+            desc.codebook.is_none(),
+            "IQ2_S should NOT have a static codebook"
+        );
 
         // Act
         let mut trace = Vec::new();
@@ -2408,15 +3093,19 @@ mod tests {
         assert!(final_slot.0 < trace.len() as u32);
 
         // IQ2_S: CodebookIndex with index_bits=2 → QuantExtractBits (2-bit)
-        let has_extract = trace.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantExtractBits { bit_width: 2, .. }
-        ));
+        let has_extract = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantExtractBits { bit_width: 2, .. }));
         assert!(has_extract, "IQ2_S should extract 2-bit indices");
 
         // IQ2_S: No codebook → no QuantCodebookLookup
-        let has_codebook = trace.iter().any(|op| matches!(op, TraceOp::QuantCodebookLookup { .. }));
-        assert!(!has_codebook, "IQ2_S should NOT use QuantCodebookLookup (no codebook)");
+        let has_codebook = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantCodebookLookup { .. }));
+        assert!(
+            !has_codebook,
+            "IQ2_S should NOT use QuantCodebookLookup (no codebook)"
+        );
 
         // IQ2_S: ZeroLayout::None → no Sub for bias
         let has_sub = trace.iter().any(|op| matches!(op, TraceOp::Sub(_, _)));
@@ -2431,7 +3120,10 @@ mod tests {
         // Arrange
         let r = registry();
         let desc = r.get(&QuantType::IQ3S).expect("IQ3_S must be registered");
-        assert!(desc.codebook.is_none(), "IQ3_S should NOT have a static codebook");
+        assert!(
+            desc.codebook.is_none(),
+            "IQ3_S should NOT have a static codebook"
+        );
 
         // Act
         let mut trace = Vec::new();
@@ -2442,15 +3134,19 @@ mod tests {
         assert!(final_slot.0 < trace.len() as u32);
 
         // IQ3_S: CodebookIndex with index_bits=3 → QuantExtractBits (3-bit)
-        let has_extract = trace.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantExtractBits { bit_width: 3, .. }
-        ));
+        let has_extract = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantExtractBits { bit_width: 3, .. }));
         assert!(has_extract, "IQ3_S should extract 3-bit indices");
 
         // IQ3_S: U8Range scale → no QuantLoadF16toF32
-        let has_f16 = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
-        assert!(!has_f16, "IQ3_S should NOT use QuantLoadF16toF32 (U8Range scale)");
+        let has_f16 = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
+        assert!(
+            !has_f16,
+            "IQ3_S should NOT use QuantLoadF16toF32 (U8Range scale)"
+        );
 
         // IQ3_S: ZeroLayout::None → no Sub for bias
         let has_sub = trace.iter().any(|op| matches!(op, TraceOp::Sub(_, _)));
@@ -2471,7 +3167,9 @@ mod tests {
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
         // Assert: Q4_0 has StaticBias(8) → Const(8.0) in trace
-        let has_bias_8 = trace.iter().any(|op| matches!(op, TraceOp::Const(v) if (*v - 8.0_f64).abs() < f64::EPSILON));
+        let has_bias_8 = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::Const(v) if (*v - 8.0_f64).abs() < f64::EPSILON));
         assert!(has_bias_8, "Q4_0 should have Const(8.0) for StaticBias(8)");
 
         // Assert: Sub must be present to subtract the bias
@@ -2494,8 +3192,13 @@ mod tests {
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
         // Assert: Q6_K 走整体式 QuantQ6KDecode (bias 在 native 内部处理, 非 trace Const/Sub)
-        let has_q6k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
-        assert!(has_q6k_decode, "Q6_K should emit QuantQ6KDecode (bias handled in native, not trace Const/Sub)");
+        let has_q6k_decode = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
+        assert!(
+            has_q6k_decode,
+            "Q6_K should emit QuantQ6KDecode (bias handled in native, not trace Const/Sub)"
+        );
     }
 
     // @trace TEST-QD-29 [req:REQ-QCG] [level:unit]
@@ -2514,13 +3217,19 @@ mod tests {
 
         // Assert: find positions of Sub and QuantDequantFma
         let sub_pos = trace.iter().position(|op| matches!(op, TraceOp::Sub(_, _)));
-        let fma_pos = trace.iter().position(|op| matches!(op, TraceOp::QuantDequantFma { .. }));
+        let fma_pos = trace
+            .iter()
+            .position(|op| matches!(op, TraceOp::QuantDequantFma { .. }));
         assert!(sub_pos.is_some(), "AWQ4 should have Sub for zero-point");
-        assert!(fma_pos.is_some(), "AWQ4 should have QuantDequantFma for scale");
+        assert!(
+            fma_pos.is_some(),
+            "AWQ4 should have QuantDequantFma for scale"
+        );
         assert!(
             sub_pos.unwrap() < fma_pos.unwrap(),
             "AWQ4 Sub (slot {}) must appear before QuantDequantFma (slot {})",
-            sub_pos.unwrap(), fma_pos.unwrap()
+            sub_pos.unwrap(),
+            fma_pos.unwrap()
         );
     }
 
@@ -2531,7 +3240,9 @@ mod tests {
     fn test_mxfp4_block_size_64() {
         // Arrange
         let r = registry();
-        let desc = r.get(&QuantType::Mxfp4 { block_size: 64 }).expect("MXFP4 block_size=64 must be registered");
+        let desc = r
+            .get(&QuantType::Mxfp4 { block_size: 64 })
+            .expect("MXFP4 block_size=64 must be registered");
 
         // Act
         let mut trace = Vec::new();
@@ -2542,15 +3253,28 @@ mod tests {
         assert!(final_slot.0 < trace.len() as u32);
 
         // MXFP4 block_size=64: still uses QuantE2m1LutDecode with nvfp4_mode=false
-        let has_e2m1 = trace.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantE2m1LutDecode { nvfp4_mode: false, .. }
-        ));
-        assert!(has_e2m1, "MXFP4 block_size=64 should emit QuantE2m1LutDecode with nvfp4_mode=false");
+        let has_e2m1 = trace.iter().any(|op| {
+            matches!(
+                op,
+                TraceOp::QuantE2m1LutDecode {
+                    nvfp4_mode: false,
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_e2m1,
+            "MXFP4 block_size=64 should emit QuantE2m1LutDecode with nvfp4_mode=false"
+        );
 
         // MXFP4 block_size=64: BlockScalar scale → loads raw scale byte via QuantScalarLoad
-        let has_scalar_load = trace.iter().any(|op| matches!(op, TraceOp::QuantScalarLoad { .. }));
-        assert!(has_scalar_load, "MXFP4 block_size=64 should have QuantScalarLoad for scale byte");
+        let has_scalar_load = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantScalarLoad { .. }));
+        assert!(
+            has_scalar_load,
+            "MXFP4 block_size=64 should have QuantScalarLoad for scale byte"
+        );
     }
 
     // @trace TEST-QD-31 [req:REQ-QCG] [level:unit]
@@ -2569,24 +3293,44 @@ mod tests {
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
         // Assert: Q4_1 has f16 scale load (d) and f16 min load (m) → 2 QuantLoadF16toF32
-        let f16_count = trace.iter()
+        let f16_count = trace
+            .iter()
             .filter(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }))
             .count();
-        assert!(f16_count >= 2, "Q4_1 should load 2 f16 values (d + m), got {}", f16_count);
+        assert!(
+            f16_count >= 2,
+            "Q4_1 should load 2 f16 values (d + m), got {}",
+            f16_count
+        );
 
         // Assert: Q4_1 两阶段 SPLIT — 不再 QuantConcatSeq, Lo phase 用 QuantAndMask(0x0F)
-        let has_concat = trace.iter().any(|op| matches!(op, TraceOp::QuantConcatSeq { .. }));
-        assert!(!has_concat, "Q4_1 should NOT have QuantConcatSeq (two-phase SPLIT)");
-        let has_lo_mask = trace.iter().any(|op| matches!(op, TraceOp::QuantAndMask { mask, .. } if *mask == 0x0F));
+        let has_concat = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantConcatSeq { .. }));
+        assert!(
+            !has_concat,
+            "Q4_1 should NOT have QuantConcatSeq (two-phase SPLIT)"
+        );
+        let has_lo_mask = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantAndMask { mask, .. } if *mask == 0x0F));
         assert!(has_lo_mask, "Q4_1 Lo phase should have QuantAndMask(0x0F)");
 
         // Assert: Q4_1 has QuantBroadcast for scale
-        let has_broadcast = trace.iter().any(|op| matches!(op, TraceOp::QuantBroadcast { .. }));
-        assert!(has_broadcast, "Q4_1 should have QuantBroadcast for scale vector");
+        let has_broadcast = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantBroadcast { .. }));
+        assert!(
+            has_broadcast,
+            "Q4_1 should have QuantBroadcast for scale vector"
+        );
 
         // Assert: Q4_1 has Add for BlockMin post-scale addition (value = d*quantized + m)
         let has_add = trace.iter().any(|op| matches!(op, TraceOp::Add(_, _)));
-        assert!(has_add, "Q4_1 should have Add for BlockMin post-scale addition");
+        assert!(
+            has_add,
+            "Q4_1 should have Add for BlockMin post-scale addition"
+        );
     }
 
     // @trace TEST-QD-32 [req:REQ-QCG] [level:unit]
@@ -2596,31 +3340,53 @@ mod tests {
     fn test_squeeze_unpack_mask_and_shift() {
         // Arrange
         let r = registry();
-        let desc = r.get(&QuantType::Squeeze).expect("Squeeze must be registered");
+        let desc = r
+            .get(&QuantType::Squeeze)
+            .expect("Squeeze must be registered");
 
         // Act
         let mut trace = Vec::new();
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
         // Assert: PackedNibbles 两阶段 SPLIT — Lo phase (默认) 用 QuantAndMask 提 lo nibble
-        let has_mask = trace.iter().any(|op| matches!(op, TraceOp::QuantAndMask { .. }));
-        assert!(has_mask, "Squeeze Lo phase should have QuantAndMask for nibble masking");
+        let has_mask = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantAndMask { .. }));
+        assert!(
+            has_mask,
+            "Squeeze Lo phase should have QuantAndMask for nibble masking"
+        );
 
         // Assert: 两阶段 SPLIT — Lo phase 不再 emit QuantShiftRight (hi 在独立 Hi phase)
-        let has_shift = trace.iter().any(|op| matches!(op, TraceOp::QuantShiftRight { .. }));
-        assert!(!has_shift, "Squeeze Lo phase should NOT have QuantShiftRight (hi in separate Hi phase)");
+        let has_shift = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantShiftRight { .. }));
+        assert!(
+            !has_shift,
+            "Squeeze Lo phase should NOT have QuantShiftRight (hi in separate Hi phase)"
+        );
 
         // Assert: 两阶段 SPLIT — 不再 QuantConcatSeq
-        let has_concat = trace.iter().any(|op| matches!(op, TraceOp::QuantConcatSeq { .. }));
-        assert!(!has_concat, "Squeeze should NOT have QuantConcatSeq (two-phase SPLIT)");
+        let has_concat = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantConcatSeq { .. }));
+        assert!(
+            !has_concat,
+            "Squeeze should NOT have QuantConcatSeq (two-phase SPLIT)"
+        );
 
         // Assert: Hi phase 有 QuantShiftRight (提 hi nibble)
         let mut hi_trace = Vec::new();
         DecodeTraceBuilder::new(desc, 8)
             .with_nibble_phase(NibblePhase::Hi)
             .build(&mut hi_trace);
-        let hi_has_shift = hi_trace.iter().any(|op| matches!(op, TraceOp::QuantShiftRight { .. }));
-        assert!(hi_has_shift, "Squeeze Hi phase should have QuantShiftRight for high nibble");
+        let hi_has_shift = hi_trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantShiftRight { .. }));
+        assert!(
+            hi_has_shift,
+            "Squeeze Hi phase should have QuantShiftRight for high nibble"
+        );
     }
 
     // @trace TEST-QD-33 [req:REQ-QCG] [level:unit]
@@ -2634,8 +3400,12 @@ mod tests {
 
         // Act & Assert: for a representative set of formats, verify broadcast lane count
         for qt in &[
-            QuantType::Q4_0, QuantType::Q4_1, QuantType::Q8_0,
-            QuantType::AWQ4, QuantType::GPTQ4, QuantType::Squeeze,
+            QuantType::Q4_0,
+            QuantType::Q4_1,
+            QuantType::Q8_0,
+            QuantType::AWQ4,
+            QuantType::GPTQ4,
+            QuantType::Squeeze,
         ] {
             let desc = match r.get(qt) {
                 Some(d) => d,
@@ -2672,13 +3442,19 @@ mod tests {
 
         // Assert
         let sub_pos = trace.iter().position(|op| matches!(op, TraceOp::Sub(_, _)));
-        let fma_pos = trace.iter().position(|op| matches!(op, TraceOp::QuantDequantFma { .. }));
+        let fma_pos = trace
+            .iter()
+            .position(|op| matches!(op, TraceOp::QuantDequantFma { .. }));
         assert!(sub_pos.is_some(), "GPTQ4 should have Sub for zero-point");
-        assert!(fma_pos.is_some(), "GPTQ4 should have QuantDequantFma for scale");
+        assert!(
+            fma_pos.is_some(),
+            "GPTQ4 should have QuantDequantFma for scale"
+        );
         assert!(
             sub_pos.unwrap() < fma_pos.unwrap(),
             "GPTQ4 Sub (slot {}) must appear before QuantDequantFma (slot {})",
-            sub_pos.unwrap(), fma_pos.unwrap()
+            sub_pos.unwrap(),
+            fma_pos.unwrap()
         );
     }
 
@@ -2695,8 +3471,13 @@ mod tests {
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
         // Verify the monolithic decode op is present
-        let has_q3k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ3KDecode { .. }));
-        assert!(has_q3k_decode, "Q3_K should emit QuantQ3KDecode monolithic TraceOp");
+        let has_q3k_decode = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantQ3KDecode { .. }));
+        assert!(
+            has_q3k_decode,
+            "Q3_K should emit QuantQ3KDecode monolithic TraceOp"
+        );
     }
 
     // @trace TEST-QD-36 [req:REQ-QCG] [level:unit]
@@ -2713,8 +3494,13 @@ mod tests {
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
         // Assert: Q5_0 走整体式 QuantQ5Decode (非旧 QuantShiftLeft/QuantBitOr)
-        let has_q5_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ5Decode { .. }));
-        assert!(has_q5_decode, "Q5_0 should emit QuantQ5Decode (replaces QuantShiftLeft(7)/QuantBitOr)");
+        let has_q5_decode = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantQ5Decode { .. }));
+        assert!(
+            has_q5_decode,
+            "Q5_0 should emit QuantQ5Decode (replaces QuantShiftLeft(7)/QuantBitOr)"
+        );
     }
 
     // @trace TEST-QD-37 [req:REQ-QCG] [level:unit]
@@ -2724,21 +3510,33 @@ mod tests {
     fn test_fp8_e5m2_no_i8_cast() {
         // Arrange
         let r = registry();
-        let desc = r.get(&QuantType::Fp8E5M2).expect("Fp8E5M2 must be registered");
+        let desc = r
+            .get(&QuantType::Fp8E5M2)
+            .expect("Fp8E5M2 must be registered");
 
         // Act
         let mut trace = Vec::new();
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
         // Assert: E5M2 uses QuantCastFp8toF32 with is_e4m3=false
-        let has_fp8_e5m2 = trace.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantCastFp8toF32 { format: Fp8Format::E5M2, .. }
-        ));
-        assert!(has_fp8_e5m2, "FP8 E5M2 should use QuantCastFp8toF32 with is_e4m3=false");
+        let has_fp8_e5m2 = trace.iter().any(|op| {
+            matches!(
+                op,
+                TraceOp::QuantCastFp8toF32 {
+                    format: Fp8Format::E5M2,
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_fp8_e5m2,
+            "FP8 E5M2 should use QuantCastFp8toF32 with is_e4m3=false"
+        );
 
         // Assert: E5M2 should NOT use QuantCastI8toF32
-        let has_i8_cast = trace.iter().any(|op| matches!(op, TraceOp::QuantCastI8toF32 { .. }));
+        let has_i8_cast = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantCastI8toF32 { .. }));
         assert!(!has_i8_cast, "FP8 E5M2 should NOT use QuantCastI8toF32");
     }
 
@@ -2758,13 +3556,19 @@ mod tests {
 
         // Assert: Q2K has Sub for post-scale min SUBTRACTION
         let sub_pos = trace.iter().position(|op| matches!(op, TraceOp::Sub(_, _)));
-        let fma_pos = trace.iter().position(|op| matches!(op, TraceOp::QuantDequantFma { .. }));
-        assert!(sub_pos.is_some(), "Q2_K should have Sub for post-scale min subtraction");
+        let fma_pos = trace
+            .iter()
+            .position(|op| matches!(op, TraceOp::QuantDequantFma { .. }));
+        assert!(
+            sub_pos.is_some(),
+            "Q2_K should have Sub for post-scale min subtraction"
+        );
         assert!(fma_pos.is_some(), "Q2_K should have QuantDequantFma");
         assert!(
             sub_pos.unwrap() > fma_pos.unwrap(),
             "Q2_K Sub (slot {}) must appear after QuantDequantFma (slot {})",
-            sub_pos.unwrap(), fma_pos.unwrap()
+            sub_pos.unwrap(),
+            fma_pos.unwrap()
         );
         // Assert NO Add (the old buggy behavior)
         let add_pos = trace.iter().position(|op| matches!(op, TraceOp::Add(_, _)));
@@ -2788,14 +3592,24 @@ mod tests {
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
         // Assert: exactly one QuantLoadBytesVec with signed=true
-        let signed_count = trace.iter()
+        let signed_count = trace
+            .iter()
             .filter(|op| matches!(op, TraceOp::QuantLoadBytesVec { signed: true, .. }))
             .count();
-        assert!(signed_count >= 1, "Q8_K should have at least 1 QuantLoadBytesVec with signed=true, got {}", signed_count);
+        assert!(
+            signed_count >= 1,
+            "Q8_K should have at least 1 QuantLoadBytesVec with signed=true, got {}",
+            signed_count
+        );
 
         // Assert: no QuantLoadF16toF32 (F32 scale uses QuantScalarLoad)
-        let has_f16_load = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
-        assert!(!has_f16_load, "Q8_K should NOT have QuantLoadF16toF32 (F32 scale dtype)");
+        let has_f16_load = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
+        assert!(
+            !has_f16_load,
+            "Q8_K should NOT have QuantLoadF16toF32 (F32 scale dtype)"
+        );
     }
 
     // @trace TEST-QD-40 [req:REQ-QCG] [level:unit]
@@ -2810,19 +3624,29 @@ mod tests {
         let mxfp4 = r.get(&QuantType::Mxfp4 { block_size: 32 }).expect("MXFP4");
         let mut trace = Vec::new();
         let _slot = DecodeTraceBuilder::new(mxfp4, 8).build(&mut trace);
-        let mxfp4_lut_count = trace.iter()
+        let mxfp4_lut_count = trace
+            .iter()
             .filter(|op| matches!(op, TraceOp::QuantE2m1LutDecode { .. }))
             .count();
-        assert_eq!(mxfp4_lut_count, 1, "MXFP4 should have exactly 1 QuantE2m1LutDecode, got {}", mxfp4_lut_count);
+        assert_eq!(
+            mxfp4_lut_count, 1,
+            "MXFP4 should have exactly 1 QuantE2m1LutDecode, got {}",
+            mxfp4_lut_count
+        );
 
         // Act & Assert: NVFP4
         let nvfp4 = r.get(&QuantType::Nvfp4).expect("NVFP4");
         let mut trace2 = Vec::new();
         let _slot2 = DecodeTraceBuilder::new(nvfp4, 8).build(&mut trace2);
-        let nvfp4_lut_count = trace2.iter()
+        let nvfp4_lut_count = trace2
+            .iter()
             .filter(|op| matches!(op, TraceOp::QuantE2m1LutDecode { .. }))
             .count();
-        assert_eq!(nvfp4_lut_count, 1, "NVFP4 should have exactly 1 QuantE2m1LutDecode, got {}", nvfp4_lut_count);
+        assert_eq!(
+            nvfp4_lut_count, 1,
+            "NVFP4 should have exactly 1 QuantE2m1LutDecode, got {}",
+            nvfp4_lut_count
+        );
     }
 
     // @trace TEST-QD-41 [req:REQ-QCG] [level:unit]
@@ -2836,8 +3660,14 @@ mod tests {
         let builder = DecodeTraceBuilder::new(desc, 8);
 
         // Assert: TQ1_0 does not need lane offset or high bits
-        assert!(!builder.needs_lane_offset(), "TQ1_0 should NOT need lane offset");
-        assert!(!builder.needs_high_bits_ptr(), "TQ1_0 should NOT need high bits ptr");
+        assert!(
+            !builder.needs_lane_offset(),
+            "TQ1_0 should NOT need lane offset"
+        );
+        assert!(
+            !builder.needs_high_bits_ptr(),
+            "TQ1_0 should NOT need high bits ptr"
+        );
         assert!(!builder.is_e2m1_format(), "TQ1_0 should NOT be E2M1 format");
     }
 
@@ -2855,20 +3685,35 @@ mod tests {
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
         // Assert: PackedNibbles 两阶段 SPLIT — Lo phase (默认) emit QuantAndMask (lo nibble)
-        let has_mask = trace.iter().any(|op| matches!(op, TraceOp::QuantAndMask { .. }));
-        assert!(has_mask, "TQ2_0 Lo phase should have QuantAndMask for nibble extraction");
+        let has_mask = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantAndMask { .. }));
+        assert!(
+            has_mask,
+            "TQ2_0 Lo phase should have QuantAndMask for nibble extraction"
+        );
 
         // Assert: 两阶段 SPLIT — Lo phase 不 emit QuantShiftRight (hi 在独立 Hi phase)
-        let has_shift = trace.iter().any(|op| matches!(op, TraceOp::QuantShiftRight { .. }));
-        assert!(!has_shift, "TQ2_0 Lo phase should NOT have QuantShiftRight (hi in Hi phase)");
+        let has_shift = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantShiftRight { .. }));
+        assert!(
+            !has_shift,
+            "TQ2_0 Lo phase should NOT have QuantShiftRight (hi in Hi phase)"
+        );
 
         // Assert: Hi phase emit QuantShiftRight
         let mut hi_trace = Vec::new();
         DecodeTraceBuilder::new(desc, 8)
             .with_nibble_phase(NibblePhase::Hi)
             .build(&mut hi_trace);
-        let hi_has_shift = hi_trace.iter().any(|op| matches!(op, TraceOp::QuantShiftRight { .. }));
-        assert!(hi_has_shift, "TQ2_0 Hi phase should have QuantShiftRight for high nibble");
+        let hi_has_shift = hi_trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantShiftRight { .. }));
+        assert!(
+            hi_has_shift,
+            "TQ2_0 Hi phase should have QuantShiftRight for high nibble"
+        );
 
         // Assert: no post-scale Add (only pre-scale Sub)
         let has_add = trace.iter().any(|op| matches!(op, TraceOp::Add(_, _)));
@@ -2889,15 +3734,16 @@ mod tests {
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
         // Assert: IQ4_XS extracts 4-bit indices
-        let has_4bit = trace.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantExtractBits { bit_width: 4, .. }
-        ));
+        let has_4bit = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantExtractBits { bit_width: 4, .. }));
         assert!(has_4bit, "IQ4_XS should extract 4-bit indices");
 
         // Assert: IQ4_XS uses codebook lookup (has codebook)
         assert!(desc.codebook.is_some(), "IQ4_XS should have a codebook");
-        let has_codebook = trace.iter().any(|op| matches!(op, TraceOp::QuantCodebookLookup { .. }));
+        let has_codebook = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantCodebookLookup { .. }));
         assert!(has_codebook, "IQ4_XS should use QuantCodebookLookup");
     }
 
@@ -2915,19 +3761,27 @@ mod tests {
         let mut trace_q4_0 = Vec::new();
         let _ = DecodeTraceBuilder::new(q4_0, 8).build(&mut trace_q4_0);
         // Q4_0 has BlockScalar scale at offset 0 → no QuantPtrAddOffset for scale
-        let q4_0_ptr_add_count = trace_q4_0.iter()
+        let q4_0_ptr_add_count = trace_q4_0
+            .iter()
             .filter(|op| matches!(op, TraceOp::QuantPtrAddOffset { .. }))
             .count();
         // Q4_0 may have ptr add for data offset depending on layout
-        assert!(q4_0_ptr_add_count <= 1, "Q4_0 should have at most 1 QuantPtrAddOffset");
+        assert!(
+            q4_0_ptr_add_count <= 1,
+            "Q4_0 should have at most 1 QuantPtrAddOffset"
+        );
 
         // Q4K: hierarchical scale has sub_scales_offset → QuantPtrAddOffset present
         let q4k = r.get(&QuantType::Q4K).expect("Q4K");
         let mut trace_q4k = Vec::new();
         let _ = DecodeTraceBuilder::new(q4k, 8).build(&mut trace_q4k);
-        let q4k_has_ptr_add = trace_q4k.iter()
+        let q4k_has_ptr_add = trace_q4k
+            .iter()
             .any(|op| matches!(op, TraceOp::QuantPtrAddOffset { .. }));
-        assert!(q4k_has_ptr_add, "Q4K should have QuantPtrAddOffset for sub_scales_offset");
+        assert!(
+            q4k_has_ptr_add,
+            "Q4K should have QuantPtrAddOffset for sub_scales_offset"
+        );
     }
 
     // @trace TEST-QD-45 [req:REQ-QCG] [level:unit]
@@ -2942,27 +3796,40 @@ mod tests {
         let q4k = r.get(&QuantType::Q4K).expect("Q4K");
         let mut trace_q4k = Vec::new();
         let _ = DecodeTraceBuilder::new(q4k, 8).build(&mut trace_q4k);
-        let q4k_div = trace_q4k.iter()
+        let q4k_div = trace_q4k
+            .iter()
             .filter(|op| matches!(op, TraceOp::QuantIntDivConst { .. }))
             .count();
-        assert!(q4k_div >= 1, "Q4K should have at least 1 QuantIntDivConst for sub_block_idx");
+        assert!(
+            q4k_div >= 1,
+            "Q4K should have at least 1 QuantIntDivConst for sub_block_idx"
+        );
 
         // Q6K: BCE-20260710-Q6K-HIGHBITS 后走整体式 QuantQ6KDecode (scale 在 native 内处理)
         // 不再含 QuantIntDivConst (旧 Q6KScales trace 路径已废)
         let q6k = r.get(&QuantType::Q6K).expect("Q6K");
         let mut trace_q6k = Vec::new();
         let _ = DecodeTraceBuilder::new(q6k, 8).build(&mut trace_q6k);
-        let has_q6k_decode = trace_q6k.iter().any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
-        assert!(has_q6k_decode, "Q6K should emit QuantQ6KDecode (replaces scale trace ops)");
+        let has_q6k_decode = trace_q6k
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
+        assert!(
+            has_q6k_decode,
+            "Q6K should emit QuantQ6KDecode (replaces scale trace ops)"
+        );
 
         // Q4_0: BlockScalar scale → no QuantIntDivConst
         let q4_0 = r.get(&QuantType::Q4_0).expect("Q4_0");
         let mut trace_q4_0 = Vec::new();
         let _ = DecodeTraceBuilder::new(q4_0, 8).build(&mut trace_q4_0);
-        let q4_0_div = trace_q4_0.iter()
+        let q4_0_div = trace_q4_0
+            .iter()
             .filter(|op| matches!(op, TraceOp::QuantIntDivConst { .. }))
             .count();
-        assert_eq!(q4_0_div, 0, "Q4_0 should have no QuantIntDivConst (flat scale layout)");
+        assert_eq!(
+            q4_0_div, 0,
+            "Q4_0 should have no QuantIntDivConst (flat scale layout)"
+        );
     }
 
     // @trace TEST-QD-46 [req:REQ-QCG] [level:unit]
@@ -2977,16 +3844,25 @@ mod tests {
         let q6k = r.get(&QuantType::Q6K).expect("Q6K");
         let mut trace = Vec::new();
         let _ = DecodeTraceBuilder::new(q6k, 8).build(&mut trace);
-        let has_q6k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
-        assert!(has_q6k_decode, "Q6K should emit QuantQ6KDecode (replaces QuantPtrAddDynamic scale path)");
+        let has_q6k_decode = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
+        assert!(
+            has_q6k_decode,
+            "Q6K should emit QuantQ6KDecode (replaces QuantPtrAddDynamic scale path)"
+        );
 
         // NVFP4: SubBlockScalars uses QuantPtrAddDynamic for sub-block scale lookup
         let nvfp4 = r.get(&QuantType::Nvfp4).expect("NVFP4");
         let mut trace_nvfp4 = Vec::new();
         let _ = DecodeTraceBuilder::new(nvfp4, 8).build(&mut trace_nvfp4);
-        let has_dynamic_ptr_nvfp4 = trace_nvfp4.iter()
+        let has_dynamic_ptr_nvfp4 = trace_nvfp4
+            .iter()
             .any(|op| matches!(op, TraceOp::QuantPtrAddDynamic { .. }));
-        assert!(has_dynamic_ptr_nvfp4, "NVFP4 should have QuantPtrAddDynamic for sub-block scale");
+        assert!(
+            has_dynamic_ptr_nvfp4,
+            "NVFP4 should have QuantPtrAddDynamic for sub-block scale"
+        );
     }
 
     // @trace TEST-QD-47 [req:REQ-QCG] [level:unit]
@@ -3003,16 +3879,25 @@ mod tests {
         let _ = DecodeTraceBuilder::new(q6k, 8).build(&mut trace);
 
         // BCE-20260710-Q6K-HIGHBITS: Q6_K 走整体式 QuantQ6KDecode (i8 scale 在 native 内加载)
-        let has_q6k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
-        assert!(has_q6k_decode, "Q6K should emit QuantQ6KDecode (i8 scale load moved to native)");
+        let has_q6k_decode = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
+        assert!(
+            has_q6k_decode,
+            "Q6K should emit QuantQ6KDecode (i8 scale load moved to native)"
+        );
 
         // Q4_0 uses f16 scale → no QuantLoadI8toF32
         let q4_0 = r.get(&QuantType::Q4_0).expect("Q4_0");
         let mut trace_q4_0 = Vec::new();
         let _ = DecodeTraceBuilder::new(q4_0, 8).build(&mut trace_q4_0);
-        let has_i8_load_q4_0 = trace_q4_0.iter()
+        let has_i8_load_q4_0 = trace_q4_0
+            .iter()
             .any(|op| matches!(op, TraceOp::QuantLoadI8toF32 { .. }));
-        assert!(!has_i8_load_q4_0, "Q4_0 should NOT have QuantLoadI8toF32 (f16 scale)");
+        assert!(
+            !has_i8_load_q4_0,
+            "Q4_0 should NOT have QuantLoadI8toF32 (f16 scale)"
+        );
     }
 
     // @trace TEST-QD-48 [req:REQ-QCG] [level:unit]
@@ -3027,19 +3912,29 @@ mod tests {
         let awq4 = r.get(&QuantType::AWQ4).expect("AWQ4");
         let mut trace_awq4 = Vec::new();
         let _ = DecodeTraceBuilder::new(awq4, 8).build(&mut trace_awq4);
-        let broadcast_count = trace_awq4.iter()
+        let broadcast_count = trace_awq4
+            .iter()
             .filter(|op| matches!(op, TraceOp::QuantBroadcast { .. }))
             .count();
-        assert!(broadcast_count >= 2, "AWQ4 should have at least 2 QuantBroadcast (scale + zero), got {}", broadcast_count);
+        assert!(
+            broadcast_count >= 2,
+            "AWQ4 should have at least 2 QuantBroadcast (scale + zero), got {}",
+            broadcast_count
+        );
 
         // GPTQ4: same formula → same broadcast pattern
         let gptq4 = r.get(&QuantType::GPTQ4).expect("GPTQ4");
         let mut trace_gptq4 = Vec::new();
         let _ = DecodeTraceBuilder::new(gptq4, 8).build(&mut trace_gptq4);
-        let gptq4_broadcast_count = trace_gptq4.iter()
+        let gptq4_broadcast_count = trace_gptq4
+            .iter()
             .filter(|op| matches!(op, TraceOp::QuantBroadcast { .. }))
             .count();
-        assert!(gptq4_broadcast_count >= 2, "GPTQ4 should have at least 2 QuantBroadcast (scale + zero), got {}", gptq4_broadcast_count);
+        assert!(
+            gptq4_broadcast_count >= 2,
+            "GPTQ4 should have at least 2 QuantBroadcast (scale + zero), got {}",
+            gptq4_broadcast_count
+        );
     }
 
     // @trace TEST-QD-49 [req:REQ-QCG] [level:unit]
@@ -3051,13 +3946,20 @@ mod tests {
         let r = registry();
 
         // Test multiple formats: all should have FMA with zero accumulator
-        for qt in &[QuantType::Q4_0, QuantType::Q4_1, QuantType::AWQ4, QuantType::GPTQ4] {
+        for qt in &[
+            QuantType::Q4_0,
+            QuantType::Q4_1,
+            QuantType::AWQ4,
+            QuantType::GPTQ4,
+        ] {
             let desc = r.get(qt).expect(&format!("{:?} must be registered", qt));
             let mut trace = Vec::new();
             let _ = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
             // Find QuantDequantFma and verify acc is a Const(0.0) slot
-            let fma_op = trace.iter().find(|op| matches!(op, TraceOp::QuantDequantFma { .. }));
+            let fma_op = trace
+                .iter()
+                .find(|op| matches!(op, TraceOp::QuantDequantFma { .. }));
             assert!(fma_op.is_some(), "{:?} should have QuantDequantFma", qt);
 
             if let Some(TraceOp::QuantDequantFma { acc, .. }) = fma_op {
@@ -3068,7 +3970,8 @@ mod tests {
                 assert!(
                     matches!(acc_op, TraceOp::Const(v) if *v == 0.0_f64),
                     "{:?} FMA accumulator should be Const(0.0), got {:?}",
-                    qt, acc_op
+                    qt,
+                    acc_op
                 );
             }
         }
@@ -3084,9 +3987,13 @@ mod tests {
 
         // Test a representative set of formats
         for qt in &[
-            QuantType::Q4_0, QuantType::Q6K, QuantType::AWQ4,
-            QuantType::Mxfp4 { block_size: 32 }, QuantType::Nvfp4,
-            QuantType::Fp8E4M3, QuantType::Bf16,
+            QuantType::Q4_0,
+            QuantType::Q6K,
+            QuantType::AWQ4,
+            QuantType::Mxfp4 { block_size: 32 },
+            QuantType::Nvfp4,
+            QuantType::Fp8E4M3,
+            QuantType::Bf16,
         ] {
             let desc = match r.get(qt) {
                 Some(d) => d,
@@ -3098,13 +4005,15 @@ mod tests {
             // First op must be Input(0) for block_base
             assert!(
                 matches!(trace.first(), Some(TraceOp::Input(0))),
-                "{:?} first op should be Input(0) for block_base", qt
+                "{:?} first op should be Input(0) for block_base",
+                qt
             );
 
             // Second op must be Input(1) for data_ptr
             assert!(
                 matches!(trace.get(1), Some(TraceOp::Input(1))),
-                "{:?} second op should be Input(1) for data_ptr", qt
+                "{:?} second op should be Input(1) for data_ptr",
+                qt
             );
         }
     }
@@ -3129,7 +4038,10 @@ mod tests {
         // Q4_0: flat scale → no lane offset → Input(2) should NOT appear
         let q4_0 = r.get(&QuantType::Q4_0).expect("Q4_0");
         let builder_q4_0 = DecodeTraceBuilder::new(q4_0, 8);
-        assert!(!builder_q4_0.needs_lane_offset(), "Q4_0 should NOT need lane offset");
+        assert!(
+            !builder_q4_0.needs_lane_offset(),
+            "Q4_0 should NOT need lane offset"
+        );
         let mut trace_q4_0 = Vec::new();
         let _ = builder_q4_0.build(&mut trace_q4_0);
         let has_input_2_q4_0 = trace_q4_0.iter().any(|op| matches!(op, TraceOp::Input(2)));
@@ -3147,27 +4059,46 @@ mod tests {
         // Q6K: BCE-20260710-Q6K-HIGHBITS 后走整体式 QuantQ6KDecode (非旧 Input(3) high_bits_ptr)
         let q6k = r.get(&QuantType::Q6K).expect("Q6K");
         let builder = DecodeTraceBuilder::new(q6k, 8);
-        assert!(builder.needs_high_bits_ptr(), "Q6K descriptor should need high bits ptr");
+        assert!(
+            builder.needs_high_bits_ptr(),
+            "Q6K descriptor should need high bits ptr"
+        );
         let mut trace = Vec::new();
         let _ = builder.build(&mut trace);
         // 整体式: 不 emit Input(3) (high bit 在 native 内从 block+qh_offset 读)
-        let has_q6k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
-        assert!(has_q6k_decode, "Q6K should emit QuantQ6KDecode (no Input(3), monolithic)");
+        let has_q6k_decode = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
+        assert!(
+            has_q6k_decode,
+            "Q6K should emit QuantQ6KDecode (no Input(3), monolithic)"
+        );
 
         // Q5_0: BCE-20260710-Q5_0-HIGHBITS 后走整体式 QuantQ5Decode (非旧 Input(3) high_bits_ptr)
         let q5_0 = r.get(&QuantType::Q5_0).expect("Q5_0");
         let builder_q5_0 = DecodeTraceBuilder::new(q5_0, 8);
-        assert!(builder_q5_0.needs_high_bits_ptr(), "Q5_0 should need high bits ptr (descriptor)");
+        assert!(
+            builder_q5_0.needs_high_bits_ptr(),
+            "Q5_0 should need high bits ptr (descriptor)"
+        );
         let mut trace_q5_0 = Vec::new();
         let _ = builder_q5_0.build(&mut trace_q5_0);
         // 整体式: 不 emit Input(3) (high bit 在 native 内从 block+qh_offset 读)
-        let has_q5_decode = trace_q5_0.iter().any(|op| matches!(op, TraceOp::QuantQ5Decode { .. }));
-        assert!(has_q5_decode, "Q5_0 should emit QuantQ5Decode (no Input(3), monolithic)");
+        let has_q5_decode = trace_q5_0
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantQ5Decode { .. }));
+        assert!(
+            has_q5_decode,
+            "Q5_0 should emit QuantQ5Decode (no Input(3), monolithic)"
+        );
 
         // Q4_0: PackedNibbles → no high bits ptr → Input(3) should NOT appear
         let q4_0 = r.get(&QuantType::Q4_0).expect("Q4_0");
         let builder_q4_0 = DecodeTraceBuilder::new(q4_0, 8);
-        assert!(!builder_q4_0.needs_high_bits_ptr(), "Q4_0 should NOT need high bits ptr");
+        assert!(
+            !builder_q4_0.needs_high_bits_ptr(),
+            "Q4_0 should NOT need high bits ptr"
+        );
         let mut trace_q4_0 = Vec::new();
         let _ = builder_q4_0.build(&mut trace_q4_0);
         let has_input_3_q4_0 = trace_q4_0.iter().any(|op| matches!(op, TraceOp::Input(3)));
@@ -3193,15 +4124,23 @@ mod tests {
         let q6k = r.get(&QuantType::Q6K).expect("Q6K");
         let mut trace_q6k = Vec::new();
         let _ = DecodeTraceBuilder::new(q6k, 8).build(&mut trace_q6k);
-        let has_q6k_decode = trace_q6k.iter().any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
-        assert!(has_q6k_decode, "Q6K should emit QuantQ6KDecode (d*sub_scale moved to native)");
+        let has_q6k_decode = trace_q6k
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
+        assert!(
+            has_q6k_decode,
+            "Q6K should emit QuantQ6KDecode (d*sub_scale moved to native)"
+        );
 
         // Q4_0: flat scale → no Mul for scale computation
         let q4_0 = r.get(&QuantType::Q4_0).expect("Q4_0");
         let mut trace_q4_0 = Vec::new();
         let _ = DecodeTraceBuilder::new(q4_0, 8).build(&mut trace_q4_0);
         let has_mul_q4_0 = trace_q4_0.iter().any(|op| matches!(op, TraceOp::Mul(_, _)));
-        assert!(!has_mul_q4_0, "Q4_0 should NOT have Mul for scale (flat BlockScalar)");
+        assert!(
+            !has_mul_q4_0,
+            "Q4_0 should NOT have Mul for scale (flat BlockScalar)"
+        );
     }
 
     // ── Wave 12k59: +10 additional tests ──
@@ -3219,7 +4158,10 @@ mod tests {
         // Verify Q4_0 uses PackedNibbles with low_first=true
         match &desc.data_layout {
             DataLayout::PackedNibbles { low_first, .. } => {
-                assert!(low_first, "Q4_0 should use low_first=true for PackedNibbles");
+                assert!(
+                    low_first,
+                    "Q4_0 should use low_first=true for PackedNibbles"
+                );
             }
             other => panic!("Q4_0 should use PackedNibbles, got {:?}", other),
         }
@@ -3229,11 +4171,16 @@ mod tests {
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
         // Assert: PackedNibbles with low_first -> QuantAndMask(mask=0x0F) for low nibble
-        let has_low_mask = trace.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantAndMask { mask, .. } if *mask == 0x0F
-        ));
-        assert!(has_low_mask, "Q4_0 should have QuantAndMask with mask=0x0F for low nibble extraction");
+        let has_low_mask = trace.iter().any(|op| {
+            matches!(
+                op,
+                TraceOp::QuantAndMask { mask, .. } if *mask == 0x0F
+            )
+        });
+        assert!(
+            has_low_mask,
+            "Q4_0 should have QuantAndMask with mask=0x0F for low nibble extraction"
+        );
     }
 
     // @trace TEST-QD-55 [req:REQ-QCG] [level:unit]
@@ -3247,9 +4194,15 @@ mod tests {
 
         // Verify Q2_K uses Hierarchical zero layout
         match &desc.zero_layout {
-            ZeroLayout::Hierarchical { dmin_offset, sub_m_offset } => {
+            ZeroLayout::Hierarchical {
+                dmin_offset,
+                sub_m_offset,
+            } => {
                 assert!(*dmin_offset > 0, "Q2_K dmin_offset should be > 0");
-                assert!(*sub_m_offset < desc.block_bytes, "Q2_K sub_m_offset should be within block");
+                assert!(
+                    *sub_m_offset < desc.block_bytes,
+                    "Q2_K sub_m_offset should be within block"
+                );
             }
             other => panic!("Q2_K should use Hierarchical zero layout, got {:?}", other),
         }
@@ -3259,18 +4212,30 @@ mod tests {
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
         // Assert: Q2_K has at least 2 QuantLoadF16toF32 (block_d + dmin)
-        let f16_load_count = trace.iter()
+        let f16_load_count = trace
+            .iter()
             .filter(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }))
             .count();
-        assert!(f16_load_count >= 2,
-            "Q2_K should have at least 2 QuantLoadF16toF32 (block_d + dmin), got {}", f16_load_count);
+        assert!(
+            f16_load_count >= 2,
+            "Q2_K should have at least 2 QuantLoadF16toF32 (block_d + dmin), got {}",
+            f16_load_count
+        );
 
         // Assert: Q2_K has QuantKQuantPackedScaleLookup with is_min=true for sub_m
-        let has_min_lookup = trace.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantKQuantPackedScaleLookup { selector: ScaleSelector::Min, .. }
-        ));
-        assert!(has_min_lookup, "Q2_K should have QuantKQuantPackedScaleLookup with is_min=true for sub_m");
+        let has_min_lookup = trace.iter().any(|op| {
+            matches!(
+                op,
+                TraceOp::QuantKQuantPackedScaleLookup {
+                    selector: ScaleSelector::Min,
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_min_lookup,
+            "Q2_K should have QuantKQuantPackedScaleLookup with is_min=true for sub_m"
+        );
     }
 
     // @trace TEST-QD-56 [req:REQ-QCG] [level:unit]
@@ -3285,9 +4250,13 @@ mod tests {
 
         // Verify Q6_K uses NibbleWithHighBits with high_bits_per_elem=2 (descriptor 不变)
         match &desc.data_layout {
-            DataLayout::NibbleWithHighBits { high_bits_per_elem, .. } => {
-                assert_eq!(*high_bits_per_elem, 2,
-                    "Q6_K should have high_bits_per_elem=2");
+            DataLayout::NibbleWithHighBits {
+                high_bits_per_elem, ..
+            } => {
+                assert_eq!(
+                    *high_bits_per_elem, 2,
+                    "Q6_K should have high_bits_per_elem=2"
+                );
             }
             other => panic!("Q6_K should use NibbleWithHighBits, got {:?}", other),
         }
@@ -3297,7 +4266,9 @@ mod tests {
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
         // Assert: Q6_K 走整体式 QuantQ6KDecode (非旧 QuantShiftLeft/QuantAndMask)
-        let has_q6k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
+        let has_q6k_decode = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantQ6KDecode { .. }));
         assert!(has_q6k_decode,
             "Q6_K should emit QuantQ6KDecode (replaces buggy qh<<6 & 0x30 QuantShiftLeft/QuantAndMask)");
     }
@@ -3313,13 +4284,24 @@ mod tests {
 
         // Verify Q4_K uses Hierarchical scale layout
         match &desc.scale_layout {
-            ScaleLayout::Hierarchical { block_d_offset, sub_scales_offset, sub_block_elements, .. } => {
-                assert!(*block_d_offset < desc.block_bytes,
-                    "Q4_K block_d_offset should be within block");
-                assert!(*sub_scales_offset < desc.block_bytes,
-                    "Q4_K sub_scales_offset should be within block");
-                assert!(*sub_block_elements > 0,
-                    "Q4_K sub_block_elements should be > 0");
+            ScaleLayout::Hierarchical {
+                block_d_offset,
+                sub_scales_offset,
+                sub_block_elements,
+                ..
+            } => {
+                assert!(
+                    *block_d_offset < desc.block_bytes,
+                    "Q4_K block_d_offset should be within block"
+                );
+                assert!(
+                    *sub_scales_offset < desc.block_bytes,
+                    "Q4_K sub_scales_offset should be within block"
+                );
+                assert!(
+                    *sub_block_elements > 0,
+                    "Q4_K sub_block_elements should be > 0"
+                );
             }
             other => panic!("Q4_K should use Hierarchical scale layout, got {:?}", other),
         }
@@ -3329,15 +4311,27 @@ mod tests {
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
         // Assert: block_d loaded via QuantLoadF16toF32
-        let has_f16_load = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
-        assert!(has_f16_load, "Q4_K should load block_d via QuantLoadF16toF32");
+        let has_f16_load = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
+        assert!(
+            has_f16_load,
+            "Q4_K should load block_d via QuantLoadF16toF32"
+        );
 
         // Assert: BCE-20260731-Q4K-MONOLITHIC-DECODE — layout-aware decode
         // replaces the generic two-phase PackedNibbles trace.
-        let has_q4k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ4KDecode { .. }));
+        let has_q4k_decode = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantQ4KDecode { .. }));
         assert!(has_q4k_decode, "Q4_K should emit QuantQ4KDecode");
-        let has_packed = trace.iter().any(|op| matches!(op, TraceOp::QuantKQuantPackedScaleLookup { .. }));
-        assert!(!has_packed, "Q4_K monolithic decode must not emit generic packed-scale lookup");
+        let has_packed = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantKQuantPackedScaleLookup { .. }));
+        assert!(
+            !has_packed,
+            "Q4_K monolithic decode must not emit generic packed-scale lookup"
+        );
     }
 
     // @trace TEST-QD-58 [req:REQ-QCG] [level:unit]
@@ -3361,14 +4355,29 @@ mod tests {
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
         // Assert: BCE-20260710-Q5_K-HIGHBITS — 走单片 QuantQ5KDecode
-        let has_q5k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ5KDecode { .. }));
-        assert!(has_q5k_decode, "Q5_K should emit QuantQ5KDecode (monolithic 转置高位平面)");
+        let has_q5k_decode = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantQ5KDecode { .. }));
+        assert!(
+            has_q5k_decode,
+            "Q5_K should emit QuantQ5KDecode (monolithic 转置高位平面)"
+        );
 
         // 禁止旧路径残留: 无 QuantKQuantPackedScaleLookup / QuantDequantFma / Add post-scale min
-        let has_old_lookup = trace.iter().any(|op| matches!(op, TraceOp::QuantKQuantPackedScaleLookup { .. }));
-        assert!(!has_old_lookup, "Q5_K monolithic 不应再 emit QuantKQuantPackedScaleLookup (旧 buggy 路径)");
-        let has_old_fma = trace.iter().any(|op| matches!(op, TraceOp::QuantDequantFma { .. }));
-        assert!(!has_old_fma, "Q5_K monolithic 不应再 emit QuantDequantFma (旧 buggy 路径)");
+        let has_old_lookup = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantKQuantPackedScaleLookup { .. }));
+        assert!(
+            !has_old_lookup,
+            "Q5_K monolithic 不应再 emit QuantKQuantPackedScaleLookup (旧 buggy 路径)"
+        );
+        let has_old_fma = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantDequantFma { .. }));
+        assert!(
+            !has_old_fma,
+            "Q5_K monolithic 不应再 emit QuantDequantFma (旧 buggy 路径)"
+        );
     }
 
     // @trace TEST-QD-59 [req:REQ-QCG] [level:unit]
@@ -3383,13 +4392,21 @@ mod tests {
 
         // Verify NVFP4 uses SubBlockScalars scale layout
         match &desc.scale_layout {
-            ScaleLayout::SubBlockScalars { offset_bytes, sub_block_size, .. } => {
-                assert!(*offset_bytes < desc.block_bytes,
-                    "NVFP4 scale offset should be within block");
-                assert!(*sub_block_size > 0,
-                    "NVFP4 sub_block_size should be > 0");
+            ScaleLayout::SubBlockScalars {
+                offset_bytes,
+                sub_block_size,
+                ..
+            } => {
+                assert!(
+                    *offset_bytes < desc.block_bytes,
+                    "NVFP4 scale offset should be within block"
+                );
+                assert!(*sub_block_size > 0, "NVFP4 sub_block_size should be > 0");
             }
-            other => panic!("NVFP4 should use SubBlockScalars scale layout, got {:?}", other),
+            other => panic!(
+                "NVFP4 should use SubBlockScalars scale layout, got {:?}",
+                other
+            ),
         }
 
         // Act
@@ -3397,19 +4414,37 @@ mod tests {
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
         // Assert: QuantIntDivConst for sub_block_idx
-        let has_div = trace.iter().any(|op| matches!(op, TraceOp::QuantIntDivConst { .. }));
-        assert!(has_div, "NVFP4 should have QuantIntDivConst for sub-block index");
+        let has_div = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantIntDivConst { .. }));
+        assert!(
+            has_div,
+            "NVFP4 should have QuantIntDivConst for sub-block index"
+        );
 
         // Assert: QuantPtrAddDynamic for sub-block scale address
-        let has_dyn_ptr = trace.iter().any(|op| matches!(op, TraceOp::QuantPtrAddDynamic { .. }));
-        assert!(has_dyn_ptr, "NVFP4 should have QuantPtrAddDynamic for sub-block scale address");
+        let has_dyn_ptr = trace
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantPtrAddDynamic { .. }));
+        assert!(
+            has_dyn_ptr,
+            "NVFP4 should have QuantPtrAddDynamic for sub-block scale address"
+        );
 
         // Assert: QuantE2m1LutDecode with nvfp4_mode=true
-        let has_nvfp4_lut = trace.iter().any(|op| matches!(
-            op,
-            TraceOp::QuantE2m1LutDecode { nvfp4_mode: true, .. }
-        ));
-        assert!(has_nvfp4_lut, "NVFP4 should have QuantE2m1LutDecode with nvfp4_mode=true");
+        let has_nvfp4_lut = trace.iter().any(|op| {
+            matches!(
+                op,
+                TraceOp::QuantE2m1LutDecode {
+                    nvfp4_mode: true,
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_nvfp4_lut,
+            "NVFP4 should have QuantE2m1LutDecode with nvfp4_mode=true"
+        );
     }
 
     // @trace TEST-QD-60 [req:REQ-QCG] [level:unit]
@@ -3426,20 +4461,28 @@ mod tests {
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
         // Assert: exactly one QuantDequantFma
-        let fma_count = trace.iter()
+        let fma_count = trace
+            .iter()
             .filter(|op| matches!(op, TraceOp::QuantDequantFma { .. }))
             .count();
-        assert_eq!(fma_count, 1, "Q4_1 should have exactly 1 QuantDequantFma, got {}", fma_count);
+        assert_eq!(
+            fma_count, 1,
+            "Q4_1 should have exactly 1 QuantDequantFma, got {}",
+            fma_count
+        );
 
         // Assert: FMA acc is Const(0.0)
-        let fma_op = trace.iter().find(|op| matches!(op, TraceOp::QuantDequantFma { .. }));
+        let fma_op = trace
+            .iter()
+            .find(|op| matches!(op, TraceOp::QuantDequantFma { .. }));
         if let Some(TraceOp::QuantDequantFma { acc, .. }) = fma_op {
             let acc_idx = acc.0 as usize;
             assert!(acc_idx < trace.len(), "Q4_1 FMA acc slot out of range");
             match &trace[acc_idx] {
                 TraceOp::Const(v) => assert!(
                     (*v - 0.0_f64).abs() < f64::EPSILON,
-                    "Q4_1 FMA accumulator should be 0.0, got {}", v
+                    "Q4_1 FMA accumulator should be 0.0, got {}",
+                    v
                 ),
                 other => panic!("Q4_1 FMA acc should be Const(0.0), got {:?}", other),
             }
@@ -3447,7 +4490,10 @@ mod tests {
 
         // Assert: Q4_1 has post-scale Add for BlockMin (value = d*quantized + m)
         let has_add = trace.iter().any(|op| matches!(op, TraceOp::Add(_, _)));
-        assert!(has_add, "Q4_1 should have Add for BlockMin post-scale addition (value = d*quantized + m)");
+        assert!(
+            has_add,
+            "Q4_1 should have Add for BlockMin post-scale addition (value = d*quantized + m)"
+        );
     }
 
     // @trace TEST-QD-61 [req:REQ-QCG] [level:unit]
@@ -3462,24 +4508,46 @@ mod tests {
         let cb = desc.codebook.as_ref().expect("IQ4_NL should have codebook");
 
         // Verify codebook parameters are sensible
-        assert!(cb.vector_size > 0, "IQ4_NL codebook vector_size should be > 0, got {}", cb.vector_size);
-        assert!(cb.bits_per_entry > 0, "IQ4_NL codebook bits_per_entry should be > 0");
-        assert!(!cb.codebook_data.is_empty(), "IQ4_NL codebook_data should not be empty");
+        assert!(
+            cb.vector_size > 0,
+            "IQ4_NL codebook vector_size should be > 0, got {}",
+            cb.vector_size
+        );
+        assert!(
+            cb.bits_per_entry > 0,
+            "IQ4_NL codebook bits_per_entry should be > 0"
+        );
+        assert!(
+            !cb.codebook_data.is_empty(),
+            "IQ4_NL codebook_data should not be empty"
+        );
 
         // Act
         let mut trace = Vec::new();
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
         // Assert: QuantCodebookLookup uses matching parameters
-        let codebook_op = trace.iter().find(|op| matches!(op, TraceOp::QuantCodebookLookup { .. }));
-        assert!(codebook_op.is_some(), "IQ4_NL should have QuantCodebookLookup");
+        let codebook_op = trace
+            .iter()
+            .find(|op| matches!(op, TraceOp::QuantCodebookLookup { .. }));
+        assert!(
+            codebook_op.is_some(),
+            "IQ4_NL should have QuantCodebookLookup"
+        );
         if let Some(TraceOp::QuantCodebookLookup {
-            vector_size, bits_per_entry, ..
-        }) = codebook_op {
-            assert_eq!(*vector_size, cb.vector_size,
-                "QuantCodebookLookup vector_size should match codebook spec");
-            assert_eq!(*bits_per_entry, cb.bits_per_entry,
-                "QuantCodebookLookup bits_per_entry should match codebook spec");
+            vector_size,
+            bits_per_entry,
+            ..
+        }) = codebook_op
+        {
+            assert_eq!(
+                *vector_size, cb.vector_size,
+                "QuantCodebookLookup vector_size should match codebook spec"
+            );
+            assert_eq!(
+                *bits_per_entry, cb.bits_per_entry,
+                "QuantCodebookLookup bits_per_entry should match codebook spec"
+            );
         }
     }
 
@@ -3495,12 +4563,19 @@ mod tests {
 
         // Verify AWQ4 uses BlockScalar zero layout (PreScaleSubtract)
         match &desc.zero_layout {
-            ZeroLayout::BlockScalar { offset_bytes, dtype } => {
-                assert!(*offset_bytes < desc.block_bytes,
-                    "AWQ4 zero offset should be within block");
+            ZeroLayout::BlockScalar {
+                offset_bytes,
+                dtype,
+            } => {
+                assert!(
+                    *offset_bytes < desc.block_bytes,
+                    "AWQ4 zero offset should be within block"
+                );
                 // AWQ4 uses F16 zero-point
-                assert!(matches!(dtype, ScaleDType::F16),
-                    "AWQ4 zero dtype should be F16");
+                assert!(
+                    matches!(dtype, ScaleDType::F16),
+                    "AWQ4 zero dtype should be F16"
+                );
             }
             other => panic!("AWQ4 should use BlockScalar zero layout, got {:?}", other),
         }
@@ -3510,28 +4585,37 @@ mod tests {
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
         // Assert: QuantLoadF16toF32 for zero-point (at least scale + zero = 2 loads)
-        let f16_count = trace.iter()
+        let f16_count = trace
+            .iter()
             .filter(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }))
             .count();
-        assert!(f16_count >= 2,
-            "AWQ4 should have at least 2 QuantLoadF16toF32 (scale + zero), got {}", f16_count);
+        assert!(
+            f16_count >= 2,
+            "AWQ4 should have at least 2 QuantLoadF16toF32 (scale + zero), got {}",
+            f16_count
+        );
 
         // Assert: QuantBroadcast for zero-point (before Sub)
         let sub_pos = trace.iter().position(|op| matches!(op, TraceOp::Sub(_, _)));
-        let broadcast_positions: Vec<usize> = trace.iter()
+        let broadcast_positions: Vec<usize> = trace
+            .iter()
             .enumerate()
             .filter(|(_, op)| matches!(op, TraceOp::QuantBroadcast { .. }))
             .map(|(i, _)| i)
             .collect();
-        assert!(broadcast_positions.len() >= 2,
-            "AWQ4 should have at least 2 QuantBroadcast (scale + zero), got {}", broadcast_positions.len());
+        assert!(
+            broadcast_positions.len() >= 2,
+            "AWQ4 should have at least 2 QuantBroadcast (scale + zero), got {}",
+            broadcast_positions.len()
+        );
 
         // Assert: at least one broadcast appears before Sub (zero-point broadcast)
         let first_broadcast = broadcast_positions[0];
         assert!(
             first_broadcast < sub_pos.unwrap(),
             "AWQ4 zero-point broadcast (slot {}) should appear before Sub (slot {})",
-            first_broadcast, sub_pos.unwrap()
+            first_broadcast,
+            sub_pos.unwrap()
         );
     }
 
@@ -3559,15 +4643,20 @@ mod tests {
             let _slot = DecodeTraceBuilder::new(desc, *lanes).build(&mut trace);
 
             // Bytes layout: count should equal output_lanes (1 byte per element)
-            let bytes_op = trace.iter().find(|op| matches!(
-                op,
-                TraceOp::QuantLoadBytesVec { signed: true, .. }
-            ));
-            assert!(bytes_op.is_some(), "Q8_0 should have QuantLoadBytesVec with signed=true for {} lanes", lanes);
+            let bytes_op = trace
+                .iter()
+                .find(|op| matches!(op, TraceOp::QuantLoadBytesVec { signed: true, .. }));
+            assert!(
+                bytes_op.is_some(),
+                "Q8_0 should have QuantLoadBytesVec with signed=true for {} lanes",
+                lanes
+            );
             if let Some(TraceOp::QuantLoadBytesVec { count, .. }) = bytes_op {
-                assert_eq!(*count, *lanes,
+                assert_eq!(
+                    *count, *lanes,
                     "Q8_0 QuantLoadBytesVec count should be {} (== output_lanes), got {}",
-                    lanes, count);
+                    lanes, count
+                );
             }
         }
     }

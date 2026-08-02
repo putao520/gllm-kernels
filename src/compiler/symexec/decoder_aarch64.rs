@@ -3,11 +3,11 @@
 //! Decodes compiled `extern "C"` scalar functions on AArch64 by reading
 //! fixed-width 32-bit instructions and feeding them to the SymbolicExecutor.
 
-use super::engine::{SymbolicExecutor, SymExecError};
+use super::engine::{SymExecError, SymbolicExecutor};
 use super::sym_value::SymValue;
 use crate::compiler::trace::{ScalarFnSignature, ScalarParam, TraceOp};
-use std::collections::HashMap;
 use crate::types::CompilerError;
+use std::collections::HashMap;
 
 const MAX_FN_BYTES: usize = 4096;
 const MAX_INSTRUCTIONS: usize = 500;
@@ -57,11 +57,19 @@ fn dreg(idx: u32) -> String {
 }
 
 fn xreg(idx: u32) -> String {
-    if idx == 31 { "sp".to_string() } else { format!("x{idx}") }
+    if idx == 31 {
+        "sp".to_string()
+    } else {
+        format!("x{idx}")
+    }
 }
 
 fn wreg(idx: u32) -> String {
-    if idx == 31 { "wsp".to_string() } else { format!("w{idx}") }
+    if idx == 31 {
+        "wsp".to_string()
+    } else {
+        format!("w{idx}")
+    }
 }
 
 /// Float register name based on type field (0=S, 1=D).
@@ -79,10 +87,22 @@ fn ftype_reg(idx: u32, ftype: u32) -> String {
 
 fn cond_name(cond: u32) -> &'static str {
     match cond & 0xF {
-        0x0 => "eq", 0x1 => "ne", 0x2 => "hs", 0x3 => "lo",
-        0x4 => "mi", 0x5 => "pl", 0x6 => "vs", 0x7 => "vc",
-        0x8 => "hi", 0x9 => "ls", 0xA => "ge", 0xB => "lt",
-        0xC => "gt", 0xD => "le", 0xE => "al", _ => "nv",
+        0x0 => "eq",
+        0x1 => "ne",
+        0x2 => "hs",
+        0x3 => "lo",
+        0x4 => "mi",
+        0x5 => "pl",
+        0x6 => "vs",
+        0x7 => "vc",
+        0x8 => "hi",
+        0x9 => "ls",
+        0xA => "ge",
+        0xB => "lt",
+        0xC => "gt",
+        0xD => "le",
+        0xE => "al",
+        _ => "nv",
     }
 }
 
@@ -172,8 +192,13 @@ fn decode_branch(word: u32, pc: u64, insn: &mut A64Insn) {
             let rt = bits(word, 4, 0);
             let offset = sign_extend(imm19, 19) * 4;
             let target = (pc as i64 + offset) as u64;
-            insn.mnemonic = if op_bit == 0 { "cbz".into() } else { "cbnz".into() };
-            insn.operands.push(if sf == 1 { xreg(rt) } else { wreg(rt) });
+            insn.mnemonic = if op_bit == 0 {
+                "cbz".into()
+            } else {
+                "cbnz".into()
+            };
+            insn.operands
+                .push(if sf == 1 { xreg(rt) } else { wreg(rt) });
             insn.operands.push(format!("0x{target:x}"));
             insn.branch_target = Some(target);
             insn.is_cond_branch = true;
@@ -188,7 +213,11 @@ fn decode_branch(word: u32, pc: u64, insn: &mut A64Insn) {
             let bit_pos = (b5 << 5) | b40;
             let offset = sign_extend(imm14, 14) * 4;
             let target = (pc as i64 + offset) as u64;
-            insn.mnemonic = if op_bit == 0 { "tbz".into() } else { "tbnz".into() };
+            insn.mnemonic = if op_bit == 0 {
+                "tbz".into()
+            } else {
+                "tbnz".into()
+            };
             insn.operands.push(xreg(rt));
             insn.operands.push(format!("#{bit_pos}"));
             insn.operands.push(format!("0x{target:x}"));
@@ -216,24 +245,31 @@ fn decode_branch(word: u32, pc: u64, insn: &mut A64Insn) {
             insn.is_call = true;
         }
         // ret/br/blr: 1101_0110
-        _ if bits(word, 31, 22) == 0b1101011000 || bits(word, 31, 22) == 0b1101011001
-            || bits(word, 31, 22) == 0b1101011010 => {
+        _ if bits(word, 31, 22) == 0b1101011000
+            || bits(word, 31, 22) == 0b1101011001
+            || bits(word, 31, 22) == 0b1101011010 =>
+        {
             let opc = bits(word, 24, 21);
             let rn = bits(word, 9, 5);
             match opc {
-                0b0000 => { // br
+                0b0000 => {
+                    // br
                     insn.mnemonic = "br".into();
                     insn.operands.push(xreg(rn));
                     insn.is_uncond_branch = true;
                 }
-                0b0001 => { // blr
+                0b0001 => {
+                    // blr
                     insn.mnemonic = "blr".into();
                     insn.operands.push(xreg(rn));
                     insn.is_call = true;
                 }
-                0b0010 => { // ret
+                0b0010 => {
+                    // ret
                     insn.mnemonic = "ret".into();
-                    if rn != 30 { insn.operands.push(xreg(rn)); }
+                    if rn != 30 {
+                        insn.operands.push(xreg(rn));
+                    }
                     insn.is_return = true;
                 }
                 _ => {
@@ -278,8 +314,7 @@ fn decode_fp(word: u32, pc: u64, insn: &mut A64Insn) {
     }
 
     // FP data processing (1-source): 0001_1110_xx1_00000_0xxxxx_xxxxx_xxxxx
-    if bits(word, 31, 24) == 0b0001_1110 && bits(word, 21, 17) == 0b10000
-        && bits(word, 14, 14) == 0
+    if bits(word, 31, 24) == 0b0001_1110 && bits(word, 21, 17) == 0b10000 && bits(word, 14, 14) == 0
     {
         let ftype = bits(word, 23, 22);
         let opcode = bits(word, 20, 15);
@@ -310,14 +345,20 @@ fn decode_fp(word: u32, pc: u64, insn: &mut A64Insn) {
     }
 
     // FP compare: 0001_1110_xx1_xxxxx_0010_00_xxxxx_x0000
-    if bits(word, 31, 24) == 0b0001_1110 && bits(word, 21, 21) == 1
-        && bits(word, 13, 10) == 0b1000 && bits(word, 2, 0) == 0b000
+    if bits(word, 31, 24) == 0b0001_1110
+        && bits(word, 21, 21) == 1
+        && bits(word, 13, 10) == 0b1000
+        && bits(word, 2, 0) == 0b000
     {
         let ftype = bits(word, 23, 22);
         let rm = bits(word, 20, 16);
         let rn = bits(word, 9, 5);
         let opc = bits(word, 4, 3);
-        insn.mnemonic = if opc & 1 == 0 { "fcmp".into() } else { "fcmpe".into() };
+        insn.mnemonic = if opc & 1 == 0 {
+            "fcmp".into()
+        } else {
+            "fcmpe".into()
+        };
         insn.operands.push(ftype_reg(rn, ftype));
         if bits(word, 4, 3) < 2 && rm == 0 && bits(word, 20, 16) == 0 {
             // fcmp with #0.0 has rm=0 and specific encoding
@@ -333,9 +374,7 @@ fn decode_fp(word: u32, pc: u64, insn: &mut A64Insn) {
     }
 
     // FP conditional select: 0001_1110_xx1_xxxxx_xxxx_11_xxxxx_xxxxx
-    if bits(word, 31, 24) == 0b0001_1110 && bits(word, 21, 21) == 1
-        && bits(word, 11, 10) == 0b11
-    {
+    if bits(word, 31, 24) == 0b0001_1110 && bits(word, 21, 21) == 1 && bits(word, 11, 10) == 0b11 {
         let ftype = bits(word, 23, 22);
         let rm = bits(word, 20, 16);
         let cond = bits(word, 15, 12);
@@ -374,7 +413,8 @@ fn decode_fp(word: u32, pc: u64, insn: &mut A64Insn) {
     }
 
     // Integer ↔ FP conversion: 0001_1110_xx1_xxxxx_000000_xxxxx_xxxxx
-    if bits(word, 31, 24) == 0b0001_1110 && bits(word, 21, 21) == 1
+    if bits(word, 31, 24) == 0b0001_1110
+        && bits(word, 21, 21) == 1
         && bits(word, 15, 10) == 0b000000
     {
         let sf = bits(word, 31, 31);
@@ -385,19 +425,29 @@ fn decode_fp(word: u32, pc: u64, insn: &mut A64Insn) {
         let rd = bits(word, 4, 0);
         // scvtf/ucvtf: int→float
         if opcode == 0b010 || opcode == 0b011 {
-            insn.mnemonic = if opcode == 0b010 { "scvtf".into() } else { "ucvtf".into() };
+            insn.mnemonic = if opcode == 0b010 {
+                "scvtf".into()
+            } else {
+                "ucvtf".into()
+            };
             insn.operands.push(ftype_reg(rd, ftype));
-            insn.operands.push(if sf == 1 { xreg(rn) } else { wreg(rn) });
+            insn.operands
+                .push(if sf == 1 { xreg(rn) } else { wreg(rn) });
             return;
         }
         // fcvtzs/fcvtzu: float→int
         if opcode == 0b000 || opcode == 0b001 {
             insn.mnemonic = if rmode == 0b11 {
-                if opcode == 0 { "fcvtzs".into() } else { "fcvtzu".into() }
+                if opcode == 0 {
+                    "fcvtzs".into()
+                } else {
+                    "fcvtzu".into()
+                }
             } else {
                 format!("fcvt_rm{rmode}_{opcode}")
             };
-            insn.operands.push(if sf == 1 { xreg(rd) } else { wreg(rd) });
+            insn.operands
+                .push(if sf == 1 { xreg(rd) } else { wreg(rd) });
             insn.operands.push(ftype_reg(rn, ftype));
             return;
         }
@@ -407,10 +457,12 @@ fn decode_fp(word: u32, pc: u64, insn: &mut A64Insn) {
             if opcode == 0b111 {
                 // GP → FP
                 insn.operands.push(ftype_reg(rd, ftype));
-                insn.operands.push(if sf == 1 { xreg(rn) } else { wreg(rn) });
+                insn.operands
+                    .push(if sf == 1 { xreg(rn) } else { wreg(rn) });
             } else {
                 // FP → GP
-                insn.operands.push(if sf == 1 { xreg(rd) } else { wreg(rd) });
+                insn.operands
+                    .push(if sf == 1 { xreg(rd) } else { wreg(rd) });
                 insn.operands.push(ftype_reg(rn, ftype));
             }
             return;
@@ -420,7 +472,6 @@ fn decode_fp(word: u32, pc: u64, insn: &mut A64Insn) {
     // Fallback
     insn.mnemonic = format!(".fp 0x{word:08x}");
 }
-
 
 // ---------------------------------------------------------------------------
 // Load/store decoding
@@ -454,7 +505,13 @@ fn decode_load_store(word: u32, pc: u64, insn: &mut A64Insn) {
         let imm12 = bits(word, 21, 10);
         let rn = bits(word, 9, 5);
         let rt = bits(word, 4, 0);
-        let scale = if size == 0b00 { 4 } else if size == 0b01 { 8 } else { 16 };
+        let scale = if size == 0b00 {
+            4
+        } else if size == 0b01 {
+            8
+        } else {
+            16
+        };
         let offset = (imm12 as i64) * scale;
         let is_load = opc & 1 == 1;
         insn.mnemonic = if is_load { "ldr".into() } else { "str".into() };
@@ -463,7 +520,11 @@ fn decode_load_store(word: u32, pc: u64, insn: &mut A64Insn) {
             0b01 => dreg(rt),
             _ => format!("q{rt}"),
         };
-        let base = if rn == 31 { "sp".to_string() } else { format!("x{rn}") };
+        let base = if rn == 31 {
+            "sp".to_string()
+        } else {
+            format!("x{rn}")
+        };
         if is_load {
             insn.operands.push(reg);
             insn.operands.push(format!("[{base}, #{offset}]"));
@@ -482,7 +543,13 @@ fn decode_load_store(word: u32, pc: u64, insn: &mut A64Insn) {
         let rt2 = bits(word, 14, 10);
         let rn = bits(word, 9, 5);
         let rt = bits(word, 4, 0);
-        let scale = if opc == 0b00 { 4 } else if opc == 0b01 { 8 } else { 16 };
+        let scale = if opc == 0b00 {
+            4
+        } else if opc == 0b01 {
+            8
+        } else {
+            16
+        };
         let offset = sign_extend(imm7, 7) * scale;
         insn.mnemonic = if is_load { "ldp".into() } else { "stp".into() };
         let reg_fn = |idx: u32| -> String {
@@ -492,7 +559,11 @@ fn decode_load_store(word: u32, pc: u64, insn: &mut A64Insn) {
                 _ => format!("q{idx}"),
             }
         };
-        let base = if rn == 31 { "sp".to_string() } else { format!("x{rn}") };
+        let base = if rn == 31 {
+            "sp".to_string()
+        } else {
+            format!("x{rn}")
+        };
         insn.operands.push(reg_fn(rt));
         insn.operands.push(reg_fn(rt2));
         insn.operands.push(format!("[{base}, #{offset}]"));
@@ -506,21 +577,32 @@ fn decode_load_store(word: u32, pc: u64, insn: &mut A64Insn) {
         let rn = bits(word, 9, 5);
         let rt = bits(word, 4, 0);
         let is_load = opc & 1 == 1;
-        insn.mnemonic = if is_load { "ldr_int".into() } else { "str_int".into() };
-        insn.operands.push(if size >= 0b11 { xreg(rt) } else { wreg(rt) });
+        insn.mnemonic = if is_load {
+            "ldr_int".into()
+        } else {
+            "str_int".into()
+        };
+        insn.operands
+            .push(if size >= 0b11 { xreg(rt) } else { wreg(rt) });
         return;
     }
 
     // LDP/STP (integer): opc 101 0 0xx imm7 Rt2 Rn Rt
     if bits(word, 29, 27) == 0b101 && bits(word, 26, 26) == 0 {
         let is_load = bits(word, 22, 22) == 1;
-        insn.mnemonic = if is_load { "ldp_int".into() } else { "stp_int".into() };
+        insn.mnemonic = if is_load {
+            "ldp_int".into()
+        } else {
+            "stp_int".into()
+        };
         return;
     }
 
     // LDR/STR (register offset): xx 111 x 00 xx 1 Rm opt S 10 Rn Rt
-    if bits(word, 29, 27) == 0b111 && bits(word, 25, 24) == 0b00
-        && bits(word, 21, 21) == 1 && bits(word, 11, 10) == 0b10
+    if bits(word, 29, 27) == 0b111
+        && bits(word, 25, 24) == 0b00
+        && bits(word, 21, 21) == 1
+        && bits(word, 11, 10) == 0b10
     {
         let is_fp = bits(word, 26, 26) == 1;
         let size = bits(word, 31, 30);
@@ -531,13 +613,26 @@ fn decode_load_store(word: u32, pc: u64, insn: &mut A64Insn) {
         let is_load = opc & 1 == 1;
         if is_fp {
             insn.mnemonic = if is_load { "ldr".into() } else { "str".into() };
-            let reg = match size { 0b00 => sreg(rt), 0b01 => dreg(rt), _ => format!("q{rt}") };
-            let base = if rn == 31 { "sp".to_string() } else { format!("x{rn}") };
+            let reg = match size {
+                0b00 => sreg(rt),
+                0b01 => dreg(rt),
+                _ => format!("q{rt}"),
+            };
+            let base = if rn == 31 {
+                "sp".to_string()
+            } else {
+                format!("x{rn}")
+            };
             insn.operands.push(reg);
             insn.operands.push(format!("[{base}, x{rm}]"));
         } else {
-            insn.mnemonic = if is_load { "ldr_int".into() } else { "str_int".into() };
-            insn.operands.push(if size >= 0b11 { xreg(rt) } else { wreg(rt) });
+            insn.mnemonic = if is_load {
+                "ldr_int".into()
+            } else {
+                "str_int".into()
+            };
+            insn.operands
+                .push(if size >= 0b11 { xreg(rt) } else { wreg(rt) });
         }
         return;
     }
@@ -560,8 +655,15 @@ fn decode_dp_imm(word: u32, insn: &mut A64Insn) {
         // MOVZ/MOVN/MOVK: 10x
         0b101 => {
             let opc = bits(word, 30, 29);
-            insn.mnemonic = match opc { 0b00 => "movn", 0b10 => "movz", 0b11 => "movk", _ => "mov_imm" }.into();
-            insn.operands.push(if sf == 1 { xreg(rd) } else { wreg(rd) });
+            insn.mnemonic = match opc {
+                0b00 => "movn",
+                0b10 => "movz",
+                0b11 => "movk",
+                _ => "mov_imm",
+            }
+            .into();
+            insn.operands
+                .push(if sf == 1 { xreg(rd) } else { wreg(rd) });
         }
         // ADD/SUB immediate: 00x
         0b001 => {
@@ -569,10 +671,12 @@ fn decode_dp_imm(word: u32, insn: &mut A64Insn) {
             let s = bits(word, 29, 29);
             if s == 1 && rd == 31 {
                 insn.mnemonic = "cmp".into();
-                insn.operands.push(if sf == 1 { xreg(rn) } else { wreg(rn) });
+                insn.operands
+                    .push(if sf == 1 { xreg(rn) } else { wreg(rn) });
             } else {
                 insn.mnemonic = if op == 0 { "add".into() } else { "sub".into() };
-                insn.operands.push(if sf == 1 { xreg(rd) } else { wreg(rd) });
+                insn.operands
+                    .push(if sf == 1 { xreg(rd) } else { wreg(rd) });
             }
         }
         // ADRP/ADR: 0b000
@@ -585,10 +689,15 @@ fn decode_dp_imm(word: u32, insn: &mut A64Insn) {
         0b010 => {
             let opc = bits(word, 30, 29);
             insn.mnemonic = match opc {
-                0b00 => "and", 0b01 => "orr", 0b10 => "eor", 0b11 => "tst",
+                0b00 => "and",
+                0b01 => "orr",
+                0b10 => "eor",
+                0b11 => "tst",
                 _ => "logic_imm",
-            }.into();
-            insn.operands.push(if sf == 1 { xreg(rd) } else { wreg(rd) });
+            }
+            .into();
+            insn.operands
+                .push(if sf == 1 { xreg(rd) } else { wreg(rd) });
         }
         _ => {
             insn.mnemonic = "dp_imm_unknown".into();
@@ -617,10 +726,14 @@ fn decode_dp_reg(word: u32, insn: &mut A64Insn) {
             (1, 0) => "csinv",
             (1, 1) => "csneg",
             _ => "csel_unknown",
-        }.into();
-        insn.operands.push(if sf == 1 { xreg(rd) } else { wreg(rd) });
-        insn.operands.push(if sf == 1 { xreg(rn) } else { wreg(rn) });
-        insn.operands.push(if sf == 1 { xreg(rm) } else { wreg(rm) });
+        }
+        .into();
+        insn.operands
+            .push(if sf == 1 { xreg(rd) } else { wreg(rd) });
+        insn.operands
+            .push(if sf == 1 { xreg(rn) } else { wreg(rn) });
+        insn.operands
+            .push(if sf == 1 { xreg(rm) } else { wreg(rm) });
         insn.operands.push(cond_name(cond).into());
         return;
     }
@@ -634,10 +747,11 @@ fn decode_dp_reg(word: u32, insn: &mut A64Insn) {
         0b10 => "and",
         0b11 => "orr",
         _ => "dp_reg",
-    }.into();
-    insn.operands.push(if sf == 1 { xreg(rd) } else { wreg(rd) });
+    }
+    .into();
+    insn.operands
+        .push(if sf == 1 { xreg(rd) } else { wreg(rd) });
 }
-
 
 // ---------------------------------------------------------------------------
 // Instruction iterator
@@ -652,7 +766,11 @@ pub struct A64Iter<'a> {
 
 impl<'a> A64Iter<'a> {
     pub fn new(bytes: &'a [u8], base_addr: u64) -> Self {
-        Self { bytes, offset: 0, base_addr }
+        Self {
+            bytes,
+            offset: 0,
+            base_addr,
+        }
     }
 }
 
@@ -743,7 +861,10 @@ fn build_ptr_map(sig: &ScalarFnSignature) -> PtrParamMap {
         }
     }
 
-    PtrParamMap { input_regs, output_regs }
+    PtrParamMap {
+        input_regs,
+        output_regs,
+    }
 }
 
 fn count_inputs(sig: &ScalarFnSignature) -> usize {
@@ -804,7 +925,10 @@ fn resolve_call_target_a64(target_addr: u64) -> String {
 
 /// Parse `[x0, #16]` or `[sp, #-8]` → base register index (0-31, 31=sp).
 fn parse_base_reg(mem_op: &str) -> Option<u32> {
-    let inner = mem_op.strip_prefix('[')?.split(|c| c == ',' || c == ']').next()?;
+    let inner = mem_op
+        .strip_prefix('[')?
+        .split(|c| c == ',' || c == ']')
+        .next()?;
     let base = inner.trim();
     if base == "sp" {
         Some(31)
@@ -837,7 +961,9 @@ pub fn analyze_scalar_fn(
     sig: &ScalarFnSignature,
 ) -> Result<Vec<TraceOp>, SymExecError> {
     if fn_ptr.is_null() {
-        return Err(SymExecError::DisassemblyFailed("null function pointer".into()));
+        return Err(SymExecError::DisassemblyFailed(
+            "null function pointer".into(),
+        ));
     }
 
     let n_inputs = count_inputs(sig);
@@ -886,9 +1012,7 @@ pub fn analyze_scalar_fn(
         let mnem = &insn.mnemonic;
 
         // PC-relative literal load → constant pool.
-        if mnem == "ldr" && insn.operands.len() == 2
-            && insn.operands[1].contains("pc,")
-        {
+        if mnem == "ldr" && insn.operands.len() == 2 && insn.operands[1].contains("pc,") {
             if let Some(lit_addr) = insn.branch_target {
                 let dst = &insn.operands[0];
                 if is_float_reg(dst) {
@@ -932,8 +1056,12 @@ pub fn analyze_scalar_fn(
             // SAFETY: guarded by operands.len() >= 2 above
             let src_str = insn.operands.last().expect("operands.len() >= 2");
             if let (Some(d), Some(s)) = (
-                dst_str.strip_prefix('x').and_then(|n| n.parse::<u32>().ok()),
-                src_str.strip_prefix('x').and_then(|n| n.parse::<u32>().ok()),
+                dst_str
+                    .strip_prefix('x')
+                    .and_then(|n| n.parse::<u32>().ok()),
+                src_str
+                    .strip_prefix('x')
+                    .and_then(|n| n.parse::<u32>().ok()),
             ) {
                 ptr_map.propagate_mov(d, s);
             }
@@ -961,17 +1089,40 @@ pub fn analyze_scalar_fn(
 fn is_integer_mnemonic(m: &str) -> bool {
     matches!(
         m,
-        "mov" | "movz" | "movk" | "movn"
-            | "add" | "sub" | "mul" | "sdiv" | "udiv"
-            | "and" | "orr" | "eor" | "tst"
-            | "lsl" | "lsr" | "asr"
-            | "cmp" | "cmn"
-            | "adrp" | "adr"
-            | "sxtw" | "uxtw"
+        "mov"
+            | "movz"
+            | "movk"
+            | "movn"
+            | "add"
+            | "sub"
+            | "mul"
+            | "sdiv"
+            | "udiv"
+            | "and"
+            | "orr"
+            | "eor"
+            | "tst"
+            | "lsl"
+            | "lsr"
+            | "asr"
+            | "cmp"
+            | "cmn"
+            | "adrp"
+            | "adr"
+            | "sxtw"
+            | "uxtw"
             | "nop"
-            | "stp_int" | "ldp_int" | "str_int" | "ldr_int"
-            | "csel" | "csinc" | "csinv" | "csneg"
-            | "ls_unknown" | "dp_imm_unknown" | "dp_reg"
+            | "stp_int"
+            | "ldp_int"
+            | "str_int"
+            | "ldr_int"
+            | "csel"
+            | "csinc"
+            | "csinv"
+            | "csneg"
+            | "ls_unknown"
+            | "dp_imm_unknown"
+            | "dp_reg"
     )
 }
 
@@ -986,10 +1137,14 @@ pub fn analyze_scalar_fn_structured(
     sig: &ScalarFnSignature,
 ) -> Result<Option<super::loop_analyzer::MultiPassAnalysis>, SymExecError> {
     use super::cfg::find_loops;
-    use super::loop_analyzer::{analyze_single_loop, analyze_nested_loops, combine_passes_with_sig};
+    use super::loop_analyzer::{
+        analyze_nested_loops, analyze_single_loop, combine_passes_with_sig,
+    };
 
     if fn_ptr.is_null() {
-        return Err(SymExecError::DisassemblyFailed("null function pointer".into()));
+        return Err(SymExecError::DisassemblyFailed(
+            "null function pointer".into(),
+        ));
     }
 
     let cfg = match build_cfg_from_fn_aarch64(fn_ptr, MAX_FN_BYTES) {
@@ -1056,8 +1211,8 @@ pub fn build_cfg_from_fn_aarch64(
     fn_ptr: *const u8,
     max_bytes: usize,
 ) -> Result<super::cfg::ControlFlowGraph, CompilerError> {
-    use std::collections::{BTreeMap, BTreeSet};
     use super::cfg::*;
+    use std::collections::{BTreeMap, BTreeSet};
 
     if fn_ptr.is_null() {
         return Err("null function pointer".into());
@@ -1092,9 +1247,8 @@ pub fn build_cfg_from_fn_aarch64(
         return Err("no instructions decoded".into());
     }
 
-    let end_addr = func_end.unwrap_or_else(|| {
-        all_insns.last().map(|i| i.addr + 4).unwrap_or(base_addr)
-    });
+    let end_addr =
+        func_end.unwrap_or_else(|| all_insns.last().map(|i| i.addr + 4).unwrap_or(base_addr));
 
     // Determine block boundaries.
     let mut block_starts: BTreeSet<u64> = BTreeSet::new();
@@ -1110,9 +1264,7 @@ pub fn build_cfg_from_fn_aarch64(
         addr_to_block.insert(addr, BlockId(idx as u32));
     }
 
-    let find_block = |addr: u64| -> Option<BlockId> {
-        addr_to_block.get(&addr).copied()
-    };
+    let find_block = |addr: u64| -> Option<BlockId> { addr_to_block.get(&addr).copied() };
 
     // Build basic blocks.
     let block_start_vec: Vec<u64> = block_starts.iter().copied().collect();
@@ -1181,7 +1333,9 @@ pub fn build_cfg_from_fn_aarch64(
         let succs = match &terminator {
             Terminator::Fallthrough(next) => vec![*next],
             Terminator::Jump(target) => vec![*target],
-            Terminator::CondBranch { taken, fallthrough, .. } => vec![*taken, *fallthrough],
+            Terminator::CondBranch {
+                taken, fallthrough, ..
+            } => vec![*taken, *fallthrough],
             Terminator::Return => vec![],
         };
 
@@ -1192,13 +1346,16 @@ pub fn build_cfg_from_fn_aarch64(
 
         let block_end_addr = last_insn.map(|i| i.addr + 4).unwrap_or(blk_end);
 
-        blocks.insert(blk_id, BasicBlock {
-            id: blk_id,
-            start_addr: blk_start,
-            end_addr: block_end_addr,
-            instructions: insns,
-            terminator,
-        });
+        blocks.insert(
+            blk_id,
+            BasicBlock {
+                id: blk_id,
+                start_addr: blk_start,
+                end_addr: block_end_addr,
+                instructions: insns,
+                terminator,
+            },
+        );
     }
 
     for &blk_id in blocks.keys() {
@@ -1451,14 +1608,14 @@ mod tests {
         let word = 0xFF00_F0F0u32;
 
         // Act & Assert
-        assert_eq!(bits(word, 31, 24), 0xFF);       // top byte
-        assert_eq!(bits(word, 7, 0), 0xF0);          // bottom byte
-        assert_eq!(bits(word, 15, 8), 0xF0);         // second byte
-        assert_eq!(bits(word, 23, 16), 0x00);        // third byte
-        assert_eq!(bits(word, 7, 7), 1);             // single bit (bit 7 of 0xF0 = 1)
-        assert_eq!(bits(word, 6, 6), 1);             // single bit (bit 6 of 0xF0 = 1)
-        assert_eq!(bits(word, 3, 3), 0);             // bit 3 of 0xF0 = 0
-        assert_eq!(bits(word, 4, 4), 1);             // bit 4 of 0xF0 = 1
+        assert_eq!(bits(word, 31, 24), 0xFF); // top byte
+        assert_eq!(bits(word, 7, 0), 0xF0); // bottom byte
+        assert_eq!(bits(word, 15, 8), 0xF0); // second byte
+        assert_eq!(bits(word, 23, 16), 0x00); // third byte
+        assert_eq!(bits(word, 7, 7), 1); // single bit (bit 7 of 0xF0 = 1)
+        assert_eq!(bits(word, 6, 6), 1); // single bit (bit 6 of 0xF0 = 1)
+        assert_eq!(bits(word, 3, 3), 0); // bit 3 of 0xF0 = 0
+        assert_eq!(bits(word, 4, 4), 1); // bit 4 of 0xF0 = 1
     }
 
     #[test]
@@ -1488,12 +1645,12 @@ mod tests {
         // Arrange & Act & Assert: xreg boundary values
         assert_eq!(xreg(0), "x0");
         assert_eq!(xreg(30), "x30");
-        assert_eq!(xreg(31), "sp");          // x31 = sp
+        assert_eq!(xreg(31), "sp"); // x31 = sp
 
         // wreg boundary values
         assert_eq!(wreg(0), "w0");
         assert_eq!(wreg(30), "w30");
-        assert_eq!(wreg(31), "wsp");          // w31 = wsp
+        assert_eq!(wreg(31), "wsp"); // w31 = wsp
 
         // sreg/dreg
         assert_eq!(sreg(0), "s0");
@@ -1585,32 +1742,58 @@ mod tests {
     #[test]
     fn test_parse_base_reg_invalid_inputs() {
         // Arrange & Act & Assert
-        assert_eq!(parse_base_reg(""), None);                   // empty string
-        assert_eq!(parse_base_reg("x0, #16]"), None);           // missing bracket
-        assert_eq!(parse_base_reg("[y0, #16]"), None);          // not x/sp register
-        assert_eq!(parse_base_reg("[x, #16]"), None);           // no digit after x
-        assert_eq!(parse_base_reg("[sp, #0]"), Some(31));       // valid sp
-        assert_eq!(parse_base_reg("[x0]"), Some(0));            // no offset, just base
+        assert_eq!(parse_base_reg(""), None); // empty string
+        assert_eq!(parse_base_reg("x0, #16]"), None); // missing bracket
+        assert_eq!(parse_base_reg("[y0, #16]"), None); // not x/sp register
+        assert_eq!(parse_base_reg("[x, #16]"), None); // no digit after x
+        assert_eq!(parse_base_reg("[sp, #0]"), Some(31)); // valid sp
+        assert_eq!(parse_base_reg("[x0]"), Some(0)); // no offset, just base
     }
 
     #[test]
     fn test_is_integer_mnemonic_coverage() {
         // Arrange & Act & Assert: mnemonics classified as integer
         let int_mnemonics = [
-            "mov", "movz", "movk", "movn",
-            "add", "sub", "mul", "sdiv", "udiv",
-            "and", "orr", "eor", "tst",
-            "lsl", "lsr", "asr",
-            "cmp", "cmn",
-            "adrp", "adr",
-            "sxtw", "uxtw",
+            "mov",
+            "movz",
+            "movk",
+            "movn",
+            "add",
+            "sub",
+            "mul",
+            "sdiv",
+            "udiv",
+            "and",
+            "orr",
+            "eor",
+            "tst",
+            "lsl",
+            "lsr",
+            "asr",
+            "cmp",
+            "cmn",
+            "adrp",
+            "adr",
+            "sxtw",
+            "uxtw",
             "nop",
-            "stp_int", "ldp_int", "str_int", "ldr_int",
-            "csel", "csinc", "csinv", "csneg",
-            "ls_unknown", "dp_imm_unknown", "dp_reg",
+            "stp_int",
+            "ldp_int",
+            "str_int",
+            "ldr_int",
+            "csel",
+            "csinc",
+            "csinv",
+            "csneg",
+            "ls_unknown",
+            "dp_imm_unknown",
+            "dp_reg",
         ];
         for m in &int_mnemonics {
-            assert!(is_integer_mnemonic(m), "expected '{m}' to be integer mnemonic");
+            assert!(
+                is_integer_mnemonic(m),
+                "expected '{m}' to be integer mnemonic"
+            );
         }
 
         // Float mnemonics should NOT be classified as integer
@@ -1719,11 +1902,16 @@ mod tests {
         let rt: u32 = 5;
         let b5: u32 = 0;
         let b40: u32 = 0;
-        let word = (1u32 << 31) | (0b011_011u32 << 25) | (0u32 << 24)
-            | (b5 << 19) | (b40 << 19) | (imm14 << 5) | rt;
+        let word = (1u32 << 31)
+            | (0b011_011u32 << 25)
+            | (0u32 << 24)
+            | (b5 << 19)
+            | (b40 << 19)
+            | (imm14 << 5)
+            | rt;
         // Reconstruct properly: bit31=b5, bits[30:25]=011011, bit24=op, bits[23:19]=b40, bits[18:5]=imm14, bits[4:0]=rt
-        let word = (b5 << 31) | (0b011_011u32 << 25) | (0u32 << 24)
-            | (b40 << 19) | (imm14 << 5) | rt;
+        let word =
+            (b5 << 31) | (0b011_011u32 << 25) | (0u32 << 24) | (b40 << 19) | (imm14 << 5) | rt;
         let insn = decode_one(word, 0x1000);
 
         assert_eq!(insn.mnemonic, "tbz");
@@ -1755,9 +1943,12 @@ mod tests {
                 | (opcode << 12)    // opcode
                 | (0b10u32 << 10)   // bits[11:10]=10
                 | (1u32 << 5)       // Rn=1
-                | 0u32;             // Rd=0
+                | 0u32; // Rd=0
             let insn = decode_one(word, 0x1000);
-            assert_eq!(insn.mnemonic, expected_mnem, "opcode {opcode} should decode to {expected_mnem}");
+            assert_eq!(
+                insn.mnemonic, expected_mnem,
+                "opcode {opcode} should decode to {expected_mnem}"
+            );
             assert_eq!(insn.operands[0], "s0");
             assert_eq!(insn.operands[1], "s1");
             assert_eq!(insn.operands[2], "s2");
@@ -1775,21 +1966,31 @@ mod tests {
             | (1u32 << 15)         // o0=1
             | (3u32 << 10)         // Ra=3
             | (1u32 << 5)          // Rn=1
-            | 0u32;                // Rd=0
+            | 0u32; // Rd=0
         let insn = decode_one(word_fmsub, 0);
         assert_eq!(insn.mnemonic, "fmsub");
         assert_eq!(insn.operands, vec!["s0", "s1", "s2", "s3"]);
 
         // fnmadd: o1=1, o0=0
         let word_fnmadd = (0b0001_1111u32 << 24)
-            | (0u32 << 22) | (1u32 << 21) | (2u32 << 16)
-            | (0u32 << 15) | (3u32 << 10) | (1u32 << 5) | 0u32;
+            | (0u32 << 22)
+            | (1u32 << 21)
+            | (2u32 << 16)
+            | (0u32 << 15)
+            | (3u32 << 10)
+            | (1u32 << 5)
+            | 0u32;
         assert_eq!(decode_one(word_fnmadd, 0).mnemonic, "fnmadd");
 
         // fnmsub: o1=1, o0=1
         let word_fnmsub = (0b0001_1111u32 << 24)
-            | (0u32 << 22) | (1u32 << 21) | (2u32 << 16)
-            | (1u32 << 15) | (3u32 << 10) | (1u32 << 5) | 0u32;
+            | (0u32 << 22)
+            | (1u32 << 21)
+            | (2u32 << 16)
+            | (1u32 << 15)
+            | (3u32 << 10)
+            | (1u32 << 5)
+            | 0u32;
         assert_eq!(decode_one(word_fnmsub, 0).mnemonic, "fnmsub");
     }
 
@@ -1803,8 +2004,8 @@ mod tests {
             | (0u32 << 14)           // bit14=0
             | (0b000000u32 << 10)    // no overlap; opcode in bits[15:10]
             | (1u32 << 5)            // Rn=1
-            | 0u32;                  // Rd=0
-        // Rebuild properly: bits[15:10] = opcode=000000, bit14=0
+            | 0u32; // Rd=0
+                    // Rebuild properly: bits[15:10] = opcode=000000, bit14=0
         let word_fmov = (0b0001_1110u32 << 24)
             | (0u32 << 22)
             | (1u32 << 21)
@@ -1814,42 +2015,72 @@ mod tests {
             | (1u32 << 5) | 0u32;
         // Actually need: bits[21:17]=10000, bit14=0, bits[15:10]=opcode
         // So: bit21=1, bits[20:17]=0000, bits[15:10]=000000, bit14=0
-        let word_fmov = (0b0001_1110u32 << 24) | (0u32 << 22) | (1u32 << 21)
-            | (0u32 << 17) | (0b000000u32 << 10) | (1u32 << 5) | 0u32;
+        let word_fmov = (0b0001_1110u32 << 24)
+            | (0u32 << 22)
+            | (1u32 << 21)
+            | (0u32 << 17)
+            | (0b000000u32 << 10)
+            | (1u32 << 5)
+            | 0u32;
         // bits[20:17] = 0000, so bits[21:17] = 10000
         let insn = decode_one(word_fmov, 0);
         assert_eq!(insn.mnemonic, "fmov");
         assert_eq!(insn.operands, vec!["s0", "s1"]);
 
         // fabs: opcode=000001
-        let word_fabs = (0b0001_1110u32 << 24) | (0u32 << 22) | (1u32 << 21)
-            | (0u32 << 17) | (0b000001u32 << 10) | (1u32 << 5) | 0u32;
+        let word_fabs = (0b0001_1110u32 << 24)
+            | (0u32 << 22)
+            | (1u32 << 21)
+            | (0u32 << 17)
+            | (0b000001u32 << 10)
+            | (1u32 << 5)
+            | 0u32;
         assert_eq!(decode_one(word_fabs, 0).mnemonic, "fabs");
 
         // fneg: opcode=000010
-        let word_fneg = (0b0001_1110u32 << 24) | (0u32 << 22) | (1u32 << 21)
-            | (0u32 << 17) | (0b000010u32 << 10) | (1u32 << 5) | 0u32;
+        let word_fneg = (0b0001_1110u32 << 24)
+            | (0u32 << 22)
+            | (1u32 << 21)
+            | (0u32 << 17)
+            | (0b000010u32 << 10)
+            | (1u32 << 5)
+            | 0u32;
         assert_eq!(decode_one(word_fneg, 0).mnemonic, "fneg");
 
         // fsqrt: opcode=000011
-        let word_fsqrt = (0b0001_1110u32 << 24) | (0u32 << 22) | (1u32 << 21)
-            | (0u32 << 17) | (0b000011u32 << 10) | (1u32 << 5) | 0u32;
+        let word_fsqrt = (0b0001_1110u32 << 24)
+            | (0u32 << 22)
+            | (1u32 << 21)
+            | (0u32 << 17)
+            | (0b000011u32 << 10)
+            | (1u32 << 5)
+            | 0u32;
         assert_eq!(decode_one(word_fsqrt, 0).mnemonic, "fsqrt");
 
         // fcvt S->D: opcode=000100 → dest is dreg, src is sreg
-        let word_fcvt_sd = (0b0001_1110u32 << 24) | (0u32 << 22) | (1u32 << 21)
-            | (0u32 << 17) | (0b000100u32 << 10) | (1u32 << 5) | 0u32;
+        let word_fcvt_sd = (0b0001_1110u32 << 24)
+            | (0u32 << 22)
+            | (1u32 << 21)
+            | (0u32 << 17)
+            | (0b000100u32 << 10)
+            | (1u32 << 5)
+            | 0u32;
         let insn_fcvt = decode_one(word_fcvt_sd, 0);
         assert_eq!(insn_fcvt.mnemonic, "fcvt");
-        assert_eq!(insn_fcvt.operands[0], "d0");  // dest: double
-        assert_eq!(insn_fcvt.operands[1], "s1");  // src: single
+        assert_eq!(insn_fcvt.operands[0], "d0"); // dest: double
+        assert_eq!(insn_fcvt.operands[1], "s1"); // src: single
 
         // fcvt D->S: opcode=000101 → dest is sreg, src is dreg
-        let word_fcvt_ds = (0b0001_1110u32 << 24) | (0u32 << 22) | (1u32 << 21)
-            | (0u32 << 17) | (0b000101u32 << 10) | (1u32 << 5) | 0u32;
+        let word_fcvt_ds = (0b0001_1110u32 << 24)
+            | (0u32 << 22)
+            | (1u32 << 21)
+            | (0u32 << 17)
+            | (0b000101u32 << 10)
+            | (1u32 << 5)
+            | 0u32;
         let insn_ds = decode_one(word_fcvt_ds, 0);
-        assert_eq!(insn_ds.operands[0], "s0");  // dest: single
-        assert_eq!(insn_ds.operands[1], "d1");  // src: double
+        assert_eq!(insn_ds.operands[0], "s0"); // dest: single
+        assert_eq!(insn_ds.operands[1], "d1"); // src: double
     }
 
     #[test]
@@ -1864,21 +2095,29 @@ mod tests {
             | (0b1000u32 << 10)    // bits[13:10]
             | (0u32 << 5)          // Rn=0
             | (0b000u32 << 3)      // bits[4:3]=opc=00
-            | 0u32;                // bits[2:0]=000
+            | 0u32; // bits[2:0]=000
         let insn = decode_one(word_fcmp, 0);
         assert_eq!(insn.mnemonic, "fcmp");
         assert!(insn.operands[0].starts_with('s'));
 
         // fcmpe: opc bits[4:3] where bit0=1 → opc=01 (bit3=0,bit4=1 → opc & 1 == 1)
         let word_fcmpe = (0b0001_1110u32 << 24)
-            | (0u32 << 22) | (1u32 << 21) | (1u32 << 16)
-            | (0b1000u32 << 10) | (0u32 << 5)
-            | (0b010u32 << 3) | 0u32;  // opc=01 → bit3=1
-        // opc bits[4:3] = 01 → opc=1 → fcmpe (opc & 1 == 1)
+            | (0u32 << 22)
+            | (1u32 << 21)
+            | (1u32 << 16)
+            | (0b1000u32 << 10)
+            | (0u32 << 5)
+            | (0b010u32 << 3)
+            | 0u32; // opc=01 → bit3=1
+                    // opc bits[4:3] = 01 → opc=1 → fcmpe (opc & 1 == 1)
         let word_fcmpe = (0b0001_1110u32 << 24)
-            | (0u32 << 22) | (1u32 << 21) | (1u32 << 16)
-            | (0b1000u32 << 10) | (0u32 << 5)
-            | (1u32 << 3) | 0u32;  // bit3=1 → opc=01
+            | (0u32 << 22)
+            | (1u32 << 21)
+            | (1u32 << 16)
+            | (0b1000u32 << 10)
+            | (0u32 << 5)
+            | (1u32 << 3)
+            | 0u32; // bit3=1 → opc=01
         let insn_e = decode_one(word_fcmpe, 0);
         assert_eq!(insn_e.mnemonic, "fcmpe");
     }
@@ -1894,7 +2133,7 @@ mod tests {
             | (0u32 << 12)         // cond=0 (eq)
             | (0b11u32 << 10)      // bits[11:10]=11
             | (1u32 << 5)          // Rn=1
-            | 0u32;                // Rd=0
+            | 0u32; // Rd=0
         let insn = decode_one(word, 0);
 
         assert_eq!(insn.mnemonic, "fcsel");
@@ -1934,7 +2173,8 @@ mod tests {
         assert_eq!(decode_one(word_sub, 0).mnemonic, "sub");
 
         // cmp: s=1, rd=31 → "cmp" mnemonic
-        let word_cmp = (1u32 << 31) | (0b11u32 << 29) | (0b100u32 << 26) | (0b001u32 << 23) | (31u32 << 0);
+        let word_cmp =
+            (1u32 << 31) | (0b11u32 << 29) | (0b100u32 << 26) | (0b001u32 << 23) | (31u32 << 0);
         let insn_cmp = decode_one(word_cmp, 0);
         assert_eq!(insn_cmp.mnemonic, "cmp");
         assert_eq!(insn_cmp.operands[0], "x5"); // rn = bits[9:5] = 0 with bit29=s=1
@@ -2012,7 +2252,7 @@ mod tests {
             | (2u32 << 16)          // Rm=2
             | (0u32 << 12)          // cond=0 (eq)
             | (1u32 << 5)           // Rn=1
-            | 0u32;                 // Rd=0
+            | 0u32; // Rd=0
         let insn = decode_one(word_csel, 0);
 
         assert_eq!(insn.mnemonic, "csel");
@@ -2022,18 +2262,36 @@ mod tests {
         assert_eq!(insn.operands[3], "eq");
 
         // csinc: op=0, op2=1
-        let word_csinc = (1u32 << 31) | (0b011010100u32 << 21)
-            | (0u32 << 30) | (1u32 << 10) | (2u32 << 16) | (0u32 << 12) | (1u32 << 5) | 0u32;
+        let word_csinc = (1u32 << 31)
+            | (0b011010100u32 << 21)
+            | (0u32 << 30)
+            | (1u32 << 10)
+            | (2u32 << 16)
+            | (0u32 << 12)
+            | (1u32 << 5)
+            | 0u32;
         assert_eq!(decode_one(word_csinc, 0).mnemonic, "csinc");
 
         // csinv: op=1, op2=0
-        let word_csinv = (1u32 << 31) | (0b011010100u32 << 21)
-            | (1u32 << 30) | (0u32 << 10) | (2u32 << 16) | (0u32 << 12) | (1u32 << 5) | 0u32;
+        let word_csinv = (1u32 << 31)
+            | (0b011010100u32 << 21)
+            | (1u32 << 30)
+            | (0u32 << 10)
+            | (2u32 << 16)
+            | (0u32 << 12)
+            | (1u32 << 5)
+            | 0u32;
         assert_eq!(decode_one(word_csinv, 0).mnemonic, "csinv");
 
         // csneg: op=1, op2=1
-        let word_csneg = (1u32 << 31) | (0b011010100u32 << 21)
-            | (1u32 << 30) | (1u32 << 10) | (2u32 << 16) | (0u32 << 12) | (1u32 << 5) | 0u32;
+        let word_csneg = (1u32 << 31)
+            | (0b011010100u32 << 21)
+            | (1u32 << 30)
+            | (1u32 << 10)
+            | (2u32 << 16)
+            | (0u32 << 12)
+            | (1u32 << 5)
+            | 0u32;
         assert_eq!(decode_one(word_csneg, 0).mnemonic, "csneg");
     }
 
@@ -2041,8 +2299,7 @@ mod tests {
     fn test_decode_dp_reg_shifted_register_ops() {
         // add (shifted reg): op_kind=00
         // bits[28:25] = 0101 (DP register), op_kind bits[30:29]=00
-        let word_add = (1u32 << 31) | (0b00u32 << 29) | (0b0101u32 << 25)
-            | (1u32 << 5) | 0u32;   // Rn=1, Rd=0
+        let word_add = (1u32 << 31) | (0b00u32 << 29) | (0b0101u32 << 25) | (1u32 << 5) | 0u32; // Rn=1, Rd=0
         let insn = decode_one(word_add, 0);
         assert_eq!(insn.mnemonic, "add");
 
@@ -2101,27 +2358,37 @@ mod tests {
             | (0b010u32 << 16)       // opcode=010 (scvtf)
             | (0b000000u32 << 10)
             | (1u32 << 5)            // Rn=1
-            | 0u32;                  // Rd=0
+            | 0u32; // Rd=0
         let insn = decode_one(word_scvtf, 0);
         assert_eq!(insn.mnemonic, "scvtf");
-        assert_eq!(insn.operands[0], "d0");   // ftype=01 → double
-        assert_eq!(insn.operands[1], "x1");   // sf=1 → x reg
+        assert_eq!(insn.operands[0], "d0"); // ftype=01 → double
+        assert_eq!(insn.operands[1], "x1"); // sf=1 → x reg
 
         // ucvtf: opcode=011
-        let word_ucvtf = (1u32 << 31) | (0b0001_1110u32 << 24)
-            | (0u32 << 22) | (1u32 << 21)
-            | (0b00u32 << 19) | (0b011u32 << 16) | (0b000000u32 << 10)
-            | (1u32 << 5) | 0u32;
+        let word_ucvtf = (1u32 << 31)
+            | (0b0001_1110u32 << 24)
+            | (0u32 << 22)
+            | (1u32 << 21)
+            | (0b00u32 << 19)
+            | (0b011u32 << 16)
+            | (0b000000u32 << 10)
+            | (1u32 << 5)
+            | 0u32;
         assert_eq!(decode_one(word_ucvtf, 0).mnemonic, "ucvtf");
 
         // scvtf s0, w1: sf=0, ftype=00
-        let word_scvtf_w = (0u32 << 31) | (0b0001_1110u32 << 24)
-            | (0u32 << 22) | (1u32 << 21)
-            | (0b00u32 << 19) | (0b010u32 << 16) | (0b000000u32 << 10)
-            | (1u32 << 5) | 0u32;
+        let word_scvtf_w = (0u32 << 31)
+            | (0b0001_1110u32 << 24)
+            | (0u32 << 22)
+            | (1u32 << 21)
+            | (0b00u32 << 19)
+            | (0b010u32 << 16)
+            | (0b000000u32 << 10)
+            | (1u32 << 5)
+            | 0u32;
         let insn_w = decode_one(word_scvtf_w, 0);
-        assert_eq!(insn_w.operands[0], "s0");  // ftype=00 → single
-        assert_eq!(insn_w.operands[1], "w1");  // sf=0 → w reg
+        assert_eq!(insn_w.operands[0], "s0"); // ftype=00 → single
+        assert_eq!(insn_w.operands[1], "w1"); // sf=0 → w reg
     }
 
     // ── Wave 12k69 tests (+10) ──────────────────────────────────────
@@ -2134,8 +2401,12 @@ mod tests {
         // bits[29:27]=011, bit[26]=1, bits[25:24]=00
         // opc=00 → s register, imm19=1 → offset = 1*4 = 4, rt=0
         let imm19: u32 = 1;
-        let word = (0b00u32 << 30) | (0b011u32 << 27) | (1u32 << 26)
-            | (0b00u32 << 24) | (imm19 << 5) | 0u32;
+        let word = (0b00u32 << 30)
+            | (0b011u32 << 27)
+            | (1u32 << 26)
+            | (0b00u32 << 24)
+            | (imm19 << 5)
+            | 0u32;
         let pc: u64 = 0x1000;
 
         // Act
@@ -2157,8 +2428,14 @@ mod tests {
         // Encoding: size=01 111 1 01 opc=01 imm12 Rn Rt
         // bits[29:27]=111, bit[26]=1, bits[25:24]=01
         // size=01 (double), opc=01 (load), imm12=1, rn=2, rt=5
-        let word_ldr = (0b01u32 << 30) | (0b111u32 << 27) | (1u32 << 26) | (0b01u32 << 24)
-            | (0b01u32 << 22) | (1u32 << 10) | (2u32 << 5) | 5u32;
+        let word_ldr = (0b01u32 << 30)
+            | (0b111u32 << 27)
+            | (1u32 << 26)
+            | (0b01u32 << 24)
+            | (0b01u32 << 22)
+            | (1u32 << 10)
+            | (2u32 << 5)
+            | 5u32;
 
         // Act
         let insn_ldr = decode_one(word_ldr, 0x1000);
@@ -2171,8 +2448,14 @@ mod tests {
 
         // Arrange: STR S3, [SP, #0] — store to sp with zero offset
         // size=00, opc=00 (store), imm12=0, rn=31 (sp), rt=3
-        let word_str = (0b00u32 << 30) | (0b111u32 << 27) | (1u32 << 26) | (0b01u32 << 24)
-            | (0b00u32 << 22) | (0u32 << 10) | (31u32 << 5) | 3u32;
+        let word_str = (0b00u32 << 30)
+            | (0b111u32 << 27)
+            | (1u32 << 26)
+            | (0b01u32 << 24)
+            | (0b00u32 << 22)
+            | (0u32 << 10)
+            | (31u32 << 5)
+            | 3u32;
 
         // Act
         let insn_str = decode_one(word_str, 0x1000);
@@ -2192,8 +2475,14 @@ mod tests {
         // bits[29:27]=101, bit[26]=1, bit[22]=1 (load)
         // opc=00 (s-reg), imm7=1, rt2=1, rn=2, rt=0
         // scale for opc=00 → 4, so offset = sign_extend(1,7) * 4 = 4
-        let word_ldp = (0b00u32 << 30) | (0b101u32 << 27) | (1u32 << 26)
-            | (1u32 << 22) | (1u32 << 15) | (1u32 << 10) | (2u32 << 5) | 0u32;
+        let word_ldp = (0b00u32 << 30)
+            | (0b101u32 << 27)
+            | (1u32 << 26)
+            | (1u32 << 22)
+            | (1u32 << 15)
+            | (1u32 << 10)
+            | (2u32 << 5)
+            | 0u32;
 
         // Act
         let insn_ldp = decode_one(word_ldp, 0x2000);
@@ -2207,8 +2496,14 @@ mod tests {
         // Arrange: STP D0, D1, [SP, #-16] — store pair, double-precision, sp base
         // opc=01 (d-reg), bit[22]=0 (store), imm7=-4 (sign-extended 7-bit), scale=8
         let imm7_neg4: u32 = ((-4i32) as u32) & 0x7F;
-        let word_stp = (0b01u32 << 30) | (0b101u32 << 27) | (1u32 << 26)
-            | (0u32 << 22) | (imm7_neg4 << 15) | (1u32 << 10) | (31u32 << 5) | 0u32;
+        let word_stp = (0b01u32 << 30)
+            | (0b101u32 << 27)
+            | (1u32 << 26)
+            | (0u32 << 22)
+            | (imm7_neg4 << 15)
+            | (1u32 << 10)
+            | (31u32 << 5)
+            | 0u32;
 
         // Act
         let insn_stp = decode_one(word_stp, 0x3000);
@@ -2228,8 +2523,14 @@ mod tests {
         // Encoding: size=11 111 0 01 opc=01 imm12 Rn Rt
         // bits[29:27]=111, bit[26]=0, bits[25:24]=01
         // size=11 (x-reg), opc=01 (load)
-        let word_ldr_int = (0b11u32 << 30) | (0b111u32 << 27) | (0u32 << 26) | (0b01u32 << 24)
-            | (0b01u32 << 22) | (0u32 << 10) | (0u32 << 5) | 0u32;
+        let word_ldr_int = (0b11u32 << 30)
+            | (0b111u32 << 27)
+            | (0u32 << 26)
+            | (0b01u32 << 24)
+            | (0b01u32 << 22)
+            | (0u32 << 10)
+            | (0u32 << 5)
+            | 0u32;
 
         // Act
         let insn = decode_one(word_ldr_int, 0);
@@ -2239,8 +2540,14 @@ mod tests {
         assert_eq!(insn.operands[0], "x0");
 
         // Arrange: STR W5, integer store (size=10, opc=00 store)
-        let word_str_int = (0b10u32 << 30) | (0b111u32 << 27) | (0u32 << 26) | (0b01u32 << 24)
-            | (0b00u32 << 22) | (0u32 << 10) | (0u32 << 5) | 5u32;
+        let word_str_int = (0b10u32 << 30)
+            | (0b111u32 << 27)
+            | (0u32 << 26)
+            | (0b01u32 << 24)
+            | (0b00u32 << 22)
+            | (0u32 << 10)
+            | (0u32 << 5)
+            | 5u32;
 
         // Act
         let insn_str = decode_one(word_str_int, 0);
@@ -2255,8 +2562,14 @@ mod tests {
     fn test_decode_ldp_stp_integer_pair() {
         // Arrange: LDP integer — opc 101 0 0xx, bit[22]=1 (load)
         // bits[29:27]=101, bit[26]=0
-        let word_ldp_int = (0b00u32 << 30) | (0b101u32 << 27) | (0u32 << 26)
-            | (1u32 << 22) | (0u32 << 15) | (0u32 << 10) | (0u32 << 5) | 0u32;
+        let word_ldp_int = (0b00u32 << 30)
+            | (0b101u32 << 27)
+            | (0u32 << 26)
+            | (1u32 << 22)
+            | (0u32 << 15)
+            | (0u32 << 10)
+            | (0u32 << 5)
+            | 0u32;
 
         // Act
         let insn = decode_one(word_ldp_int, 0);
@@ -2265,8 +2578,7 @@ mod tests {
         assert_eq!(insn.mnemonic, "ldp_int");
 
         // Arrange: STP integer — bit[22]=0 (store)
-        let word_stp_int = (0b00u32 << 30) | (0b101u32 << 27) | (0u32 << 26)
-            | (0u32 << 22);
+        let word_stp_int = (0b00u32 << 30) | (0b101u32 << 27) | (0u32 << 26) | (0u32 << 22);
 
         // Act
         let insn_stp = decode_one(word_stp_int, 0);
@@ -2282,9 +2594,16 @@ mod tests {
         // Encoding: xx 111 x 00 xx 1 Rm opt S 10 Rn Rt
         // bits[29:27]=111, bits[25:24]=00, bit[21]=1, bits[11:10]=10
         // is_fp: bit[26]=1, size=00 (s-reg), opc=01 (load), rm=2, rn=1, rt=0
-        let word_ldr_reg = (0b00u32 << 30) | (0b111u32 << 27) | (1u32 << 26) | (0b00u32 << 24)
-            | (1u32 << 21) | (0b01u32 << 22) | (2u32 << 16) | (0b10u32 << 10)
-            | (1u32 << 5) | 0u32;
+        let word_ldr_reg = (0b00u32 << 30)
+            | (0b111u32 << 27)
+            | (1u32 << 26)
+            | (0b00u32 << 24)
+            | (1u32 << 21)
+            | (0b01u32 << 22)
+            | (2u32 << 16)
+            | (0b10u32 << 10)
+            | (1u32 << 5)
+            | 0u32;
 
         // Act
         let insn = decode_one(word_ldr_reg, 0);
@@ -2297,9 +2616,16 @@ mod tests {
 
         // Arrange: STR D3, [X5, X7] — register offset, double store
         // size=01, bit[26]=1, opc=00 (store), rm=7, rn=5, rt=3
-        let word_str_reg = (0b01u32 << 30) | (0b111u32 << 27) | (1u32 << 26) | (0b00u32 << 24)
-            | (1u32 << 21) | (0b00u32 << 22) | (7u32 << 16) | (0b10u32 << 10)
-            | (5u32 << 5) | 3u32;
+        let word_str_reg = (0b01u32 << 30)
+            | (0b111u32 << 27)
+            | (1u32 << 26)
+            | (0b00u32 << 24)
+            | (1u32 << 21)
+            | (0b00u32 << 22)
+            | (7u32 << 16)
+            | (0b10u32 << 10)
+            | (5u32 << 5)
+            | 3u32;
 
         // Act
         let insn_str = decode_one(word_str_reg, 0);
@@ -2310,9 +2636,16 @@ mod tests {
 
         // Arrange: LDR integer register offset (bit[26]=0)
         // size=11 (x-reg), opc=01 (load)
-        let word_ldr_int_reg = (0b11u32 << 30) | (0b111u32 << 27) | (0u32 << 26) | (0b00u32 << 24)
-            | (1u32 << 21) | (0b01u32 << 22) | (2u32 << 16) | (0b10u32 << 10)
-            | (1u32 << 5) | 0u32;
+        let word_ldr_int_reg = (0b11u32 << 30)
+            | (0b111u32 << 27)
+            | (0u32 << 26)
+            | (0b00u32 << 24)
+            | (1u32 << 21)
+            | (0b01u32 << 22)
+            | (2u32 << 16)
+            | (0b10u32 << 10)
+            | (1u32 << 5)
+            | 0u32;
 
         // Act
         let insn_int = decode_one(word_ldr_int_reg, 0);
@@ -2388,8 +2721,8 @@ mod tests {
         // Arrange: several different instruction encodings at different PCs
         let test_pcs: Vec<u64> = vec![0x0, 0x100, 0xFFFF_0000, 0x1_0000_0000];
         let test_words: Vec<u32> = vec![
-            0xD65F03C0,   // ret
-            0x0000_0000,  // unknown
+            0xD65F03C0,                                // ret
+            0x0000_0000,                               // unknown
             0b0001_1110_0010_0010_0010_1000_0010_0000, // fadd
         ];
 
@@ -2399,7 +2732,10 @@ mod tests {
                 let insn = decode_one(word, pc);
 
                 // Assert: len is always 4, addr is always pc
-                assert_eq!(insn.len, 4, "len should be 4 for word 0x{word:08x} at pc 0x{pc:x}");
+                assert_eq!(
+                    insn.len, 4,
+                    "len should be 4 for word 0x{word:08x} at pc 0x{pc:x}"
+                );
                 assert_eq!(insn.addr, pc, "addr should be pc for word 0x{word:08x}");
             }
         }
@@ -2411,33 +2747,43 @@ mod tests {
         // Arrange: fmov GP→FP (opcode=111): moves integer register to float register
         // Encoding: 0001_1110_sf_fty_1_rmode_opcode_000000_Rn_Rd
         // opcode=111, sf=1 (x-reg), ftype=00 (single), rmode=00
-        let word_gp_to_fp = (1u32 << 31) | (0b0001_1110u32 << 24)
-            | (0u32 << 22) | (1u32 << 21)
-            | (0b00u32 << 19) | (0b111u32 << 16) | (0b000000u32 << 10)
-            | (1u32 << 5) | 0u32;
+        let word_gp_to_fp = (1u32 << 31)
+            | (0b0001_1110u32 << 24)
+            | (0u32 << 22)
+            | (1u32 << 21)
+            | (0b00u32 << 19)
+            | (0b111u32 << 16)
+            | (0b000000u32 << 10)
+            | (1u32 << 5)
+            | 0u32;
 
         // Act
         let insn_g2f = decode_one(word_gp_to_fp, 0);
 
         // Assert: fmov x1 → s0 (GP to FP)
         assert_eq!(insn_g2f.mnemonic, "fmov");
-        assert_eq!(insn_g2f.operands[0], "s0");  // dest: float (ftype=0 → s)
-        assert_eq!(insn_g2f.operands[1], "x1");  // src: integer (sf=1 → x)
+        assert_eq!(insn_g2f.operands[0], "s0"); // dest: float (ftype=0 → s)
+        assert_eq!(insn_g2f.operands[1], "x1"); // src: integer (sf=1 → x)
 
         // Arrange: fmov FP→GP (opcode=110): moves float register to integer register
         // opcode=110, sf=0 (w-reg), ftype=01 (double)
-        let word_fp_to_gp = (0u32 << 31) | (0b0001_1110u32 << 24)
-            | (1u32 << 22) | (1u32 << 21)
-            | (0b00u32 << 19) | (0b110u32 << 16) | (0b000000u32 << 10)
-            | (1u32 << 5) | 0u32;
+        let word_fp_to_gp = (0u32 << 31)
+            | (0b0001_1110u32 << 24)
+            | (1u32 << 22)
+            | (1u32 << 21)
+            | (0b00u32 << 19)
+            | (0b110u32 << 16)
+            | (0b000000u32 << 10)
+            | (1u32 << 5)
+            | 0u32;
 
         // Act
         let insn_f2g = decode_one(word_fp_to_gp, 0);
 
         // Assert: fmov d1 → w0 (FP to GP)
         assert_eq!(insn_f2g.mnemonic, "fmov");
-        assert_eq!(insn_f2g.operands[0], "w0");  // dest: integer (sf=0 → w)
-        assert_eq!(insn_f2g.operands[1], "d1");  // src: float (ftype=1 → d)
+        assert_eq!(insn_f2g.operands[0], "w0"); // dest: integer (sf=0 → w)
+        assert_eq!(insn_f2g.operands[1], "d1"); // src: float (ftype=1 → d)
     }
 
     // ── Wave 12kau tests (+10, target: 58 total) ───────────────────────
@@ -2454,7 +2800,7 @@ mod tests {
             | (0b000u32 << 16)       // opcode=000 (fcvtzs)
             | (0b000000u32 << 10)
             | (1u32 << 5)            // Rn=1
-            | 0u32;                  // Rd=0
+            | 0u32; // Rd=0
 
         // Act
         let insn = decode_one(word_fcvtzs, 0);
@@ -2472,7 +2818,7 @@ mod tests {
             | (0b001u32 << 16)       // opcode=001 (fcvtzu)
             | (0b000000u32 << 10)
             | (5u32 << 5)            // Rn=5
-            | 3u32;                  // Rd=3
+            | 3u32; // Rd=3
 
         // Act
         let insn_u = decode_one(word_fcvtzu, 0);
@@ -2516,7 +2862,7 @@ mod tests {
             | (0b0000u32 << 12)      // opcode=fmul
             | (0b10u32 << 10)        // bits[11:10]=10
             | (7u32 << 5)            // Rn=7
-            | 3u32;                  // Rd=3
+            | 3u32; // Rd=3
 
         // Act
         let insn = decode_one(word, 0);
@@ -2559,7 +2905,7 @@ mod tests {
             | (0u32 << 14)           // bit14=0
             | (0b000001u32 << 15)    // opcode=000001 (fabs) in bits[20:15]
             | (7u32 << 5)            // Rn=7
-            | 5u32;                  // Rd=5
+            | 5u32; // Rd=5
 
         // Act
         let insn = decode_one(word, 0);
@@ -2581,7 +2927,7 @@ mod tests {
             | (1u32 << 24)                // op=1 (tbnz)
             | (7u32 << 19)                // b40=7
             | (2u32 << 5)                 // imm14=2 → offset = 2*4 = 8
-            | 5u32;                       // rt=5
+            | 5u32; // rt=5
 
         // Act
         let insn = decode_one(word, 0x1000);
@@ -2609,7 +2955,11 @@ mod tests {
         let insn = decode_one(word, 0);
 
         // Assert: falls to branch fallback ".branch 0x..."
-        assert!(insn.mnemonic.starts_with(".branch"), "got: {}", insn.mnemonic);
+        assert!(
+            insn.mnemonic.starts_with(".branch"),
+            "got: {}",
+            insn.mnemonic
+        );
     }
 
     // @trace TEST-12kau
@@ -2618,8 +2968,12 @@ mod tests {
         // Arrange: LDR Q0, [PC, #offset] — opc=10 → q register
         // bits[29:27]=011, bit[26]=1, bits[25:24]=00
         // opc=10 (q-register), imm19=4, rt=0
-        let word = (0b10u32 << 30) | (0b011u32 << 27) | (1u32 << 26)
-            | (0b00u32 << 24) | (4u32 << 5) | 0u32;
+        let word = (0b10u32 << 30)
+            | (0b011u32 << 27)
+            | (1u32 << 26)
+            | (0b00u32 << 24)
+            | (4u32 << 5)
+            | 0u32;
 
         // Act
         let insn = decode_one(word, 0x1000);
@@ -2637,8 +2991,14 @@ mod tests {
         // Arrange: LDR Q7, [X3, #64] — size=10 → q-register, scale=16
         // bits[29:27]=111, bit[26]=1, bits[25:24]=01
         // size=10, opc=01 (load), imm12=4, rn=3, rt=7
-        let word_ldr = (0b10u32 << 30) | (0b111u32 << 27) | (1u32 << 26) | (0b01u32 << 24)
-            | (0b01u32 << 22) | (4u32 << 10) | (3u32 << 5) | 7u32;
+        let word_ldr = (0b10u32 << 30)
+            | (0b111u32 << 27)
+            | (1u32 << 26)
+            | (0b01u32 << 24)
+            | (0b01u32 << 22)
+            | (4u32 << 10)
+            | (3u32 << 5)
+            | 7u32;
 
         // Act
         let insn_ldr = decode_one(word_ldr, 0);
@@ -2650,8 +3010,14 @@ mod tests {
         assert!(insn_ldr.operands[1].contains("#64"));
 
         // Arrange: STR Q2, [X5, #32] — size=10, opc=00 (store), imm12=2, rn=5
-        let word_str = (0b10u32 << 30) | (0b111u32 << 27) | (1u32 << 26) | (0b01u32 << 24)
-            | (0b00u32 << 22) | (2u32 << 10) | (5u32 << 5) | 2u32;
+        let word_str = (0b10u32 << 30)
+            | (0b111u32 << 27)
+            | (1u32 << 26)
+            | (0b01u32 << 24)
+            | (0b00u32 << 22)
+            | (2u32 << 10)
+            | (5u32 << 5)
+            | 2u32;
 
         // Act
         let insn_str = decode_one(word_str, 0);
@@ -2674,7 +3040,7 @@ mod tests {
             | (2u32 << 15)            // imm7=2
             | (1u32 << 10)            // Rt2=1
             | (2u32 << 5)             // Rn=2
-            | 0u32;                   // Rt=0
+            | 0u32; // Rt=0
 
         // Act
         let insn_ldp = decode_one(word_ldp, 0x4000);
@@ -2694,7 +3060,7 @@ mod tests {
             | (imm7_neg1 << 15)       // imm7=-1
             | (4u32 << 10)            // Rt2=4
             | (31u32 << 5)            // Rn=31 (sp)
-            | 3u32;                   // Rt=3
+            | 3u32; // Rt=3
 
         // Act
         let insn_stp = decode_one(word_stp, 0);
@@ -2771,7 +3137,7 @@ mod tests {
             | (0u32 << 24)                    // op=0 (tbz)
             | (7u32 << 19)                    // b40=7
             | (4u32 << 5)                     // imm14=4
-            | 0u32;                           // rt=0
+            | 0u32; // rt=0
 
         // Act
         let insn = decode_one(word, 0x1000);
@@ -2796,7 +3162,7 @@ mod tests {
             | (0u32 << 15)           // o0=0
             | (3u32 << 10)           // Ra=3
             | (1u32 << 5)            // Rn=1
-            | 0u32;                  // Rd=0
+            | 0u32; // Rd=0
 
         // Act
         let insn = decode_one(word, 0);
@@ -2847,23 +3213,23 @@ mod tests {
         // Act & Assert: single bit extraction at various positions
         assert_eq!(bits(word, 31, 31), 1); // bit 31 = 1
         assert_eq!(bits(word, 30, 30), 0); // bit 30 = 0
-        assert_eq!(bits(word, 0, 0), 1);   // bit 0 = 1
-        assert_eq!(bits(word, 1, 1), 0);   // bit 1 = 0
+        assert_eq!(bits(word, 0, 0), 1); // bit 0 = 1
+        assert_eq!(bits(word, 1, 1), 0); // bit 1 = 0
 
         // Act & Assert: half-word extraction (avoiding hi=31,lo=0 overflow in bits())
         assert_eq!(bits(word, 31, 16), 0xA5A5); // upper 16 bits
-        assert_eq!(bits(word, 15, 0), 0xA5A5);  // lower 16 bits
+        assert_eq!(bits(word, 15, 0), 0xA5A5); // lower 16 bits
 
         // Act & Assert: byte extraction
-        assert_eq!(bits(word, 23, 16), 0xA5);   // third byte
-        assert_eq!(bits(word, 7, 0), 0xA5);      // lowest byte
+        assert_eq!(bits(word, 23, 16), 0xA5); // third byte
+        assert_eq!(bits(word, 7, 0), 0xA5); // lowest byte
 
         // Act & Assert: multi-bit extraction with known values
         // 0xA5 = binary 10100101: bit7=1, bit6=0, bit5=1, bit4=0, bit3=0, bit2=1, bit1=0, bit0=1
-        assert_eq!(bits(word, 7, 6), 0b10);   // bits 7:6 = 10 = 2
-        assert_eq!(bits(word, 5, 4), 0b10);   // bits 5:4 = 10 = 2
-        assert_eq!(bits(word, 3, 2), 0b01);   // bits 3:2 = 01 = 1
-        assert_eq!(bits(word, 1, 0), 0b01);   // bits 1:0 = 01 = 1
+        assert_eq!(bits(word, 7, 6), 0b10); // bits 7:6 = 10 = 2
+        assert_eq!(bits(word, 5, 4), 0b10); // bits 5:4 = 10 = 2
+        assert_eq!(bits(word, 3, 2), 0b01); // bits 3:2 = 01 = 1
+        assert_eq!(bits(word, 1, 0), 0b01); // bits 1:0 = 01 = 1
     }
 
     // @trace TEST-12khf
@@ -2876,9 +3242,9 @@ mod tests {
         assert_eq!(sign_extend(0xFFFF_FFFF, 64), 0xFFFF_FFFF_i64);
 
         // Arrange & Act & Assert: 8-bit signed values
-        assert_eq!(sign_extend(0x7F, 8), 127);       // max positive 8-bit
-        assert_eq!(sign_extend(0x80, 8), -128);       // min negative 8-bit
-        assert_eq!(sign_extend(0xFF, 8), -1);          // -1 in 8-bit
+        assert_eq!(sign_extend(0x7F, 8), 127); // max positive 8-bit
+        assert_eq!(sign_extend(0x80, 8), -128); // min negative 8-bit
+        assert_eq!(sign_extend(0xFF, 8), -1); // -1 in 8-bit
 
         // Arrange & Act & Assert: 14-bit (used in tbz/tbnz imm14)
         // 14-bit all 1s = 0x3FFF, sign-extended = -1
@@ -3021,7 +3387,7 @@ mod tests {
             | (0b0011u32 << 12)      // opcode=fsub
             | (0b10u32 << 10)
             | (15u32 << 5)           // Rn=15
-            | 7u32;                  // Rd=7
+            | 7u32; // Rd=7
 
         // Act
         let insn = decode_one(word, 0);
@@ -3042,7 +3408,7 @@ mod tests {
             | (0u32 << 17)           // bits[20:17]=0000
             | (0b000010u32 << 10)    // opcode=fneg
             | (10u32 << 5)           // Rn=10
-            | 20u32;                 // Rd=20
+            | 20u32; // Rd=20
 
         // Act
         let insn = decode_one(word, 0);
@@ -3065,7 +3431,7 @@ mod tests {
             | (0u32 << 15)           // o0=0
             | (4u32 << 10)           // Ra=4
             | (2u32 << 5)            // Rn=2
-            | 1u32;                  // Rd=1
+            | 1u32; // Rd=1
 
         // Act
         let insn = decode_one(word, 0);
@@ -3087,7 +3453,7 @@ mod tests {
             | (0b1010u32 << 12)      // cond=ge
             | (0b11u32 << 10)
             | (1u32 << 5)            // Rn=1
-            | 0u32;                  // Rd=0
+            | 0u32; // Rd=0
 
         // Act
         let insn = decode_one(word, 0);
@@ -3107,7 +3473,7 @@ mod tests {
             | (0b011_0100u32 << 25)
             | (0u32 << 24)                     // op=0 (cbz)
             | (imm19 << 5)
-            | 7u32;                            // rt=7
+            | 7u32; // rt=7
 
         // Act
         let insn = decode_one(word, 0x5000);
@@ -3128,7 +3494,7 @@ mod tests {
             | (1u32 << 30)                   // op=1 (sub)
             | (0b100u32 << 26)
             | (0b001u32 << 23)
-            | (3u32 << 0);                   // Rd=3
+            | (3u32 << 0); // Rd=3
 
         // Act
         let insn = decode_one(word, 0);
@@ -3150,7 +3516,7 @@ mod tests {
             | (2u32 << 16)                     // Rm=2
             | (0b1000u32 << 12)                // cond=hi
             | (1u32 << 5)                      // Rn=1
-            | 0u32;                            // Rd=0
+            | 0u32; // Rd=0
 
         // Act
         let insn = decode_one(word, 0);
@@ -3198,7 +3564,7 @@ mod tests {
             | (0b0001u32 << 12)      // opcode=fdiv
             | (0b10u32 << 10)
             | (20u32 << 5)           // Rn=20
-            | 10u32;                 // Rd=10
+            | 10u32; // Rd=10
 
         // Act
         let insn_single = decode_one(word_single, 0);
@@ -3216,7 +3582,7 @@ mod tests {
             | (0b0001u32 << 12)      // opcode=fdiv
             | (0b10u32 << 10)
             | (1u32 << 5)            // Rn=1
-            | 0u32;                  // Rd=0
+            | 0u32; // Rd=0
 
         // Act
         let insn_double = decode_one(word_double, 0);
@@ -3256,7 +3622,7 @@ mod tests {
             | (0b011010u32 << 25)                // bits[30:25] = 011010
             | (1u32 << 24)                       // op=1 (cbnz)
             | (imm19 << 5)
-            | 15u32;                             // rt=15
+            | 15u32; // rt=15
 
         // Act
         let insn = decode_one(word, 0x3000);
@@ -3282,7 +3648,7 @@ mod tests {
             | (0u32 << 14)           // bit14=0
             | (0b000011u32 << 15)    // opcode=fsqrt in bits[20:15] (bits 16:15 = 11)
             | (20u32 << 5)           // Rn=20
-            | 15u32;                 // Rd=15
+            | 15u32; // Rd=15
 
         // Act
         let insn = decode_one(word, 0);
@@ -3305,7 +3671,7 @@ mod tests {
             | (1u32 << 15)           // o0=1 → fmsub
             | (20u32 << 10)          // Ra=20
             | (10u32 << 5)           // Rn=10
-            | 5u32;                  // Rd=5
+            | 5u32; // Rd=5
 
         // Act
         let insn = decode_one(word, 0);
@@ -3363,8 +3729,14 @@ mod tests {
     fn test_decode_ldr_str_unsigned_offset_d_register_high_numbered() {
         // Arrange: STR D30, [X20, #80] — store high-numbered d-register
         // size=01 (d-reg), opc=00 (store), imm12=10, rn=20, rt=30
-        let word = (0b01u32 << 30) | (0b111u32 << 27) | (1u32 << 26) | (0b01u32 << 24)
-            | (0b00u32 << 22) | (10u32 << 10) | (20u32 << 5) | 30u32;
+        let word = (0b01u32 << 30)
+            | (0b111u32 << 27)
+            | (1u32 << 26)
+            | (0b01u32 << 24)
+            | (0b00u32 << 22)
+            | (10u32 << 10)
+            | (20u32 << 5)
+            | 30u32;
 
         // Act
         let insn = decode_one(word, 0);
@@ -3377,8 +3749,14 @@ mod tests {
 
         // Arrange: LDR D31, [SP, #96] — load from sp with high d-register
         // size=01, opc=01 (load), imm12=12, rn=31 (sp), rt=31
-        let word_ldr = (0b01u32 << 30) | (0b111u32 << 27) | (1u32 << 26) | (0b01u32 << 24)
-            | (0b01u32 << 22) | (12u32 << 10) | (31u32 << 5) | 31u32;
+        let word_ldr = (0b01u32 << 30)
+            | (0b111u32 << 27)
+            | (1u32 << 26)
+            | (0b01u32 << 24)
+            | (0b01u32 << 22)
+            | (12u32 << 10)
+            | (31u32 << 5)
+            | 31u32;
 
         // Act
         let insn_ldr = decode_one(word_ldr, 0);
@@ -3405,15 +3783,21 @@ mod tests {
             | (0b1000u32 << 10)      // bits[13:10]=1000
             | (0u32 << 5)            // Rn=0
             | (0b000u32 << 3)        // opc=00 (fcmp)
-            | 0u32;                  // bits[2:0]=000
+            | 0u32; // bits[2:0]=000
 
         // Act
         let insn = decode_one(word, 0);
 
         // Assert: double-precision fcmp uses d-registers
         assert_eq!(insn.mnemonic, "fcmp");
-        assert_eq!(insn.operands[0], "d0", "first operand should be d0 (Rn=0, ftype=01)");
-        assert_eq!(insn.operands[1], "d16", "second operand should be d16 (Rm=16, ftype=01)");
+        assert_eq!(
+            insn.operands[0], "d0",
+            "first operand should be d0 (Rn=0, ftype=01)"
+        );
+        assert_eq!(
+            insn.operands[1], "d16",
+            "second operand should be d16 (Rm=16, ftype=01)"
+        );
     }
 
     // @trace TEST-12x60
@@ -3423,10 +3807,19 @@ mod tests {
         // fadd → fmul → ldr literal → b.cond → bl → ret
         let fadd: u32 = 0b0001_1110_0010_0010_0010_1000_0010_0000; // fadd s0, s1, s2
         let fmul_word = (0b0001_1110u32 << 24)
-            | (0u32 << 22) | (1u32 << 21) | (2u32 << 16)
-            | (0b0000u32 << 12) | (0b10u32 << 10) | (1u32 << 5) | 0u32; // fmul s0, s1, s2
-        let ldr_lit = (0b00u32 << 30) | (0b011u32 << 27) | (1u32 << 26)
-            | (0b00u32 << 24) | (1u32 << 5) | 0u32; // ldr s0, [pc, #4]
+            | (0u32 << 22)
+            | (1u32 << 21)
+            | (2u32 << 16)
+            | (0b0000u32 << 12)
+            | (0b10u32 << 10)
+            | (1u32 << 5)
+            | 0u32; // fmul s0, s1, s2
+        let ldr_lit = (0b00u32 << 30)
+            | (0b011u32 << 27)
+            | (1u32 << 26)
+            | (0b00u32 << 24)
+            | (1u32 << 5)
+            | 0u32; // ldr s0, [pc, #4]
         let bcond_eq = (0b0101_0100u32 << 24) | (1u32 << 5) | 0b0000u32; // b.eq #+4
         let bl_word = (0b100101u32 << 26) | 16u32; // bl #+64
         let ret_word = 0xD65F03C0u32;

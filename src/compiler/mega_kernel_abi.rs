@@ -17,13 +17,22 @@
 #[derive(Debug, Clone)]
 pub enum OutputMode {
     /// Autoregressive generation: logits producer → argmax → store → check → loop
-    Generate { max_new_tokens: usize, eos_token_id: u32 },
+    Generate {
+        max_new_tokens: usize,
+        eos_token_id: u32,
+    },
     /// Binary classification: logits producer → write positive/negative token logits
-    ClassifyBinary { positive_token_id: u32, negative_token_id: u32 },
+    ClassifyBinary {
+        positive_token_id: u32,
+        negative_token_id: u32,
+    },
     /// Multi-way classification: logits producer → write N label token logits
     ClassifyMultiway { label_token_ids: Vec<u32> },
     /// Mid-layer encoding: truncate at anchor layer → pool hidden state
-    EncodeToLayer { anchor_layer: usize, pool_mode: PoolMode },
+    EncodeToLayer {
+        anchor_layer: usize,
+        pool_mode: PoolMode,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -159,58 +168,58 @@ impl Default for BusinessConfig {
 ///    → rax: generated token count (generate) | 0 (classify/encode)
 /// ```
 pub type MegaKernelFn = unsafe extern "C" fn(
-    *const u32,   // arg 0: input_ids_ptr         → rdi  (prompt token ID array)
-    *const u8,    // arg 1: weight_blob_ptr        → rsi  (all weights contiguous)
-    *mut u8,      // arg 2: kv_cache_ptr           → rdx
-    *const u32,   // arg 3: positions_ptr          → rcx
-    *const u8,    // arg 4: aux_ptr                → r8   (KV-V half pointers)
-    usize,        // arg 5: batch_size             → r9
+    *const u32, // arg 0: input_ids_ptr         → rdi  (prompt token ID array)
+    *const u8,  // arg 1: weight_blob_ptr        → rsi  (all weights contiguous)
+    *mut u8,    // arg 2: kv_cache_ptr           → rdx
+    *const u32, // arg 3: positions_ptr          → rcx
+    *const u8,  // arg 4: aux_ptr                → r8   (KV-V half pointers)
+    usize,      // arg 5: batch_size             → r9
     // Stack parameters (8-byte aligned, all usize to guarantee 8-byte passing):
-    usize,        // arg 6: prompt_len             → [rbp+16]  (SymDim runtime binding)
-    *mut u8,      // arg 7: scratchpad_ptr         → [rbp+24]
-    *mut u32,     // arg 8: output_tokens_ptr      → [rbp+32]
-    usize,        // arg 9: temperature_u32        → [rbp+40] (f32::to_bits() as usize)
-    usize,        // arg 10: top_k                 → [rbp+48]
-    usize,        // arg 11: top_p_u32             → [rbp+56] (f32::to_bits() as usize)
-    usize,        // arg 12: max_new_tokens        → [rbp+64]
-    usize,        // arg 13: eos_token_id          → [rbp+72]
-    *const u8,    // arg 14: hook_ctx_ptr          → [rbp+80]
-    *mut u8,      // arg 15: telemetry_ptr         → [rbp+88]
-    usize,        // arg 16: session_position      → [rbp+96] (0 = new session, >0 = resume position)
-    *const u8,    // arg 17: fused_hidden_ptr      → [rbp+104] (NULL = no multimodal injection)
-    usize,        // arg 18: num_mm_tokens          → [rbp+112] (number of multimodal tokens to inject)
-    *const u8,    // arg 19: callback_table_ptr    → [rbp+120] (NULL = no callbacks, C-style fn_ptr array)
-    *const u32,   // arg 20: page_table_ptr        → [rbp+128] (NULL = contiguous KV, u32[] = paged KV)
-    *const u8,    // arg 21: batch_ctx_ptr         → [rbp+136] (NULL = single-seq legacy, non-NULL = batch mode)
-    *const u8,    // arg 22: kv_page_header_ptr    → [rbp+144] (NULL = no page headers; KIVI4 needs valid)
-) -> usize;      // → rax: generated token count (generate) | 0 (classify/encode)
+    usize,      // arg 6: prompt_len             → [rbp+16]  (SymDim runtime binding)
+    *mut u8,    // arg 7: scratchpad_ptr         → [rbp+24]
+    *mut u32,   // arg 8: output_tokens_ptr      → [rbp+32]
+    usize,      // arg 9: temperature_u32        → [rbp+40] (f32::to_bits() as usize)
+    usize,      // arg 10: top_k                 → [rbp+48]
+    usize,      // arg 11: top_p_u32             → [rbp+56] (f32::to_bits() as usize)
+    usize,      // arg 12: max_new_tokens        → [rbp+64]
+    usize,      // arg 13: eos_token_id          → [rbp+72]
+    *const u8,  // arg 14: hook_ctx_ptr          → [rbp+80]
+    *mut u8,    // arg 15: telemetry_ptr         → [rbp+88]
+    usize,      // arg 16: session_position      → [rbp+96] (0 = new session, >0 = resume position)
+    *const u8,  // arg 17: fused_hidden_ptr      → [rbp+104] (NULL = no multimodal injection)
+    usize, // arg 18: num_mm_tokens          → [rbp+112] (number of multimodal tokens to inject)
+    *const u8, // arg 19: callback_table_ptr    → [rbp+120] (NULL = no callbacks, C-style fn_ptr array)
+    *const u32, // arg 20: page_table_ptr        → [rbp+128] (NULL = contiguous KV, u32[] = paged KV)
+    *const u8, // arg 21: batch_ctx_ptr         → [rbp+136] (NULL = single-seq legacy, non-NULL = batch mode)
+    *const u8, // arg 22: kv_page_header_ptr    → [rbp+144] (NULL = no page headers; KIVI4 needs valid)
+) -> usize; // → rax: generated token count (generate) | 0 (classify/encode)
 
 /// ABI parameter names in order. Used by SymDimSlotMap to resolve
 /// symbolic dimensions and runtime values.
 pub const MEGA_KERNEL_PARAMS: &[&str] = &[
-    "input_ids_ptr",        // arg 0  → rdi
-    "weight_blob_ptr",      // arg 1  → rsi
-    "kv_cache_ptr",         // arg 2  → rdx
-    "positions_ptr",        // arg 3  → rcx
-    "aux_ptr",              // arg 4  → r8
-    "batch_size",           // arg 5  → r9
-    "prompt_len",           // arg 6  → [rbp+16]
-    "scratchpad_ptr",       // arg 7  → [rbp+24]
-    "output_tokens_ptr",    // arg 8  → [rbp+32]
-    "temperature_u32",      // arg 9  → [rbp+40] (f32::to_bits())
-    "top_k",                // arg 10 → [rbp+48]
-    "top_p_u32",            // arg 11 → [rbp+56] (f32::to_bits())
-    "max_new_tokens",       // arg 12 → [rbp+64]
-    "eos_token_id",         // arg 13 → [rbp+72]
-    "hook_ctx_ptr",         // arg 14 → [rbp+80]
-    "telemetry_ptr",        // arg 15 → [rbp+88]
-    "session_position",     // arg 16 → [rbp+96] (0 = new session, >0 = resume position)
-    "fused_hidden_ptr",     // arg 17 → [rbp+104] (NULL = no multimodal injection)
-    "num_mm_tokens",        // arg 18 → [rbp+112] (number of multimodal tokens to inject)
-    "callback_table_ptr",   // arg 19 → [rbp+120] (NULL = no callbacks)
-    "page_table_ptr",       // arg 20 → [rbp+128] (NULL = contiguous KV, u32[] = paged KV)
-    "batch_ctx_ptr",        // arg 21 → [rbp+136] (NULL = single-seq legacy mode, non-NULL = batch mode)
-    "kv_page_header_ptr",   // arg 22 → [rbp+144] (NULL = no page headers; KIVI4 needs valid)
+    "input_ids_ptr",      // arg 0  → rdi
+    "weight_blob_ptr",    // arg 1  → rsi
+    "kv_cache_ptr",       // arg 2  → rdx
+    "positions_ptr",      // arg 3  → rcx
+    "aux_ptr",            // arg 4  → r8
+    "batch_size",         // arg 5  → r9
+    "prompt_len",         // arg 6  → [rbp+16]
+    "scratchpad_ptr",     // arg 7  → [rbp+24]
+    "output_tokens_ptr",  // arg 8  → [rbp+32]
+    "temperature_u32",    // arg 9  → [rbp+40] (f32::to_bits())
+    "top_k",              // arg 10 → [rbp+48]
+    "top_p_u32",          // arg 11 → [rbp+56] (f32::to_bits())
+    "max_new_tokens",     // arg 12 → [rbp+64]
+    "eos_token_id",       // arg 13 → [rbp+72]
+    "hook_ctx_ptr",       // arg 14 → [rbp+80]
+    "telemetry_ptr",      // arg 15 → [rbp+88]
+    "session_position",   // arg 16 → [rbp+96] (0 = new session, >0 = resume position)
+    "fused_hidden_ptr",   // arg 17 → [rbp+104] (NULL = no multimodal injection)
+    "num_mm_tokens",      // arg 18 → [rbp+112] (number of multimodal tokens to inject)
+    "callback_table_ptr", // arg 19 → [rbp+120] (NULL = no callbacks)
+    "page_table_ptr",     // arg 20 → [rbp+128] (NULL = contiguous KV, u32[] = paged KV)
+    "batch_ctx_ptr", // arg 21 → [rbp+136] (NULL = single-seq legacy mode, non-NULL = batch mode)
+    "kv_page_header_ptr", // arg 22 → [rbp+144] (NULL = no page headers; KIVI4 needs valid)
 ];
 
 /// Stack parameter byte offsets (relative to [rbp+16] after standard prologue).
@@ -430,9 +439,17 @@ impl KernelWeightLayout {
         let w_up_bytes = intermediate * hidden * elem_bytes;
         let w_down_bytes = hidden * intermediate * elem_bytes;
 
-        let layer_stride = attn_norm_bytes + w_q_bytes + w_k_bytes + w_v_bytes + w_o_bytes
-            + w_q_norm_bytes + w_k_norm_bytes + ffn_norm_bytes
-            + w_gate_bytes + w_up_bytes + w_down_bytes;
+        let layer_stride = attn_norm_bytes
+            + w_q_bytes
+            + w_k_bytes
+            + w_v_bytes
+            + w_o_bytes
+            + w_q_norm_bytes
+            + w_k_norm_bytes
+            + ffn_norm_bytes
+            + w_gate_bytes
+            + w_up_bytes
+            + w_down_bytes;
         let layer_0_offset = embed_offset + embed_bytes;
 
         let final_norm_bytes = hidden * elem_bytes;
@@ -497,7 +514,6 @@ impl KernelWeightLayout {
     pub fn layer_base_offset(&self, layer_idx: usize) -> usize {
         self.layer_0_offset + layer_idx * self.layer_stride
     }
-
 }
 
 /// Heterogeneous weight layout with per-segment-type information.
@@ -544,11 +560,22 @@ impl HeteroKernelWeightLayout {
         geo: &super::graph_geometry::GraphDerivedGeometry,
         hetero: &HeteroLayerConfig,
     ) -> Self {
-        Self::build(geo.storage_dtype.size_bytes(), geo.hidden, geo.num_heads, geo.vocab_size, hetero)
+        Self::build(
+            geo.storage_dtype.size_bytes(),
+            geo.hidden,
+            geo.num_heads,
+            geo.vocab_size,
+            hetero,
+        )
     }
 
-    fn build(elem_bytes: usize, h: usize, num_heads: usize, vocab_size: usize, hetero: &HeteroLayerConfig) -> Self {
-
+    fn build(
+        elem_bytes: usize,
+        h: usize,
+        num_heads: usize,
+        vocab_size: usize,
+        hetero: &HeteroLayerConfig,
+    ) -> Self {
         let embed_bytes = vocab_size * h * elem_bytes;
         let layer_0_offset = embed_bytes;
 
@@ -576,9 +603,17 @@ impl HeteroKernelWeightLayout {
             let w_up_bytes = intermediate * hidden * eb;
             let w_down_bytes = hidden * intermediate * eb;
 
-            let total = attn_norm_bytes + w_q_bytes + w_k_bytes + w_v_bytes + w_o_bytes
-                + w_q_norm_bytes + w_k_norm_bytes + ffn_norm_bytes
-                + w_gate_bytes + w_up_bytes + w_down_bytes;
+            let total = attn_norm_bytes
+                + w_q_bytes
+                + w_k_bytes
+                + w_v_bytes
+                + w_o_bytes
+                + w_q_norm_bytes
+                + w_k_norm_bytes
+                + ffn_norm_bytes
+                + w_gate_bytes
+                + w_up_bytes
+                + w_down_bytes;
 
             let o0 = 0usize;
             let o1 = o0 + attn_norm_bytes;
@@ -592,44 +627,70 @@ impl HeteroKernelWeightLayout {
             let o9 = o8 + w_gate_bytes;
             let o10 = o9 + w_up_bytes;
 
-            (PerLayerWeightLayout {
-                attn_norm_offset: o0, attn_norm_bytes,
-                w_q_offset: o1, w_q_bytes,
-                w_k_offset: o2, w_k_bytes,
-                w_v_offset: o3, w_v_bytes,
-                w_o_offset: o4, w_o_bytes,
-                w_q_norm_offset: o5, w_q_norm_bytes,
-                w_k_norm_offset: o6, w_k_norm_bytes,
-                ffn_norm_offset: o7, ffn_norm_bytes,
-                w_gate_offset: o8, w_gate_bytes,
-                w_up_offset: o9, w_up_bytes,
-                w_down_offset: o10, w_down_bytes,
-            }, total)
+            (
+                PerLayerWeightLayout {
+                    attn_norm_offset: o0,
+                    attn_norm_bytes,
+                    w_q_offset: o1,
+                    w_q_bytes,
+                    w_k_offset: o2,
+                    w_k_bytes,
+                    w_v_offset: o3,
+                    w_v_bytes,
+                    w_o_offset: o4,
+                    w_o_bytes,
+                    w_q_norm_offset: o5,
+                    w_q_norm_bytes,
+                    w_k_norm_offset: o6,
+                    w_k_norm_bytes,
+                    ffn_norm_offset: o7,
+                    ffn_norm_bytes,
+                    w_gate_offset: o8,
+                    w_gate_bytes,
+                    w_up_offset: o9,
+                    w_up_bytes,
+                    w_down_offset: o10,
+                    w_down_bytes,
+                },
+                total,
+            )
         };
 
         let (sliding_small_pl, sliding_small_total) = compute_wl(
-            h, hetero.sliding_num_q_heads * hetero.sliding_head_dim,
+            h,
+            hetero.sliding_num_q_heads * hetero.sliding_head_dim,
             hetero.sliding_num_kv_heads * hetero.sliding_head_dim,
             hetero.sliding_num_q_heads * hetero.sliding_head_dim,
-            hetero.sliding_head_dim, hetero.small_intermediate, elem_bytes,
+            hetero.sliding_head_dim,
+            hetero.small_intermediate,
+            elem_bytes,
         );
         let (full_small_pl, full_small_total) = compute_wl(
-            h, hetero.full_num_q_heads * hetero.full_head_dim,
+            h,
+            hetero.full_num_q_heads * hetero.full_head_dim,
             hetero.full_num_kv_heads * hetero.full_head_dim,
             hetero.full_num_q_heads * hetero.full_head_dim,
-            hetero.full_head_dim, hetero.small_intermediate, elem_bytes,
+            hetero.full_head_dim,
+            hetero.small_intermediate,
+            elem_bytes,
         );
         let (sliding_large_pl, sliding_large_total) = compute_wl(
-            h, hetero.sliding_num_q_heads * hetero.sliding_head_dim,
+            h,
+            hetero.sliding_num_q_heads * hetero.sliding_head_dim,
             hetero.sliding_num_kv_heads * hetero.sliding_head_dim,
             hetero.sliding_num_q_heads * hetero.sliding_head_dim,
-            hetero.sliding_head_dim, hetero.large_intermediate, elem_bytes,
+            hetero.sliding_head_dim,
+            hetero.large_intermediate,
+            elem_bytes,
         );
         let (full_large_pl, full_large_total) = compute_wl(
-            h, hetero.full_num_q_heads * hetero.full_head_dim,
+            h,
+            hetero.full_num_q_heads * hetero.full_head_dim,
             hetero.full_num_kv_heads * hetero.full_head_dim,
             hetero.full_num_q_heads * hetero.full_head_dim,
-            hetero.full_head_dim, hetero.large_intermediate, elem_bytes,
+            hetero.full_head_dim,
+            hetero.large_intermediate,
+            elem_bytes,
         );
 
         let small_seg_stride = hetero.sliding_per_segment * sliding_small_total + full_small_total;
@@ -637,7 +698,8 @@ impl HeteroKernelWeightLayout {
 
         let num_small_segs = hetero.large_ffn_start_segment;
         let num_large_segs = hetero.num_segments - num_small_segs;
-        let layers_blob_bytes = num_small_segs * small_seg_stride + num_large_segs * large_seg_stride;
+        let layers_blob_bytes =
+            num_small_segs * small_seg_stride + num_large_segs * large_seg_stride;
 
         let final_norm_bytes = h * elem_bytes;
         let final_norm_offset = layer_0_offset + layers_blob_bytes;
@@ -747,7 +809,13 @@ impl BufferLayout {
         sg_enabled: bool,
     ) -> Self {
         let _ = max_seq_len; // Reserved: will drive RoPE cache sizing when unified from plan_lower
-        Self::build(geo.storage_dtype.size_bytes(), max_M, geo.hidden, geo.vocab_size, sg_enabled)
+        Self::build(
+            geo.storage_dtype.size_bytes(),
+            max_M,
+            geo.hidden,
+            geo.vocab_size,
+            sg_enabled,
+        )
     }
 
     /// Build buffer layout for the single-sequence mega-kernel.
@@ -763,7 +831,14 @@ impl BufferLayout {
         vocab_size: usize,
         sg_enabled: bool,
     ) -> Self {
-        Self::build_with_logits_rows(elem_bytes, activation_dim, 1, hidden, vocab_size, sg_enabled)
+        Self::build_with_logits_rows(
+            elem_bytes,
+            activation_dim,
+            1,
+            hidden,
+            vocab_size,
+            sg_enabled,
+        )
     }
 
     /// Build buffer layout from raw dimensions.
@@ -858,9 +933,15 @@ mod tests {
 
     #[test]
     fn output_mode_generate_fields() {
-        let mode = OutputMode::Generate { max_new_tokens: 256, eos_token_id: 2 };
+        let mode = OutputMode::Generate {
+            max_new_tokens: 256,
+            eos_token_id: 2,
+        };
         match mode {
-            OutputMode::Generate { max_new_tokens, eos_token_id } => {
+            OutputMode::Generate {
+                max_new_tokens,
+                eos_token_id,
+            } => {
                 assert_eq!(max_new_tokens, 256);
                 assert_eq!(eos_token_id, 2);
             }
@@ -870,9 +951,15 @@ mod tests {
 
     #[test]
     fn output_mode_classify_binary() {
-        let mode = OutputMode::ClassifyBinary { positive_token_id: 1, negative_token_id: 0 };
+        let mode = OutputMode::ClassifyBinary {
+            positive_token_id: 1,
+            negative_token_id: 0,
+        };
         match mode {
-            OutputMode::ClassifyBinary { positive_token_id, negative_token_id } => {
+            OutputMode::ClassifyBinary {
+                positive_token_id,
+                negative_token_id,
+            } => {
                 assert_eq!(positive_token_id, 1);
                 assert_eq!(negative_token_id, 0);
             }
@@ -883,7 +970,9 @@ mod tests {
     #[test]
     fn output_mode_classify_multiway() {
         let ids = vec![10, 20, 30];
-        let mode = OutputMode::ClassifyMultiway { label_token_ids: ids.clone() };
+        let mode = OutputMode::ClassifyMultiway {
+            label_token_ids: ids.clone(),
+        };
         match mode {
             OutputMode::ClassifyMultiway { label_token_ids } => {
                 assert_eq!(label_token_ids, ids);
@@ -894,9 +983,15 @@ mod tests {
 
     #[test]
     fn output_mode_encode_to_layer() {
-        let mode = OutputMode::EncodeToLayer { anchor_layer: 12, pool_mode: PoolMode::MeanPool };
+        let mode = OutputMode::EncodeToLayer {
+            anchor_layer: 12,
+            pool_mode: PoolMode::MeanPool,
+        };
         match mode {
-            OutputMode::EncodeToLayer { anchor_layer, pool_mode } => {
+            OutputMode::EncodeToLayer {
+                anchor_layer,
+                pool_mode,
+            } => {
                 assert_eq!(anchor_layer, 12);
                 assert!(matches!(pool_mode, PoolMode::MeanPool));
             }
@@ -917,7 +1012,10 @@ mod tests {
         let cfg = BusinessConfig::default();
         assert_eq!(cfg.output_modes.len(), 1);
         match &cfg.output_modes[0] {
-            OutputMode::Generate { max_new_tokens, eos_token_id } => {
+            OutputMode::Generate {
+                max_new_tokens,
+                eos_token_id,
+            } => {
                 assert_eq!(*max_new_tokens, 512);
                 assert_eq!(*eos_token_id, 2);
             }
@@ -990,7 +1088,12 @@ mod tests {
     #[test]
     fn mega_kernel_stack_offsets_strictly_increasing() {
         for w in MEGA_KERNEL_STACK_OFFSETS.windows(2) {
-            assert!(w[0] < w[1], "offsets not strictly increasing: {} >= {}", w[0], w[1]);
+            assert!(
+                w[0] < w[1],
+                "offsets not strictly increasing: {} >= {}",
+                w[0],
+                w[1]
+            );
         }
     }
 
@@ -999,13 +1102,13 @@ mod tests {
     #[test]
     fn weight_layout_build_symmetric_qkv() {
         let wl = KernelWeightLayout::build(
-            2,    // elem_bytes (BF16)
-            4096, // hidden
+            2,     // elem_bytes (BF16)
+            4096,  // hidden
             11008, // intermediate
-            32,   // num_layers
-            32,   // num_heads
-            32,   // num_kv_heads (GQA disabled)
-            128,  // head_dim
+            32,    // num_layers
+            32,    // num_heads
+            32,    // num_kv_heads (GQA disabled)
+            128,   // head_dim
             32000, // vocab_size
         );
 
@@ -1022,14 +1125,15 @@ mod tests {
 
     #[test]
     fn weight_layout_gqa_smaller_kv() {
-        let wl = KernelWeightLayout::build(
-            2, 4096, 11008, 32, 32, 8, 128, 32000,
-        );
+        let wl = KernelWeightLayout::build(2, 4096, 11008, 32, 32, 8, 128, 32000);
         let q_bytes = wl.per_layer.w_q_bytes;
         let k_bytes = wl.per_layer.w_k_bytes;
         let v_bytes = wl.per_layer.w_v_bytes;
 
-        assert!(k_bytes < q_bytes, "GQA K projection should be smaller than Q");
+        assert!(
+            k_bytes < q_bytes,
+            "GQA K projection should be smaller than Q"
+        );
         assert_eq!(k_bytes, v_bytes, "K and V should be same size");
         assert_eq!(k_bytes, 8 * 128 * 4096 * 2);
     }
@@ -1080,7 +1184,10 @@ mod tests {
     #[test]
     fn buffer_layout_logits_after_activations() {
         let bl = BufferLayout::build(2, 512, 4096, 32000, true);
-        assert_eq!(bl.logits_offset, bl.activation_b_offset + bl.activation_bytes);
+        assert_eq!(
+            bl.logits_offset,
+            bl.activation_b_offset + bl.activation_bytes
+        );
         assert_eq!(bl.logits_bytes, 512 * 32000 * 2);
     }
 
@@ -1090,16 +1197,16 @@ mod tests {
         assert_eq!(bl.activation_bytes, 8192 * 1536 * 4);
         assert_eq!(bl.logits_bytes, 262_144 * 4);
         assert_eq!(bl.sampling_workspace_bytes, 4 * 262_144 * 4);
-        assert_eq!(
-            bl.sampling_workspace_offset,
-            bl.logits_offset + 262_144 * 4,
-        );
+        assert_eq!(bl.sampling_workspace_offset, bl.logits_offset + 262_144 * 4,);
     }
 
     #[test]
     fn buffer_layout_sampling_after_logits() {
         let bl = BufferLayout::build(2, 512, 4096, 32000, true);
-        assert_eq!(bl.sampling_workspace_offset, bl.logits_offset + bl.logits_bytes);
+        assert_eq!(
+            bl.sampling_workspace_offset,
+            bl.logits_offset + bl.logits_bytes
+        );
         assert_eq!(bl.sampling_workspace_bytes, 32000 * 2 * 4);
     }
 
@@ -1107,7 +1214,10 @@ mod tests {
     fn buffer_layout_sg_data() {
         let bl = BufferLayout::build(2, 128, 768, 50000, true);
         let sg_hidden = 768 * 2;
-        assert_eq!(bl.sg_detect_offset, bl.sampling_workspace_offset + bl.sampling_workspace_bytes);
+        assert_eq!(
+            bl.sg_detect_offset,
+            bl.sampling_workspace_offset + bl.sampling_workspace_bytes
+        );
         assert_eq!(bl.sg_knowledge_offset, bl.sg_detect_offset + sg_hidden);
         assert_eq!(bl.sg_data_bytes, sg_hidden * 2);
     }
@@ -1116,11 +1226,16 @@ mod tests {
     fn buffer_layout_sg_disabled_zero_allocation() {
         // [FIX-PSC29] When sg_enabled=false, no SG space should be allocated.
         let bl = BufferLayout::build(2, 128, 768, 50000, false);
-        assert_eq!(bl.sg_data_bytes, 0, "sg_data_bytes should be 0 when SG disabled");
+        assert_eq!(
+            bl.sg_data_bytes, 0,
+            "sg_data_bytes should be 0 when SG disabled"
+        );
         let bl_enabled = BufferLayout::build(2, 128, 768, 50000, true);
         let sg_savings = bl_enabled.sg_data_bytes;
-        assert!(bl.total_scratchpad_bytes + sg_savings == bl_enabled.total_scratchpad_bytes,
-            "SG-disabled scratchpad should be smaller by exactly sg_data_bytes");
+        assert!(
+            bl.total_scratchpad_bytes + sg_savings == bl_enabled.total_scratchpad_bytes,
+            "SG-disabled scratchpad should be smaller by exactly sg_data_bytes"
+        );
     }
 
     #[test]
@@ -1171,7 +1286,9 @@ mod tests {
 
     #[test]
     fn cot_step_config() {
-        let cfg = CotStepConfig { shared_mem_offset: 8192 };
+        let cfg = CotStepConfig {
+            shared_mem_offset: 8192,
+        };
         assert_eq!(cfg.shared_mem_offset, 8192);
     }
 
@@ -1179,7 +1296,11 @@ mod tests {
 
     #[test]
     fn mtp_kernel_config() {
-        let cfg = MtpKernelConfig { depth: 2, hidden_size: 4096, vocab_size: 32000 };
+        let cfg = MtpKernelConfig {
+            depth: 2,
+            hidden_size: 4096,
+            vocab_size: 32000,
+        };
         assert_eq!(cfg.depth, 2);
         assert_eq!(cfg.hidden_size, 4096);
     }
@@ -1200,4 +1321,3 @@ mod tests {
         assert_eq!(cfg.target, CompileTarget::Cpu);
     }
 }
-

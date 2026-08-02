@@ -5,7 +5,7 @@
 //!
 //! Gated behind `#[cfg(feature = "jit-metal")]`.
 
-pub mod objc_runtime;
 pub mod device;
+pub mod objc_runtime;
 
 pub use device::MetalDevice;

@@ -23,19 +23,22 @@ macro_rules! define_matmul_x86_int8 {
         use std::arch::x86_64::*;
 
         const TM: usize = 14;
-        const LANES: usize = 16;  // i32 lanes per __m512i
-        const NV: usize = 2;      // accumulator vectors per row
-        const TN: usize = NV * LANES;  // 32 output N-columns per strip
-        // Packed B stride per K-quad = NV * 64 bytes = 128 bytes
-        const BK_STRIDE: usize = NV * 64;  // bytes per K-quad in packed B
+        const LANES: usize = 16; // i32 lanes per __m512i
+        const NV: usize = 2; // accumulator vectors per row
+        const TN: usize = NV * LANES; // 32 output N-columns per strip
+                                      // Packed B stride per K-quad = NV * 64 bytes = 128 bytes
+        const BK_STRIDE: usize = NV * 64; // bytes per K-quad in packed B
 
         /// Cached blocking parameters for INT8 VNNI backend.
         #[inline(always)]
         fn _blocking() -> $crate::cache_params::BlockingParams {
-            static BP: std::sync::OnceLock<$crate::cache_params::BlockingParams> = std::sync::OnceLock::new();
-            *BP.get_or_init(|| $crate::cache_params::blocking_params(
-                TM, NV, LANES, 1, // elem_bytes = 1 for int8
-            ))
+            static BP: std::sync::OnceLock<$crate::cache_params::BlockingParams> =
+                std::sync::OnceLock::new();
+            *BP.get_or_init(|| {
+                $crate::cache_params::blocking_params(
+                    TM, NV, LANES, 1, // elem_bytes = 1 for int8
+                )
+            })
         }
 
         /// Broadcast 4 consecutive u8 from A as a single i32 to all 16 lanes.
@@ -83,7 +86,7 @@ macro_rules! define_matmul_x86_int8 {
                         // Vec 0: N columns ns..ns+15
                         for nn in 0..LANES.min(n_size.saturating_sub(ns)) {
                             let dst = quad_base + nn * 4;
-                            packed[dst]     = b[(ks + kk)     * n_size + ns + nn];
+                            packed[dst] = b[(ks + kk) * n_size + ns + nn];
                             packed[dst + 1] = b[(ks + kk + 1) * n_size + ns + nn];
                             packed[dst + 2] = b[(ks + kk + 2) * n_size + ns + nn];
                             packed[dst + 3] = b[(ks + kk + 3) * n_size + ns + nn];
@@ -91,12 +94,13 @@ macro_rules! define_matmul_x86_int8 {
                         // Vec 1: N columns ns+16..ns+31
                         for nn in 0..LANES.min(n_size.saturating_sub(ns + LANES)) {
                             let dst = quad_base + 64 + nn * 4;
-                            packed[dst]     = b[(ks + kk)     * n_size + ns + LANES + nn];
+                            packed[dst] = b[(ks + kk) * n_size + ns + LANES + nn];
                             packed[dst + 1] = b[(ks + kk + 1) * n_size + ns + LANES + nn];
                             packed[dst + 2] = b[(ks + kk + 2) * n_size + ns + LANES + nn];
                             packed[dst + 3] = b[(ks + kk + 3) * n_size + ns + LANES + nn];
                         }
-                        kk += 4; kq += 1;
+                        kk += 4;
+                        kq += 1;
                     }
                     // Remainder K (1..3 leftover): pad with zeros (already zeroed)
                     if kk < kc {
@@ -116,7 +120,8 @@ macro_rules! define_matmul_x86_int8 {
                         }
                     }
                 }
-                ks += kc_max; ch += 1;
+                ks += kc_max;
+                ch += 1;
             }
             packed
         }
@@ -132,9 +137,12 @@ macro_rules! define_matmul_x86_int8 {
         // first_chunk: if true, zero-init accumulators; else load from C
         #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
         unsafe fn microkernel_14x32(
-            ac: *const u8, bp: *const i8,
+            ac: *const u8,
+            bp: *const i8,
             cp: *mut i32,
-            kc_quads: usize, k_size: usize, n_size: usize,
+            kc_quads: usize,
+            k_size: usize,
+            n_size: usize,
             first_chunk: bool,
         ) {
             macro_rules! init {
@@ -142,8 +150,10 @@ macro_rules! define_matmul_x86_int8 {
                     if first_chunk {
                         (_mm512_setzero_si512(), _mm512_setzero_si512())
                     } else {
-                        (_mm512_loadu_si512(cp.add($r * n_size) as *const __m512i),
-                         _mm512_loadu_si512(cp.add($r * n_size + LANES) as *const __m512i))
+                        (
+                            _mm512_loadu_si512(cp.add($r * n_size) as *const __m512i),
+                            _mm512_loadu_si512(cp.add($r * n_size + LANES) as *const __m512i),
+                        )
                     }
                 };
             }
@@ -167,8 +177,8 @@ macro_rules! define_matmul_x86_int8 {
 
             for _kq in 0..kc_quads {
                 // Load 2 B vectors for this K-quad (each 64 bytes = 16 × i32)
-                let vb0 = _mm512_loadu_si512(b_ptr as *const __m512i);           // N cols 0..15
-                let vb1 = _mm512_loadu_si512(b_ptr.add(64) as *const __m512i);   // N cols 16..31
+                let vb0 = _mm512_loadu_si512(b_ptr as *const __m512i); // N cols 0..15
+                let vb1 = _mm512_loadu_si512(b_ptr.add(64) as *const __m512i); // N cols 16..31
 
                 // Prefetch next B quad
                 _mm_prefetch(b_ptr.add(BK_STRIDE * 2) as *const i8, _MM_HINT_T0);
@@ -195,7 +205,7 @@ macro_rules! define_matmul_x86_int8 {
                 dp_row!(12, c12_0, c12_1);
                 dp_row!(13, c13_0, c13_1);
 
-                a_ptr = a_ptr.add(4);       // advance 4 K positions in A
+                a_ptr = a_ptr.add(4); // advance 4 K positions in A
                 b_ptr = b_ptr.add(BK_STRIDE); // advance to next K-quad in packed B
             }
 
@@ -225,16 +235,21 @@ macro_rules! define_matmul_x86_int8 {
         // ── 1×32 edge microkernel (single row) ──────────────────────────
         #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
         unsafe fn microkernel_1x32(
-            ac: *const u8, bp: *const i8,
+            ac: *const u8,
+            bp: *const i8,
             cp: *mut i32,
-            kc_quads: usize, _k_size: usize, _n_size: usize,
+            kc_quads: usize,
+            _k_size: usize,
+            _n_size: usize,
             first_chunk: bool,
         ) {
             let (mut c0, mut c1) = if first_chunk {
                 (_mm512_setzero_si512(), _mm512_setzero_si512())
             } else {
-                (_mm512_loadu_si512(cp as *const __m512i),
-                 _mm512_loadu_si512(cp.add(LANES) as *const __m512i))
+                (
+                    _mm512_loadu_si512(cp as *const __m512i),
+                    _mm512_loadu_si512(cp.add(LANES) as *const __m512i),
+                )
             };
             let mut a_ptr = ac;
             let mut b_ptr = bp;
@@ -254,14 +269,26 @@ macro_rules! define_matmul_x86_int8 {
         // ── Scalar edge for N-tail (< TN columns) ──────────────────────
         #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
         unsafe fn edge_n_scalar(
-            a: &[u8], b: &[i8], c: &mut [i32],
-            m_start: usize, m_end: usize, n_start: usize, n_size: usize,
-            ks: usize, kc: usize, k_size: usize, first_chunk: bool,
+            a: &[u8],
+            b: &[i8],
+            c: &mut [i32],
+            m_start: usize,
+            m_end: usize,
+            n_start: usize,
+            n_size: usize,
+            ks: usize,
+            kc: usize,
+            k_size: usize,
+            first_chunk: bool,
         ) {
             let n_rem = n_size - n_start;
             for mi in m_start..m_end {
                 for ni in 0..n_rem {
-                    let mut acc: i32 = if first_chunk { 0 } else { c[mi * n_size + n_start + ni] };
+                    let mut acc: i32 = if first_chunk {
+                        0
+                    } else {
+                        c[mi * n_size + n_start + ni]
+                    };
                     for ki in 0..kc {
                         let av = a[mi * k_size + ks + ki] as i32;
                         let bv = b[(ks + ki) * n_size + n_start + ni] as i32;
@@ -278,8 +305,13 @@ macro_rules! define_matmul_x86_int8 {
         // `b_orig` is the original unpacked B (row-major i8) needed for N-tail scalar fallback.
         #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
         pub unsafe fn gemm_int8(
-            a: &[u8], b_packed: &[i8], b_orig: &[i8], c: &mut [i32],
-            m_size: usize, n_size: usize, k_size: usize,
+            a: &[u8],
+            b_packed: &[i8],
+            b_orig: &[i8],
+            c: &mut [i32],
+            m_size: usize,
+            n_size: usize,
+            k_size: usize,
         ) {
             let bp_params = _blocking();
             let kc_max = bp_params.kc;
@@ -312,8 +344,17 @@ macro_rules! define_matmul_x86_int8 {
                             let ac = ap.add(m * k_size + ks);
                             let bp_ptr = b_packed.as_ptr().add(ch * cs + si * strip_size);
                             let c_out = cp.add(m * n_size + n);
-                            microkernel_14x32(ac, bp_ptr, c_out, kc_quads, k_size, n_size, first_chunk);
-                            n += TN; si += 1;
+                            microkernel_14x32(
+                                ac,
+                                bp_ptr,
+                                c_out,
+                                kc_quads,
+                                k_size,
+                                n_size,
+                                first_chunk,
+                            );
+                            n += TN;
+                            si += 1;
                         }
                         m += TM;
                     }
@@ -326,8 +367,17 @@ macro_rules! define_matmul_x86_int8 {
                             let ac = ap.add(m * k_size + ks);
                             let bp_ptr = b_packed.as_ptr().add(ch * cs + si * strip_size);
                             let c_out = cp.add(m * n_size + n);
-                            microkernel_1x32(ac, bp_ptr, c_out, kc_quads, k_size, n_size, first_chunk);
-                            n += TN; si += 1;
+                            microkernel_1x32(
+                                ac,
+                                bp_ptr,
+                                c_out,
+                                kc_quads,
+                                k_size,
+                                n_size,
+                                first_chunk,
+                            );
+                            n += TN;
+                            si += 1;
                         }
                         m += 1;
                     }
@@ -338,11 +388,23 @@ macro_rules! define_matmul_x86_int8 {
                 // N-tail (< TN columns): scalar fallback
                 let nm = (n_size / TN) * TN;
                 if nm < n_size {
-                    edge_n_scalar(a, b_orig, c,
-                                  0, m_size, nm, n_size, ks, kc, k_size, first_chunk);
+                    edge_n_scalar(
+                        a,
+                        b_orig,
+                        c,
+                        0,
+                        m_size,
+                        nm,
+                        n_size,
+                        ks,
+                        kc,
+                        k_size,
+                        first_chunk,
+                    );
                 }
 
-                ks += kc_max; ch += 1;
+                ks += kc_max;
+                ch += 1;
             }
         }
 
@@ -350,9 +412,12 @@ macro_rules! define_matmul_x86_int8 {
         // C_f32 = scale_a * scale_b * C_i32 + bias, then activation
         #[target_feature(enable = "avx512f")]
         pub unsafe fn dequantize_i32_to_f32(
-            c_i32: &[i32], c_f32: &mut [f32],
-            m: usize, n: usize,
-            scale_a: f32, scale_b: f32,
+            c_i32: &[i32],
+            c_f32: &mut [f32],
+            m: usize,
+            n: usize,
+            scale_a: f32,
+            scale_b: f32,
             bias: Option<&[f32]>,
             activation: $crate::Activation,
         ) {
@@ -381,7 +446,9 @@ macro_rules! define_matmul_x86_int8 {
                 while j < n {
                     let idx = i * n + j;
                     let mut val = c_i32[idx] as f32 * scale_a * scale_b;
-                    if let Some(b) = bias { val += b[j]; }
+                    if let Some(b) = bias {
+                        val += b[j];
+                    }
                     val = $crate::apply_act_scalar_runtime!(val, activation);
                     c_f32[idx] = val;
                     j += 1;

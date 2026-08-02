@@ -19,8 +19,7 @@ pub unsafe extern "C" fn scalar_moe_gate(
             for e in 0..num_experts {
                 let mut acc = 0.0f32;
                 for h in 0..hidden {
-                    acc += *hidden_input.add(s * hidden + h)
-                        * *router_w.add(h * num_experts + e);
+                    acc += *hidden_input.add(s * hidden + h) * *router_w.add(h * num_experts + e);
                 }
                 *output.add(s * num_experts + e) = acc;
             }
@@ -32,7 +31,9 @@ pub unsafe extern "C" fn scalar_moe_gate(
             let mut max_val = f32::NEG_INFINITY;
             for e in 0..num_experts {
                 let v = *output.add(row + e);
-                if v > max_val { max_val = v; }
+                if v > max_val {
+                    max_val = v;
+                }
             }
             let mut sum = 0.0f32;
             for e in 0..num_experts {
@@ -143,8 +144,7 @@ pub unsafe extern "C" fn scalar_weighted_sum(
                 let expert_idx = f32::to_bits(*indices.add(s * top_k + ki)) as usize;
                 let w = *weights.add(s * top_k + ki);
 
-                let expert_row = expert_outputs
-                    .add(expert_idx * seq_len * hidden + s * hidden);
+                let expert_row = expert_outputs.add(expert_idx * seq_len * hidden + s * hidden);
 
                 for d in 0..hidden {
                     *output.add(s * hidden + d) += w * *expert_row.add(d);
@@ -167,8 +167,12 @@ mod tests {
         let router = vec![0.1f32; hidden * num_experts];
         let mut output = vec![0.0f32; seq_len * num_experts];
         scalar_moe_gate(
-            input.as_ptr(), router.as_ptr(), output.as_mut_ptr(),
-            seq_len, num_experts, hidden,
+            input.as_ptr(),
+            router.as_ptr(),
+            output.as_mut_ptr(),
+            seq_len,
+            num_experts,
+            hidden,
         );
         for s in 0..seq_len {
             let sum: f32 = output[s * num_experts..(s + 1) * num_experts].iter().sum();
@@ -201,8 +205,13 @@ mod tests {
         let weights = vec![1.0f32];
         let mut output = vec![0.0f32; hidden];
         scalar_weighted_sum(
-            expert_out.as_ptr(), indices.as_ptr(), weights.as_ptr(),
-            output.as_mut_ptr(), seq_len, hidden, top_k,
+            expert_out.as_ptr(),
+            indices.as_ptr(),
+            weights.as_ptr(),
+            output.as_mut_ptr(),
+            seq_len,
+            hidden,
+            top_k,
         );
         assert_eq!(output, vec![1.0, 2.0, 3.0]);
     }

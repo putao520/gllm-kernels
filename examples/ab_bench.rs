@@ -37,11 +37,20 @@ fn main() {
     ];
 
     println!("=== GEMM A/B Benchmark (median of N runs) ===\n");
-    println!("{:>20}  {:>10}  {:>10}  {:>5}", "Size", "Time", "GFLOPS", "Iters");
+    println!(
+        "{:>20}  {:>10}  {:>10}  {:>5}",
+        "Size", "Time", "GFLOPS", "Iters"
+    );
     println!("{}", "-".repeat(52));
     for &(m, n, k, iters) in sizes {
         let label = format!("{}x{}x{}", m, n, k);
         let (secs, gflops) = bench_gemm(m, n, k, iters);
-        println!("{:>20}  {:>8.3} ms  {:>7.1}  {:>5}", label, secs * 1000.0, gflops, iters);
+        println!(
+            "{:>20}  {:>8.3} ms  {:>7.1}  {:>5}",
+            label,
+            secs * 1000.0,
+            gflops,
+            iters
+        );
     }
 }

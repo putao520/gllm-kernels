@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::autotuning::search_space::{ProblemShape, TuningConfig, JitParams, RegAllocStrategy};
+use crate::autotuning::search_space::{JitParams, ProblemShape, RegAllocStrategy, TuningConfig};
 use crate::types::CompilerError;
 
 /// A single cached tuning result.
@@ -71,9 +71,7 @@ impl WisdomDb {
 
     /// Look up a cached result.
     pub fn get(&self, hw_fingerprint: &str, op_key: &str) -> Option<&CachedResult> {
-        self.entries
-            .get(hw_fingerprint)
-            .and_then(|m| m.get(op_key))
+        self.entries.get(hw_fingerprint).and_then(|m| m.get(op_key))
     }
 
     /// Insert or update a cached result.
@@ -90,10 +88,7 @@ impl WisdomDb {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        let hw_map = self
-            .entries
-            .entry(hw_fingerprint.to_string())
-            .or_default();
+        let hw_map = self.entries.entry(hw_fingerprint.to_string()).or_default();
         hw_map.insert(
             op_key.to_string(),
             CachedResult {
@@ -164,7 +159,13 @@ impl WisdomDb {
         dtype_id: u8,
     ) -> Option<&CachedResult> {
         // Try jit_gemm key first (includes dtype_id from tune_jit_gemm)
-        let jit_shape = ProblemShape { m, n, k, elem_bytes, dtype_id };
+        let jit_shape = ProblemShape {
+            m,
+            n,
+            k,
+            elem_bytes,
+            dtype_id,
+        };
         let jit_key = op_key("jit_gemm", &jit_shape);
         if let Some(result) = self.get(hw_fingerprint, &jit_key) {
             return Some(result);
@@ -172,7 +173,13 @@ impl WisdomDb {
         // Fallback: legacy tune_gemm entries (always dtype_id=0)
         // Only match if the query dtype matches F32 (elem_id=0)
         if dtype_id == 0 {
-            let std_shape = ProblemShape { m, n, k, elem_bytes, dtype_id: 0 };
+            let std_shape = ProblemShape {
+                m,
+                n,
+                k,
+                elem_bytes,
+                dtype_id: 0,
+            };
             let std_key = op_key("gemm", &std_shape);
             if let Some(result) = self.get(hw_fingerprint, &std_key) {
                 return Some(result);
@@ -189,9 +196,7 @@ pub fn op_key(op_name: &str, shape: &ProblemShape) -> String {
 
 // ── Serialization (simple JSON, no serde dependency) ────────────────────
 
-fn serialize_wisdom(
-    entries: &HashMap<String, HashMap<String, CachedResult>>,
-) -> String {
+fn serialize_wisdom(entries: &HashMap<String, HashMap<String, CachedResult>>) -> String {
     let mut out = String::from("{\n");
     let hw_keys: Vec<&String> = {
         let mut v: Vec<_> = entries.keys().collect();
@@ -334,7 +339,9 @@ fn extract_usize(json: &str, key: &str) -> Option<usize> {
     let pos = json.find(&pattern)?;
     let after = &json[pos + pattern.len()..];
     let after = after.trim_start();
-    let end = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
+    let end = after
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after.len());
     after[..end].parse().ok()
 }
 
@@ -347,7 +354,9 @@ fn extract_f64(json: &str, key: &str) -> Option<f64> {
         return None;
     }
     let end = after
-        .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-' && c != 'e' && c != 'E' && c != '+')
+        .find(|c: char| {
+            !c.is_ascii_digit() && c != '.' && c != '-' && c != 'e' && c != 'E' && c != '+'
+        })
         .unwrap_or(after.len());
     after[..end].parse().ok()
 }
@@ -465,7 +474,13 @@ mod tests {
             num_threads: 8,
             jit: None,
         };
-        db.put("test_hw_fp", "gemm_512x512x512_e4", config.clone(), 1234.5, Some(42.0));
+        db.put(
+            "test_hw_fp",
+            "gemm_512x512x512_e4",
+            config.clone(),
+            1234.5,
+            Some(42.0),
+        );
         db.save().unwrap();
 
         // Reload
@@ -503,7 +518,13 @@ mod tests {
                 nr_variant: 16,
             }),
         };
-        db.put("test_hw_jit", "jit_gemm_256x256x256_e4", config.clone(), 500.0, Some(80.0));
+        db.put(
+            "test_hw_jit",
+            "jit_gemm_256x256x256_e4",
+            config.clone(),
+            500.0,
+            Some(80.0),
+        );
         db.save().unwrap();
 
         let db2 = WisdomDb::load(&path);
@@ -527,11 +548,35 @@ mod tests {
         let path = dir.join("test_wisdom2.json");
 
         let mut db = WisdomDb::new(path.clone());
-        let c1 = TuningConfig { kc: 128, mc: 48, nc: 512, num_threads: 4, jit: None };
-        let c2 = TuningConfig { kc: 256, mc: 96, nc: 2048, num_threads: 8, jit: None };
+        let c1 = TuningConfig {
+            kc: 128,
+            mc: 48,
+            nc: 512,
+            num_threads: 4,
+            jit: None,
+        };
+        let c2 = TuningConfig {
+            kc: 256,
+            mc: 96,
+            nc: 2048,
+            num_threads: 8,
+            jit: None,
+        };
         db.put("hw1", "gemm_256x256x256_e4", c1, 500.0, Some(10.0));
         db.put("hw1", "gemm_1024x1024x1024_e4", c2, 2000.0, Some(80.0));
-        db.put("hw2", "gemm_256x256x256_e4", TuningConfig { kc: 64, mc: 24, nc: 256, num_threads: 2, jit: None }, 800.0, None);
+        db.put(
+            "hw2",
+            "gemm_256x256x256_e4",
+            TuningConfig {
+                kc: 64,
+                mc: 24,
+                nc: 256,
+                num_threads: 2,
+                jit: None,
+            },
+            800.0,
+            None,
+        );
         db.save().unwrap();
 
         let db2 = WisdomDb::load(&path);
@@ -547,7 +592,13 @@ mod tests {
 
     #[test]
     fn test_op_key_format() {
-        let shape = ProblemShape { m: 512, n: 1024, k: 768, elem_bytes: 4, dtype_id: 0 };
+        let shape = ProblemShape {
+            m: 512,
+            n: 1024,
+            k: 768,
+            elem_bytes: 4,
+            dtype_id: 0,
+        };
         let key = op_key("gemm", &shape);
         assert_eq!(key, "gemm_512x1024x768_e4_d0");
     }
@@ -560,15 +611,29 @@ mod tests {
         let path = dir.join("test_blocking.json");
 
         let mut db = WisdomDb::new(path);
-        let config = TuningConfig { kc: 256, mc: 72, nc: 1024, num_threads: 8, jit: None };
-        db.put("hw_test", "gemm_512x512x512_e4_d0", config, 1000.0, Some(50.0));
+        let config = TuningConfig {
+            kc: 256,
+            mc: 72,
+            nc: 1024,
+            num_threads: 8,
+            jit: None,
+        };
+        db.put(
+            "hw_test",
+            "gemm_512x512x512_e4_d0",
+            config,
+            1000.0,
+            Some(50.0),
+        );
 
         let result = db.get_gemm_blocking("hw_test", 512, 512, 512, 4, 0);
         assert!(result.is_some());
         assert_eq!(result.unwrap().config.kc, 256);
 
         // Non-existent shape returns None
-        assert!(db.get_gemm_blocking("hw_test", 1024, 1024, 1024, 4, 0).is_none());
+        assert!(db
+            .get_gemm_blocking("hw_test", 1024, 1024, 1024, 4, 0)
+            .is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -658,8 +723,20 @@ mod tests {
     fn test_wisdom_db_put_overwrite_same_key() {
         // Arrange
         let mut db = WisdomDb::new(PathBuf::from("/tmp/_unused.json"));
-        let c1 = TuningConfig { kc: 64, mc: 32, nc: 256, num_threads: 2, jit: None };
-        let c2 = TuningConfig { kc: 128, mc: 64, nc: 512, num_threads: 4, jit: None };
+        let c1 = TuningConfig {
+            kc: 64,
+            mc: 32,
+            nc: 256,
+            num_threads: 2,
+            jit: None,
+        };
+        let c2 = TuningConfig {
+            kc: 128,
+            mc: 64,
+            nc: 512,
+            num_threads: 4,
+            jit: None,
+        };
 
         // Act: insert then overwrite the same key
         db.put("hw", "op_a", c1, 100.0, Some(10.0));
@@ -678,7 +755,13 @@ mod tests {
     fn test_wisdom_db_clear_hw_selective() {
         // Arrange
         let mut db = WisdomDb::new(PathBuf::from("/tmp/_unused.json"));
-        let cfg = TuningConfig { kc: 64, mc: 32, nc: 256, num_threads: 2, jit: None };
+        let cfg = TuningConfig {
+            kc: 64,
+            mc: 32,
+            nc: 256,
+            num_threads: 2,
+            jit: None,
+        };
         db.put("hw_a", "op1", cfg.clone(), 100.0, None);
         db.put("hw_a", "op2", cfg.clone(), 200.0, None);
         db.put("hw_b", "op1", cfg.clone(), 300.0, None);
@@ -701,7 +784,13 @@ mod tests {
     fn test_wisdom_db_clear_all() {
         // Arrange
         let mut db = WisdomDb::new(PathBuf::from("/tmp/_unused.json"));
-        let cfg = TuningConfig { kc: 64, mc: 32, nc: 256, num_threads: 2, jit: None };
+        let cfg = TuningConfig {
+            kc: 64,
+            mc: 32,
+            nc: 256,
+            num_threads: 2,
+            jit: None,
+        };
         db.put("hw1", "op1", cfg.clone(), 100.0, None);
         db.put("hw2", "op2", cfg.clone(), 200.0, None);
         assert_eq!(db.total_entries(), 2);
@@ -722,7 +811,13 @@ mod tests {
     fn test_wisdom_db_fingerprints_ordering() {
         // Arrange
         let mut db = WisdomDb::new(PathBuf::from("/tmp/_unused.json"));
-        let cfg = TuningConfig { kc: 64, mc: 32, nc: 256, num_threads: 2, jit: None };
+        let cfg = TuningConfig {
+            kc: 64,
+            mc: 32,
+            nc: 256,
+            num_threads: 2,
+            jit: None,
+        };
 
         // Act: insert in non-alphabetical order
         db.put("charlie", "op1", cfg.clone(), 100.0, None);
@@ -741,7 +836,13 @@ mod tests {
     #[test]
     fn test_cached_result_float_precision() {
         // Arrange: use values that are tricky for floating-point
-        let config = TuningConfig { kc: 1, mc: 1, nc: 1, num_threads: 1, jit: None };
+        let config = TuningConfig {
+            kc: 1,
+            mc: 1,
+            nc: 1,
+            num_threads: 1,
+            jit: None,
+        };
         let median = 0.123456789012345f64;
         let gflops = 1e15f64;
 
@@ -761,7 +862,13 @@ mod tests {
     #[test]
     fn test_cached_result_timestamp_zero_boundary() {
         // Arrange: timestamp = 0 (UNIX epoch boundary)
-        let config = TuningConfig { kc: 1, mc: 1, nc: 1, num_threads: 1, jit: None };
+        let config = TuningConfig {
+            kc: 1,
+            mc: 1,
+            nc: 1,
+            num_threads: 1,
+            jit: None,
+        };
         let result = CachedResult {
             config,
             median_ns: 0.0,
@@ -838,7 +945,10 @@ mod tests {
         assert!(updated.gflops.is_none());
         assert_eq!(updated.config.kc, 256);
         assert_eq!(updated.config.jit.as_ref().unwrap().k_unroll, 2);
-        assert_eq!(updated.config.jit.as_ref().unwrap().reg_alloc_strategy, RegAllocStrategy::MinSpill);
+        assert_eq!(
+            updated.config.jit.as_ref().unwrap().reg_alloc_strategy,
+            RegAllocStrategy::MinSpill
+        );
         assert_eq!(updated.timestamp, 9999);
     }
 
@@ -876,9 +986,27 @@ mod tests {
     #[test]
     fn test_problem_shape_equality_and_format() {
         // Arrange
-        let a = ProblemShape { m: 128, n: 256, k: 512, elem_bytes: 2, dtype_id: 1 };
-        let b = ProblemShape { m: 128, n: 256, k: 512, elem_bytes: 2, dtype_id: 1 };
-        let c = ProblemShape { m: 128, n: 256, k: 512, elem_bytes: 2, dtype_id: 2 };
+        let a = ProblemShape {
+            m: 128,
+            n: 256,
+            k: 512,
+            elem_bytes: 2,
+            dtype_id: 1,
+        };
+        let b = ProblemShape {
+            m: 128,
+            n: 256,
+            k: 512,
+            elem_bytes: 2,
+            dtype_id: 1,
+        };
+        let c = ProblemShape {
+            m: 128,
+            n: 256,
+            k: 512,
+            elem_bytes: 2,
+            dtype_id: 2,
+        };
 
         // Assert: equality
         assert_eq!(a, b);
@@ -897,7 +1025,9 @@ mod tests {
     #[test]
     fn test_load_nonexistent_file_returns_empty() {
         // Arrange: path that definitely does not exist
-        let path = std::env::temp_dir().join("gllm_wisdom_nonexistent_42af9c").join("nope.json");
+        let path = std::env::temp_dir()
+            .join("gllm_wisdom_nonexistent_42af9c")
+            .join("nope.json");
 
         // Act
         let db = WisdomDb::load(&path);
@@ -936,7 +1066,13 @@ mod tests {
         let path = nested.join("wisdom.json");
 
         let mut db = WisdomDb::new(path.clone());
-        let cfg = TuningConfig { kc: 64, mc: 32, nc: 256, num_threads: 2, jit: None };
+        let cfg = TuningConfig {
+            kc: 64,
+            mc: 32,
+            nc: 256,
+            num_threads: 2,
+            jit: None,
+        };
 
         // Act: put (makes dirty) then save
         db.put("hw", "op1", cfg, 100.0, Some(5.0));
@@ -955,12 +1091,30 @@ mod tests {
     fn test_get_gemm_blocking_prefers_jit_key_over_legacy() {
         // Arrange: insert both a jit_gemm entry and a legacy gemm entry for the same shape
         let mut db = WisdomDb::new(PathBuf::from("/tmp/_unused.json"));
-        let shape = ProblemShape { m: 256, n: 256, k: 256, elem_bytes: 4, dtype_id: 0 };
+        let shape = ProblemShape {
+            m: 256,
+            n: 256,
+            k: 256,
+            elem_bytes: 4,
+            dtype_id: 0,
+        };
         let jit_key = op_key("jit_gemm", &shape);
         let std_key = op_key("gemm", &shape);
 
-        let legacy_cfg = TuningConfig { kc: 64, mc: 32, nc: 256, num_threads: 2, jit: None };
-        let jit_cfg = TuningConfig { kc: 128, mc: 64, nc: 512, num_threads: 4, jit: None };
+        let legacy_cfg = TuningConfig {
+            kc: 64,
+            mc: 32,
+            nc: 256,
+            num_threads: 2,
+            jit: None,
+        };
+        let jit_cfg = TuningConfig {
+            kc: 128,
+            mc: 64,
+            nc: 512,
+            num_threads: 4,
+            jit: None,
+        };
 
         db.put("hw", &std_key, legacy_cfg, 500.0, Some(10.0));
         db.put("hw", &jit_key, jit_cfg, 200.0, Some(50.0));
@@ -978,9 +1132,21 @@ mod tests {
     fn test_get_gemm_blocking_dtype_id_isolation() {
         // Arrange: insert a legacy gemm entry (dtype_id=0 implicit)
         let mut db = WisdomDb::new(PathBuf::from("/tmp/_unused.json"));
-        let legacy_shape = ProblemShape { m: 512, n: 512, k: 512, elem_bytes: 2, dtype_id: 0 };
+        let legacy_shape = ProblemShape {
+            m: 512,
+            n: 512,
+            k: 512,
+            elem_bytes: 2,
+            dtype_id: 0,
+        };
         let std_key = op_key("gemm", &legacy_shape);
-        let cfg = TuningConfig { kc: 64, mc: 32, nc: 256, num_threads: 2, jit: None };
+        let cfg = TuningConfig {
+            kc: 64,
+            mc: 32,
+            nc: 256,
+            num_threads: 2,
+            jit: None,
+        };
         db.put("hw", &std_key, cfg, 500.0, None);
 
         // Act: query with dtype_id != 0 (e.g. BF16=2)
@@ -999,7 +1165,13 @@ mod tests {
         let path = dir.join("null_gflops.json");
 
         let mut db = WisdomDb::new(path.clone());
-        let cfg = TuningConfig { kc: 128, mc: 64, nc: 512, num_threads: 4, jit: None };
+        let cfg = TuningConfig {
+            kc: 128,
+            mc: 64,
+            nc: 512,
+            num_threads: 4,
+            jit: None,
+        };
         db.put("hw_null", "gemm_64x64x64_e4", cfg, 333.3, None);
         db.save().unwrap();
 
@@ -1234,7 +1406,13 @@ mod tests {
     fn test_put_updates_timestamp_monotonically() {
         // Arrange
         let mut db = WisdomDb::new(PathBuf::from("/tmp/_unused.json"));
-        let cfg = TuningConfig { kc: 64, mc: 32, nc: 256, num_threads: 2, jit: None };
+        let cfg = TuningConfig {
+            kc: 64,
+            mc: 32,
+            nc: 256,
+            num_threads: 2,
+            jit: None,
+        };
 
         // Act: two puts in quick succession
         db.put("hw", "op_ts", cfg.clone(), 100.0, None);
@@ -1261,12 +1439,24 @@ mod tests {
         let path = dir.join("clear_put.json");
 
         let mut db = WisdomDb::new(path.clone());
-        let cfg_old = TuningConfig { kc: 64, mc: 32, nc: 256, num_threads: 2, jit: None };
+        let cfg_old = TuningConfig {
+            kc: 64,
+            mc: 32,
+            nc: 256,
+            num_threads: 2,
+            jit: None,
+        };
         db.put("hw", "old_op", cfg_old, 100.0, None);
 
         // Act: clear, then add a new entry, then save
         db.clear_all();
-        let cfg_new = TuningConfig { kc: 256, mc: 128, nc: 1024, num_threads: 8, jit: Some(JitParams::default()) };
+        let cfg_new = TuningConfig {
+            kc: 256,
+            mc: 128,
+            nc: 1024,
+            num_threads: 8,
+            jit: Some(JitParams::default()),
+        };
         db.put("hw_new", "new_op", cfg_new.clone(), 500.0, Some(60.0));
         db.save().unwrap();
 

@@ -27,7 +27,9 @@ pub struct OptStats {
 pub trait VmOptPass: Send + Sync {
     fn name(&self) -> &'static str;
     fn priority(&self) -> u32;
-    fn is_applicable(&self, _profile: &IsaProfile) -> bool { true }
+    fn is_applicable(&self, _profile: &IsaProfile) -> bool {
+        true
+    }
     fn run(&self, program: &mut VmProgram, profile: &IsaProfile, hook: &dyn IsaHook) -> OptStats;
 }
 
@@ -40,7 +42,9 @@ pub struct PassRegistry {
 }
 
 impl PassRegistry {
-    pub fn new() -> Self { Self { passes: vec![] } }
+    pub fn new() -> Self {
+        Self { passes: vec![] }
+    }
 
     // @trace REQ-PASS-INV-002 [entity:ENT-COMPILER-GRAPH] [api:POST /compile]
     pub fn register(&mut self, pass: Box<dyn VmOptPass>) {
@@ -65,13 +69,23 @@ impl PassRegistry {
 
     // @trace REQ-PASS-INV-002 [entity:ENT-COMPILER-GRAPH] [api:POST /compile]
     // @trace REQ-PASS-INV-003 [entity:ENT-COMPILER-GRAPH] [api:POST /compile]
-    pub fn run_all(&self, program: &mut VmProgram, profile: &IsaProfile, hook: &dyn IsaHook) -> Vec<OptStats> {
-        let mut sorted: Vec<&dyn VmOptPass> = self.passes.iter()
+    pub fn run_all(
+        &self,
+        program: &mut VmProgram,
+        profile: &IsaProfile,
+        hook: &dyn IsaHook,
+    ) -> Vec<OptStats> {
+        let mut sorted: Vec<&dyn VmOptPass> = self
+            .passes
+            .iter()
             .filter(|p| p.is_applicable(profile))
             .map(|p| p.as_ref())
             .collect();
         sorted.sort_by_key(|p| p.priority());
-        sorted.iter().map(|p| p.run(program, profile, hook)).collect()
+        sorted
+            .iter()
+            .map(|p| p.run(program, profile, hook))
+            .collect()
     }
 }
 
@@ -83,8 +97,12 @@ impl PassRegistry {
 pub struct DeadVRegEliminationPass;
 
 impl VmOptPass for DeadVRegEliminationPass {
-    fn name(&self) -> &'static str { "dead_vreg_elimination" }
-    fn priority(&self) -> u32 { 10 }
+    fn name(&self) -> &'static str {
+        "dead_vreg_elimination"
+    }
+    fn priority(&self) -> u32 {
+        10
+    }
 
     fn run(&self, program: &mut VmProgram, _profile: &IsaProfile, _hook: &dyn IsaHook) -> OptStats {
         // 收集所有被实际使用（读或写）的 VRegId — referenced_vregs() 覆盖所有指令类型。
@@ -105,7 +123,7 @@ impl VmOptPass for DeadVRegEliminationPass {
         program.instrs.retain(|instr| {
             if let VmInstr::DeclareVReg { id, .. } = instr {
                 // 只删除 Vec 类型的死 VReg。
-            // Ptr/Counter/ByteOffset 有控制流副作用，不能删。
+                // Ptr/Counter/ByteOffset 有控制流副作用，不能删。
                 if !read_set.contains(id) {
                     if let VmInstr::DeclareVReg { kind, .. } = instr {
                         if matches!(kind, VRegKind::Vec) {
@@ -118,7 +136,10 @@ impl VmOptPass for DeadVRegEliminationPass {
         });
         let removed = before - program.instrs.len();
 
-        OptStats { instrs_removed: removed, instrs_added: 0 }
+        OptStats {
+            instrs_removed: removed,
+            instrs_added: 0,
+        }
     }
 }
 
@@ -126,8 +147,12 @@ impl VmOptPass for DeadVRegEliminationPass {
 pub struct ScopeFlattenPass;
 
 impl VmOptPass for ScopeFlattenPass {
-    fn name(&self) -> &'static str { "scope_flatten" }
-    fn priority(&self) -> u32 { 20 }
+    fn name(&self) -> &'static str {
+        "scope_flatten"
+    }
+    fn priority(&self) -> u32 {
+        20
+    }
 
     fn run(&self, program: &mut VmProgram, _profile: &IsaProfile, _hook: &dyn IsaHook) -> OptStats {
         // 查找 ScopeEnd 紧跟 ScopeBegin 的模式 → 删除两者
@@ -155,15 +180,22 @@ impl VmOptPass for ScopeFlattenPass {
         }
         program.instrs = new_instrs;
 
-        OptStats { instrs_removed: before - program.instrs.len(), instrs_added: 0 }
+        OptStats {
+            instrs_removed: before - program.instrs.len(),
+            instrs_added: 0,
+        }
     }
 }
 
 /// §12 Layer 3.5: 合并相邻同 bound 的循环。
 pub struct LoopFusionPass;
 impl VmOptPass for LoopFusionPass {
-    fn name(&self) -> &'static str { "loop_fusion" }
-    fn priority(&self) -> u32 { 30 }
+    fn name(&self) -> &'static str {
+        "loop_fusion"
+    }
+    fn priority(&self) -> u32 {
+        30
+    }
     fn run(&self, program: &mut VmProgram, _profile: &IsaProfile, _hook: &dyn IsaHook) -> OptStats {
         // 查找 LoopEnd 紧跟 LoopBegin (同 bound + 同 step) → 合并
         let mut fused = 0usize;
@@ -180,22 +212,33 @@ impl VmOptPass for LoopFusionPass {
                 i += 1;
             }
         }
-        OptStats { instrs_removed: fused * 2, instrs_added: 0 }
+        OptStats {
+            instrs_removed: fused * 2,
+            instrs_added: 0,
+        }
     }
 }
 
 /// §12 Layer 3.5: 连续 Store→Load 同地址 → VReg 直传。
 pub struct StoreLoadForwardPass;
 impl VmOptPass for StoreLoadForwardPass {
-    fn name(&self) -> &'static str { "store_load_forward" }
-    fn priority(&self) -> u32 { 40 }
+    fn name(&self) -> &'static str {
+        "store_load_forward"
+    }
+    fn priority(&self) -> u32 {
+        40
+    }
     fn run(&self, program: &mut VmProgram, _profile: &IsaProfile, _hook: &dyn IsaHook) -> OptStats {
         let mut removed = 0;
         let mut i = 0;
         while i + 1 < program.instrs.len() {
             let forward = match (&program.instrs[i], &program.instrs[i + 1]) {
                 (VmInstr::VecStore { src, dtype, .. }, VmInstr::VecLoad { dst, .. }) => {
-                    if src != dst { Some((*dst, *src, *dtype)) } else { None }
+                    if src != dst {
+                        Some((*dst, *src, *dtype))
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             };
@@ -210,7 +253,10 @@ impl VmOptPass for StoreLoadForwardPass {
                 i += 1;
             }
         }
-        OptStats { instrs_removed: removed * 2, instrs_added: removed }
+        OptStats {
+            instrs_removed: removed * 2,
+            instrs_added: removed,
+        }
     }
 }
 
@@ -221,8 +267,12 @@ impl VmOptPass for StoreLoadForwardPass {
 /// 删除 LoopBegin/LoopEnd 控制流。
 pub struct LoopUnrollPass;
 impl VmOptPass for LoopUnrollPass {
-    fn name(&self) -> &'static str { "loop_unroll" }
-    fn priority(&self) -> u32 { 50 }
+    fn name(&self) -> &'static str {
+        "loop_unroll"
+    }
+    fn priority(&self) -> u32 {
+        50
+    }
     fn run(&self, program: &mut VmProgram, profile: &IsaProfile, _hook: &dyn IsaHook) -> OptStats {
         const UNROLL_THRESHOLD: usize = 4;
         let l1i_budget = (profile.cache.l1i_bytes as f64 * 0.8) as usize;
@@ -236,11 +286,21 @@ impl VmOptPass for LoopUnrollPass {
         let mut added = 0;
         let mut i = 0;
         while i < program.instrs.len() {
-            let unroll_info = if let VmInstr::LoopBegin { bound: BoundExpr::Const(n), offsets, .. } = &program.instrs[i] {
+            let unroll_info = if let VmInstr::LoopBegin {
+                bound: BoundExpr::Const(n),
+                offsets,
+                ..
+            } = &program.instrs[i]
+            {
                 if *n <= UNROLL_THRESHOLD && *n > 0 && !offsets.is_empty() {
                     let steps: Option<Vec<(usize, VRegId)>> = offsets
                         .iter()
-                        .map(|offset| offset.stride.as_fixed_bytes().map(|step| (step, offset.vreg)))
+                        .map(|offset| {
+                            offset
+                                .stride
+                                .as_fixed_bytes()
+                                .map(|step| (step, offset.vreg))
+                        })
                         .collect();
                     steps.map(|steps| (*n, steps))
                 } else {
@@ -264,9 +324,14 @@ impl VmOptPass for LoopUnrollPass {
                         VmInstr::LoopEnd => depth -= 1,
                         _ => {}
                     }
-                    if depth > 0 { end_idx += 1; }
+                    if depth > 0 {
+                        end_idx += 1;
+                    }
                 }
-                if depth != 0 { i += 1; continue; }
+                if depth != 0 {
+                    i += 1;
+                    continue;
+                }
 
                 // ARCH-UNROLL-NO-NESTED-SSA: 含内层 LoopBegin 的循环不展开。
                 // 内层 counter/byte_offset VReg 是单次分配,展开会让同一 VReg 被
@@ -278,7 +343,7 @@ impl VmOptPass for LoopUnrollPass {
                     continue;
                 }
 
-                let body: Vec<VmInstr> = program.instrs[i+1..end_idx].to_vec();
+                let body: Vec<VmInstr> = program.instrs[i + 1..end_idx].to_vec();
                 let body_len = body.len();
 
                 // L1i budget 检查
@@ -313,7 +378,10 @@ impl VmOptPass for LoopUnrollPass {
             }
         }
 
-        OptStats { instrs_removed: removed, instrs_added: added }
+        OptStats {
+            instrs_removed: removed,
+            instrs_added: added,
+        }
     }
 }
 
@@ -329,27 +397,75 @@ fn substitute_loop_offset_in_instr(instr: &VmInstr, vreg: VRegId, value: usize) 
     let sub = |oe: &OffsetExpr| oe.substitute_loop_offset(vreg, value);
     let sub_ptr = |pe: &PtrExpr| -> PtrExpr {
         match pe {
-            PtrExpr::VRegPlusVReg(base, off) if *off == vreg =>
-                PtrExpr::VRegPlusConst(*base, value),
+            PtrExpr::VRegPlusVReg(base, off) if *off == vreg => {
+                PtrExpr::VRegPlusConst(*base, value)
+            }
             other => other.clone(),
         }
     };
     match instr {
-        VmInstr::VecLoad { dst, base, ref offset, width, dtype, predicate } =>
-            VmInstr::VecLoad { dst: *dst, base: *base, offset: sub(offset), width: *width, dtype: *dtype, predicate: predicate.clone(), },
-        VmInstr::VecStore { base, ref offset, src, width, dtype, predicate } =>
-            VmInstr::VecStore { base: *base, offset: sub(offset), src: *src, width: *width, dtype: *dtype, predicate: predicate.clone(), },
-        VmInstr::Broadcast { dst, ref src, width, dtype } => {
+        VmInstr::VecLoad {
+            dst,
+            base,
+            ref offset,
+            width,
+            dtype,
+            predicate,
+        } => VmInstr::VecLoad {
+            dst: *dst,
+            base: *base,
+            offset: sub(offset),
+            width: *width,
+            dtype: *dtype,
+            predicate: predicate.clone(),
+        },
+        VmInstr::VecStore {
+            base,
+            ref offset,
+            src,
+            width,
+            dtype,
+            predicate,
+        } => VmInstr::VecStore {
+            base: *base,
+            offset: sub(offset),
+            src: *src,
+            width: *width,
+            dtype: *dtype,
+            predicate: predicate.clone(),
+        },
+        VmInstr::Broadcast {
+            dst,
+            ref src,
+            width,
+            dtype,
+        } => {
             let new_src = match src {
                 ScalarExpr::MemLoad(base, ref off) => ScalarExpr::MemLoad(*base, sub(off)),
                 other => other.clone(),
             };
-            VmInstr::Broadcast { dst: *dst, src: new_src, width: *width, dtype: *dtype, }
+            VmInstr::Broadcast {
+                dst: *dst,
+                src: new_src,
+                width: *width,
+                dtype: *dtype,
+            }
         }
-        VmInstr::Prefetch { base, ref offset, distance, hint } =>
-            VmInstr::Prefetch { base: *base, offset: sub(offset), distance: *distance, hint: *hint },
-        VmInstr::LoadPtr { dst, src } =>
-            VmInstr::LoadPtr { dst: *dst, src: sub_ptr(src) },
+        VmInstr::Prefetch {
+            base,
+            ref offset,
+            distance,
+            hint,
+        } => VmInstr::Prefetch {
+            base: *base,
+            offset: sub(offset),
+            distance: *distance,
+            hint: *hint,
+        },
+        VmInstr::LoadPtr { dst, src } => VmInstr::LoadPtr {
+            dst: *dst,
+            src: sub_ptr(src),
+        },
         other => other.clone(),
     }
 }
@@ -362,8 +478,12 @@ fn substitute_loop_offset_in_instr(instr: &VmInstr, vreg: VRegId, value: usize) 
 /// (例如累加器 acc 的 Broadcast(0.0) 清零不能提升)。
 pub struct TranscendentalBatchPass;
 impl VmOptPass for TranscendentalBatchPass {
-    fn name(&self) -> &'static str { "transcendental_batch" }
-    fn priority(&self) -> u32 { 60 }
+    fn name(&self) -> &'static str {
+        "transcendental_batch"
+    }
+    fn priority(&self) -> u32 {
+        60
+    }
     fn run(&self, program: &mut VmProgram, _profile: &IsaProfile, _hook: &dyn IsaHook) -> OptStats {
         let hoisted = 0;
         let mut i = 0;
@@ -380,32 +500,52 @@ impl VmOptPass for TranscendentalBatchPass {
             while scan < program.instrs.len() && depth > 0 {
                 match &program.instrs[scan] {
                     VmInstr::LoopBegin { .. } => depth += 1,
-                    VmInstr::LoopEnd => { depth -= 1; if depth == 0 { break; } }
-                    VmInstr::Broadcast { dst, src: ScalarExpr::Const(_), .. } if depth == 1 => {
+                    VmInstr::LoopEnd => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    VmInstr::Broadcast {
+                        dst,
+                        src: ScalarExpr::Const(_),
+                        ..
+                    } if depth == 1 => {
                         const_broadcasts.push((scan, *dst));
                     }
                     _ => {}
                 }
                 scan += 1;
             }
-            if depth != 0 { i += 1; continue; }
+            if depth != 0 {
+                i += 1;
+                continue;
+            }
             let loop_end = scan;
 
             // 对每个常量 Broadcast 检查: dst 是否在循环体中被其他指令写入
             let mut to_hoist: Vec<usize> = Vec::new();
             for &(bc_idx, bc_dst) in &const_broadcasts {
-                let has_other_write = program.instrs[loop_start+1..loop_end].iter().enumerate().any(|(off, instr)| {
-                    let abs = loop_start + 1 + off;
-                    if abs == bc_idx { return false; }
-                    match instr {
-                        VmInstr::Fma { dst, .. } | VmInstr::VecBinOp { dst, .. }
-                        | VmInstr::VecUnaryOp { dst, .. } | VmInstr::HReduce { dst, .. }
-                        | VmInstr::Transcendental { dst, .. } | VmInstr::VecLoad { dst, .. } => *dst == bc_dst,
-                        VmInstr::Accumulate { acc, .. } => *acc == bc_dst,
-                        VmInstr::Broadcast { dst, .. } if abs != bc_idx => *dst == bc_dst,
-                        _ => false,
-                    }
-                });
+                let has_other_write = program.instrs[loop_start + 1..loop_end]
+                    .iter()
+                    .enumerate()
+                    .any(|(off, instr)| {
+                        let abs = loop_start + 1 + off;
+                        if abs == bc_idx {
+                            return false;
+                        }
+                        match instr {
+                            VmInstr::Fma { dst, .. }
+                            | VmInstr::VecBinOp { dst, .. }
+                            | VmInstr::VecUnaryOp { dst, .. }
+                            | VmInstr::HReduce { dst, .. }
+                            | VmInstr::Transcendental { dst, .. }
+                            | VmInstr::VecLoad { dst, .. } => *dst == bc_dst,
+                            VmInstr::Accumulate { acc, .. } => *acc == bc_dst,
+                            VmInstr::Broadcast { dst, .. } if abs != bc_idx => *dst == bc_dst,
+                            _ => false,
+                        }
+                    });
                 if !has_other_write {
                     to_hoist.push(bc_idx);
                 }
@@ -422,7 +562,10 @@ impl VmOptPass for TranscendentalBatchPass {
             i += 1;
         }
         let _ = hoisted;
-        OptStats { instrs_removed: 0, instrs_added: 0 }
+        OptStats {
+            instrs_removed: 0,
+            instrs_added: 0,
+        }
     }
 }
 
@@ -435,16 +578,24 @@ impl VmOptPass for TranscendentalBatchPass {
 /// FP7/FP9 等融合点在 epilogue 执行期间白嫖注入。
 pub struct EpilogueFusionPass;
 impl VmOptPass for EpilogueFusionPass {
-    fn name(&self) -> &'static str { "epilogue_fusion" }
-    fn priority(&self) -> u32 { 70 }
+    fn name(&self) -> &'static str {
+        "epilogue_fusion"
+    }
+    fn priority(&self) -> u32 {
+        70
+    }
     fn run(&self, program: &mut VmProgram, profile: &IsaProfile, hook: &dyn IsaHook) -> OptStats {
         let width = profile.optimal_simd_width();
 
         // 统计累加器和 epilogue 操作数
-        let acc_count = program.instrs.iter()
+        let acc_count = program
+            .instrs
+            .iter()
             .filter(|i| matches!(i, VmInstr::Fma { .. }))
             .count();
-        let epi_ops = program.instrs.iter()
+        let epi_ops = program
+            .instrs
+            .iter()
             .filter(|i| matches!(i, VmInstr::Transcendental { .. }))
             .count();
 
@@ -476,7 +627,10 @@ impl VmOptPass for EpilogueFusionPass {
             _ => false,
         });
         if !telemetry_in_use {
-            return OptStats { instrs_removed: 0, instrs_added: 0 };
+            return OptStats {
+                instrs_removed: 0,
+                instrs_added: 0,
+            };
         }
 
         // ARCH-OPT-DECLARE-ORDER: alloc_vreg 会把 DeclareVReg 追加到 program.instrs
@@ -496,7 +650,11 @@ impl VmOptPass for EpilogueFusionPass {
                 return;
             }
             let decl = program.instrs.remove(last_idx);
-            let fixed_pos = if last_idx < insert_pos { insert_pos - 1 } else { insert_pos };
+            let fixed_pos = if last_idx < insert_pos {
+                insert_pos - 1
+            } else {
+                insert_pos
+            };
             program.instrs.insert(fixed_pos, decl);
         };
 
@@ -514,9 +672,14 @@ impl VmOptPass for EpilogueFusionPass {
                             reattach_if_at_end(program, stat, i + 1);
                             // FP7: 在累加器 Store 前就地统计 (零写回开销)
                             // DeclareVReg(stat) 已前移到 i+1, HReduce 插到 i+2
-                            program.instrs.insert(i + 2, VmInstr::HReduce {
-                                dst: stat, src: acc, op: ReduceOp::Max,
-                            });
+                            program.instrs.insert(
+                                i + 2,
+                                VmInstr::HReduce {
+                                    dst: stat,
+                                    src: acc,
+                                    op: ReduceOp::Max,
+                                },
+                            );
                             added += 1;
                             i += 4; // Fma + DeclareVReg(stat) + HReduce + Store
                             continue;
@@ -558,17 +721,36 @@ impl VmOptPass for EpilogueFusionPass {
                 let mut i = 0;
                 while i < program.instrs.len() {
                     if matches!(&program.instrs[i], VmInstr::VecStore { .. }) {
-                        if let VmInstr::VecStore { base, ref offset, src, width: w, .. } = program.instrs[i].clone() {
+                        if let VmInstr::VecStore {
+                            base,
+                            ref offset,
+                            src,
+                            width: w,
+                            ..
+                        } = program.instrs[i].clone()
+                        {
                             let reload = program.alloc_vreg(VRegKind::Vec, width);
                             let stat = program.alloc_vreg(VRegKind::Vec, width);
                             // 1. 先插入 use 指令到 i+1 / i+2 (Declare 暂时还在末尾)
-                            program.instrs.insert(i + 1, VmInstr::VecLoad {
-                                dst: reload, base, offset: offset.clone(), width: w,
-                                dtype: QuantPrecision::F32, predicate: None,
-                            });
-                            program.instrs.insert(i + 2, VmInstr::HReduce {
-                                dst: stat, src: reload, op: ReduceOp::Max,
-                            });
+                            program.instrs.insert(
+                                i + 1,
+                                VmInstr::VecLoad {
+                                    dst: reload,
+                                    base,
+                                    offset: offset.clone(),
+                                    width: w,
+                                    dtype: QuantPrecision::F32,
+                                    predicate: None,
+                                },
+                            );
+                            program.instrs.insert(
+                                i + 2,
+                                VmInstr::HReduce {
+                                    dst: stat,
+                                    src: reload,
+                                    op: ReduceOp::Max,
+                                },
+                            );
                             // 2. 倒序 reattach: 先 stat (末尾), 再 reload (新末尾)。
                             //    每次 reattach 的 insert 会把已就位的 Declare 往后推 1 格。
                             //    stat 先到 i+1, reload 随后到 i+1 把 stat 推到 i+2。
@@ -588,7 +770,10 @@ impl VmOptPass for EpilogueFusionPass {
 
         let _ = reattach_if_at_end;
 
-        OptStats { instrs_removed: 0, instrs_added: added }
+        OptStats {
+            instrs_removed: 0,
+            instrs_added: added,
+        }
     }
 }
 
@@ -616,8 +801,12 @@ impl VmOptPass for EpilogueFusionPass {
 /// 4. RoPE 旋转: VecBinOp(Sub) after cos/sin pattern
 pub struct FwhtInsertPass;
 impl VmOptPass for FwhtInsertPass {
-    fn name(&self) -> &'static str { "fwht_insert" }
-    fn priority(&self) -> u32 { 75 }
+    fn name(&self) -> &'static str {
+        "fwht_insert"
+    }
+    fn priority(&self) -> u32 {
+        75
+    }
     fn run(&self, program: &mut VmProgram, profile: &IsaProfile, _hook: &dyn IsaHook) -> OptStats {
         let mut inserted = 0;
         let mut i = 0;
@@ -625,21 +814,54 @@ impl VmOptPass for FwhtInsertPass {
         while i + 1 < program.instrs.len() {
             let boundary = match (&program.instrs[i], &program.instrs[i + 1]) {
                 // Softmax 边界: Exp → Store
-                (VmInstr::Transcendental { dst, func: TranscendentalFn::Exp, .. }, VmInstr::VecStore { .. }) => Some(*dst),
+                (
+                    VmInstr::Transcendental {
+                        dst,
+                        func: TranscendentalFn::Exp,
+                        ..
+                    },
+                    VmInstr::VecStore { .. },
+                ) => Some(*dst),
                 // SiLU/SwiGLU: Sigmoid → Mul (x * sigmoid(x))
-                (VmInstr::Transcendental { dst, func: TranscendentalFn::Sigmoid, .. }, VmInstr::VecBinOp { op: VecOp::Mul, .. }) => Some(*dst),
+                (
+                    VmInstr::Transcendental {
+                        dst,
+                        func: TranscendentalFn::Sigmoid,
+                        ..
+                    },
+                    VmInstr::VecBinOp { op: VecOp::Mul, .. },
+                ) => Some(*dst),
                 // Sigmoid → Store
-                (VmInstr::Transcendental { dst, func: TranscendentalFn::Sigmoid, .. }, VmInstr::VecStore { .. }) => Some(*dst),
+                (
+                    VmInstr::Transcendental {
+                        dst,
+                        func: TranscendentalFn::Sigmoid,
+                        ..
+                    },
+                    VmInstr::VecStore { .. },
+                ) => Some(*dst),
                 // Tanh → Store
-                (VmInstr::Transcendental { dst, func: TranscendentalFn::Tanh, .. }, VmInstr::VecStore { .. }) => Some(*dst),
+                (
+                    VmInstr::Transcendental {
+                        dst,
+                        func: TranscendentalFn::Tanh,
+                        ..
+                    },
+                    VmInstr::VecStore { .. },
+                ) => Some(*dst),
                 _ => None,
             };
             if let Some(fwht_vreg) = boundary {
                 // §11.1: Intra-register FWHT 就地旋转 (dst == src)
                 // 这对应 FWHT 的前 log2(simd_lanes) 个 butterfly stages
-                program.instrs.insert(i + 1, VmInstr::Transcendental {
-                    dst: fwht_vreg, src: fwht_vreg, func: TranscendentalFn::Fwht,
-                });
+                program.instrs.insert(
+                    i + 1,
+                    VmInstr::Transcendental {
+                        dst: fwht_vreg,
+                        src: fwht_vreg,
+                        func: TranscendentalFn::Fwht,
+                    },
+                );
                 inserted += 1;
 
                 // §11.1: Inter-register butterfly stages
@@ -679,7 +901,10 @@ impl VmOptPass for FwhtInsertPass {
             }
             i += 1;
         }
-        OptStats { instrs_removed: 0, instrs_added: inserted }
+        OptStats {
+            instrs_removed: 0,
+            instrs_added: inserted,
+        }
     }
 }
 
@@ -689,7 +914,10 @@ impl FwhtInsertPass {
         // 反向扫描找最近的 LoopBegin
         for j in (0..instr_idx).rev() {
             match &instrs[j] {
-                VmInstr::LoopBegin { bound: BoundExpr::Const(n), .. } => return Some(*n),
+                VmInstr::LoopBegin {
+                    bound: BoundExpr::Const(n),
+                    ..
+                } => return Some(*n),
                 VmInstr::LoopEnd => return None, // 已退出一个循环，不在循环内
                 _ => continue,
             }
@@ -705,15 +933,20 @@ impl FwhtInsertPass {
 /// 端口配置从 IsaHook::residual_bus_port() 获取。
 pub struct ResidualBusPass;
 impl VmOptPass for ResidualBusPass {
-    fn name(&self) -> &'static str { "residual_bus" }
-    fn priority(&self) -> u32 { 80 }
+    fn name(&self) -> &'static str {
+        "residual_bus"
+    }
+    fn priority(&self) -> u32 {
+        80
+    }
     fn run(&self, program: &mut VmProgram, _profile: &IsaProfile, hook: &dyn IsaHook) -> OptStats {
         let mut added = 0;
         let mut layer_idx = 0usize;
         let mut i = 0;
         while i + 1 < program.instrs.len() {
-            let is_residual = matches!(&program.instrs[i], VmInstr::VecBinOp { op: VecOp::Add, .. })
-                && matches!(&program.instrs[i + 1], VmInstr::VecStore { .. });
+            let is_residual =
+                matches!(&program.instrs[i], VmInstr::VecBinOp { op: VecOp::Add, .. })
+                    && matches!(&program.instrs[i + 1], VmInstr::VecStore { .. });
             if is_residual {
                 // §16: 从 IsaHook 获取端口配置。None 表示此 Hook 不需要 residual
                 // 探针 (ARCH-TELEMETRY-NONNULL)，跳过插入避免 telemetry==NULL 时 SIGSEGV。
@@ -723,26 +956,36 @@ impl VmOptPass for ResidualBusPass {
                 };
                 // 先加载 telemetry 基地址 (ARCH-VM-QUERY-NOT-ASSUME: 通过 NamedArg 查询)
                 let telemetry_base = program.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                program.instrs.insert(i + 1, VmInstr::LoadPtr {
-                    dst: telemetry_base,
-                    src: PtrExpr::NamedArg("telemetry".into()),
-                });
+                program.instrs.insert(
+                    i + 1,
+                    VmInstr::LoadPtr {
+                        dst: telemetry_base,
+                        src: PtrExpr::NamedArg("telemetry".into()),
+                    },
+                );
                 // 注入端口地址 = telemetry_base + port_offset
                 let injection_port = program.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                program.instrs.insert(i + 2, VmInstr::LoadPtr {
-                    dst: injection_port,
-                    src: PtrExpr::VRegPlusConst(telemetry_base, port_cfg.port_offset),
-                });
+                program.instrs.insert(
+                    i + 2,
+                    VmInstr::LoadPtr {
+                        dst: injection_port,
+                        src: PtrExpr::VRegPlusConst(telemetry_base, port_cfg.port_offset),
+                    },
+                );
                 // 在注入端口后 Store 残差值供外部探针读取 (offset +3: 原指令 + 2 条 LoadPtr)
                 if let VmInstr::VecBinOp { dst, .. } = &program.instrs[i] {
                     let src = *dst;
-                    program.instrs.insert(i + 3, VmInstr::VecStore {
-                        base: injection_port,
-                        offset: OffsetExpr::Const(0),
-                        src,
-                        width: SimdWidth::W256,
-                        dtype: QuantPrecision::F32, predicate: None,
-                    });
+                    program.instrs.insert(
+                        i + 3,
+                        VmInstr::VecStore {
+                            base: injection_port,
+                            offset: OffsetExpr::Const(0),
+                            src,
+                            width: SimdWidth::W256,
+                            dtype: QuantPrecision::F32,
+                            predicate: None,
+                        },
+                    );
                     added += 2;
                 }
                 layer_idx += 1;
@@ -751,32 +994,48 @@ impl VmOptPass for ResidualBusPass {
                 i += 1;
             }
         }
-        OptStats { instrs_removed: 0, instrs_added: added }
+        OptStats {
+            instrs_removed: 0,
+            instrs_added: added,
+        }
     }
 }
 
 /// §9 热修补: 在分支点插入 HotpatchSlot NOP 占位。
 pub struct HotpatchSlotPass;
 impl VmOptPass for HotpatchSlotPass {
-    fn name(&self) -> &'static str { "hotpatch_slot" }
-    fn priority(&self) -> u32 { 100 }
+    fn name(&self) -> &'static str {
+        "hotpatch_slot"
+    }
+    fn priority(&self) -> u32 {
+        100
+    }
     fn run(&self, program: &mut VmProgram, _profile: &IsaProfile, _hook: &dyn IsaHook) -> OptStats {
         let mut inserted = 0;
         let mut i = 0;
         while i < program.instrs.len() {
-            if matches!(program.instrs[i], VmInstr::ConditionalSkip { .. } | VmInstr::IndirectJump { .. }) {
-                program.instrs.insert(i, VmInstr::HotpatchSlot {
-                    slot_id: inserted as u32,
-                    initial_target: super::instr::HotpatchTarget::InstrIndex(i + 1),
-                    alternatives: vec![],
-                });
+            if matches!(
+                program.instrs[i],
+                VmInstr::ConditionalSkip { .. } | VmInstr::IndirectJump { .. }
+            ) {
+                program.instrs.insert(
+                    i,
+                    VmInstr::HotpatchSlot {
+                        slot_id: inserted as u32,
+                        initial_target: super::instr::HotpatchTarget::InstrIndex(i + 1),
+                        alternatives: vec![],
+                    },
+                );
                 inserted += 1;
                 i += 2;
             } else {
                 i += 1;
             }
         }
-        OptStats { instrs_removed: 0, instrs_added: inserted }
+        OptStats {
+            instrs_removed: 0,
+            instrs_added: inserted,
+        }
     }
 }
 
@@ -786,14 +1045,22 @@ impl VmOptPass for HotpatchSlotPass {
 /// 对第一个 VecLoad 在其前方插入 Prefetch（距离由 IsaProfile 平台推导）。
 pub struct PrefetchInsertPass;
 impl VmOptPass for PrefetchInsertPass {
-    fn name(&self) -> &'static str { "prefetch_insert" }
-    fn priority(&self) -> u32 { 95 } // 在 HotpatchSlot 前
+    fn name(&self) -> &'static str {
+        "prefetch_insert"
+    }
+    fn priority(&self) -> u32 {
+        95
+    } // 在 HotpatchSlot 前
 
     fn run(&self, program: &mut VmProgram, _profile: &IsaProfile, hook: &dyn IsaHook) -> OptStats {
         use super::isa_hook::AccessPattern;
 
         // §14: 从 IsaHook::prefetch_hint() 获取策略
-        let access = AccessPattern { stride: 32, total_bytes: 4096, reuse_count: 1 };
+        let access = AccessPattern {
+            stride: 32,
+            total_bytes: 4096,
+            reuse_count: 1,
+        };
         let config = match hook.prefetch_hint(&access) {
             Some(cfg) => cfg,
             None => return OptStats::default(),
@@ -815,7 +1082,9 @@ impl VmOptPass for PrefetchInsertPass {
                     in_loop = false;
                     loop_first_load_done = false;
                 }
-                VmInstr::VecLoad { base, ref offset, .. } if in_loop && !loop_first_load_done => {
+                VmInstr::VecLoad {
+                    base, ref offset, ..
+                } if in_loop && !loop_first_load_done => {
                     // 在此 VecLoad 前插入 Prefetch
                     let prefetch = VmInstr::Prefetch {
                         base: *base,
@@ -833,15 +1102,18 @@ impl VmOptPass for PrefetchInsertPass {
             }
             i += 1;
         }
-        OptStats { instrs_removed: 0, instrs_added: inserted }
+        OptStats {
+            instrs_removed: 0,
+            instrs_added: inserted,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dispatch::DeviceProfile;
     use crate::compiler::codegen::vm::isa_profile::IsaProfile;
+    use crate::dispatch::DeviceProfile;
 
     // ── BCE-20260630-OPTPASS: dtype 不丢失回归（substitute_loop_offset_in_instr）──
     // 循环展开替换 LoopOffset 时，VecLoad/VecStore/Broadcast 必须保留原 dtype，
@@ -854,14 +1126,31 @@ mod tests {
         let base = VRegId(1);
         let dst = VRegId(2);
         let load = VmInstr::VecLoad {
-            dst, base, offset: OffsetExpr::LoopOffset(vreg),
-            width: SimdWidth::W256, dtype: QuantPrecision::BF16, predicate: None,
+            dst,
+            base,
+            offset: OffsetExpr::LoopOffset(vreg),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::BF16,
+            predicate: None,
         };
         let out = substitute_loop_offset_in_instr(&load, vreg, 64);
         match out {
-            VmInstr::VecLoad { dtype, offset, predicate, .. } => {
-                assert_eq!(dtype, QuantPrecision::BF16, "VecLoad dtype must be preserved (BF16), not reset to F32");
-                assert_eq!(offset, OffsetExpr::Const(64), "LoopOffset substituted to Const");
+            VmInstr::VecLoad {
+                dtype,
+                offset,
+                predicate,
+                ..
+            } => {
+                assert_eq!(
+                    dtype,
+                    QuantPrecision::BF16,
+                    "VecLoad dtype must be preserved (BF16), not reset to F32"
+                );
+                assert_eq!(
+                    offset,
+                    OffsetExpr::Const(64),
+                    "LoopOffset substituted to Const"
+                );
                 assert!(predicate.is_none(), "predicate preserved (None)");
             }
             _ => panic!("expected VecLoad, got {:?}", out),
@@ -875,13 +1164,21 @@ mod tests {
         let base = VRegId(1);
         let src = VRegId(3);
         let store = VmInstr::VecStore {
-            base, offset: OffsetExpr::LoopOffset(vreg), src,
-            width: SimdWidth::W256, dtype: QuantPrecision::F16, predicate: None,
+            base,
+            offset: OffsetExpr::LoopOffset(vreg),
+            src,
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F16,
+            predicate: None,
         };
         let out = substitute_loop_offset_in_instr(&store, vreg, 128);
         match out {
             VmInstr::VecStore { dtype, offset, .. } => {
-                assert_eq!(dtype, QuantPrecision::F16, "VecStore dtype must be preserved (F16), not reset to F32");
+                assert_eq!(
+                    dtype,
+                    QuantPrecision::F16,
+                    "VecStore dtype must be preserved (F16), not reset to F32"
+                );
                 assert_eq!(offset, OffsetExpr::Const(128));
             }
             _ => panic!("expected VecStore, got {:?}", out),
@@ -895,13 +1192,19 @@ mod tests {
         let base = VRegId(1);
         let dst = VRegId(4);
         let bcast = VmInstr::Broadcast {
-            dst, src: ScalarExpr::MemLoad(base, OffsetExpr::LoopOffset(vreg)),
-            width: SimdWidth::Scalar, dtype: QuantPrecision::BF16,
+            dst,
+            src: ScalarExpr::MemLoad(base, OffsetExpr::LoopOffset(vreg)),
+            width: SimdWidth::Scalar,
+            dtype: QuantPrecision::BF16,
         };
         let out = substitute_loop_offset_in_instr(&bcast, vreg, 32);
         match out {
             VmInstr::Broadcast { dtype, src, .. } => {
-                assert_eq!(dtype, QuantPrecision::BF16, "Broadcast dtype must be preserved (BF16), not reset to F32");
+                assert_eq!(
+                    dtype,
+                    QuantPrecision::BF16,
+                    "Broadcast dtype must be preserved (BF16), not reset to F32"
+                );
                 match src {
                     ScalarExpr::MemLoad(_, off) => assert_eq!(off, OffsetExpr::Const(32)),
                     _ => panic!("expected MemLoad after substitution"),
@@ -916,7 +1219,12 @@ mod tests {
         let mut prog = VmProgram::new();
         let used = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let _dead = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256); // 未读取
-        prog.emit(VmInstr::Broadcast { dst: used, src: ScalarExpr::Const(1.0), width: SimdWidth::W256, dtype: QuantPrecision::F32, });
+        prog.emit(VmInstr::Broadcast {
+            dst: used,
+            src: ScalarExpr::Const(1.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+        });
 
         let before = prog.len();
         let profile = IsaProfile::from_device_profile(&DeviceProfile::detect());
@@ -969,13 +1277,19 @@ mod tests {
         let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         prog.emit(VmInstr::LoopBegin {
             counter,
-            offsets: vec![LoopOffset { vreg: off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(8),
+            offsets: vec![LoopOffset {
+                vreg: off,
+                stride: LoopStride::FixedBytes(32),
+            }],
+            bound: BoundExpr::Const(8),
         });
         prog.emit(VmInstr::VecLoad {
-            dst: vec, base: ptr,
+            dst: vec,
+            base: ptr,
             offset: OffsetExpr::LoopOffset(off),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32, predicate: None,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         prog.emit(VmInstr::LoopEnd);
 
@@ -987,8 +1301,14 @@ mod tests {
         // 应该在 VecLoad 前插入了 1 个 Prefetch (如果 hook 返回 prefetch config)
         if stats.instrs_added > 0 {
             assert_eq!(prog.len(), before + 1);
-            let prefetch_pos = prog.instrs.iter().position(|i| matches!(i, VmInstr::Prefetch { .. }));
-            let load_pos = prog.instrs.iter().position(|i| matches!(i, VmInstr::VecLoad { .. }));
+            let prefetch_pos = prog
+                .instrs
+                .iter()
+                .position(|i| matches!(i, VmInstr::Prefetch { .. }));
+            let load_pos = prog
+                .instrs
+                .iter()
+                .position(|i| matches!(i, VmInstr::VecLoad { .. }));
             assert!(prefetch_pos.unwrap() < load_pos.unwrap());
         }
     }
@@ -997,9 +1317,9 @@ mod tests {
 #[cfg(test)]
 mod data_structure_tests {
     use super::*;
-    use crate::dispatch::DeviceProfile;
-    use crate::compiler::codegen::vm::isa_profile::IsaProfile;
     use crate::compiler::codegen::vm::isa_hook;
+    use crate::compiler::codegen::vm::isa_profile::IsaProfile;
+    use crate::dispatch::DeviceProfile;
 
     fn make_hook() -> (IsaProfile, Box<dyn IsaHook>) {
         let profile = IsaProfile::from_device_profile(&DeviceProfile::detect());
@@ -1022,15 +1342,24 @@ mod data_structure_tests {
 
     #[test]
     fn opt_stats_construction_with_values() {
-        let stats = OptStats { instrs_removed: 5, instrs_added: 3 };
+        let stats = OptStats {
+            instrs_removed: 5,
+            instrs_added: 3,
+        };
         assert_eq!(stats.instrs_removed, 5);
         assert_eq!(stats.instrs_added, 3);
     }
 
     #[test]
     fn opt_stats_addition_semantics() {
-        let a = OptStats { instrs_removed: 2, instrs_added: 1 };
-        let b = OptStats { instrs_removed: 3, instrs_added: 4 };
+        let a = OptStats {
+            instrs_removed: 2,
+            instrs_added: 1,
+        };
+        let b = OptStats {
+            instrs_removed: 3,
+            instrs_added: 4,
+        };
         let combined = OptStats {
             instrs_removed: a.instrs_removed + b.instrs_removed,
             instrs_added: a.instrs_added + b.instrs_added,
@@ -1160,7 +1489,10 @@ mod data_structure_tests {
         let priorities: Vec<u32> = all_passes.iter().map(|p| p.priority()).collect();
         let mut sorted_p = priorities.clone();
         sorted_p.sort();
-        assert_eq!(priorities, sorted_p, "pass priorities should already be ascending");
+        assert_eq!(
+            priorities, sorted_p,
+            "pass priorities should already be ascending"
+        );
 
         // Also verify run_all processes all 11 passes on a minimal program.
         let reg = PassRegistry::with_defaults();
@@ -1171,12 +1503,19 @@ mod data_structure_tests {
         let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         prog.emit(VmInstr::Fma {
-            dst: vec0, acc: vec0, a: vec1, b: vec1,
+            dst: vec0,
+            acc: vec0,
+            a: vec1,
+            b: vec1,
             dtype: QuantPrecision::F32,
         });
         prog.emit(VmInstr::VecStore {
-            base: ptr, offset: OffsetExpr::Const(0), src: vec0,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            base: ptr,
+            offset: OffsetExpr::Const(0),
+            src: vec0,
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
 
         let results = reg.run_all(&mut prog, &profile, hook.as_ref());
@@ -1190,8 +1529,10 @@ mod data_structure_tests {
         let mut prog = empty_program();
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::Broadcast {
-            dst: vec0, src: ScalarExpr::Const(1.0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            dst: vec0,
+            src: ScalarExpr::Const(1.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
         });
         let before = prog.len();
         let (profile, hook) = make_hook();
@@ -1213,20 +1554,34 @@ mod data_structure_tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
         prog.emit(VmInstr::LoopBegin {
-            counter: counter0, offsets: vec![LoopOffset { vreg: off0, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(8),
+            counter: counter0,
+            offsets: vec![LoopOffset {
+                vreg: off0,
+                stride: LoopStride::FixedBytes(32),
+            }],
+            bound: BoundExpr::Const(8),
         });
         prog.emit(VmInstr::Broadcast {
-            dst: vec0, src: ScalarExpr::Const(1.0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            dst: vec0,
+            src: ScalarExpr::Const(1.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
         });
         prog.emit(VmInstr::LoopEnd);
         // Adjacent LoopEnd→LoopBegin: should be fused
         prog.emit(VmInstr::LoopBegin {
-            counter: counter1, offsets: vec![LoopOffset { vreg: off1, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(8),
+            counter: counter1,
+            offsets: vec![LoopOffset {
+                vreg: off1,
+                stride: LoopStride::FixedBytes(32),
+            }],
+            bound: BoundExpr::Const(8),
         });
         prog.emit(VmInstr::Broadcast {
-            dst: vec0, src: ScalarExpr::Const(2.0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            dst: vec0,
+            src: ScalarExpr::Const(2.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
         });
         prog.emit(VmInstr::LoopEnd);
 
@@ -1236,8 +1591,16 @@ mod data_structure_tests {
         assert_eq!(stats.instrs_removed, 2); // LoopEnd + LoopBegin pair
         assert_eq!(stats.instrs_added, 0);
         // Should have removed the LoopEnd(i) + LoopBegin(i+1)
-        let loop_begins = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
-        let loop_ends = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopEnd)).count();
+        let loop_begins = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopBegin { .. }))
+            .count();
+        let loop_ends = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopEnd))
+            .count();
         assert_eq!(loop_begins, 1);
         assert_eq!(loop_ends, 1);
     }
@@ -1255,22 +1618,36 @@ mod data_structure_tests {
         // Store vec0, Load into vec2 — src != dst so should forward
         // But make src == dst to test non-matching
         prog.emit(VmInstr::VecStore {
-            base: ptr, offset: OffsetExpr::Const(0), src: vec0,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            base: ptr,
+            offset: OffsetExpr::Const(0),
+            src: vec0,
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         // Load from same ptr into vec1 (different from store src vec0) → should forward
         prog.emit(VmInstr::VecLoad {
-            dst: vec1, base: ptr, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            dst: vec1,
+            base: ptr,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         // Now test a truly non-matching pair: Store vec2, then a non-Load instruction
         prog.emit(VmInstr::VecStore {
-            base: ptr, offset: OffsetExpr::Const(64), src: vec2,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            base: ptr,
+            offset: OffsetExpr::Const(64),
+            src: vec2,
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         prog.emit(VmInstr::Broadcast {
-            dst: vec0, src: ScalarExpr::Const(0.0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            dst: vec0,
+            src: ScalarExpr::Const(0.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
         });
 
         let (profile, hook) = make_hook();
@@ -1292,8 +1669,12 @@ mod data_structure_tests {
 
         // Use vec0 in a VecStore so it is referenced
         prog.emit(VmInstr::VecStore {
-            base: ptr, offset: OffsetExpr::Const(0), src: vec0,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            base: ptr,
+            offset: OffsetExpr::Const(0),
+            src: vec0,
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
 
         let (profile, hook) = make_hook();
@@ -1313,12 +1694,20 @@ mod data_structure_tests {
 
         // Create dead vreg (vec1 never used), plus store-load pair
         prog.emit(VmInstr::VecStore {
-            base: ptr, offset: OffsetExpr::Const(0), src: vec0,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            base: ptr,
+            offset: OffsetExpr::Const(0),
+            src: vec0,
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         prog.emit(VmInstr::VecLoad {
-            dst: vec1, base: ptr, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            dst: vec1,
+            base: ptr,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
 
         let (profile, hook) = make_hook();
@@ -1332,7 +1721,10 @@ mod data_structure_tests {
         let total_removed = stats_dead.instrs_removed + stats_fwd.instrs_removed;
         let total_added = stats_dead.instrs_added + stats_fwd.instrs_added;
 
-        assert!(total_removed > 0, "at least one pass should remove instructions");
+        assert!(
+            total_removed > 0,
+            "at least one pass should remove instructions"
+        );
         // Verify cumulative accounting: removed >= added (net shrink or equal)
         assert!(total_removed >= total_added);
     }
@@ -1369,7 +1761,10 @@ mod data_structure_tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let mask = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::Fma {
-            dst: vec0, acc: vec0, a: vec0, b: vec0,
+            dst: vec0,
+            acc: vec0,
+            a: vec0,
+            b: vec0,
             dtype: QuantPrecision::F32,
         });
         prog.emit(VmInstr::ConditionalSkip {
@@ -1387,8 +1782,14 @@ mod data_structure_tests {
         assert_eq!(stats.instrs_removed, 0);
         assert_eq!(prog.len(), before + 1);
         // Verify the HotpatchSlot is immediately before the ConditionalSkip
-        let hp_pos = prog.instrs.iter().position(|i| matches!(i, VmInstr::HotpatchSlot { .. }));
-        let cs_pos = prog.instrs.iter().position(|i| matches!(i, VmInstr::ConditionalSkip { .. }));
+        let hp_pos = prog
+            .instrs
+            .iter()
+            .position(|i| matches!(i, VmInstr::HotpatchSlot { .. }));
+        let cs_pos = prog
+            .instrs
+            .iter()
+            .position(|i| matches!(i, VmInstr::ConditionalSkip { .. }));
         assert!(hp_pos.is_some());
         assert!(cs_pos.is_some());
         assert_eq!(hp_pos.unwrap() + 1, cs_pos.unwrap());
@@ -1402,8 +1803,10 @@ mod data_structure_tests {
         let mut prog = empty_program();
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::Broadcast {
-            dst: vec0, src: ScalarExpr::Const(1.0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            dst: vec0,
+            src: ScalarExpr::Const(1.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
         });
         let before = prog.len();
 
@@ -1428,11 +1831,18 @@ mod data_structure_tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
         prog.emit(VmInstr::LoopBegin {
-            counter, offsets: vec![LoopOffset { vreg: off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(2),
+            counter,
+            offsets: vec![LoopOffset {
+                vreg: off,
+                stride: LoopStride::FixedBytes(32),
+            }],
+            bound: BoundExpr::Const(2),
         });
         prog.emit(VmInstr::Broadcast {
-            dst: vec0, src: ScalarExpr::Const(1.0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            dst: vec0,
+            src: ScalarExpr::Const(1.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
         });
         prog.emit(VmInstr::LoopEnd);
 
@@ -1441,11 +1851,17 @@ mod data_structure_tests {
         let stats = LoopUnrollPass.run(&mut prog, &profile, hook.as_ref());
 
         // Assert: LoopBegin+LoopEnd removed (2), 2 copies of body added
-        assert!(stats.instrs_removed >= 2, "should remove LoopBegin and LoopEnd");
+        assert!(
+            stats.instrs_removed >= 2,
+            "should remove LoopBegin and LoopEnd"
+        );
         // The loop body (1 Broadcast) replicated 2 times = 2 instrs added
         assert_eq!(stats.instrs_added, 2);
         // No LoopBegin/LoopEnd should remain
-        assert!(prog.instrs.iter().all(|i| !matches!(i, VmInstr::LoopBegin { .. })));
+        assert!(prog
+            .instrs
+            .iter()
+            .all(|i| !matches!(i, VmInstr::LoopBegin { .. })));
         assert!(prog.instrs.iter().all(|i| !matches!(i, VmInstr::LoopEnd)));
     }
 
@@ -1459,11 +1875,17 @@ mod data_structure_tests {
         let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         prog.emit(VmInstr::Transcendental {
-            dst: vec0, src: vec0, func: TranscendentalFn::Exp,
+            dst: vec0,
+            src: vec0,
+            func: TranscendentalFn::Exp,
         });
         prog.emit(VmInstr::VecStore {
-            base: ptr, offset: OffsetExpr::Const(0), src: vec0,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            base: ptr,
+            offset: OffsetExpr::Const(0),
+            src: vec0,
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         let before = prog.len();
 
@@ -1491,12 +1913,19 @@ mod data_structure_tests {
         let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         prog.emit(VmInstr::Fma {
-            dst: vec0, acc: vec0, a: vec0, b: vec0,
+            dst: vec0,
+            acc: vec0,
+            a: vec0,
+            b: vec0,
             dtype: QuantPrecision::F32,
         });
         prog.emit(VmInstr::VecStore {
-            base: ptr, offset: OffsetExpr::Const(0), src: vec0,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            base: ptr,
+            offset: OffsetExpr::Const(0),
+            src: vec0,
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         let before = prog.len();
 
@@ -1514,9 +1943,18 @@ mod data_structure_tests {
 
     struct CustomNoopPass;
     impl VmOptPass for CustomNoopPass {
-        fn name(&self) -> &'static str { "custom_noop" }
-        fn priority(&self) -> u32 { 999 }
-        fn run(&self, _program: &mut VmProgram, _profile: &IsaProfile, _hook: &dyn IsaHook) -> OptStats {
+        fn name(&self) -> &'static str {
+            "custom_noop"
+        }
+        fn priority(&self) -> u32 {
+            999
+        }
+        fn run(
+            &self,
+            _program: &mut VmProgram,
+            _profile: &IsaProfile,
+            _hook: &dyn IsaHook,
+        ) -> OptStats {
             OptStats::default()
         }
     }
@@ -1543,14 +1981,23 @@ mod data_structure_tests {
     #[test]
     fn opt_stats_debug_format_contains_fields() {
         // Arrange
-        let stats = OptStats { instrs_removed: 7, instrs_added: 3 };
+        let stats = OptStats {
+            instrs_removed: 7,
+            instrs_added: 3,
+        };
 
         // Act
         let debug_str = format!("{:?}", stats);
 
         // Assert: Debug output contains field names and values
-        assert!(debug_str.contains("instrs_removed"), "Debug should contain instrs_removed");
-        assert!(debug_str.contains("instrs_added"), "Debug should contain instrs_added");
+        assert!(
+            debug_str.contains("instrs_removed"),
+            "Debug should contain instrs_removed"
+        );
+        assert!(
+            debug_str.contains("instrs_added"),
+            "Debug should contain instrs_added"
+        );
         assert!(debug_str.contains("7"), "Debug should contain value 7");
         assert!(debug_str.contains("3"), "Debug should contain value 3");
     }
@@ -1565,8 +2012,10 @@ mod data_structure_tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         // Use vec0 so it's not dead
         prog.emit(VmInstr::Broadcast {
-            dst: vec0, src: ScalarExpr::Const(1.0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            dst: vec0,
+            src: ScalarExpr::Const(1.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
         });
 
         // Act
@@ -1575,10 +2024,22 @@ mod data_structure_tests {
 
         // Assert: Ptr VReg declarations are preserved (only Vec dead vregs removed)
         let has_dead_ptr_decl = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::DeclareVReg { kind: VRegKind::Ptr, .. })
+            matches!(
+                i,
+                VmInstr::DeclareVReg {
+                    kind: VRegKind::Ptr,
+                    ..
+                }
+            )
         });
-        assert!(has_dead_ptr_decl, "Ptr VReg declarations should not be removed");
-        assert_eq!(stats.instrs_removed, 0, "no Vec dead vregs to remove in this program");
+        assert!(
+            has_dead_ptr_decl,
+            "Ptr VReg declarations should not be removed"
+        );
+        assert_eq!(
+            stats.instrs_removed, 0,
+            "no Vec dead vregs to remove in this program"
+        );
     }
 
     // ── 18. FwhtInsertPass::find_enclosing_loop_bound ───────────────
@@ -1591,13 +2052,20 @@ mod data_structure_tests {
         let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         prog.emit(VmInstr::LoopBegin {
-            counter, offsets: vec![LoopOffset { vreg: off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(16),
+            counter,
+            offsets: vec![LoopOffset {
+                vreg: off,
+                stride: LoopStride::FixedBytes(32),
+            }],
+            bound: BoundExpr::Const(16),
         });
         prog.emit(VmInstr::Comment("inside loop".into()));
         // Find the index of the Comment (which is inside the loop)
-        let comment_idx = prog.instrs.iter().rposition(|i| {
-            matches!(i, VmInstr::Comment(s) if s == "inside loop")
-        }).expect("Comment should exist");
+        let comment_idx = prog
+            .instrs
+            .iter()
+            .rposition(|i| matches!(i, VmInstr::Comment(s) if s == "inside loop"))
+            .expect("Comment should exist");
 
         // Act
         let bound = FwhtInsertPass::find_enclosing_loop_bound(&prog.instrs, comment_idx);
@@ -1612,9 +2080,11 @@ mod data_structure_tests {
         let mut prog = empty_program();
         prog.emit(VmInstr::Comment("no loop".into()));
         // Find the Comment index dynamically
-        let comment_idx = prog.instrs.iter().position(|i| {
-            matches!(i, VmInstr::Comment(s) if s == "no loop")
-        }).expect("Comment should exist");
+        let comment_idx = prog
+            .instrs
+            .iter()
+            .position(|i| matches!(i, VmInstr::Comment(s) if s == "no loop"))
+            .expect("Comment should exist");
 
         // Act
         let bound = FwhtInsertPass::find_enclosing_loop_bound(&prog.instrs, comment_idx);
@@ -1638,21 +2108,37 @@ mod data_structure_tests {
 
         // Pair 1: Store vec0 → Load vec1
         prog.emit(VmInstr::VecStore {
-            base: ptr0, offset: OffsetExpr::Const(0), src: vec0,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            base: ptr0,
+            offset: OffsetExpr::Const(0),
+            src: vec0,
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         prog.emit(VmInstr::VecLoad {
-            dst: vec1, base: ptr0, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            dst: vec1,
+            base: ptr0,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         // Pair 2: Store vec2 → Load vec3
         prog.emit(VmInstr::VecStore {
-            base: ptr1, offset: OffsetExpr::Const(0), src: vec2,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            base: ptr1,
+            offset: OffsetExpr::Const(0),
+            src: vec2,
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         prog.emit(VmInstr::VecLoad {
-            dst: vec3, base: ptr1, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            dst: vec3,
+            base: ptr1,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
 
         // Act
@@ -1660,10 +2146,17 @@ mod data_structure_tests {
         let stats = StoreLoadForwardPass.run(&mut prog, &profile, hook.as_ref());
 
         // Assert: both pairs forwarded — 2 pairs × (removed:2 + added:1) each
-        assert_eq!(stats.instrs_removed, 4, "should remove 4 instructions (2 Store + 2 Load)");
+        assert_eq!(
+            stats.instrs_removed, 4,
+            "should remove 4 instructions (2 Store + 2 Load)"
+        );
         assert_eq!(stats.instrs_added, 2, "should add 2 Mov instructions");
         // Verify: no VecStore or VecLoad remain, replaced by Mov
-        let mov_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::Mov { .. })).count();
+        let mov_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::Mov { .. }))
+            .count();
         assert_eq!(mov_count, 2);
     }
 
@@ -1677,12 +2170,20 @@ mod data_structure_tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
         prog.emit(VmInstr::VecStore {
-            base: ptr, offset: OffsetExpr::Const(0), src: vec0,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            base: ptr,
+            offset: OffsetExpr::Const(0),
+            src: vec0,
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         prog.emit(VmInstr::VecLoad {
-            dst: vec0, base: ptr, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            dst: vec0,
+            base: ptr,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         let before = prog.len();
 
@@ -1707,11 +2208,18 @@ mod data_structure_tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
         prog.emit(VmInstr::LoopBegin {
-            counter, offsets: vec![LoopOffset { vreg: off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(8),
+            counter,
+            offsets: vec![LoopOffset {
+                vreg: off,
+                stride: LoopStride::FixedBytes(32),
+            }],
+            bound: BoundExpr::Const(8),
         });
         prog.emit(VmInstr::Broadcast {
-            dst: vec0, src: ScalarExpr::Const(1.0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            dst: vec0,
+            src: ScalarExpr::Const(1.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
         });
         prog.emit(VmInstr::LoopEnd);
         let before = prog.len();
@@ -1739,14 +2247,26 @@ mod data_structure_tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
         prog.emit(VmInstr::LoopBegin {
-            counter: outer_counter, offsets: vec![LoopOffset { vreg: outer_off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(2),
+            counter: outer_counter,
+            offsets: vec![LoopOffset {
+                vreg: outer_off,
+                stride: LoopStride::FixedBytes(32),
+            }],
+            bound: BoundExpr::Const(2),
         });
         prog.emit(VmInstr::LoopBegin {
-            counter: inner_counter, offsets: vec![LoopOffset { vreg: inner_off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(2),
+            counter: inner_counter,
+            offsets: vec![LoopOffset {
+                vreg: inner_off,
+                stride: LoopStride::FixedBytes(32),
+            }],
+            bound: BoundExpr::Const(2),
         });
         prog.emit(VmInstr::Broadcast {
-            dst: vec0, src: ScalarExpr::Const(1.0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            dst: vec0,
+            src: ScalarExpr::Const(1.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
         });
         prog.emit(VmInstr::LoopEnd); // inner
         prog.emit(VmInstr::LoopEnd); // outer
@@ -1772,11 +2292,16 @@ mod data_structure_tests {
         let vec1 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
         prog.emit(VmInstr::Transcendental {
-            dst: vec0, src: vec0, func: TranscendentalFn::Sigmoid,
+            dst: vec0,
+            src: vec0,
+            func: TranscendentalFn::Sigmoid,
         });
         prog.emit(VmInstr::VecBinOp {
-            dst: vec1, a: vec0, b: vec0,
-            op: VecOp::Mul, dtype: QuantPrecision::F32,
+            dst: vec1,
+            a: vec0,
+            b: vec0,
+            op: VecOp::Mul,
+            dtype: QuantPrecision::F32,
         });
         let before = prog.len();
 
@@ -1803,11 +2328,17 @@ mod data_structure_tests {
         let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         prog.emit(VmInstr::Transcendental {
-            dst: vec0, src: vec0, func: TranscendentalFn::Tanh,
+            dst: vec0,
+            src: vec0,
+            func: TranscendentalFn::Tanh,
         });
         prog.emit(VmInstr::VecStore {
-            base: ptr, offset: OffsetExpr::Const(0), src: vec0,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            base: ptr,
+            offset: OffsetExpr::Const(0),
+            src: vec0,
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         let before = prog.len();
 
@@ -1834,8 +2365,12 @@ mod data_structure_tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
         prog.emit(VmInstr::VecLoad {
-            dst: vec0, base: ptr, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            dst: vec0,
+            base: ptr,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         let before = prog.len();
 
@@ -1858,8 +2393,10 @@ mod data_structure_tests {
         let _v1 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256); // dead
         let _v2 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256); // dead
         prog.emit(VmInstr::Broadcast {
-            dst: v0, src: ScalarExpr::Const(1.0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            dst: v0,
+            src: ScalarExpr::Const(1.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
         });
 
         // Act
@@ -1867,11 +2404,15 @@ mod data_structure_tests {
         let stats = DeadVRegEliminationPass.run(&mut prog, &profile, hook.as_ref());
 
         // Assert: 2 dead Vec DeclareVRegs removed
-        assert_eq!(stats.instrs_removed, 2, "should remove 2 dead Vec declarations");
+        assert_eq!(
+            stats.instrs_removed, 2,
+            "should remove 2 dead Vec declarations"
+        );
         // The alive v0's DeclareVReg should still exist
-        let alive_decl = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::DeclareVReg { id, .. } if *id == v0)
-        });
+        let alive_decl = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::DeclareVReg { id, .. } if *id == v0));
         assert!(alive_decl, "used v0 DeclareVReg should be preserved");
     }
 
@@ -1901,8 +2442,16 @@ mod data_structure_tests {
         assert_eq!(stats.instrs_removed, 4);
         // Remaining: ScopeBegin(0), Comment(a), Comment(b), Comment(c), ScopeEnd(2)
         // i.e., the two middle ScopeEnd+ScopeBegin pairs are gone
-        let scope_begins = prog.instrs.iter().filter(|i| matches!(i, VmInstr::ScopeBegin { .. })).count();
-        let scope_ends = prog.instrs.iter().filter(|i| matches!(i, VmInstr::ScopeEnd { .. })).count();
+        let scope_begins = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::ScopeBegin { .. }))
+            .count();
+        let scope_ends = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::ScopeEnd { .. }))
+            .count();
         assert_eq!(scope_begins, 1, "only outermost ScopeBegin should remain");
         assert_eq!(scope_ends, 1, "only outermost ScopeEnd should remain");
     }
@@ -1916,7 +2465,10 @@ mod data_structure_tests {
         let index = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         prog.emit(VmInstr::IndirectJump {
             index,
-            targets: vec![super::super::instr::JumpTarget { expert_id: 0, instr_index: 0 }],
+            targets: vec![super::super::instr::JumpTarget {
+                expert_id: 0,
+                instr_index: 0,
+            }],
         });
         let before = prog.len();
 
@@ -1928,8 +2480,14 @@ mod data_structure_tests {
         assert_eq!(stats.instrs_added, 1);
         assert_eq!(stats.instrs_removed, 0);
         assert_eq!(prog.len(), before + 1);
-        let hp_pos = prog.instrs.iter().position(|i| matches!(i, VmInstr::HotpatchSlot { .. }));
-        let ij_pos = prog.instrs.iter().position(|i| matches!(i, VmInstr::IndirectJump { .. }));
+        let hp_pos = prog
+            .instrs
+            .iter()
+            .position(|i| matches!(i, VmInstr::HotpatchSlot { .. }));
+        let ij_pos = prog
+            .instrs
+            .iter()
+            .position(|i| matches!(i, VmInstr::IndirectJump { .. }));
         assert!(hp_pos.is_some());
         assert!(ij_pos.is_some());
         assert_eq!(hp_pos.unwrap() + 1, ij_pos.unwrap());
@@ -1951,16 +2509,52 @@ mod data_structure_tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
         // Loop 0
-        prog.emit(VmInstr::LoopBegin { counter: c0, offsets: vec![LoopOffset { vreg: off0, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(4)});
-        prog.emit(VmInstr::Broadcast { dst: vec0, src: ScalarExpr::Const(1.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
+        prog.emit(VmInstr::LoopBegin {
+            counter: c0,
+            offsets: vec![LoopOffset {
+                vreg: off0,
+                stride: LoopStride::FixedBytes(32),
+            }],
+            bound: BoundExpr::Const(4),
+        });
+        prog.emit(VmInstr::Broadcast {
+            dst: vec0,
+            src: ScalarExpr::Const(1.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+        });
         prog.emit(VmInstr::LoopEnd);
         // Loop 1
-        prog.emit(VmInstr::LoopBegin { counter: c1, offsets: vec![LoopOffset { vreg: off1, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(4)});
-        prog.emit(VmInstr::Broadcast { dst: vec0, src: ScalarExpr::Const(2.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
+        prog.emit(VmInstr::LoopBegin {
+            counter: c1,
+            offsets: vec![LoopOffset {
+                vreg: off1,
+                stride: LoopStride::FixedBytes(32),
+            }],
+            bound: BoundExpr::Const(4),
+        });
+        prog.emit(VmInstr::Broadcast {
+            dst: vec0,
+            src: ScalarExpr::Const(2.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+        });
         prog.emit(VmInstr::LoopEnd);
         // Loop 2
-        prog.emit(VmInstr::LoopBegin { counter: c2, offsets: vec![LoopOffset { vreg: off2, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(4)});
-        prog.emit(VmInstr::Broadcast { dst: vec0, src: ScalarExpr::Const(3.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
+        prog.emit(VmInstr::LoopBegin {
+            counter: c2,
+            offsets: vec![LoopOffset {
+                vreg: off2,
+                stride: LoopStride::FixedBytes(32),
+            }],
+            bound: BoundExpr::Const(4),
+        });
+        prog.emit(VmInstr::Broadcast {
+            dst: vec0,
+            src: ScalarExpr::Const(3.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+        });
         prog.emit(VmInstr::LoopEnd);
 
         // Act
@@ -1970,8 +2564,16 @@ mod data_structure_tests {
         // Assert: two adjacent pairs fused → removes 2×2 = 4 instructions
         assert_eq!(stats.instrs_removed, 4);
         // Only 1 LoopBegin + 1 LoopEnd remain
-        let loop_begins = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
-        let loop_ends = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopEnd)).count();
+        let loop_begins = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopBegin { .. }))
+            .count();
+        let loop_ends = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopEnd))
+            .count();
         assert_eq!(loop_begins, 1);
         assert_eq!(loop_ends, 1);
     }
@@ -1986,13 +2588,20 @@ mod data_structure_tests {
         let off_vreg = VRegId(30); // the loop offset VReg
 
         let load = VmInstr::VecLoad {
-            dst: vec0, base: ptr,
+            dst: vec0,
+            base: ptr,
             offset: OffsetExpr::LoopOffset(off_vreg),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         };
         let store = VmInstr::VecStore {
-            base: ptr, offset: OffsetExpr::LoopOffset(off_vreg),
-            src: vec0, width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            base: ptr,
+            offset: OffsetExpr::LoopOffset(off_vreg),
+            src: vec0,
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         };
 
         // Act: substitute LoopOffset(off_vreg) → Const(64)
@@ -2031,7 +2640,10 @@ mod data_structure_tests {
 
         // Assert: MemLoad offset is now Const(96)
         match result {
-            VmInstr::Broadcast { src: ScalarExpr::MemLoad(_, ref offset), .. } => {
+            VmInstr::Broadcast {
+                src: ScalarExpr::MemLoad(_, ref offset),
+                ..
+            } => {
                 assert_eq!(*offset, OffsetExpr::Const(96));
             }
             _ => panic!("expected Broadcast"),
@@ -2082,7 +2694,10 @@ mod data_structure_tests {
 
         // Assert: VRegPlusVReg(base, off_vreg) → VRegPlusConst(base, 256)
         match result {
-            VmInstr::LoadPtr { src: PtrExpr::VRegPlusConst(b, val), .. } => {
+            VmInstr::LoadPtr {
+                src: PtrExpr::VRegPlusConst(b, val),
+                ..
+            } => {
                 assert_eq!(b, base);
                 assert_eq!(val, 256);
             }
@@ -2101,9 +2716,12 @@ mod data_structure_tests {
         let vreg_b = VRegId(40); // different vreg — should NOT match
 
         let load = VmInstr::VecLoad {
-            dst: vec0, base: ptr,
+            dst: vec0,
+            base: ptr,
             offset: OffsetExpr::LoopOffset(vreg_a),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         };
 
         // Act: substitute wrong vreg
@@ -2128,7 +2746,10 @@ mod data_structure_tests {
         let off_vreg = VRegId(99);
 
         let fma = VmInstr::Fma {
-            dst: vec0, acc: vec0, a: vec1, b: vec1,
+            dst: vec0,
+            acc: vec0,
+            a: vec1,
+            b: vec1,
             dtype: QuantPrecision::F32,
         };
 
@@ -2137,7 +2758,13 @@ mod data_structure_tests {
 
         // Assert: Fma returned unchanged (clone)
         match result {
-            VmInstr::Fma { dst, acc, a, b, dtype } => {
+            VmInstr::Fma {
+                dst,
+                acc,
+                a,
+                b,
+                dtype,
+            } => {
                 assert_eq!(dst, vec0);
                 assert_eq!(acc, vec0);
                 assert_eq!(a, vec1);
@@ -2158,16 +2785,23 @@ mod data_structure_tests {
         let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         prog.emit(VmInstr::LoopBegin {
-            counter, offsets: vec![LoopOffset { vreg: off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(4),
+            counter,
+            offsets: vec![LoopOffset {
+                vreg: off,
+                stride: LoopStride::FixedBytes(32),
+            }],
+            bound: BoundExpr::Const(4),
         });
         prog.emit(VmInstr::Comment("inside loop".into()));
         prog.emit(VmInstr::LoopEnd);
         prog.emit(VmInstr::Comment("after loop".into()));
 
         // Find the "after loop" Comment index
-        let after_idx = prog.instrs.iter().rposition(|i| {
-            matches!(i, VmInstr::Comment(s) if s == "after loop")
-        }).expect("after loop Comment should exist");
+        let after_idx = prog
+            .instrs
+            .iter()
+            .rposition(|i| matches!(i, VmInstr::Comment(s) if s == "after loop"))
+            .expect("after loop Comment should exist");
 
         // Act
         let bound = FwhtInsertPass::find_enclosing_loop_bound(&prog.instrs, after_idx);
@@ -2187,11 +2821,18 @@ mod data_structure_tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
         prog.emit(VmInstr::LoopBegin {
-            counter, offsets: vec![LoopOffset { vreg: off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(0),
+            counter,
+            offsets: vec![LoopOffset {
+                vreg: off,
+                stride: LoopStride::FixedBytes(32),
+            }],
+            bound: BoundExpr::Const(0),
         });
         prog.emit(VmInstr::Broadcast {
-            dst: vec0, src: ScalarExpr::Const(1.0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            dst: vec0,
+            src: ScalarExpr::Const(1.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
         });
         prog.emit(VmInstr::LoopEnd);
         let before = prog.len();
@@ -2216,11 +2857,17 @@ mod data_structure_tests {
         let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         prog.emit(VmInstr::Transcendental {
-            dst: vec0, src: vec0, func: TranscendentalFn::Sigmoid,
+            dst: vec0,
+            src: vec0,
+            func: TranscendentalFn::Sigmoid,
         });
         prog.emit(VmInstr::VecStore {
-            base: ptr, offset: OffsetExpr::Const(0), src: vec0,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            base: ptr,
+            offset: OffsetExpr::Const(0),
+            src: vec0,
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         let before = prog.len();
 
@@ -2247,8 +2894,10 @@ mod data_structure_tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         // Use vec0 so it's not dead
         prog.emit(VmInstr::Broadcast {
-            dst: vec0, src: ScalarExpr::Const(1.0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            dst: vec0,
+            src: ScalarExpr::Const(1.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
         });
 
         // Act
@@ -2257,9 +2906,18 @@ mod data_structure_tests {
 
         // Assert: ByteOffset VReg declarations are preserved (only Vec dead vregs removed)
         let has_bo_decl = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::DeclareVReg { kind: VRegKind::ByteOffset, .. })
+            matches!(
+                i,
+                VmInstr::DeclareVReg {
+                    kind: VRegKind::ByteOffset,
+                    ..
+                }
+            )
         });
-        assert!(has_bo_decl, "ByteOffset VReg declarations should not be removed");
+        assert!(
+            has_bo_decl,
+            "ByteOffset VReg declarations should not be removed"
+        );
         assert_eq!(stats.instrs_removed, 0);
     }
 
@@ -2275,9 +2933,28 @@ mod data_structure_tests {
         let off1 = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
-        prog.emit(VmInstr::LoopBegin { counter: c0, offsets: vec![LoopOffset { vreg: off0, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(4)});
-        prog.emit(VmInstr::LoopBegin { counter: c1, offsets: vec![LoopOffset { vreg: off1, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(4)});
-        prog.emit(VmInstr::Broadcast { dst: vec0, src: ScalarExpr::Const(1.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
+        prog.emit(VmInstr::LoopBegin {
+            counter: c0,
+            offsets: vec![LoopOffset {
+                vreg: off0,
+                stride: LoopStride::FixedBytes(32),
+            }],
+            bound: BoundExpr::Const(4),
+        });
+        prog.emit(VmInstr::LoopBegin {
+            counter: c1,
+            offsets: vec![LoopOffset {
+                vreg: off1,
+                stride: LoopStride::FixedBytes(32),
+            }],
+            bound: BoundExpr::Const(4),
+        });
+        prog.emit(VmInstr::Broadcast {
+            dst: vec0,
+            src: ScalarExpr::Const(1.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+        });
         prog.emit(VmInstr::LoopEnd);
         prog.emit(VmInstr::LoopEnd);
         let before = prog.len();
@@ -2308,7 +2985,10 @@ mod data_structure_tests {
         assert_eq!(results.len(), 11);
         let total_removed = results.iter().map(|s| s.instrs_removed).sum::<usize>();
         let total_added = results.iter().map(|s| s.instrs_added).sum::<usize>();
-        assert_eq!(total_removed, 0, "no instructions to remove in empty program");
+        assert_eq!(
+            total_removed, 0,
+            "no instructions to remove in empty program"
+        );
         assert_eq!(total_added, 0, "no instructions to add in empty program");
     }
 
@@ -2323,8 +3003,10 @@ mod data_structure_tests {
         let _dead = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let alive = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::Broadcast {
-            dst: alive, src: ScalarExpr::Const(1.0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            dst: alive,
+            src: ScalarExpr::Const(1.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
         });
 
         // Act
@@ -2343,8 +3025,8 @@ mod data_structure_tests {
     fn multi_pass_chain_execution_by_priority_not_register_order() {
         // Arrange: register passes in reverse priority order
         let mut reg = PassRegistry::new();
-        reg.register(Box::new(HotpatchSlotPass));   // priority=100
-        reg.register(Box::new(ScopeFlattenPass));    // priority=20
+        reg.register(Box::new(HotpatchSlotPass)); // priority=100
+        reg.register(Box::new(ScopeFlattenPass)); // priority=20
         reg.register(Box::new(DeadVRegEliminationPass)); // priority=10
         let mut prog = empty_program();
         prog.emit(VmInstr::ScopeBegin { scope_id: 0 });
@@ -2415,8 +3097,11 @@ mod data_structure_tests {
 
         // Act + Assert: every pass should be applicable on the detected profile
         for pass in &passes {
-            assert!(pass.is_applicable(&profile),
-                "pass '{}' should be applicable by default", pass.name());
+            assert!(
+                pass.is_applicable(&profile),
+                "pass '{}' should be applicable by default",
+                pass.name()
+            );
         }
     }
 
@@ -2426,16 +3111,28 @@ mod data_structure_tests {
     fn opt_stats_debug_default_vs_explicit() {
         // Arrange: two OptStats — default and explicit
         let default_stats = OptStats::default();
-        let explicit_stats = OptStats { instrs_removed: 100, instrs_added: 50 };
+        let explicit_stats = OptStats {
+            instrs_removed: 100,
+            instrs_added: 50,
+        };
 
         // Act
         let default_debug = format!("{:?}", default_stats);
         let explicit_debug = format!("{:?}", explicit_stats);
 
         // Assert: default shows zeros, explicit shows the given values
-        assert!(default_debug.contains("0"), "default Debug should show 0 values");
-        assert!(explicit_debug.contains("100"), "explicit Debug should show 100");
-        assert!(explicit_debug.contains("50"), "explicit Debug should show 50");
+        assert!(
+            default_debug.contains("0"),
+            "default Debug should show 0 values"
+        );
+        assert!(
+            explicit_debug.contains("100"),
+            "explicit Debug should show 100"
+        );
+        assert!(
+            explicit_debug.contains("50"),
+            "explicit Debug should show 50"
+        );
     }
 
     // ── 47. PassRegistry register then run — incremental addition ──────
@@ -2477,8 +3174,10 @@ mod data_structure_tests {
         let _dead = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let alive = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::Broadcast {
-            dst: alive, src: ScalarExpr::Const(1.0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            dst: alive,
+            src: ScalarExpr::Const(1.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
         });
 
         // Act
@@ -2488,8 +3187,14 @@ mod data_structure_tests {
         // Assert: both instances ran (2 results), first removed the dead VReg,
         // second found nothing left to remove
         assert_eq!(results.len(), 2);
-        assert!(results[0].instrs_removed > 0, "first pass should remove dead VReg");
-        assert_eq!(results[1].instrs_removed, 0, "second pass has nothing left to remove");
+        assert!(
+            results[0].instrs_removed > 0,
+            "first pass should remove dead VReg"
+        );
+        assert_eq!(
+            results[1].instrs_removed, 0,
+            "second pass has nothing left to remove"
+        );
     }
 
     // ── 49. LoopFusionPass — nested loop has no adjacent LoopEnd+LoopBegin ──
@@ -2505,11 +3210,35 @@ mod data_structure_tests {
         let inner_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
-        prog.emit(VmInstr::LoopBegin { counter: outer_c, offsets: vec![LoopOffset { vreg: outer_off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(4)});
-        prog.emit(VmInstr::LoopBegin { counter: inner_c, offsets: vec![LoopOffset { vreg: inner_off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(2)});
-        prog.emit(VmInstr::Broadcast { dst: vec0, src: ScalarExpr::Const(1.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
+        prog.emit(VmInstr::LoopBegin {
+            counter: outer_c,
+            offsets: vec![LoopOffset {
+                vreg: outer_off,
+                stride: LoopStride::FixedBytes(32),
+            }],
+            bound: BoundExpr::Const(4),
+        });
+        prog.emit(VmInstr::LoopBegin {
+            counter: inner_c,
+            offsets: vec![LoopOffset {
+                vreg: inner_off,
+                stride: LoopStride::FixedBytes(32),
+            }],
+            bound: BoundExpr::Const(2),
+        });
+        prog.emit(VmInstr::Broadcast {
+            dst: vec0,
+            src: ScalarExpr::Const(1.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+        });
         prog.emit(VmInstr::LoopEnd); // inner
-        prog.emit(VmInstr::Broadcast { dst: vec0, src: ScalarExpr::Const(2.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
+        prog.emit(VmInstr::Broadcast {
+            dst: vec0,
+            src: ScalarExpr::Const(2.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+        });
         prog.emit(VmInstr::LoopEnd); // outer
         let before = prog.len();
 
@@ -2542,8 +3271,14 @@ mod data_structure_tests {
         assert_eq!(results.len(), 11);
         let total_removed = results.iter().map(|s| s.instrs_removed).sum::<usize>();
         let total_added = results.iter().map(|s| s.instrs_added).sum::<usize>();
-        assert_eq!(total_removed, 0, "comments should not be removed by any pass");
-        assert_eq!(total_added, 0, "no new instructions added for comment-only program");
+        assert_eq!(
+            total_removed, 0,
+            "comments should not be removed by any pass"
+        );
+        assert_eq!(
+            total_added, 0,
+            "no new instructions added for comment-only program"
+        );
         assert_eq!(prog.len(), before);
     }
 
@@ -2556,8 +3291,10 @@ mod data_structure_tests {
         let _dead_counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::Broadcast {
-            dst: vec0, src: ScalarExpr::Const(1.0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            dst: vec0,
+            src: ScalarExpr::Const(1.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
         });
 
         // Act
@@ -2566,9 +3303,18 @@ mod data_structure_tests {
 
         // Assert: Counter VReg declarations are preserved (only Vec dead vregs removed)
         let has_counter_decl = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::DeclareVReg { kind: VRegKind::Counter, .. })
+            matches!(
+                i,
+                VmInstr::DeclareVReg {
+                    kind: VRegKind::Counter,
+                    ..
+                }
+            )
         });
-        assert!(has_counter_decl, "Counter VReg declarations should not be removed");
+        assert!(
+            has_counter_decl,
+            "Counter VReg declarations should not be removed"
+        );
         assert_eq!(stats.instrs_removed, 0);
     }
 
@@ -2588,10 +3334,23 @@ mod data_structure_tests {
         let stats = DeadVRegEliminationPass.run(&mut prog, &profile, hook.as_ref());
 
         // Assert: all 3 dead Vec DeclareVRegs removed
-        assert_eq!(stats.instrs_removed, 3, "should remove all 3 dead Vec declarations");
-        let vec_decls = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::DeclareVReg { kind: VRegKind::Vec, .. })
-        }).count();
+        assert_eq!(
+            stats.instrs_removed, 3,
+            "should remove all 3 dead Vec declarations"
+        );
+        let vec_decls = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::DeclareVReg {
+                        kind: VRegKind::Vec,
+                        ..
+                    }
+                )
+            })
+            .count();
         assert_eq!(vec_decls, 0, "no Vec DeclareVReg should remain");
     }
 
@@ -2606,12 +3365,20 @@ mod data_structure_tests {
         let vec1 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
         prog.emit(VmInstr::VecStore {
-            base: ptr, offset: OffsetExpr::Const(0), src: vec0,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            base: ptr,
+            offset: OffsetExpr::Const(0),
+            src: vec0,
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         prog.emit(VmInstr::VecLoad {
-            dst: vec1, base: ptr, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            dst: vec1,
+            base: ptr,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
 
         // Act
@@ -2621,7 +3388,10 @@ mod data_structure_tests {
         // Assert: Store+Load replaced by Mov with correct dst/src
         assert_eq!(stats.instrs_removed, 2);
         assert_eq!(stats.instrs_added, 1);
-        let mov_instr = prog.instrs.iter().find(|i| matches!(i, VmInstr::Mov { .. }));
+        let mov_instr = prog
+            .instrs
+            .iter()
+            .find(|i| matches!(i, VmInstr::Mov { .. }));
         assert!(mov_instr.is_some(), "should contain a Mov instruction");
         if let Some(VmInstr::Mov { dst, src, dtype }) = mov_instr {
             assert_eq!(*dst, vec1, "Mov dst should be the Load's dst");
@@ -2641,11 +3411,18 @@ mod data_structure_tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
         prog.emit(VmInstr::LoopBegin {
-            counter, offsets: vec![LoopOffset { vreg: off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(1),
+            counter,
+            offsets: vec![LoopOffset {
+                vreg: off,
+                stride: LoopStride::FixedBytes(32),
+            }],
+            bound: BoundExpr::Const(1),
         });
         prog.emit(VmInstr::Broadcast {
-            dst: vec0, src: ScalarExpr::Const(1.0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            dst: vec0,
+            src: ScalarExpr::Const(1.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
         });
         prog.emit(VmInstr::LoopEnd);
 
@@ -2654,10 +3431,16 @@ mod data_structure_tests {
         let stats = LoopUnrollPass.run(&mut prog, &profile, hook.as_ref());
 
         // Assert: LoopBegin+LoopEnd removed (2), 1 copy of body added (1)
-        assert!(stats.instrs_removed >= 2, "should remove LoopBegin and LoopEnd");
+        assert!(
+            stats.instrs_removed >= 2,
+            "should remove LoopBegin and LoopEnd"
+        );
         assert_eq!(stats.instrs_added, 1, "should add 1 copy of the body");
         // No loop control flow remains
-        assert!(prog.instrs.iter().all(|i| !matches!(i, VmInstr::LoopBegin { .. })));
+        assert!(prog
+            .instrs
+            .iter()
+            .all(|i| !matches!(i, VmInstr::LoopBegin { .. })));
         assert!(prog.instrs.iter().all(|i| !matches!(i, VmInstr::LoopEnd)));
     }
 
@@ -2671,10 +3454,16 @@ mod data_structure_tests {
         let mask = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let index = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
 
-        prog.emit(VmInstr::ConditionalSkip { mask, skip_count: 1 });
+        prog.emit(VmInstr::ConditionalSkip {
+            mask,
+            skip_count: 1,
+        });
         prog.emit(VmInstr::IndirectJump {
             index,
-            targets: vec![super::super::instr::JumpTarget { expert_id: 0, instr_index: 0 }],
+            targets: vec![super::super::instr::JumpTarget {
+                expert_id: 0,
+                instr_index: 0,
+            }],
         });
         let before = prog.len();
 
@@ -2687,9 +3476,17 @@ mod data_structure_tests {
         assert_eq!(stats.instrs_removed, 0);
         assert_eq!(prog.len(), before + 2);
         // Each HotpatchSlot should have a distinct slot_id
-        let slot_ids: Vec<u32> = prog.instrs.iter().filter_map(|i| {
-            if let VmInstr::HotpatchSlot { slot_id, .. } = i { Some(*slot_id) } else { None }
-        }).collect();
+        let slot_ids: Vec<u32> = prog
+            .instrs
+            .iter()
+            .filter_map(|i| {
+                if let VmInstr::HotpatchSlot { slot_id, .. } = i {
+                    Some(*slot_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(slot_ids.len(), 2);
         assert_ne!(slot_ids[0], slot_ids[1], "slot_ids should be distinct");
     }
@@ -2704,11 +3501,17 @@ mod data_structure_tests {
         let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         prog.emit(VmInstr::Transcendental {
-            dst: vec0, src: vec0, func: TranscendentalFn::Exp,
+            dst: vec0,
+            src: vec0,
+            func: TranscendentalFn::Exp,
         });
         prog.emit(VmInstr::VecStore {
-            base: ptr, offset: OffsetExpr::Const(0), src: vec0,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+            base: ptr,
+            offset: OffsetExpr::Const(0),
+            src: vec0,
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
 
         // Act
@@ -2734,11 +3537,18 @@ mod data_structure_tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
         prog.emit(VmInstr::LoopBegin {
-            counter, offsets: vec![LoopOffset { vreg: off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(8),
+            counter,
+            offsets: vec![LoopOffset {
+                vreg: off,
+                stride: LoopStride::FixedBytes(32),
+            }],
+            bound: BoundExpr::Const(8),
         });
         prog.emit(VmInstr::Broadcast {
-            dst: vec0, src: ScalarExpr::Const(0.044715),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            dst: vec0,
+            src: ScalarExpr::Const(0.044715),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
         });
         prog.emit(VmInstr::LoopEnd);
         let before = prog.len();
@@ -2761,11 +3571,25 @@ mod data_structure_tests {
         // Arrange: custom pass that is never applicable
         struct NeverApplicablePass;
         impl VmOptPass for NeverApplicablePass {
-            fn name(&self) -> &'static str { "never_applicable" }
-            fn priority(&self) -> u32 { 50 }
-            fn is_applicable(&self, _profile: &IsaProfile) -> bool { false }
-            fn run(&self, _program: &mut VmProgram, _profile: &IsaProfile, _hook: &dyn IsaHook) -> OptStats {
-                OptStats { instrs_removed: 999, instrs_added: 999 }
+            fn name(&self) -> &'static str {
+                "never_applicable"
+            }
+            fn priority(&self) -> u32 {
+                50
+            }
+            fn is_applicable(&self, _profile: &IsaProfile) -> bool {
+                false
+            }
+            fn run(
+                &self,
+                _program: &mut VmProgram,
+                _profile: &IsaProfile,
+                _hook: &dyn IsaHook,
+            ) -> OptStats {
+                OptStats {
+                    instrs_removed: 999,
+                    instrs_added: 999,
+                }
             }
         }
 
@@ -2824,8 +3648,10 @@ mod data_structure_tests {
             }),
         });
         prog.emit(VmInstr::Broadcast {
-            dst: vec0, src: ScalarExpr::Const(1.0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            dst: vec0,
+            src: ScalarExpr::Const(1.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
         });
         prog.emit(VmInstr::LoopEnd);
         let before = prog.len();

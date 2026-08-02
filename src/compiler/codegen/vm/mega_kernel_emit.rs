@@ -2,28 +2,27 @@
 
 use super::instr::*;
 use super::isa_profile::IsaProfile;
-use super::vm_state::AbiPtrs;
 use super::plan_lower::{
-    CompileSession, LoweringContext, SymDimSlotMap, TensorPtrResolver,
-    FusionEmitCtx,
-    emit_fusion_groups, compute_rope_requirement, compute_ple_requirement,
-    compute_dwc_requirement, graph_dtype, kv_cache_elem_bytes, maybe_debug_bp,
+    compute_dwc_requirement, compute_ple_requirement, compute_rope_requirement, emit_fusion_groups,
+    graph_dtype, kv_cache_elem_bytes, maybe_debug_bp, CompileSession, FusionEmitCtx,
+    LoweringContext, SymDimSlotMap, TensorPtrResolver,
 };
+use super::vm_state::AbiPtrs;
 
+use super::resource_planner::GraphResourcePlan;
+use crate::compiler::buffer_alloc::{BufferAllocation, TensorPtrSource};
+use crate::compiler::codegen::vm::topology::{KvCacheSource, LoopTopology};
 use crate::compiler::codegen::RopeCacheRequirement;
 use crate::compiler::fusion::FusionPlan;
 use crate::compiler::graph::CompilerGraph;
-use crate::compiler::codegen::vm::topology::{LoopTopology, KvCacheSource};
-use crate::compiler::buffer_alloc::{BufferAllocation, TensorPtrSource};
+use crate::compiler::hardware_profile::HardwareProfile;
 use crate::compiler::mega_kernel_abi::MtpKernelConfig;
-use crate::compiler::registry::ScalarOpRegistry;
 use crate::compiler::pain_point::{OpBottleneckMap, ParallelismDesc};
+use crate::compiler::registry::ScalarOpRegistry;
+use crate::compiler::trace::QuantPrecision;
 use crate::compiler::virtual_activation::VirtualActivationMap;
 use crate::compiler::virtual_tensor::VirtualTensorMap;
-use crate::compiler::hardware_profile::HardwareProfile;
-use crate::compiler::trace::QuantPrecision;
 use crate::types::CompilerError;
-use super::resource_planner::GraphResourcePlan;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // SPEC 32 §2.2: Mega-Kernel Variants (REQ-MKO-002)
@@ -45,9 +44,15 @@ pub enum MkVariant {
     /// SM 70-89: CTAs partitioned 75% decode / 25% prefill with grid_sync.
     GridSync { total_ctas: u32 },
     /// SM 90+: 6 decode + 2 prefill CTAs per cluster, cluster.sync + mbarrier.
-    Cluster6x2 { cluster_size: u32, num_clusters: u32 },
+    Cluster6x2 {
+        cluster_size: u32,
+        num_clusters: u32,
+    },
     /// SM 90+: 5 decode + 3 prefill CTAs per cluster (prefill-heavy workloads).
-    Cluster5x3 { cluster_size: u32, num_clusters: u32 },
+    Cluster5x3 {
+        cluster_size: u32,
+        num_clusters: u32,
+    },
 }
 
 /// Select the MkVariant based on SM version and total SM count.
@@ -59,10 +64,15 @@ pub fn select_mk_variant(sm_version: u32, total_sm: u32) -> MkVariant {
         // default portable=8, opt-in=16.
         let cluster_size = 8u32;
         let num_clusters = total_sm / cluster_size;
-        MkVariant::Cluster6x2 { cluster_size, num_clusters: num_clusters.max(1) }
+        MkVariant::Cluster6x2 {
+            cluster_size,
+            num_clusters: num_clusters.max(1),
+        }
     } else if sm_version >= 70 {
         // SM70-89 (Volta/Turing/Ampere): cooperative grid_sync
-        MkVariant::GridSync { total_ctas: total_sm }
+        MkVariant::GridSync {
+            total_ctas: total_sm,
+        }
     } else {
         // SM < 60 (Pascal/Maxwell): serial execution, ring barrier
         MkVariant::Serial
@@ -114,32 +124,40 @@ pub mod batch_ctx_offsets {
 
 /// RequestQueue field offsets (from request_queue_ptr base).
 pub mod request_queue_offsets {
-    pub const READ_IDX: u32 = 0;   // u64
-    pub const WRITE_IDX: u32 = 8;  // u64
-    pub const CAPACITY: u32 = 16;  // u32
-    pub const ENTRIES: u32 = 24;   // RequestQueueEntry[]
+    pub const READ_IDX: u32 = 0; // u64
+    pub const WRITE_IDX: u32 = 8; // u64
+    pub const CAPACITY: u32 = 16; // u32
+    pub const ENTRIES: u32 = 24; // RequestQueueEntry[]
 }
 
 /// Emit MK_SERIAL compact: single-CTA mark + prefix-scan + parallel move.
 ///
 /// For MK_SERIAL, all operations execute within a single CTA — no cross-CTA
 /// synchronization needed. The compact operates on seq_meta entries in-place.
-fn emit_compact_serial(
-    prog: &mut VmProgram,
-    batch_ctx_ptr: VRegId,
-    seq_count: VRegId,
-) {
+fn emit_compact_serial(prog: &mut VmProgram, batch_ctx_ptr: VRegId, seq_count: VRegId) {
     let compacted_count = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprLoadImm { dst: compacted_count, value: 0 });
+    prog.emit(VmInstr::GprLoadImm {
+        dst: compacted_count,
+        value: 0,
+    });
 
     let loop_ctr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
     let loop_byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprLoadImm { dst: loop_ctr, value: 0 });
-    prog.emit(VmInstr::GprLoadImm { dst: loop_byte_off, value: 0 });
+    prog.emit(VmInstr::GprLoadImm {
+        dst: loop_ctr,
+        value: 0,
+    });
+    prog.emit(VmInstr::GprLoadImm {
+        dst: loop_byte_off,
+        value: 0,
+    });
 
     prog.emit(VmInstr::LoopBegin {
         counter: loop_ctr,
-        offsets: vec![LoopOffset { vreg: loop_byte_off, stride: LoopStride::FixedBytes(1) }],
+        offsets: vec![LoopOffset {
+            vreg: loop_byte_off,
+            stride: LoopStride::FixedBytes(1),
+        }],
         bound: BoundExpr::DynamicVReg(seq_count),
     });
 
@@ -192,11 +210,7 @@ fn emit_compact_serial(
 ///
 /// `atom.global.add.u64 read_idx, 1` → load RequestQueueEntry at that index.
 /// For MK_SERIAL, only CTA 0 executes refill (redundant guard in serial mode).
-fn emit_request_queue_refill(
-    prog: &mut VmProgram,
-    batch_ctx_ptr: VRegId,
-    survivor_count: VRegId,
-) {
+fn emit_request_queue_refill(prog: &mut VmProgram, batch_ctx_ptr: VRegId, survivor_count: VRegId) {
     // Load request_queue_ptr from batch_ctx
     let rq_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     prog.emit(VmInstr::ScalarLoad {
@@ -231,11 +245,20 @@ fn emit_request_queue_refill(
     // Refill loop: for i in 0..free_slots
     let refill_ctr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
     let refill_byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprLoadImm { dst: refill_ctr, value: 0 });
-    prog.emit(VmInstr::GprLoadImm { dst: refill_byte_off, value: 0 });
+    prog.emit(VmInstr::GprLoadImm {
+        dst: refill_ctr,
+        value: 0,
+    });
+    prog.emit(VmInstr::GprLoadImm {
+        dst: refill_byte_off,
+        value: 0,
+    });
     prog.emit(VmInstr::LoopBegin {
         counter: refill_ctr,
-        offsets: vec![LoopOffset { vreg: refill_byte_off, stride: LoopStride::FixedBytes(1) }],
+        offsets: vec![LoopOffset {
+            vreg: refill_byte_off,
+            stride: LoopStride::FixedBytes(1),
+        }],
         bound: BoundExpr::DynamicVReg(free_slots),
     });
 
@@ -272,28 +295,23 @@ fn emit_request_queue_refill(
 ///
 /// For MK_SERIAL on SM61 (no cluster/mbarrier support), cross-CTA sync
 /// uses a global memory atomic counter. Each CTA increments on arrive.
-fn emit_ring_barrier_arrive(
-    prog: &mut VmProgram,
-    barrier_ptr: VRegId,
-) {
+fn emit_ring_barrier_arrive(prog: &mut VmProgram, barrier_ptr: VRegId) {
     prog.emit(VmInstr::AtomicAdd {
         base: barrier_ptr,
         offset: OffsetExpr::Const(0),
         value: 1,
         elem_width: 4,
     });
-    prog.emit(VmInstr::MemFence { order: MemFenceOrder::AcqRel });
+    prog.emit(VmInstr::MemFence {
+        order: MemFenceOrder::AcqRel,
+    });
 }
 
 /// Emit ring barrier wait: spin-loop until barrier counter reaches expected value.
 ///
 /// Loads the counter, compares against `expected_count`, and re-reads if not reached.
 /// After successful wait, resets counter to 0 for next barrier phase.
-fn emit_ring_barrier_wait(
-    prog: &mut VmProgram,
-    barrier_ptr: VRegId,
-    expected_count: u32,
-) {
+fn emit_ring_barrier_wait(prog: &mut VmProgram, barrier_ptr: VRegId, expected_count: u32) {
     let counter_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
     // Spin-wait: load barrier counter, skip reset if not yet reached expected_count
     prog.emit(VmInstr::ScalarLoad {
@@ -308,14 +326,21 @@ fn emit_ring_barrier_wait(
         action: GprBranchAction::Skip(4), // skip past reset block
     });
     // Barrier satisfied: reset counter to 0 for next phase
-    prog.emit(VmInstr::MemFence { order: MemFenceOrder::AcqRel });
-    prog.emit(VmInstr::GprLoadImm { dst: counter_val, value: 0 });
+    prog.emit(VmInstr::MemFence {
+        order: MemFenceOrder::AcqRel,
+    });
+    prog.emit(VmInstr::GprLoadImm {
+        dst: counter_val,
+        value: 0,
+    });
     prog.emit(VmInstr::ScalarStore {
         src: counter_val,
         base: barrier_ptr,
         offset: OffsetExpr::Const(0),
     });
-    prog.emit(VmInstr::MemFence { order: MemFenceOrder::Release });
+    prog.emit(VmInstr::MemFence {
+        order: MemFenceOrder::Release,
+    });
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -326,7 +351,7 @@ fn emit_ring_barrier_wait(
 pub mod page_pool_offsets {
     // pool_global free_list head: atom.global CAS to grab a page
     pub const GLOBAL_FREE_HEAD: u32 = 160; // batch_ctx + 160
-    // pool_global total page count
+                                           // pool_global total page count
     pub const GLOBAL_TOTAL_PAGES: u32 = 168;
     // pool_local free count (per-CTA, stored in seq_meta scratch area)
     // pool_local is managed via scalar registers, no device memory needed.
@@ -342,9 +367,9 @@ pub mod page_pool_offsets {
 fn emit_page_alloc_serial(
     prog: &mut VmProgram,
     batch_ctx_ptr: VRegId,
-    local_free_count: VRegId,  // per-CTA local free count (register)
-    local_next_id: VRegId,     // per-CTA next available page_id (register)
-    dst_page_id: VRegId,       // output: allocated page_id
+    local_free_count: VRegId, // per-CTA local free count (register)
+    local_next_id: VRegId,    // per-CTA next available page_id (register)
+    dst_page_id: VRegId,      // output: allocated page_id
 ) {
     // Fast path: pool_local has free pages
     prog.emit(VmInstr::GprCondAction {
@@ -355,25 +380,38 @@ fn emit_page_alloc_serial(
 
     // pool_local hit: use local_next_id, increment it, decrement count
     prog.emit(VmInstr::GprBinOp {
-        dst: dst_page_id, a: local_next_id, b: GprOperand::Imm(0), op: GprOp::Add,
+        dst: dst_page_id,
+        a: local_next_id,
+        b: GprOperand::Imm(0),
+        op: GprOp::Add,
     });
     prog.emit(VmInstr::GprBinOp {
-        dst: local_next_id, a: local_next_id, b: GprOperand::Imm(1), op: GprOp::Add,
+        dst: local_next_id,
+        a: local_next_id,
+        b: GprOperand::Imm(1),
+        op: GprOp::Add,
     });
     prog.emit(VmInstr::GprBinOp {
-        dst: local_free_count, a: local_free_count, b: GprOperand::Imm(1), op: GprOp::Sub,
+        dst: local_free_count,
+        a: local_free_count,
+        b: GprOperand::Imm(1),
+        op: GprOp::Sub,
     });
 
     // Skip slow path
     prog.emit(VmInstr::GprCondAction {
         cond: GprCondition::CmpEq(dst_page_id, 0), // always false; used as unconditional jump
-        action: GprBranchAction::Skip(0), // patch below to skip slow path
+        action: GprBranchAction::Skip(0),          // patch below to skip slow path
     });
     let skip_slow = prog.instrs.len() - 1;
 
     // Patch fast-path skip to jump over fast-path body + skip_slow instruction
     let fast_path_body_len = prog.instrs.len() - skip_fast_path - 1;
-    if let VmInstr::GprCondAction { action: GprBranchAction::Skip(ref mut n), .. } = prog.instrs[skip_fast_path] {
+    if let VmInstr::GprCondAction {
+        action: GprBranchAction::Skip(ref mut n),
+        ..
+    } = prog.instrs[skip_fast_path]
+    {
         *n = fast_path_body_len;
     }
 
@@ -399,31 +437,43 @@ fn emit_page_alloc_serial(
     // (In full implementation, this needs AtomicFetchAdd VmInstr returning old value)
     // For now, use the batch start as first allocated page
     prog.emit(VmInstr::GprBinOp {
-        dst: dst_page_id, a: global_head_ptr, b: GprOperand::Imm(0), op: GprOp::Add,
+        dst: dst_page_id,
+        a: global_head_ptr,
+        b: GprOperand::Imm(0),
+        op: GprOp::Add,
     });
 
     // Update local pool: next_id = old_head + 1, free_count = batch_size - 1
     prog.emit(VmInstr::GprBinOp {
-        dst: local_next_id, a: dst_page_id, b: GprOperand::Imm(1), op: GprOp::Add,
+        dst: local_next_id,
+        a: dst_page_id,
+        b: GprOperand::Imm(1),
+        op: GprOp::Add,
     });
-    prog.emit(VmInstr::GprLoadImm { dst: local_free_count, value: (batch_size - 1) as usize });
+    prog.emit(VmInstr::GprLoadImm {
+        dst: local_free_count,
+        value: (batch_size - 1) as usize,
+    });
 
     // Patch skip_slow to jump over slow path body
     let slow_path_len = prog.instrs.len() - skip_slow - 1;
-    if let VmInstr::GprCondAction { action: GprBranchAction::Skip(ref mut n), .. } = prog.instrs[skip_slow] {
+    if let VmInstr::GprCondAction {
+        action: GprBranchAction::Skip(ref mut n),
+        ..
+    } = prog.instrs[skip_slow]
+    {
         *n = slow_path_len;
     }
 }
 
 /// Emit page free: return page to pool_local (no atomic needed).
-fn emit_page_free_serial(
-    prog: &mut VmProgram,
-    _page_id: VRegId,
-    local_free_count: VRegId,
-) {
+fn emit_page_free_serial(prog: &mut VmProgram, _page_id: VRegId, local_free_count: VRegId) {
     // Simply increment local free count; freed pages are reused next alloc cycle
     prog.emit(VmInstr::GprBinOp {
-        dst: local_free_count, a: local_free_count, b: GprOperand::Imm(1), op: GprOp::Add,
+        dst: local_free_count,
+        a: local_free_count,
+        b: GprOperand::Imm(1),
+        op: GprOp::Add,
     });
 }
 
@@ -558,7 +608,10 @@ fn emit_output_token_write(
     });
 
     let is_final_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprLoadImm { dst: is_final_val, value: if is_final { 1 } else { 0 } });
+    prog.emit(VmInstr::GprLoadImm {
+        dst: is_final_val,
+        value: if is_final { 1 } else { 0 },
+    });
     prog.emit(VmInstr::ScalarStore {
         src: is_final_val,
         base: entry_ptr,
@@ -573,11 +626,7 @@ fn emit_output_token_write(
 ///
 /// MK_SERIAL (single CTA): writes local_write_count to doorbell[0].
 /// The Rust consumer polls/awaits this doorbell to consume sub-ring entries.
-fn emit_doorbell_update(
-    prog: &mut VmProgram,
-    batch_ctx_ptr: VRegId,
-    local_write_count: VRegId,
-) {
+fn emit_doorbell_update(prog: &mut VmProgram, batch_ctx_ptr: VRegId, local_write_count: VRegId) {
     let doorbell_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     prog.emit(VmInstr::ScalarLoad {
         dst: doorbell_ptr,
@@ -625,10 +674,7 @@ fn emit_streaming_output_serial(
 ///   current_epoch += 1
 ///   swap(ping_seq_offset, pong_seq_offset)
 ///   swap(ping_seq_count, pong_seq_count)
-fn emit_dual_batch_meta_swap(
-    prog: &mut VmProgram,
-    batch_ctx_ptr: VRegId,
-) {
+fn emit_dual_batch_meta_swap(prog: &mut VmProgram, batch_ctx_ptr: VRegId) {
     // Load epoch flag ptr and increment epoch
     let epoch_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     prog.emit(VmInstr::ScalarLoad {
@@ -679,7 +725,10 @@ impl SmPartitionConfig {
                     cluster_size: 0,
                 }
             }
-            MkVariant::Cluster6x2 { cluster_size, num_clusters } => {
+            MkVariant::Cluster6x2 {
+                cluster_size,
+                num_clusters,
+            } => {
                 let total_ctas = cluster_size * num_clusters;
                 SmPartitionConfig {
                     variant,
@@ -689,7 +738,10 @@ impl SmPartitionConfig {
                     cluster_size,
                 }
             }
-            MkVariant::Cluster5x3 { cluster_size, num_clusters } => {
+            MkVariant::Cluster5x3 {
+                cluster_size,
+                num_clusters,
+            } => {
                 let total_ctas = cluster_size * num_clusters;
                 SmPartitionConfig {
                     variant,
@@ -736,7 +788,9 @@ pub struct FusionParams {
 }
 
 /// Select prefill FusionParams based on HardwareProfile (SPEC 32 §5.1).
-pub fn prefill_fusion_params(profile: &crate::compiler::hardware_profile::HardwareProfile) -> FusionParams {
+pub fn prefill_fusion_params(
+    profile: &crate::compiler::hardware_profile::HardwareProfile,
+) -> FusionParams {
     match profile {
         HardwareProfile::CudaSM100 => FusionParams {
             gemm_tile: TileSize(128, 256, 64),
@@ -794,7 +848,10 @@ pub fn prefill_fusion_params(profile: &crate::compiler::hardware_profile::Hardwa
             use_ld_nc: false,
             use_tensor_core_gemv: false,
         },
-        HardwareProfile::CpuAvx512 | HardwareProfile::AppleM1 | HardwareProfile::AppleM2 | HardwareProfile::AppleM3 => FusionParams {
+        HardwareProfile::CpuAvx512
+        | HardwareProfile::AppleM1
+        | HardwareProfile::AppleM2
+        | HardwareProfile::AppleM3 => FusionParams {
             gemm_tile: TileSize(16, 16, 64),
             attention: AttentionMode::FlashAttention,
             kv_mode: KvMode::WriteFull,
@@ -834,7 +891,9 @@ pub fn prefill_fusion_params(profile: &crate::compiler::hardware_profile::Hardwa
 }
 
 /// Select decode FusionParams based on HardwareProfile (SPEC 32 §5.1).
-pub fn decode_fusion_params(profile: &crate::compiler::hardware_profile::HardwareProfile) -> FusionParams {
+pub fn decode_fusion_params(
+    profile: &crate::compiler::hardware_profile::HardwareProfile,
+) -> FusionParams {
     match profile {
         HardwareProfile::CudaSM100 => FusionParams {
             gemm_tile: TileSize(1, 256, 64),
@@ -891,7 +950,10 @@ pub fn decode_fusion_params(profile: &crate::compiler::hardware_profile::Hardwar
             use_ld_nc: false,
             use_tensor_core_gemv: false,
         },
-        HardwareProfile::CpuAvx512 | HardwareProfile::AppleM1 | HardwareProfile::AppleM2 | HardwareProfile::AppleM3 => FusionParams {
+        HardwareProfile::CpuAvx512
+        | HardwareProfile::AppleM1
+        | HardwareProfile::AppleM2
+        | HardwareProfile::AppleM3 => FusionParams {
             gemm_tile: TileSize(1, 16, 64),
             attention: AttentionMode::IncrementalKvAttention,
             kv_mode: KvMode::ReadHistoryWriteOne,
@@ -1030,12 +1092,17 @@ fn _gk_oom_probe(tag: &str, extra: &str, prog: &VmProgram) {
     let vregs = prog.vreg_counts_by_kind();
     let line = format!(
         "{:>30} | RSS={} MB | instrs={} vregs={:?} | {}",
-        tag, rss_mb, prog.instrs.len(), vregs, extra
+        tag,
+        rss_mb,
+        prog.instrs.len(),
+        vregs,
+        extra
     );
     eprintln!("[OOMPROBE-CMKE] {}", line);
     std::io::stderr().flush().ok();
     let _ = std::fs::OpenOptions::new()
-        .create(true).append(true)
+        .create(true)
+        .append(true)
         .open("/tmp/oomprobe_cmke.log")
         .and_then(|mut f| writeln!(f, "{}", line));
 }
@@ -1057,7 +1124,6 @@ pub fn compile_mega_kernel_vm(
     resource_plan: Option<&GraphResourcePlan>,
     topology: super::topology::GraphTopologyAnalysis,
 ) -> Result<(VmProgram, Option<RopeCacheRequirement>, usize), CompilerError> {
-
     /// Sampling workspace needs 4x vocab_bytes: softmax + top-k + top-p + multinomial buffers.
     const SAMPLING_WORKSPACE_MULTIPLIER: usize = 4;
 
@@ -1073,14 +1139,24 @@ pub fn compile_mega_kernel_vm(
     let sym_map = SymDimSlotMap::mega_kernel_abi_for_target(&profile.platform);
     let mut prog = VmProgram::new();
 
-    _gk_oom_probe("cmke-vm-entry", &format!("groups={} ops={}", plan.groups.len(), graph.ops.len()), &mut prog);
+    _gk_oom_probe(
+        "cmke-vm-entry",
+        &format!("groups={} ops={}", plan.groups.len(), graph.ops.len()),
+        &mut prog,
+    );
     // ── ABI prologue: Load MegaKernelFn ABI parameters ──
     let input_ids_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
     // Load register params (AbiArg 0/1 = input_ids_ptr / weight_blob_ptr)
-    prog.emit(VmInstr::LoadPtr { dst: input_ids_ptr, src: PtrExpr::AbiArg(0) });
-    prog.emit(VmInstr::LoadPtr { dst: weight_ptr, src: PtrExpr::AbiArg(1) });
+    prog.emit(VmInstr::LoadPtr {
+        dst: input_ids_ptr,
+        src: PtrExpr::AbiArg(0),
+    });
+    prog.emit(VmInstr::LoadPtr {
+        dst: weight_ptr,
+        src: PtrExpr::AbiArg(1),
+    });
 
     // Load stack params: scratchpad, prompt_len, output_tokens
     let scratchpad_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -1089,16 +1165,37 @@ pub fn compile_mega_kernel_vm(
 
     // BCE-20260703-GPU-MEGA-KERNEL-ABI: 参数物理位置由 sym_map 决定 (x86=StackArg, GPU=AbiArg).
     // 禁止硬编码 MEGA_KERNEL_STACK_OFFSETS — GPU 无栈参数概念, 会触发 StackArg 拒绝.
-    prog.emit(VmInstr::LoadPtr { dst: scratchpad_ptr, src: sym_map.resolve("scratchpad_ptr").cloned().expect("ABI: scratchpad_ptr") });
-    prog.emit(VmInstr::LoadPtr { dst: prompt_len_vreg, src: sym_map.resolve("prompt_len").cloned().expect("ABI: prompt_len") });
+    prog.emit(VmInstr::LoadPtr {
+        dst: scratchpad_ptr,
+        src: sym_map
+            .resolve("scratchpad_ptr")
+            .cloned()
+            .expect("ABI: scratchpad_ptr"),
+    });
+    prog.emit(VmInstr::LoadPtr {
+        dst: prompt_len_vreg,
+        src: sym_map
+            .resolve("prompt_len")
+            .cloned()
+            .expect("ABI: prompt_len"),
+    });
 
     // ── ForwardPhaseDispatch: Load batch_ctx_ptr (ABI arg 16) + branch to batch mode if non-NULL (SPEC/20 BCI-002/003) ──
     let batch_ctx_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: batch_ctx_ptr, src: sym_map.resolve("batch_ctx_ptr").cloned().expect("ABI: batch_ctx_ptr") });
+    prog.emit(VmInstr::LoadPtr {
+        dst: batch_ctx_ptr,
+        src: sym_map
+            .resolve("batch_ctx_ptr")
+            .cloned()
+            .expect("ABI: batch_ctx_ptr"),
+    });
     // If batch_ctx_ptr != NULL → jump to BATCH_MODE label (iteration setup/seq_len derivation batch logic, to be implemented)
     // NULL → fall through to outer loop setup.Legacy (current single-seq behavior, zero overhead)
     const BATCH_MODE_LABEL: usize = 100; // label ID for batch mode entry
-    prog.emit(VmInstr::BranchIfPtrNonNull { ptr: batch_ctx_ptr, target_label: BATCH_MODE_LABEL });
+    prog.emit(VmInstr::BranchIfPtrNonNull {
+        ptr: batch_ctx_ptr,
+        target_label: BATCH_MODE_LABEL,
+    });
 
     // seq_len=1 is SymDim::Concrete(1) — no runtime slot needed.
     // Old code wrote to [rbp+104] (caller's stack frame!) which caused heap corruption.
@@ -1108,10 +1205,21 @@ pub fn compile_mega_kernel_vm(
     // IMPORTANT: compute prompt_len_bytes BEFORE loading output_tokens_ptr,
     // otherwise RegAllocator may reuse the same physical register and clobber prompt_len.
     let prompt_len_bytes = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprBinOp { dst: prompt_len_bytes, a: prompt_len_vreg, b: GprOperand::Imm(2_i64), op: GprOp::Shl });
+    prog.emit(VmInstr::GprBinOp {
+        dst: prompt_len_bytes,
+        a: prompt_len_vreg,
+        b: GprOperand::Imm(2_i64),
+        op: GprOp::Shl,
+    });
 
     // Now safe to load output_tokens — prompt_len has been consumed
-    prog.emit(VmInstr::LoadPtr { dst: output_tokens_ptr, src: sym_map.resolve("output_tokens_ptr").cloned().expect("ABI: output_tokens_ptr") });
+    prog.emit(VmInstr::LoadPtr {
+        dst: output_tokens_ptr,
+        src: sym_map
+            .resolve("output_tokens_ptr")
+            .cloned()
+            .expect("ABI: output_tokens_ptr"),
+    });
 
     // input_base = input_ids_ptr (start from first token for prefill)
     // The unified loop processes tokens 0..prompt_len-2 (prefill) then
@@ -1119,7 +1227,10 @@ pub fn compile_mega_kernel_vm(
     // StoreToken writes generated tokens to input_ids[prompt_len + gen_counter],
     // so the generate phase reads them on subsequent iterations.
     let input_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: input_base, src: PtrExpr::VRegPlusConst(input_ids_ptr, 0) });
+    prog.emit(VmInstr::LoadPtr {
+        dst: input_base,
+        src: PtrExpr::VRegPlusConst(input_ids_ptr, 0),
+    });
 
     // ── Logits scratch offset: Compute buffer layout for sampling pipeline ──
     // CRITICAL: logits must be placed AFTER all intermediate tensors and RoPE cache
@@ -1132,7 +1243,8 @@ pub fn compile_mega_kernel_vm(
     let dwc_req = compute_dwc_requirement(plan, graph, alloc, rope_req.as_ref(), ple_req.as_ref())?;
 
     let logits_scratch_offset = {
-        let after_rope = rope_req.as_ref()
+        let after_rope = rope_req
+            .as_ref()
             .map(|rc| {
                 // LEGAL-PSC30: RoPE cos/sin table is always F32 (fill_cos_sin_table writes &[f32]),
                 // so *4 is correct regardless of model weight dtype.
@@ -1140,18 +1252,19 @@ pub fn compile_mega_kernel_vm(
                 rc.cache_offset + cache_bytes
             })
             .unwrap_or(alloc.total_bytes);
-        
+
         (after_rope + 63) & !63
     };
-
 
     // output_ptr: where the graph's final output tensor is written.
     // All graphs (generate and non-generate) write output to scratchpad + logits_scratch_offset.
     // For generate: sampling pipeline reads logits from there.
     // For non-generate: MeanPool/classifier result is written there; the executor reads from scratchpad.
     let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: PtrExpr::VRegPlusConst(scratchpad_ptr, logits_scratch_offset) });
-
+    prog.emit(VmInstr::LoadPtr {
+        dst: output_ptr,
+        src: PtrExpr::VRegPlusConst(scratchpad_ptr, logits_scratch_offset),
+    });
 
     // ── iteration setup: Unified prefill + generate loop ──
     // Total iterations = (prompt_len - 1) + max_new_tokens
@@ -1166,20 +1279,39 @@ pub fn compile_mega_kernel_vm(
     let max_new_tokens_vreg = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
     prog.emit(VmInstr::LoadPtr {
         dst: max_new_tokens_vreg,
-        src: sym_map.resolve("max_new_tokens").cloned().unwrap_or(PtrExpr::StackArg(64)),
+        src: sym_map
+            .resolve("max_new_tokens")
+            .cloned()
+            .unwrap_or(PtrExpr::StackArg(64)),
     });
     let one_imm = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprLoadImm { dst: one_imm, value: 1 });
+    prog.emit(VmInstr::GprLoadImm {
+        dst: one_imm,
+        value: 1,
+    });
     let prompt_minus_1 = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprBinOp { dst: prompt_minus_1, a: prompt_len_vreg, b: GprOperand::VReg(one_imm ), op: GprOp::Sub });
+    prog.emit(VmInstr::GprBinOp {
+        dst: prompt_minus_1,
+        a: prompt_len_vreg,
+        b: GprOperand::VReg(one_imm),
+        op: GprOp::Sub,
+    });
     let total_iters = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprBinOp { dst: total_iters, a: max_new_tokens_vreg, b: GprOperand::VReg(prompt_minus_1 ), op: GprOp::Add });
+    prog.emit(VmInstr::GprBinOp {
+        dst: total_iters,
+        a: max_new_tokens_vreg,
+        b: GprOperand::VReg(prompt_minus_1),
+        op: GprOp::Add,
+    });
 
     // Pre-allocate decode_counter before loop: defined outside → structurally LoopCarried.
     // Inside the loop it's recomputed as gen_counter - (prompt_len - 1) at each iteration.
     // After LoopEnd it's used for the return value (decode_counter + 1).
     let decode_counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprLoadImm { dst: decode_counter, value: 0 });
+    prog.emit(VmInstr::GprLoadImm {
+        dst: decode_counter,
+        value: 0,
+    });
 
     // ── iteration setup: Unified prefill + generate loop ──
     // 无 Argmax 的图（pool/classify/encode）: 单遍，M=prompt_len。
@@ -1192,7 +1324,10 @@ pub fn compile_mega_kernel_vm(
 
     prog.emit(VmInstr::LoopBegin {
         counter: gen_counter,
-        offsets: vec![LoopOffset { vreg: gen_byte_offset, stride: LoopStride::FixedBytes(4) }],
+        offsets: vec![LoopOffset {
+            vreg: gen_byte_offset,
+            stride: LoopStride::FixedBytes(4),
+        }],
         bound: loop_bound,
     });
 
@@ -1201,9 +1336,15 @@ pub fn compile_mega_kernel_vm(
     // 含 Argmax 的图: 当前位置的单一 token。
     let gen_input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     if topology.loop_topology == LoopTopology::GenerateLoop {
-        prog.emit(VmInstr::LoadPtr { dst: gen_input_ptr, src: PtrExpr::VRegPlusVReg(input_base, gen_byte_offset) });
+        prog.emit(VmInstr::LoadPtr {
+            dst: gen_input_ptr,
+            src: PtrExpr::VRegPlusVReg(input_base, gen_byte_offset),
+        });
     } else {
-        prog.emit(VmInstr::LoadPtr { dst: gen_input_ptr, src: PtrExpr::VRegPlusConst(input_base, 0) });
+        prog.emit(VmInstr::LoadPtr {
+            dst: gen_input_ptr,
+            src: PtrExpr::VRegPlusConst(input_base, 0),
+        });
     }
 
     // ── Loop-carried reload: Reload scratchpad_ptr from ABI stack slot ──
@@ -1214,7 +1355,10 @@ pub fn compile_mega_kernel_vm(
     let scratchpad_reloaded = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     prog.emit(VmInstr::LoadPtr {
         dst: scratchpad_reloaded,
-        src: sym_map.resolve("scratchpad_ptr").cloned().expect("ABI: scratchpad_ptr"),
+        src: sym_map
+            .resolve("scratchpad_ptr")
+            .cloned()
+            .expect("ABI: scratchpad_ptr"),
     });
     // Also reload output_ptr: always from scratchpad + logits_scratch_offset
     // (same for both generate and non-generate graphs; see output_ptr setup above).
@@ -1246,7 +1390,10 @@ pub fn compile_mega_kernel_vm(
     // (rope_req, ple_req, dwc_req already computed in logits scratch offset section above)
 
     let needs_scratch = super::vm_state::needs_scratch_for_plan(
-        alloc.total_bytes, ple_req.is_some(), dwc_req.is_some(), plan,
+        alloc.total_bytes,
+        ple_req.is_some(),
+        dwc_req.is_some(),
+        plan,
     );
 
     let mut resolver = TensorPtrResolver::build(graph, alloc, &topology);
@@ -1279,10 +1426,20 @@ pub fn compile_mega_kernel_vm(
     match topology.seq_len_source {
         super::topology::SeqLenSource::PromptLen => {
             // 无 Argmax 的图: seq_len = prompt_len
-            prog.emit(VmInstr::GprBinOp { dst: decode_seq_len, a: prompt_len_vreg, b: GprOperand::Imm(0), op: GprOp::Add });
+            prog.emit(VmInstr::GprBinOp {
+                dst: decode_seq_len,
+                a: prompt_len_vreg,
+                b: GprOperand::Imm(0),
+                op: GprOp::Add,
+            });
         }
         super::topology::SeqLenSource::LoopCounterPlusOne => {
-            prog.emit(VmInstr::GprBinOp { dst: decode_seq_len, a: gen_counter, b: GprOperand::VReg(one_imm ), op: GprOp::Add });
+            prog.emit(VmInstr::GprBinOp {
+                dst: decode_seq_len,
+                a: gen_counter,
+                b: GprOperand::VReg(one_imm),
+                op: GprOp::Add,
+            });
         }
     }
 
@@ -1293,17 +1450,28 @@ pub fn compile_mega_kernel_vm(
         // The embed gather reads this single token ID (not the full input_ids array).
         input_ptr: gen_input_ptr,
         weight_ptr: original_weight_vreg,
-        output_ptr: output_reloaded,  // Reloaded each iteration from ABI stack
-        scratch_ptr: if needs_scratch { Some(scratchpad_reloaded) } else { None },  // Reloaded each iteration
+        output_ptr: output_reloaded, // Reloaded each iteration from ABI stack
+        scratch_ptr: if needs_scratch {
+            Some(scratchpad_reloaded)
+        } else {
+            None
+        }, // Reloaded each iteration
         gen_loop_counter: Some(gen_counter),
         layer_loop_counter: None,
         layer_loop_counter_fresh: None,
-        mega_decode_seq_len: if topology.loop_topology == LoopTopology::GenerateLoop { Some(decode_seq_len) } else { None },
+        mega_decode_seq_len: if topology.loop_topology == LoopTopology::GenerateLoop {
+            Some(decode_seq_len)
+        } else {
+            None
+        },
         hook_ctx_ptr: {
             let hook_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
             prog.emit(VmInstr::LoadPtr {
                 dst: hook_ptr,
-                src: sym_map.resolve("hook_ctx_ptr").cloned().expect("ABI: hook_ctx_ptr"),
+                src: sym_map
+                    .resolve("hook_ctx_ptr")
+                    .cloned()
+                    .expect("ABI: hook_ctx_ptr"),
             });
             Some(hook_ptr)
         },
@@ -1328,7 +1496,8 @@ pub fn compile_mega_kernel_vm(
                     let elem_bytes = graph_dtype(graph).elem_bytes();
                     let vocab_bytes = vocab_size * elem_bytes;
                     let sampling_bytes = vocab_bytes * 4;
-                    let detect_off = (logits_scratch_offset + vocab_bytes + sampling_bytes + 63) & !63;
+                    let detect_off =
+                        (logits_scratch_offset + vocab_bytes + sampling_bytes + 63) & !63;
                     let off = detect_off + hdim * elem_bytes;
                     Some(off)
                 }
@@ -1342,7 +1511,10 @@ pub fn compile_mega_kernel_vm(
                 let cb_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::LoadPtr {
                     dst: cb_ptr,
-                    src: sym_map.resolve("callback_table_ptr").cloned().expect("ABI: callback_table_ptr"),
+                    src: sym_map
+                        .resolve("callback_table_ptr")
+                        .cloned()
+                        .expect("ABI: callback_table_ptr"),
                 });
                 Some(cb_ptr)
             } else {
@@ -1356,7 +1528,10 @@ pub fn compile_mega_kernel_vm(
                 let pt_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::LoadPtr {
                     dst: pt_ptr,
-                    src: sym_map.resolve("page_table_ptr").cloned().unwrap_or(PtrExpr::StackArg(136)),
+                    src: sym_map
+                        .resolve("page_table_ptr")
+                        .cloned()
+                        .unwrap_or(PtrExpr::StackArg(136)),
                 });
                 Some(pt_ptr)
             } else {
@@ -1369,7 +1544,10 @@ pub fn compile_mega_kernel_vm(
                 let header_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::LoadPtr {
                     dst: header_ptr,
-                    src: sym_map.resolve("kv_page_header_ptr").expect("ABI: kv_page_header_ptr").clone(),
+                    src: sym_map
+                        .resolve("kv_page_header_ptr")
+                        .expect("ABI: kv_page_header_ptr")
+                        .clone(),
                 });
                 Some(header_ptr)
             } else {
@@ -1384,7 +1562,10 @@ pub fn compile_mega_kernel_vm(
                 let kv_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::LoadPtr {
                     dst: kv_ptr,
-                    src: sym_map.resolve("kv_cache_ptr").cloned().unwrap_or(PtrExpr::AbiArg(2)),
+                    src: sym_map
+                        .resolve("kv_cache_ptr")
+                        .cloned()
+                        .unwrap_or(PtrExpr::AbiArg(2)),
                 });
                 Some(kv_ptr)
             } else {
@@ -1425,7 +1606,6 @@ pub fn compile_mega_kernel_vm(
         }),
     };
 
-
     let fctx = FusionEmitCtx {
         plan,
         graph,
@@ -1435,10 +1615,12 @@ pub fn compile_mega_kernel_vm(
         rope_cache_offset: rope_req.as_ref().map(|r| r.cache_offset),
         original_weight_vreg,
     };
-    _gk_oom_probe("cmke-vm-pre-fusion-groups", &format!("groups={}", plan.groups.len()), &mut prog);
-    emit_fusion_groups(
-        &fctx, &mut prog, &mut current_abi, &resolver,
-    )?;
+    _gk_oom_probe(
+        "cmke-vm-pre-fusion-groups",
+        &format!("groups={}", plan.groups.len()),
+        &mut prog,
+    );
+    emit_fusion_groups(&fctx, &mut prog, &mut current_abi, &resolver)?;
     _gk_oom_probe("cmke-vm-post-fusion-groups", "fwd-pass-done", &mut prog);
 
     // ARCH-REGALLOC-POST-FORWARD-RELOAD: Reload scratchpad_ptr from ABI stack slot
@@ -1449,7 +1631,10 @@ pub fn compile_mega_kernel_vm(
     let scratchpad_post_forward = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     prog.emit(VmInstr::LoadPtr {
         dst: scratchpad_post_forward,
-        src: sym_map.resolve("scratchpad_ptr").cloned().expect("ABI: scratchpad_ptr"),
+        src: sym_map
+            .resolve("scratchpad_ptr")
+            .cloned()
+            .expect("ABI: scratchpad_ptr"),
     });
 
     // L6 debug: embed + all layers done, before sampling pipeline
@@ -1461,26 +1646,58 @@ pub fn compile_mega_kernel_vm(
     // Head Routing 场景编译多个 MegaKernel，每个 MegaKernel 走唯一路径。
     let has_generate_loop = topology.loop_topology == LoopTopology::GenerateLoop;
 
-
     // ── .generate_path: 采样管线 ──
     // DEC-MKEMIT-001: build orchestrator ctx + regs (shared by sampling & batch paths).
     let mk = MkEmitCtx {
-        plan, graph, alloc, registry, profile, hook, buffer_layout,
-        bottleneck_map, virtual_activation, virtual_tensor_map, layout,
-        debug_jit, resource_plan: None, topology: topology.clone(),
-        vocab_size, width, sym_map: &sym_map,
-        rope_req: &rope_req, ple_req: &ple_req, dwc_req: &dwc_req,
-        logits_scratch_offset, needs_scratch,
+        plan,
+        graph,
+        alloc,
+        registry,
+        profile,
+        hook,
+        buffer_layout,
+        bottleneck_map,
+        virtual_activation,
+        virtual_tensor_map,
+        layout,
+        debug_jit,
+        resource_plan: None,
+        topology: topology.clone(),
+        vocab_size,
+        width,
+        sym_map: &sym_map,
+        rope_req: &rope_req,
+        ple_req: &ple_req,
+        dwc_req: &dwc_req,
+        logits_scratch_offset,
+        needs_scratch,
         sg_detect_scratch_offset: current_abi.sg_detect_scratch_offset,
         sg_knowledge_scratch_offset: current_abi.sg_knowledge_scratch_offset,
     };
     let regs = MkRegs {
-        input_ids_ptr, weight_ptr, scratchpad_ptr, prompt_len_vreg,
-        output_tokens_ptr, batch_ctx_ptr, prompt_len_bytes, input_base,
-        gen_counter, gen_byte_offset, max_new_tokens_vreg, one_imm,
-        prompt_minus_1, total_iters, decode_counter, scratchpad_reloaded,
-        output_reloaded, weight_reloaded, input_ids_reloaded, gen_input_ptr,
-        decode_seq_len, output_ptr, scratchpad_post_forward,
+        input_ids_ptr,
+        weight_ptr,
+        scratchpad_ptr,
+        prompt_len_vreg,
+        output_tokens_ptr,
+        batch_ctx_ptr,
+        prompt_len_bytes,
+        input_base,
+        gen_counter,
+        gen_byte_offset,
+        max_new_tokens_vreg,
+        one_imm,
+        prompt_minus_1,
+        total_iters,
+        decode_counter,
+        scratchpad_reloaded,
+        output_reloaded,
+        weight_reloaded,
+        input_ids_reloaded,
+        gen_input_ptr,
+        decode_seq_len,
+        output_ptr,
+        scratchpad_post_forward,
     };
     if has_generate_loop {
         _gk_oom_probe("cmke-vm-pre-sampling", "pre-sampling", &mut prog);
@@ -1492,7 +1709,9 @@ pub fn compile_mega_kernel_vm(
     // Const(1) 循环仅执行一次，LoopEnd 配对 LoopBegin 后 BreakLoop 返回。
     if !has_generate_loop {
         prog.emit(VmInstr::LoopEnd);
-        prog.emit(VmInstr::BreakLoop { return_value: ReturnValue::Const(0) });
+        prog.emit(VmInstr::BreakLoop {
+            return_value: ReturnValue::Const(0),
+        });
     }
 
     // ── .batch_mode_path: Batch mode entry (SPEC/20 BCI-003) ──
@@ -1509,13 +1728,19 @@ pub fn compile_mega_kernel_vm(
     prog.validate_structure()
         .map_err(|e| CompilerError::CodegenViolation(format!("mega-kernel structure: {e}")))?;
     if let Err(e) = prog.validate_type_consistency() {
-        return Err(CompilerError::CodegenViolation(format!("mega-kernel type-check: {e}")));
+        return Err(CompilerError::CodegenViolation(format!(
+            "mega-kernel type-check: {e}"
+        )));
     }
     if let Err(e) = prog.validate_width_consistency() {
-        return Err(CompilerError::CodegenViolation(format!("mega-kernel width-check: {e}")));
+        return Err(CompilerError::CodegenViolation(format!(
+            "mega-kernel width-check: {e}"
+        )));
     }
     if let Err(e) = prog.validate_value_domains() {
-        return Err(CompilerError::CodegenViolation(format!("mega-kernel value-domain: {e}")));
+        return Err(CompilerError::CodegenViolation(format!(
+            "mega-kernel value-domain: {e}"
+        )));
     }
 
     // DEBUG: dump mega-kernel VmProgram
@@ -1524,7 +1749,12 @@ pub fn compile_mega_kernel_vm(
         let _ = std::fs::create_dir_all(&dir);
         let path = format!("{}/mega_kernel_vm.txt", dir);
         if let Ok(mut f) = std::fs::File::create(&path) {
-            writeln!(f, "=== Mega-Kernel VmProgram ({} instrs) ===", prog.instrs.len()).ok();
+            writeln!(
+                f,
+                "=== Mega-Kernel VmProgram ({} instrs) ===",
+                prog.instrs.len()
+            )
+            .ok();
             for (i, instr) in prog.instrs.iter().enumerate() {
                 writeln!(f, "{:4}: {:?}", i, instr).ok();
             }
@@ -1547,8 +1777,6 @@ fn emit_sampling_pipeline(
     ctx: &LoweringContext,
     resolver: &mut TensorPtrResolver,
 ) -> Result<(), CompilerError> {
-
-
     // ── Prefill/Generate branch ──
     // During prefill (regs.gen_counter < prompt_len - 1), skip sampling and StoreToken.
     // The forward pass (embed + layers) already ran; KV cache is being populated.
@@ -1576,9 +1804,17 @@ fn emit_sampling_pipeline(
 
     // logits_ptr = regs.scratchpad_post_forward + mk.logits_scratch_offset + row_byte_offset
     let logits_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: logits_base, src: PtrExpr::VRegPlusConst(regs.scratchpad_post_forward, mk.logits_scratch_offset) });
+    prog.emit(VmInstr::LoadPtr {
+        dst: logits_base,
+        src: PtrExpr::VRegPlusConst(regs.scratchpad_post_forward, mk.logits_scratch_offset),
+    });
     let fresh_logits_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprBinOp { dst: fresh_logits_ptr, a: logits_base, b: GprOperand::VReg(row_byte_offset ), op: GprOp::Add });
+    prog.emit(VmInstr::GprBinOp {
+        dst: fresh_logits_ptr,
+        a: logits_base,
+        b: GprOperand::VReg(row_byte_offset),
+        op: GprOp::Add,
+    });
 
     // ── 采样: Argmax（temperature == 0 时）──
     const ARGMAX_LABEL: usize = 200;
@@ -1588,14 +1824,28 @@ fn emit_sampling_pipeline(
     prog.emit(VmInstr::LoadPtr {
         dst: temp_u32,
         // BCE-20260703-GPU-MEGA-KERNEL-ABI: sym_map 决定物理位置 (x86=StackArg(40), GPU=AbiArg(9))
-        src: mk.sym_map.resolve("temperature_u32").cloned().expect("ABI: temperature_u32"),
+        src: mk
+            .sym_map
+            .resolve("temperature_u32")
+            .cloned()
+            .expect("ABI: temperature_u32"),
     });
-    prog.emit(VmInstr::BranchIfGprZero { value: temp_u32, target_label: ARGMAX_LABEL });
+    prog.emit(VmInstr::BranchIfGprZero {
+        value: temp_u32,
+        target_label: ARGMAX_LABEL,
+    });
 
     // ── 采样: Stochastic（temperature > 0）──
     // TemperatureScale: logits[i] /= temperature
     let temp_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: temp_ptr, src: mk.sym_map.resolve("temperature_u32").cloned().expect("ABI: temperature_u32") });
+    prog.emit(VmInstr::LoadPtr {
+        dst: temp_ptr,
+        src: mk
+            .sym_map
+            .resolve("temperature_u32")
+            .cloned()
+            .expect("ABI: temperature_u32"),
+    });
     prog.emit(VmInstr::TemperatureScale {
         logits_ptr: fresh_logits_ptr,
         temp_ptr,
@@ -1631,10 +1881,16 @@ fn emit_sampling_pipeline(
     let indices_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     prog.emit(VmInstr::LoadPtr {
         dst: indices_ptr,
-        src: PtrExpr::VRegPlusConst(regs.scratchpad_post_forward, mk.logits_scratch_offset + vocab_bytes),
+        src: PtrExpr::VRegPlusConst(
+            regs.scratchpad_post_forward,
+            mk.logits_scratch_offset + vocab_bytes,
+        ),
     });
     let top_k_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: top_k_ptr, src: mk.sym_map.resolve("top_k").cloned().expect("ABI: top_k") });
+    prog.emit(VmInstr::LoadPtr {
+        dst: top_k_ptr,
+        src: mk.sym_map.resolve("top_k").cloned().expect("ABI: top_k"),
+    });
     prog.emit(VmInstr::SampleTopKFilter {
         probs_ptr: fresh_logits_ptr,
         indices_ptr,
@@ -1645,7 +1901,14 @@ fn emit_sampling_pipeline(
 
     // Top-P filter (if top_p > 0)
     let top_p_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: top_p_ptr, src: mk.sym_map.resolve("top_p_u32").cloned().expect("ABI: top_p_u32") });
+    prog.emit(VmInstr::LoadPtr {
+        dst: top_p_ptr,
+        src: mk
+            .sym_map
+            .resolve("top_p_u32")
+            .cloned()
+            .expect("ABI: top_p_u32"),
+    });
     prog.emit(VmInstr::SampleTopPFilter {
         probs_ptr: fresh_logits_ptr,
         p_ptr: top_p_ptr,
@@ -1658,7 +1921,10 @@ fn emit_sampling_pipeline(
     let rng_state_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     prog.emit(VmInstr::LoadPtr {
         dst: rng_state_ptr,
-        src: PtrExpr::VRegPlusConst(regs.scratchpad_post_forward, mk.logits_scratch_offset + vocab_bytes + vocab_bytes),
+        src: PtrExpr::VRegPlusConst(
+            regs.scratchpad_post_forward,
+            mk.logits_scratch_offset + vocab_bytes + vocab_bytes,
+        ),
     });
     let sampled_token = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
     prog.emit(VmInstr::SampleMultinomial {
@@ -1668,10 +1934,14 @@ fn emit_sampling_pipeline(
         vocab_bytes,
         width: mk.width,
     });
-    prog.emit(VmInstr::UnconditionalBranch { target_label: SAMPLING_DONE_LABEL });
+    prog.emit(VmInstr::UnconditionalBranch {
+        target_label: SAMPLING_DONE_LABEL,
+    });
 
     // ── 采样: Argmax 路径（T == 0）──
-    prog.emit(VmInstr::MarkLabel { label_id: ARGMAX_LABEL });
+    prog.emit(VmInstr::MarkLabel {
+        label_id: ARGMAX_LABEL,
+    });
     prog.emit(VmInstr::Argmax {
         dst: sampled_token, // reuse sampled_token for unified path
         logits_ptr: fresh_logits_ptr,
@@ -1680,11 +1950,18 @@ fn emit_sampling_pipeline(
         dtype: ctx.accum_dtype,
     });
 
-    prog.emit(VmInstr::MarkLabel { label_id: SAMPLING_DONE_LABEL });
+    prog.emit(VmInstr::MarkLabel {
+        label_id: SAMPLING_DONE_LABEL,
+    });
 
     // ── 采样: Store token ──
     // regs.decode_counter = regs.gen_counter - (prompt_len - 1) = actual generated token index
-    prog.emit(VmInstr::GprBinOp { dst: regs.decode_counter, a: regs.gen_counter, b: GprOperand::VReg(regs.prompt_minus_1 ), op: GprOp::Sub });
+    prog.emit(VmInstr::GprBinOp {
+        dst: regs.decode_counter,
+        a: regs.gen_counter,
+        b: GprOperand::VReg(regs.prompt_minus_1),
+        op: GprOp::Sub,
+    });
     prog.emit(VmInstr::StoreToken {
         token_id: sampled_token,
         output_buf: regs.output_tokens_ptr,
@@ -1696,7 +1973,11 @@ fn emit_sampling_pipeline(
     // ── 采样: MTP（Multi-Token Prediction）候选 token 生成 ──
     // Route through TraceOp::MtpDraft → auto_select pipeline (MTP-001).
     if let Some(ref mtp) = mk.topology.mtp_config {
-        let MtpKernelConfig { depth, hidden_size, vocab_size: _mtp_vocab } = *mtp;
+        let MtpKernelConfig {
+            depth,
+            hidden_size,
+            vocab_size: _mtp_vocab,
+        } = *mtp;
         let elem_bytes = ctx.accum_dtype.elem_bytes();
         // logits_producer_bytes 使用函数级 mk.vocab_size（从拓扑推导）和 MTP hidden_size
         let logits_producer_bytes = mk.vocab_size * hidden_size * elem_bytes;
@@ -1704,24 +1985,28 @@ fn emit_sampling_pipeline(
         // Resolve MTP weight base: logits producer weight offset + logits producer size
         // 拓扑驱动：从 mk.topology.logits_producer_op_idx 获取 logits producer op，
         // 替代旧代码中的 `find(|op| op.label == "lm_head")` label 约定搜索。
-        let logits_producer_idx = mk.topology.logits_producer_op_idx
-            .ok_or_else(|| CompilerError::CodegenViolation(
-                "MTP: cannot find logits producer op (no Argmax in mk.graph)".into()
-            ))?;
-        let logits_producer_op = mk.graph.ops.get(logits_producer_idx)
-            .ok_or_else(|| CompilerError::CodegenViolation(
-                "MTP: logits producer op index out of bounds".into()
-            ))?;
+        let logits_producer_idx = mk.topology.logits_producer_op_idx.ok_or_else(|| {
+            CompilerError::CodegenViolation(
+                "MTP: cannot find logits producer op (no Argmax in mk.graph)".into(),
+            )
+        })?;
+        let logits_producer_op = mk.graph.ops.get(logits_producer_idx).ok_or_else(|| {
+            CompilerError::CodegenViolation("MTP: logits producer op index out of bounds".into())
+        })?;
 
-        let logits_producer_blob_offset = logits_producer_op.inputs.get(1)
+        let logits_producer_blob_offset = logits_producer_op
+            .inputs
+            .get(1)
             .and_then(|&wid| resolver.source(wid))
             .and_then(|src| match src {
                 TensorPtrSource::Weight { offset } => Some(offset),
                 _ => None,
             })
-            .ok_or_else(|| CompilerError::CodegenViolation(
-                "MTP: cannot find logits producer weight offset in resolver".into()
-            ))?;
+            .ok_or_else(|| {
+                CompilerError::CodegenViolation(
+                    "MTP: cannot find logits producer weight offset in resolver".into(),
+                )
+            })?;
         let mtp_weights_base_offset = logits_producer_blob_offset + logits_producer_bytes;
         let mtp_weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         prog.emit(VmInstr::GprBinOp {
@@ -1734,57 +2019,77 @@ fn emit_sampling_pipeline(
         // Resolve hidden pointer (logits producer's first input)
         let (hidden_ptr_base, hidden_offset) = {
             let fn_tid = logits_producer_op.inputs[0];
-            let src = resolver.source(fn_tid)
-                .ok_or_else(|| CompilerError::CodegenViolation(
-                    "MTP: final_normed tensor source not found".into()
-                ))?;
+            let src = resolver.source(fn_tid).ok_or_else(|| {
+                CompilerError::CodegenViolation("MTP: final_normed tensor source not found".into())
+            })?;
             match src {
                 TensorPtrSource::ActivationPing => {
                     let ping = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                    let ping_off = mk.alloc.slots.iter()
+                    let ping_off = mk
+                        .alloc
+                        .slots
+                        .iter()
                         .find(|s| s.tensor_id.0 == 0xFFFF_FF00)
                         .map(|s| s.offset)
                         .unwrap_or(0);
-                    prog.emit(VmInstr::AddPtr { dst: ping, base: regs.scratchpad_reloaded, offset: ping_off });
+                    prog.emit(VmInstr::AddPtr {
+                        dst: ping,
+                        base: regs.scratchpad_reloaded,
+                        offset: ping_off,
+                    });
                     (ping, 0usize)
                 }
                 TensorPtrSource::ActivationPong => {
                     let pong = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                    let pong_off = mk.alloc.slots.iter()
+                    let pong_off = mk
+                        .alloc
+                        .slots
+                        .iter()
                         .find(|s| s.tensor_id.0 == 0xFFFF_FF01)
                         .map(|s| s.offset)
                         .unwrap_or(0);
-                    prog.emit(VmInstr::AddPtr { dst: pong, base: regs.scratchpad_reloaded, offset: pong_off });
+                    prog.emit(VmInstr::AddPtr {
+                        dst: pong,
+                        base: regs.scratchpad_reloaded,
+                        offset: pong_off,
+                    });
                     (pong, 0usize)
                 }
-                TensorPtrSource::Intermediate { offset } => {
-                    (regs.scratchpad_reloaded, offset)
-                }
+                TensorPtrSource::Intermediate { offset } => (regs.scratchpad_reloaded, offset),
                 _ => {
-                    return Err(CompilerError::CodegenViolation(
-                        format!("MTP: unexpected final_normed source: {:?}", src)
-                    ));
+                    return Err(CompilerError::CodegenViolation(format!(
+                        "MTP: unexpected final_normed source: {:?}",
+                        src
+                    )));
                 }
             }
         };
         let hidden_ptr = if hidden_offset > 0 {
             let hp = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::AddPtr { dst: hp, base: hidden_ptr_base, offset: hidden_offset });
+            prog.emit(VmInstr::AddPtr {
+                dst: hp,
+                base: hidden_ptr_base,
+                offset: hidden_offset,
+            });
             hp
         } else {
             hidden_ptr_base
         };
 
         // Route through auto_select via TraceOp::MtpDraft
-        use crate::compiler::trace::TraceOp;
         use crate::compiler::codegen::vm::auto_select::auto_lower_trace_raw;
+        use crate::compiler::trace::TraceOp;
         auto_lower_trace_raw(
             prog,
             &[
                 TraceOp::Input(0),
                 TraceOp::Input(1),
                 TraceOp::Input(2),
-                TraceOp::MtpDraft { depth, hidden_size, vocab_size: mk.vocab_size },
+                TraceOp::MtpDraft {
+                    depth,
+                    hidden_size,
+                    vocab_size: mk.vocab_size,
+                },
             ],
             &[hidden_ptr, mtp_weight_ptr, regs.output_tokens_ptr],
             mk.width,
@@ -1813,17 +2118,25 @@ fn emit_sampling_pipeline(
     });
 
     // ── SKIP_SAMPLING: prefill iterations land here (no sampling, no store) ──
-    prog.emit(VmInstr::MarkLabel { label_id: SKIP_SAMPLING_LABEL });
+    prog.emit(VmInstr::MarkLabel {
+        label_id: SKIP_SAMPLING_LABEL,
+    });
 
     // ── 生成循环结束 ──
     prog.emit(VmInstr::LoopEnd);
     // Return regs.decode_counter + 1 as generated count (regs.decode_counter is 0-indexed)
     let ret_count = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprBinOp { dst: ret_count, a: regs.decode_counter, b: GprOperand::VReg(regs.one_imm ), op: GprOp::Add });
-    prog.emit(VmInstr::BreakLoop { return_value: ReturnValue::VReg(ret_count) });
+    prog.emit(VmInstr::GprBinOp {
+        dst: ret_count,
+        a: regs.decode_counter,
+        b: GprOperand::VReg(regs.one_imm),
+        op: GprOp::Add,
+    });
+    prog.emit(VmInstr::BreakLoop {
+        return_value: ReturnValue::VReg(ret_count),
+    });
     Ok(())
 }
-
 
 /// DEC-MKEMIT-001: Batch mode path — extracted from compile_mega_kernel_vm.
 ///
@@ -1836,7 +2149,6 @@ fn emit_batch_mode_path(
     regs: &MkRegs,
     batch_label: usize,
 ) -> Result<(), CompilerError> {
-
     // ── .batch_mode_path: Batch mode entry (SPEC/20 BCI-003) ──
     // BranchIfPtrNonNull jumps here when regs.batch_ctx_ptr != NULL.
     //
@@ -1844,7 +2156,9 @@ fn emit_batch_mode_path(
     // set input_ptr to input_ids_flat_ptr from batch_ctx[16],
     // run full forward pass (embed → N layers → logits producer) with M = total_prefill_tokens,
     // then return total_prefill_tokens to signal "prefill done, Rust handles decode."
-    prog.emit(VmInstr::MarkLabel { label_id: batch_label });
+    prog.emit(VmInstr::MarkLabel {
+        label_id: batch_label,
+    });
 
     // ARCH-REGALLOC-POST-FORWARD-RELOAD: Load scratchpad_batch for batch mode.
     // When entering batch mode from prologue (BranchIfPtrNonNull), the original
@@ -1853,7 +2167,11 @@ fn emit_batch_mode_path(
     let scratchpad_batch = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     prog.emit(VmInstr::LoadPtr {
         dst: scratchpad_batch,
-        src: mk.sym_map.resolve("scratchpad_ptr").cloned().expect("ABI: scratchpad_ptr"),
+        src: mk
+            .sym_map
+            .resolve("scratchpad_ptr")
+            .cloned()
+            .expect("ABI: scratchpad_ptr"),
     });
 
     {
@@ -1893,7 +2211,9 @@ fn emit_batch_mode_path(
         // but with different GEMM tile parameters at compile time (REQ-MKO-005).
         // For MK_SERIAL (SM<70), mixed and prefill use identical tile sizes,
         // so mixed_path is simply a label alias jumping into prefill forward pass.
-        prog.emit(VmInstr::MarkLabel { label_id: MIXED_PATH_LABEL });
+        prog.emit(VmInstr::MarkLabel {
+            label_id: MIXED_PATH_LABEL,
+        });
 
         // Read num_seqs from batch_ctx + 0 (needed for per-seq metadata)
         let _batch_num_seqs = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
@@ -1914,7 +2234,10 @@ fn emit_batch_mode_path(
         // but input points to flat batch input_ids and seq_len = total_prefill_tokens.
         // output always from scratchpad + mk.logits_scratch_offset (same for generate and non-generate).
         let batch_output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        prog.emit(VmInstr::LoadPtr { dst: batch_output_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, mk.logits_scratch_offset) });
+        prog.emit(VmInstr::LoadPtr {
+            dst: batch_output_ptr,
+            src: PtrExpr::VRegPlusConst(scratchpad_batch, mk.logits_scratch_offset),
+        });
 
         // page_table_flat_ptr from batch_ctx + 40
         let batch_pt_ptr = {
@@ -1940,7 +2263,11 @@ fn emit_batch_mode_path(
                 let kv = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::LoadPtr {
                     dst: kv,
-                    src: mk.sym_map.resolve("kv_cache_ptr").cloned().unwrap_or(PtrExpr::AbiArg(2)),
+                    src: mk
+                        .sym_map
+                        .resolve("kv_cache_ptr")
+                        .cloned()
+                        .unwrap_or(PtrExpr::AbiArg(2)),
                 });
                 Some(kv)
             } else {
@@ -1954,7 +2281,11 @@ fn emit_batch_mode_path(
             let hook_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
             prog.emit(VmInstr::LoadPtr {
                 dst: hook_ptr,
-                src: mk.sym_map.resolve("hook_ctx_ptr").cloned().expect("ABI: hook_ctx_ptr"),
+                src: mk
+                    .sym_map
+                    .resolve("hook_ctx_ptr")
+                    .cloned()
+                    .expect("ABI: hook_ctx_ptr"),
             });
             Some(hook_ptr)
         };
@@ -1963,7 +2294,11 @@ fn emit_batch_mode_path(
                 let cb_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::LoadPtr {
                     dst: cb_ptr,
-                    src: mk.sym_map.resolve("callback_table_ptr").cloned().expect("ABI: callback_table_ptr"),
+                    src: mk
+                        .sym_map
+                        .resolve("callback_table_ptr")
+                        .cloned()
+                        .expect("ABI: callback_table_ptr"),
                 });
                 Some(cb_ptr)
             } else {
@@ -1975,7 +2310,11 @@ fn emit_batch_mode_path(
             input_ptr: batch_input_ptr,
             weight_ptr: Some(regs.weight_ptr),
             output_ptr: batch_output_ptr,
-            scratch_ptr: if mk.needs_scratch { Some(scratchpad_batch) } else { None },
+            scratch_ptr: if mk.needs_scratch {
+                Some(scratchpad_batch)
+            } else {
+                None
+            },
             gen_loop_counter: None, // no generate loop in prefill
             layer_loop_counter: None,
             layer_loop_counter_fresh: None,
@@ -1986,10 +2325,10 @@ fn emit_batch_mode_path(
             callback_table_ptr: batch_cb_ptr,
             page_table_ptr: batch_pt_ptr,
             kv_load_mode: mk.graph.kv_load_mode,
-        kv_page_header_ptr: None,
-        kv_cache_ptr: batch_kv_ptr,
-        activation_ping_ptr: None,
-        activation_pong_ptr: None,
+            kv_page_header_ptr: None,
+            kv_cache_ptr: batch_kv_ptr,
+            activation_ping_ptr: None,
+            activation_pong_ptr: None,
         };
 
         let mut batch_resolver = TensorPtrResolver::build(mk.graph, mk.alloc, &mk.topology);
@@ -2042,15 +2381,17 @@ fn emit_batch_mode_path(
             rope_cache_offset: mk.rope_req.as_ref().map(|r| r.cache_offset),
             original_weight_vreg: Some(regs.weight_ptr),
         };
-        emit_fusion_groups(
-            &fctx, prog, &mut batch_current_abi, &batch_resolver,
-        )?;
+        emit_fusion_groups(&fctx, prog, &mut batch_current_abi, &batch_resolver)?;
 
         // ARCH-REGALLOC-POST-FORWARD-RELOAD: Reload scratchpad_batch after
         // batch prefill emit_fusion_groups — same reason as the generate loop reload.
         prog.emit(VmInstr::LoadPtr {
             dst: scratchpad_batch,
-            src: mk.sym_map.resolve("scratchpad_ptr").cloned().expect("ABI: scratchpad_ptr"),
+            src: mk
+                .sym_map
+                .resolve("scratchpad_ptr")
+                .cloned()
+                .expect("ABI: scratchpad_ptr"),
         });
 
         // ── iteration setup post: Per-seq argmax on last token of each prompt (BCI-006) ──
@@ -2065,7 +2406,9 @@ fn emit_batch_mode_path(
         // After prefill + per-seq argmax, enter decode step loop.
         // Only emit when mk.vocab_size > 0 (has Argmax ops). Without Argmax, no decode/sampling needed.
         emit_batch_decode_step_loop(
-            mk, prog, regs,
+            mk,
+            prog,
+            regs,
             &BatchAbiRegs {
                 scratchpad_batch,
                 hook_ctx: batch_hook_ctx,
@@ -2077,12 +2420,8 @@ fn emit_batch_mode_path(
         )?;
     }
 
-
     Ok(())
 }
-
-
-
 
 /// ABI register bundle for batch decode step loop (BCE-20260630-MEGA-KERNEL-EMIT-CTX).
 /// Packs VRegIds allocated during batch setup so they cross fn boundaries without >6 params.
@@ -2123,102 +2462,244 @@ fn emit_batch_prefill_argmax(
 
         // Read num_seqs from batch_ctx+0
         let num_seqs_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        prog.emit(VmInstr::ScalarLoad { dst: num_seqs_gpr, base: regs.batch_ctx_ptr, offset: OffsetExpr::Const(0) });
+        prog.emit(VmInstr::ScalarLoad {
+            dst: num_seqs_gpr,
+            base: regs.batch_ctx_ptr,
+            offset: OffsetExpr::Const(0),
+        });
 
         // Read seq_meta_base from batch_ctx+88 (absolute pointer to per-seq array)
         let seq_meta_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        prog.emit(VmInstr::ScalarLoad { dst: seq_meta_base, base: regs.batch_ctx_ptr, offset: OffsetExpr::Const(88) });
+        prog.emit(VmInstr::ScalarLoad {
+            dst: seq_meta_base,
+            base: regs.batch_ctx_ptr,
+            offset: OffsetExpr::Const(88),
+        });
 
         // logits_base = scratchpad + mk.logits_scratch_offset
         let logits_base_arg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        prog.emit(VmInstr::LoadPtr { dst: logits_base_arg, src: PtrExpr::VRegPlusConst(scratchpad_batch, mk.logits_scratch_offset) });
+        prog.emit(VmInstr::LoadPtr {
+            dst: logits_base_arg,
+            src: PtrExpr::VRegPlusConst(scratchpad_batch, mk.logits_scratch_offset),
+        });
 
         // Read output_tokens_flat_ptr from batch_ctx+24
         let out_tokens_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        prog.emit(VmInstr::LoadPtr { dst: out_tokens_ptr, src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 24) });
+        prog.emit(VmInstr::LoadPtr {
+            dst: out_tokens_ptr,
+            src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 24),
+        });
 
         // Read sampling_params_ptr from batch_ctx+56 (for prefill temperature check)
         let sampling_params_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        prog.emit(VmInstr::LoadPtr { dst: sampling_params_ptr, src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 56) });
+        prog.emit(VmInstr::LoadPtr {
+            dst: sampling_params_ptr,
+            src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 56),
+        });
 
         // cumsum accumulator: tracks sum of prompt_lens[0..seq) across iterations
         let cumsum_acc = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        prog.emit(VmInstr::GprLoadImm { dst: cumsum_acc, value: 0 });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: cumsum_acc,
+            value: 0,
+        });
 
         let seq_stride: usize = 64;
-        prog.emit_loop(BoundExpr::DynamicVReg(num_seqs_gpr), 1, |prog, seq_ctr, _seq_off| {
-            // Read prompt_len[seq] = seq_meta_base + seq * stride + 0
-            let prompt_len_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            let seq_byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprBinOp { dst: seq_byte_off, a: seq_ctr, b: GprOperand::Imm(seq_stride as i64), op: GprOp::Mul });
-            prog.emit(VmInstr::ScalarLoad { dst: prompt_len_gpr, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(seq_byte_off)), Box::new(OffsetExpr::Const(0))) });
+        prog.emit_loop(
+            BoundExpr::DynamicVReg(num_seqs_gpr),
+            1,
+            |prog, seq_ctr, _seq_off| {
+                // Read prompt_len[seq] = seq_meta_base + seq * stride + 0
+                let prompt_len_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+                let seq_byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprBinOp {
+                    dst: seq_byte_off,
+                    a: seq_ctr,
+                    b: GprOperand::Imm(seq_stride as i64),
+                    op: GprOp::Mul,
+                });
+                prog.emit(VmInstr::ScalarLoad {
+                    dst: prompt_len_gpr,
+                    base: seq_meta_base,
+                    offset: OffsetExpr::Add(
+                        Box::new(OffsetExpr::ScalarVReg(seq_byte_off)),
+                        Box::new(OffsetExpr::Const(0)),
+                    ),
+                });
 
-            // Skip if prompt_len == 0 (pure decode, no prefill for this seq)
-            prog.emit(VmInstr::GprCondAction {
-                cond: GprCondition::CmpEq(prompt_len_gpr, 0),
-                action: GprBranchAction::Skip(0), // placeholder, patched below
-            });
-            let skip_patch = prog.instrs.len() - 1;
+                // Skip if prompt_len == 0 (pure decode, no prefill for this seq)
+                prog.emit(VmInstr::GprCondAction {
+                    cond: GprCondition::CmpEq(prompt_len_gpr, 0),
+                    action: GprBranchAction::Skip(0), // placeholder, patched below
+                });
+                let skip_patch = prog.instrs.len() - 1;
 
-            // Compute last token row index = cumsum_acc + prompt_len - 1
-            let last_row_idx = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            let pl_minus_1 = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprBinOp { dst: pl_minus_1, a: prompt_len_gpr, b: GprOperand::Imm(1), op: GprOp::Sub });
-            prog.emit(VmInstr::GprBinOp { dst: last_row_idx, a: cumsum_acc, b: GprOperand::VReg(pl_minus_1), op: GprOp::Add });
+                // Compute last token row index = cumsum_acc + prompt_len - 1
+                let last_row_idx = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+                let pl_minus_1 = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprBinOp {
+                    dst: pl_minus_1,
+                    a: prompt_len_gpr,
+                    b: GprOperand::Imm(1),
+                    op: GprOp::Sub,
+                });
+                prog.emit(VmInstr::GprBinOp {
+                    dst: last_row_idx,
+                    a: cumsum_acc,
+                    b: GprOperand::VReg(pl_minus_1),
+                    op: GprOp::Add,
+                });
 
-            // logits_ptr = logits_base + last_row_idx * vocab_bytes
-            let row_byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprBinOp { dst: row_byte_off, a: last_row_idx, b: GprOperand::Imm(vocab_bytes as i64), op: GprOp::Mul });
-            let logits_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprBinOp { dst: logits_ptr, a: logits_base_arg, b: GprOperand::VReg(row_byte_off), op: GprOp::Add });
+                // logits_ptr = logits_base + last_row_idx * vocab_bytes
+                let row_byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprBinOp {
+                    dst: row_byte_off,
+                    a: last_row_idx,
+                    b: GprOperand::Imm(vocab_bytes as i64),
+                    op: GprOp::Mul,
+                });
+                let logits_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprBinOp {
+                    dst: logits_ptr,
+                    a: logits_base_arg,
+                    b: GprOperand::VReg(row_byte_off),
+                    op: GprOp::Add,
+                });
 
-            // Argmax this row
-            let sampled = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::Argmax { dst: sampled, logits_ptr, vocab_bytes, width:  mk.width, dtype });
+                // Argmax this row
+                let sampled = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+                prog.emit(VmInstr::Argmax {
+                    dst: sampled,
+                    logits_ptr,
+                    vocab_bytes,
+                    width: mk.width,
+                    dtype,
+                });
 
-            // Write last_sampled_token[seq] at seq_meta + seq*stride + 48
-            let tok_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprBinOp { dst: tok_off, a: seq_ctr, b: GprOperand::Imm(seq_stride as i64), op: GprOp::Mul });
-            prog.emit(VmInstr::GprBinOp { dst: tok_off, a: tok_off, b: GprOperand::Imm(48), op: GprOp::Add });
-            prog.emit(VmInstr::ScalarStore { base: seq_meta_base, offset: OffsetExpr::ScalarVReg(tok_off), src: sampled });
+                // Write last_sampled_token[seq] at seq_meta + seq*stride + 48
+                let tok_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprBinOp {
+                    dst: tok_off,
+                    a: seq_ctr,
+                    b: GprOperand::Imm(seq_stride as i64),
+                    op: GprOp::Mul,
+                });
+                prog.emit(VmInstr::GprBinOp {
+                    dst: tok_off,
+                    a: tok_off,
+                    b: GprOperand::Imm(48),
+                    op: GprOp::Add,
+                });
+                prog.emit(VmInstr::ScalarStore {
+                    base: seq_meta_base,
+                    offset: OffsetExpr::ScalarVReg(tok_off),
+                    src: sampled,
+                });
 
-            // Update gen_count[seq] = 1 at offset +44
-            let one_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprLoadImm { dst: one_gpr, value: 1 });
-            let gc_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprBinOp { dst: gc_off, a: seq_ctr, b: GprOperand::Imm(seq_stride as i64), op: GprOp::Mul });
-            prog.emit(VmInstr::GprBinOp { dst: gc_off, a: gc_off, b: GprOperand::Imm(44), op: GprOp::Add });
-            prog.emit(VmInstr::ScalarStore { base: seq_meta_base, offset: OffsetExpr::ScalarVReg(gc_off), src: one_gpr });
+                // Update gen_count[seq] = 1 at offset +44
+                let one_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprLoadImm {
+                    dst: one_gpr,
+                    value: 1,
+                });
+                let gc_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprBinOp {
+                    dst: gc_off,
+                    a: seq_ctr,
+                    b: GprOperand::Imm(seq_stride as i64),
+                    op: GprOp::Mul,
+                });
+                prog.emit(VmInstr::GprBinOp {
+                    dst: gc_off,
+                    a: gc_off,
+                    b: GprOperand::Imm(44),
+                    op: GprOp::Add,
+                });
+                prog.emit(VmInstr::ScalarStore {
+                    base: seq_meta_base,
+                    offset: OffsetExpr::ScalarVReg(gc_off),
+                    src: one_gpr,
+                });
 
-            // Update seq_position[seq] = prompt_len[seq] at offset +40
-            let sp_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprBinOp { dst: sp_off, a: seq_ctr, b: GprOperand::Imm(seq_stride as i64), op: GprOp::Mul });
-            prog.emit(VmInstr::GprBinOp { dst: sp_off, a: sp_off, b: GprOperand::Imm(40), op: GprOp::Add });
-            prog.emit(VmInstr::ScalarStore { base: seq_meta_base, offset: OffsetExpr::ScalarVReg(sp_off), src: prompt_len_gpr });
+                // Update seq_position[seq] = prompt_len[seq] at offset +40
+                let sp_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprBinOp {
+                    dst: sp_off,
+                    a: seq_ctr,
+                    b: GprOperand::Imm(seq_stride as i64),
+                    op: GprOp::Mul,
+                });
+                prog.emit(VmInstr::GprBinOp {
+                    dst: sp_off,
+                    a: sp_off,
+                    b: GprOperand::Imm(40),
+                    op: GprOp::Add,
+                });
+                prog.emit(VmInstr::ScalarStore {
+                    base: seq_meta_base,
+                    offset: OffsetExpr::ScalarVReg(sp_off),
+                    src: prompt_len_gpr,
+                });
 
-            // Write first generated token to output_tokens_flat[output_offset + prompt_len]
-            // output_offset[seq] at seq_meta +52, write position = output_offset + prompt_len
-            let out_off_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            let oo_byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprBinOp { dst: oo_byte_off, a: seq_ctr, b: GprOperand::Imm(seq_stride as i64), op: GprOp::Mul });
-            prog.emit(VmInstr::ScalarLoad { dst: out_off_gpr, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(oo_byte_off)), Box::new(OffsetExpr::Const(52))) });
-            // flat_index = output_offset + prompt_len
-            let flat_idx = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprBinOp { dst: flat_idx, a: out_off_gpr, b: GprOperand::VReg(prompt_len_gpr), op: GprOp::Add });
-            // byte_offset = flat_idx * 4
-            let flat_byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprBinOp { dst: flat_byte_off, a: flat_idx, b: GprOperand::Imm(4), op: GprOp::Mul });
-            prog.emit(VmInstr::ScalarStore { base: out_tokens_ptr, offset: OffsetExpr::ScalarVReg(flat_byte_off), src: sampled });
+                // Write first generated token to output_tokens_flat[output_offset + prompt_len]
+                // output_offset[seq] at seq_meta +52, write position = output_offset + prompt_len
+                let out_off_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+                let oo_byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprBinOp {
+                    dst: oo_byte_off,
+                    a: seq_ctr,
+                    b: GprOperand::Imm(seq_stride as i64),
+                    op: GprOp::Mul,
+                });
+                prog.emit(VmInstr::ScalarLoad {
+                    dst: out_off_gpr,
+                    base: seq_meta_base,
+                    offset: OffsetExpr::Add(
+                        Box::new(OffsetExpr::ScalarVReg(oo_byte_off)),
+                        Box::new(OffsetExpr::Const(52)),
+                    ),
+                });
+                // flat_index = output_offset + prompt_len
+                let flat_idx = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprBinOp {
+                    dst: flat_idx,
+                    a: out_off_gpr,
+                    b: GprOperand::VReg(prompt_len_gpr),
+                    op: GprOp::Add,
+                });
+                // byte_offset = flat_idx * 4
+                let flat_byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprBinOp {
+                    dst: flat_byte_off,
+                    a: flat_idx,
+                    b: GprOperand::Imm(4),
+                    op: GprOp::Mul,
+                });
+                prog.emit(VmInstr::ScalarStore {
+                    base: out_tokens_ptr,
+                    offset: OffsetExpr::ScalarVReg(flat_byte_off),
+                    src: sampled,
+                });
 
-            // Update cumsum_acc += prompt_len for next iteration
-            prog.emit(VmInstr::GprBinOp { dst: cumsum_acc, a: cumsum_acc, b: GprOperand::VReg(prompt_len_gpr), op: GprOp::Add });
+                // Update cumsum_acc += prompt_len for next iteration
+                prog.emit(VmInstr::GprBinOp {
+                    dst: cumsum_acc,
+                    a: cumsum_acc,
+                    b: GprOperand::VReg(prompt_len_gpr),
+                    op: GprOp::Add,
+                });
 
-            // Patch skip target for prompt_len == 0
-            let skip_count = prog.instrs.len() - skip_patch - 1;
-            if let VmInstr::GprCondAction { action: GprBranchAction::Skip(ref mut n), .. } = prog.instrs[skip_patch] {
-                *n = skip_count;
-            }
-        });
+                // Patch skip target for prompt_len == 0
+                let skip_count = prog.instrs.len() - skip_patch - 1;
+                if let VmInstr::GprCondAction {
+                    action: GprBranchAction::Skip(ref mut n),
+                    ..
+                } = prog.instrs[skip_patch]
+                {
+                    *n = skip_count;
+                }
+            },
+        );
     } // end if mk.vocab_size > 0 (per-seq argmax)
     Ok(())
 }
@@ -2243,14 +2724,30 @@ fn emit_batch_per_seq_sampling(
     // per-seq sampling loop so the verifier sees a write (LoopCarried pattern).
     prog.emit(VmInstr::LoadPtr {
         dst: scratchpad_batch,
-        src: mk.sym_map.resolve("scratchpad_ptr").cloned().expect("ABI: scratchpad_ptr"),
+        src: mk
+            .sym_map
+            .resolve("scratchpad_ptr")
+            .cloned()
+            .expect("ABI: scratchpad_ptr"),
     });
     let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprBinOp { dst: byte_off, a: seq_ctr, b: GprOperand::Imm(stride as i64), op: GprOp::Mul });
+    prog.emit(VmInstr::GprBinOp {
+        dst: byte_off,
+        a: seq_ctr,
+        b: GprOperand::Imm(stride as i64),
+        op: GprOp::Mul,
+    });
 
     // Read active_flag[seq]
     let flag = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::ScalarLoad { dst: flag, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(36))) });
+    prog.emit(VmInstr::ScalarLoad {
+        dst: flag,
+        base: seq_meta_base,
+        offset: OffsetExpr::Add(
+            Box::new(OffsetExpr::ScalarVReg(byte_off)),
+            Box::new(OffsetExpr::Const(36)),
+        ),
+    });
 
     // If inactive, skip all argmax + stop logic
     prog.emit(VmInstr::GprCondAction {
@@ -2261,20 +2758,45 @@ fn emit_batch_per_seq_sampling(
 
     // ── Per-seq logits row: [compact_row * vocab_bytes] ──
     let row_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprBinOp { dst: row_off, a: compact_row, b: GprOperand::Imm(vb as i64), op: GprOp::Mul });
+    prog.emit(VmInstr::GprBinOp {
+        dst: row_off,
+        a: compact_row,
+        b: GprOperand::Imm(vb as i64),
+        op: GprOp::Mul,
+    });
     let logits_row_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: logits_row_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, mk.logits_scratch_offset) });
-    prog.emit(VmInstr::GprBinOp { dst: logits_row_ptr, a: logits_row_ptr, b: GprOperand::VReg(row_off), op: GprOp::Add });
+    prog.emit(VmInstr::LoadPtr {
+        dst: logits_row_ptr,
+        src: PtrExpr::VRegPlusConst(scratchpad_batch, mk.logits_scratch_offset),
+    });
+    prog.emit(VmInstr::GprBinOp {
+        dst: logits_row_ptr,
+        a: logits_row_ptr,
+        b: GprOperand::VReg(row_off),
+        op: GprOp::Add,
+    });
 
     // ── Per-seq sampling: read temperature from sampling_params_ptr + seq * 16 + 0 ──
     // sampling_params layout: [temp_f32_bits, top_k_u32, top_p_f32_bits, eos_u32] × N
     let sp_ptr_gpr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: sp_ptr_gpr, src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 56) });
+    prog.emit(VmInstr::LoadPtr {
+        dst: sp_ptr_gpr,
+        src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 56),
+    });
     let seq_sp_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprBinOp { dst: seq_sp_off, a: seq_ctr, b: GprOperand::Imm(16), op: GprOp::Mul });
+    prog.emit(VmInstr::GprBinOp {
+        dst: seq_sp_off,
+        a: seq_ctr,
+        b: GprOperand::Imm(16),
+        op: GprOp::Mul,
+    });
     // Read temperature (sp_ptr + seq_sp_off + 0)
     let temp_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::ScalarLoad { dst: temp_val, base: sp_ptr_gpr, offset: OffsetExpr::ScalarVReg(seq_sp_off) });
+    prog.emit(VmInstr::ScalarLoad {
+        dst: temp_val,
+        base: sp_ptr_gpr,
+        offset: OffsetExpr::ScalarVReg(seq_sp_off),
+    });
 
     // Branch: temperature == 0 → Argmax, temperature > 0 → stochastic
     // We use Skip-based branching: if temp != 0, skip the Argmax and go to stochastic.
@@ -2289,12 +2811,18 @@ fn emit_batch_per_seq_sampling(
     });
 
     // Argmax path (temperature == 0)
-    prog.emit(VmInstr::Argmax { dst: sampled, logits_ptr: logits_row_ptr, vocab_bytes: vb, width:  mk.width, dtype: graph_dtype(caps.mk.graph) });
+    prog.emit(VmInstr::Argmax {
+        dst: sampled,
+        logits_ptr: logits_row_ptr,
+        vocab_bytes: vb,
+        width: mk.width,
+        dtype: graph_dtype(caps.mk.graph),
+    });
 
     // After Argmax, skip the entire stochastic section
     prog.emit(VmInstr::GprCondAction {
         cond: GprCondition::IsNonNull(temp_val), // temp != 0 means we came from stochastic, skip this skip
-        action: GprBranchAction::Skip(0), // placeholder — patched below
+        action: GprBranchAction::Skip(0),        // placeholder — patched below
     });
     let stochastic_skip_patch = prog.instrs.len() - 1;
 
@@ -2302,7 +2830,11 @@ fn emit_batch_per_seq_sampling(
     // TemperatureScale: logits[i] /= temperature
     // temp_val is f32 bits — need a pointer for TemperatureScale
     let temp_store_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::AddPtr { dst: temp_store_ptr, base: sp_ptr_gpr, offset: 0 }); // point to seq's temp
+    prog.emit(VmInstr::AddPtr {
+        dst: temp_store_ptr,
+        base: sp_ptr_gpr,
+        offset: 0,
+    }); // point to seq's temp
     prog.emit(VmInstr::TemperatureScale {
         logits_ptr: logits_row_ptr,
         temp_ptr: temp_store_ptr,
@@ -2336,15 +2868,34 @@ fn emit_batch_per_seq_sampling(
     // Top-K: read top_k from sampling_params + seq_sp_off + 4
     let top_k_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
     let seq_sp_off_k = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprBinOp { dst: seq_sp_off_k, a: seq_sp_off, b: GprOperand::Imm(4), op: GprOp::Add });
-    prog.emit(VmInstr::ScalarLoad { dst: top_k_val, base: sp_ptr_gpr, offset: OffsetExpr::ScalarVReg(seq_sp_off_k) });
+    prog.emit(VmInstr::GprBinOp {
+        dst: seq_sp_off_k,
+        a: seq_sp_off,
+        b: GprOperand::Imm(4),
+        op: GprOp::Add,
+    });
+    prog.emit(VmInstr::ScalarLoad {
+        dst: top_k_val,
+        base: sp_ptr_gpr,
+        offset: OffsetExpr::ScalarVReg(seq_sp_off_k),
+    });
     // TopK filter needs a ptr to k value — store k to scratch temp, use ptr
     let k_store_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     let indices_region = mk.logits_scratch_offset + vb;
-    prog.emit(VmInstr::LoadPtr { dst: k_store_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, indices_region + vb) });
-    prog.emit(VmInstr::ScalarStore { base: scratchpad_batch, offset: OffsetExpr::Const(indices_region + vb), src: top_k_val });
+    prog.emit(VmInstr::LoadPtr {
+        dst: k_store_ptr,
+        src: PtrExpr::VRegPlusConst(scratchpad_batch, indices_region + vb),
+    });
+    prog.emit(VmInstr::ScalarStore {
+        base: scratchpad_batch,
+        offset: OffsetExpr::Const(indices_region + vb),
+        src: top_k_val,
+    });
     let indices_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: indices_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, indices_region) });
+    prog.emit(VmInstr::LoadPtr {
+        dst: indices_ptr,
+        src: PtrExpr::VRegPlusConst(scratchpad_batch, indices_region),
+    });
     prog.emit(VmInstr::SampleTopKFilter {
         probs_ptr: logits_row_ptr,
         indices_ptr,
@@ -2356,12 +2907,28 @@ fn emit_batch_per_seq_sampling(
     // Top-P: read top_p from sampling_params + seq_sp_off + 8
     let top_p_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
     let seq_sp_off_p = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprBinOp { dst: seq_sp_off_p, a: seq_sp_off, b: GprOperand::Imm(8), op: GprOp::Add });
-    prog.emit(VmInstr::ScalarLoad { dst: top_p_val, base: sp_ptr_gpr, offset: OffsetExpr::ScalarVReg(seq_sp_off_p) });
+    prog.emit(VmInstr::GprBinOp {
+        dst: seq_sp_off_p,
+        a: seq_sp_off,
+        b: GprOperand::Imm(8),
+        op: GprOp::Add,
+    });
+    prog.emit(VmInstr::ScalarLoad {
+        dst: top_p_val,
+        base: sp_ptr_gpr,
+        offset: OffsetExpr::ScalarVReg(seq_sp_off_p),
+    });
     // Store p to scratch temp, use ptr
     let p_store_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: p_store_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, indices_region + vb + 4) });
-    prog.emit(VmInstr::ScalarStore { base: scratchpad_batch, offset: OffsetExpr::Const(indices_region + vb + 4), src: top_p_val });
+    prog.emit(VmInstr::LoadPtr {
+        dst: p_store_ptr,
+        src: PtrExpr::VRegPlusConst(scratchpad_batch, indices_region + vb + 4),
+    });
+    prog.emit(VmInstr::ScalarStore {
+        base: scratchpad_batch,
+        offset: OffsetExpr::Const(indices_region + vb + 4),
+        src: top_p_val,
+    });
     prog.emit(VmInstr::SampleTopPFilter {
         probs_ptr: logits_row_ptr,
         p_ptr: p_store_ptr,
@@ -2371,7 +2938,10 @@ fn emit_batch_per_seq_sampling(
 
     // Multinomial sampling
     let rng_state_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: rng_state_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, indices_region + vb + vb) });
+    prog.emit(VmInstr::LoadPtr {
+        dst: rng_state_ptr,
+        src: PtrExpr::VRegPlusConst(scratchpad_batch, indices_region + vb + vb),
+    });
     prog.emit(VmInstr::SampleMultinomial {
         dst: sampled,
         probs_ptr: logits_row_ptr,
@@ -2383,55 +2953,140 @@ fn emit_batch_per_seq_sampling(
     // Patch stochastic_skip to jump over entire stochastic section
     let stochastic_end = prog.instrs.len();
     let stochastic_instr_count = stochastic_end - stochastic_skip_patch - 1;
-    if let VmInstr::GprCondAction { cond: _, action: GprBranchAction::Skip(ref mut n) } = prog.instrs[stochastic_skip_patch] {
+    if let VmInstr::GprCondAction {
+        cond: _,
+        action: GprBranchAction::Skip(ref mut n),
+    } = prog.instrs[stochastic_skip_patch]
+    {
         *n = stochastic_instr_count;
     }
 
     // ── Write last_sampled_token[seq] = sampled at offset +48 ──
-    prog.emit(VmInstr::ScalarStore { base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(48))), src: sampled });
+    prog.emit(VmInstr::ScalarStore {
+        base: seq_meta_base,
+        offset: OffsetExpr::Add(
+            Box::new(OffsetExpr::ScalarVReg(byte_off)),
+            Box::new(OffsetExpr::Const(48)),
+        ),
+        src: sampled,
+    });
 
     // ── Write sampled token to output_tokens_flat[output_offset + gc] ──
     // Read output_offset[seq] at offset +52
     let out_off_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::ScalarLoad { dst: out_off_val, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(52))) });
+    prog.emit(VmInstr::ScalarLoad {
+        dst: out_off_val,
+        base: seq_meta_base,
+        offset: OffsetExpr::Add(
+            Box::new(OffsetExpr::ScalarVReg(byte_off)),
+            Box::new(OffsetExpr::Const(52)),
+        ),
+    });
 
     // Read gen_count[seq] at offset +44 (BEFORE increment)
     let gc = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::ScalarLoad { dst: gc, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(44))) });
+    prog.emit(VmInstr::ScalarLoad {
+        dst: gc,
+        base: seq_meta_base,
+        offset: OffsetExpr::Add(
+            Box::new(OffsetExpr::ScalarVReg(byte_off)),
+            Box::new(OffsetExpr::Const(44)),
+        ),
+    });
 
     // flat_index = output_offset + gen_count
     let flat_idx = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprBinOp { dst: flat_idx, a: out_off_val, b: GprOperand::VReg(gc), op: GprOp::Add });
+    prog.emit(VmInstr::GprBinOp {
+        dst: flat_idx,
+        a: out_off_val,
+        b: GprOperand::VReg(gc),
+        op: GprOp::Add,
+    });
     // byte_offset = flat_index * 4
     let flat_byte = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprBinOp { dst: flat_byte, a: flat_idx, b: GprOperand::Imm(4), op: GprOp::Mul });
+    prog.emit(VmInstr::GprBinOp {
+        dst: flat_byte,
+        a: flat_idx,
+        b: GprOperand::Imm(4),
+        op: GprOp::Mul,
+    });
 
     // Read output_tokens_flat_ptr from batch_ctx+24
     let out_flat_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: out_flat_ptr, src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 24) });
-    prog.emit(VmInstr::ScalarStore { base: out_flat_ptr, offset: OffsetExpr::ScalarVReg(flat_byte), src: sampled });
+    prog.emit(VmInstr::LoadPtr {
+        dst: out_flat_ptr,
+        src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 24),
+    });
+    prog.emit(VmInstr::ScalarStore {
+        base: out_flat_ptr,
+        offset: OffsetExpr::ScalarVReg(flat_byte),
+        src: sampled,
+    });
 
     // ── Increment gen_count[seq] at offset +44 ──
     let gc_plus1 = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprBinOp { dst: gc_plus1, a: gc, b: GprOperand::Imm(1), op: GprOp::Add });
-    prog.emit(VmInstr::ScalarStore { base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(44))), src: gc_plus1 });
+    prog.emit(VmInstr::GprBinOp {
+        dst: gc_plus1,
+        a: gc,
+        b: GprOperand::Imm(1),
+        op: GprOp::Add,
+    });
+    prog.emit(VmInstr::ScalarStore {
+        base: seq_meta_base,
+        offset: OffsetExpr::Add(
+            Box::new(OffsetExpr::ScalarVReg(byte_off)),
+            Box::new(OffsetExpr::Const(44)),
+        ),
+        src: gc_plus1,
+    });
 
     // Increment seq_position[seq] at offset +40
     let sp = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::ScalarLoad { dst: sp, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(40))) });
+    prog.emit(VmInstr::ScalarLoad {
+        dst: sp,
+        base: seq_meta_base,
+        offset: OffsetExpr::Add(
+            Box::new(OffsetExpr::ScalarVReg(byte_off)),
+            Box::new(OffsetExpr::Const(40)),
+        ),
+    });
     let sp_plus1 = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprBinOp { dst: sp_plus1, a: sp, b: GprOperand::Imm(1), op: GprOp::Add });
-    prog.emit(VmInstr::ScalarStore { base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(40))), src: sp_plus1 });
+    prog.emit(VmInstr::GprBinOp {
+        dst: sp_plus1,
+        a: sp,
+        b: GprOperand::Imm(1),
+        op: GprOp::Add,
+    });
+    prog.emit(VmInstr::ScalarStore {
+        base: seq_meta_base,
+        offset: OffsetExpr::Add(
+            Box::new(OffsetExpr::ScalarVReg(byte_off)),
+            Box::new(OffsetExpr::Const(40)),
+        ),
+        src: sp_plus1,
+    });
 
     // Check stop: gen_count >= max_new_tokens OR sampled == eos
     // Read max_new_tokens[seq] at offset +12
     let max_new = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::ScalarLoad { dst: max_new, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(12))) });
+    prog.emit(VmInstr::ScalarLoad {
+        dst: max_new,
+        base: seq_meta_base,
+        offset: OffsetExpr::Add(
+            Box::new(OffsetExpr::ScalarVReg(byte_off)),
+            Box::new(OffsetExpr::Const(12)),
+        ),
+    });
 
     // Stop condition 1: max_new_tokens > 0 AND gen_count >= max_new_tokens
     // (max_new_tokens == 0 means no limit)
     let at_max = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprBinOp { dst: at_max, a: gc_plus1, b: GprOperand::VReg(max_new), op: GprOp::Sub });
+    prog.emit(VmInstr::GprBinOp {
+        dst: at_max,
+        a: gc_plus1,
+        b: GprOperand::VReg(max_new),
+        op: GprOp::Sub,
+    });
     // at_max >= 0 means gen_count >= max_new_tokens (unsigned cmp: CmpLtU would check <)
     // If max_new == 0, skip this check
     prog.emit(VmInstr::GprCondAction {
@@ -2456,18 +3111,40 @@ fn emit_batch_per_seq_sampling(
     // Stop condition 2: sampled == eos (from sampling_params_ptr + seq * 16 + 12)
     // Read sampling_params_ptr from batch_ctx+56
     let sp_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: sp_ptr, src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 56) });
+    prog.emit(VmInstr::LoadPtr {
+        dst: sp_ptr,
+        src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 56),
+    });
     // eos for seq = sp_ptr + seq * 16 + 12 (packed: temp,top_k,top_p,eos per seq)
     let seq_sp_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprBinOp { dst: seq_sp_off, a: seq_ctr, b: GprOperand::Imm(16), op: GprOp::Mul });
-    prog.emit(VmInstr::GprBinOp { dst: seq_sp_off, a: seq_sp_off, b: GprOperand::Imm(12), op: GprOp::Add });
+    prog.emit(VmInstr::GprBinOp {
+        dst: seq_sp_off,
+        a: seq_ctr,
+        b: GprOperand::Imm(16),
+        op: GprOp::Mul,
+    });
+    prog.emit(VmInstr::GprBinOp {
+        dst: seq_sp_off,
+        a: seq_sp_off,
+        b: GprOperand::Imm(12),
+        op: GprOp::Add,
+    });
     let eos_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::ScalarLoad { dst: eos_val, base: sp_ptr, offset: OffsetExpr::ScalarVReg(seq_sp_off) });
+    prog.emit(VmInstr::ScalarLoad {
+        dst: eos_val,
+        base: sp_ptr,
+        offset: OffsetExpr::ScalarVReg(seq_sp_off),
+    });
 
     // Compute eos_match = (sampled == eos_val). Use CmpEq for zero comparison.
     // sampled - eos_val == 0 means match.
     let eos_diff = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprBinOp { dst: eos_diff, a: sampled, b: GprOperand::VReg(eos_val), op: GprOp::Sub });
+    prog.emit(VmInstr::GprBinOp {
+        dst: eos_diff,
+        a: sampled,
+        b: GprOperand::VReg(eos_val),
+        op: GprOp::Sub,
+    });
 
     // Deactivate if: (max_new > 0 AND gen_count >= max_new) OR (sampled == eos)
     // We write active_flag = 0 for both conditions.
@@ -2477,7 +3154,11 @@ fn emit_batch_per_seq_sampling(
     //   Since both are u32, gc_plus1 >= max_new means no underflow → at_max >= 0.
     //   So: deactivate when NOT (gc_plus1 < max_new), i.e., when CmpLtU(gc_plus1, max_new) is false.
     // Patch the max_check placeholder: skip deactivate when gc_plus1 < max_new
-    if let VmInstr::GprCondAction { cond: GprCondition::CmpLtU(ref mut v, _), .. } = prog.instrs[max_check_patch] {
+    if let VmInstr::GprCondAction {
+        cond: GprCondition::CmpLtU(ref mut v, _),
+        ..
+    } = prog.instrs[max_check_patch]
+    {
         *v = gc_plus1;
         // Also need the immediate to be max_new. But CmpLtU takes (VRegId, u64).
         // We can't compare two VRegs with CmpLtU. Need a different approach.
@@ -2490,12 +3171,25 @@ fn emit_batch_per_seq_sampling(
     // Simpler stop: use a combined approach.
     // Zero the active_flag, then conditionally restore it if both stop conditions are false.
     let zero_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprLoadImm { dst: zero_gpr, value: 0 });
+    prog.emit(VmInstr::GprLoadImm {
+        dst: zero_gpr,
+        value: 0,
+    });
     let one_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprLoadImm { dst: one_gpr, value: 1 });
+    prog.emit(VmInstr::GprLoadImm {
+        dst: one_gpr,
+        value: 1,
+    });
 
     // Start by assuming we stop: write flag = 0
-    prog.emit(VmInstr::ScalarStore { base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(36))), src: zero_gpr });
+    prog.emit(VmInstr::ScalarStore {
+        base: seq_meta_base,
+        offset: OffsetExpr::Add(
+            Box::new(OffsetExpr::ScalarVReg(byte_off)),
+            Box::new(OffsetExpr::Const(36)),
+        ),
+        src: zero_gpr,
+    });
 
     // If should continue (gen_count < max_new AND sampled != eos), restore flag = 1.
     // Condition to continue: at_max >= 0 (gen_count < max_new when max_new > 0) AND eos_diff != 0
@@ -2527,24 +3221,40 @@ fn emit_batch_per_seq_sampling(
     // CmpLtU(at_max, 0x80000000) = true means no underflow → gen >= max → stop.
     prog.emit(VmInstr::GprCondAction {
         cond: GprCondition::CmpLtU(at_max, 0x8000_0000), // no underflow → gen >= max → stop
-        action: GprBranchAction::Skip(3), // skip eos check + restore → flag stays 0
+        action: GprBranchAction::Skip(3),                // skip eos check + restore → flag stays 0
     });
 
     // Check 2: sampled == eos → flag stays 0
     prog.emit(VmInstr::GprCondAction {
         cond: GprCondition::CmpEq(eos_diff, 0), // sampled == eos
-        action: GprBranchAction::Skip(1), // skip restore → flag stays 0
+        action: GprBranchAction::Skip(1),       // skip restore → flag stays 0
     });
 
     // Neither stop condition met → restore active_flag = 1
-    prog.emit(VmInstr::ScalarStore { base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(36))), src: one_gpr });
+    prog.emit(VmInstr::ScalarStore {
+        base: seq_meta_base,
+        offset: OffsetExpr::Add(
+            Box::new(OffsetExpr::ScalarVReg(byte_off)),
+            Box::new(OffsetExpr::Const(36)),
+        ),
+        src: one_gpr,
+    });
 
     // compact_row += 1 (only for active seqs — already past the inactive skip)
-    prog.emit(VmInstr::GprBinOp { dst: compact_row, a: compact_row, b: GprOperand::Imm(1), op: GprOp::Add });
+    prog.emit(VmInstr::GprBinOp {
+        dst: compact_row,
+        a: compact_row,
+        b: GprOperand::Imm(1),
+        op: GprOp::Add,
+    });
 
     // Patch the inactive skip count
     let skip_count = prog.instrs.len() - skip_start - 1;
-    if let VmInstr::GprCondAction { action: GprBranchAction::Skip(ref mut n), .. } = prog.instrs[skip_start] {
+    if let VmInstr::GprCondAction {
+        action: GprBranchAction::Skip(ref mut n),
+        ..
+    } = prog.instrs[skip_start]
+    {
         *n = skip_count;
     }
 }
@@ -2599,24 +3309,32 @@ fn emit_batch_decode_step_loop(
     const DECODE_ENTRY_LABEL: usize = 101;
     if mk.vocab_size > 0 {
         // ── ForwardPhaseDispatch decode entry: jump target when total_prefill_tokens == 0 (SPEC 32 REQ-MKO-001) ──
-        prog.emit(VmInstr::MarkLabel { label_id: DECODE_ENTRY_LABEL });
+        prog.emit(VmInstr::MarkLabel {
+            label_id: DECODE_ENTRY_LABEL,
+        });
         let vb = mk.vocab_size * batch_ctx.accum_dtype.elem_bytes();
         let stride: usize = 64; // SEQ_META_STRIDE
 
         // Read max_decode_steps from batch_ctx+4
         let max_steps = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        prog.emit(VmInstr::ScalarLoad { dst: max_steps, base: regs.batch_ctx_ptr, offset: OffsetExpr::Const(4) });
+        prog.emit(VmInstr::ScalarLoad {
+            dst: max_steps,
+            base: regs.batch_ctx_ptr,
+            offset: OffsetExpr::Const(4),
+        });
 
         // Decode input buffer: scratchpad region after all existing allocations.
         let decode_input_offset = {
             let sampling_end = mk.logits_scratch_offset + vb * 5;
-            let sg_end = mk.sg_detect_scratch_offset
+            let sg_end = mk
+                .sg_detect_scratch_offset
                 .map(|off| {
                     let hdim = mk.topology.sg_detect_hidden_dim.unwrap_or(0);
                     (off + hdim * batch_ctx.accum_dtype.elem_bytes() + 63) & !63
                 })
                 .unwrap_or(0);
-            let sgk_end = mk.sg_knowledge_scratch_offset
+            let sgk_end = mk
+                .sg_knowledge_scratch_offset
                 .map(|off| {
                     let hdim = mk.topology.sg_inject_hidden_dim.unwrap_or(0);
                     (off + hdim * batch_ctx.accum_dtype.elem_bytes() + 63) & !63
@@ -2626,92 +3344,191 @@ fn emit_batch_decode_step_loop(
             (base + 63) & !63
         };
         let decode_input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        prog.emit(VmInstr::AddPtr { dst: decode_input_ptr, base: scratchpad_batch, offset: decode_input_offset });
+        prog.emit(VmInstr::AddPtr {
+            dst: decode_input_ptr,
+            base: scratchpad_batch,
+            offset: decode_input_offset,
+        });
 
         // Re-read shared batch metadata (defined in per-seq argmax block above, not in scope)
         let num_seqs_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        prog.emit(VmInstr::ScalarLoad { dst: num_seqs_gpr, base: regs.batch_ctx_ptr, offset: OffsetExpr::Const(0) });
+        prog.emit(VmInstr::ScalarLoad {
+            dst: num_seqs_gpr,
+            base: regs.batch_ctx_ptr,
+            offset: OffsetExpr::Const(0),
+        });
         let seq_meta_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        prog.emit(VmInstr::ScalarLoad { dst: seq_meta_base, base: regs.batch_ctx_ptr, offset: OffsetExpr::Const(88) });
+        prog.emit(VmInstr::ScalarLoad {
+            dst: seq_meta_base,
+            base: regs.batch_ctx_ptr,
+            offset: OffsetExpr::Const(88),
+        });
 
         // Persistent GPRs across decode steps
         let num_active = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         let total_gen = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         let compact_idx = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        prog.emit(VmInstr::GprLoadImm { dst: total_gen, value: 0 });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: total_gen,
+            value: 0,
+        });
 
         // ── Outer decode step loop ──
         let step_ctr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let step_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-        prog.emit(VmInstr::LoopBegin { counter: step_ctr, offsets: vec![LoopOffset { vreg: step_off, stride: LoopStride::FixedBytes(4) }], bound: BoundExpr::DynamicVReg(max_steps) });
+        prog.emit(VmInstr::LoopBegin {
+            counter: step_ctr,
+            offsets: vec![LoopOffset {
+                vreg: step_off,
+                stride: LoopStride::FixedBytes(4),
+            }],
+            bound: BoundExpr::DynamicVReg(max_steps),
+        });
 
         // ── Step 3a: Count num_active — active_flag is 0 or 1, just accumulate ──
-        prog.emit(VmInstr::GprLoadImm { dst: num_active, value: 0 });
-        prog.emit_loop(BoundExpr::DynamicVReg(num_seqs_gpr), 1, |prog, seq_ctr, _off| {
-            let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprBinOp { dst: byte_off, a: seq_ctr, b: GprOperand::Imm(stride as i64), op: GprOp::Mul });
-            let flag = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::ScalarLoad { dst: flag, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(36))) });
-            // active_flag is 0 or 1 — just add it to num_active (no branch needed)
-            prog.emit(VmInstr::GprBinOp { dst: num_active, a: num_active, b: GprOperand::VReg(flag), op: GprOp::Add });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: num_active,
+            value: 0,
         });
+        prog.emit_loop(
+            BoundExpr::DynamicVReg(num_seqs_gpr),
+            1,
+            |prog, seq_ctr, _off| {
+                let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprBinOp {
+                    dst: byte_off,
+                    a: seq_ctr,
+                    b: GprOperand::Imm(stride as i64),
+                    op: GprOp::Mul,
+                });
+                let flag = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+                prog.emit(VmInstr::ScalarLoad {
+                    dst: flag,
+                    base: seq_meta_base,
+                    offset: OffsetExpr::Add(
+                        Box::new(OffsetExpr::ScalarVReg(byte_off)),
+                        Box::new(OffsetExpr::Const(36)),
+                    ),
+                });
+                // active_flag is 0 or 1 — just add it to num_active (no branch needed)
+                prog.emit(VmInstr::GprBinOp {
+                    dst: num_active,
+                    a: num_active,
+                    b: GprOperand::VReg(flag),
+                    op: GprOp::Add,
+                });
+            },
+        );
 
         // ── Step 3b: Break if num_active == 0 (IsNonNull → skip BreakLoop when active) ──
         prog.emit(VmInstr::GprCondAction {
             cond: GprCondition::IsNonNull(num_active),
             action: GprBranchAction::Skip(1),
         });
-        prog.emit(VmInstr::BreakLoop { return_value: ReturnValue::VReg(total_gen) });
+        prog.emit(VmInstr::BreakLoop {
+            return_value: ReturnValue::VReg(total_gen),
+        });
 
         // ── Step 3c: Build compact decode input from last_sampled_token[active seqs] ──
-        prog.emit(VmInstr::GprLoadImm { dst: compact_idx, value: 0 });
-        prog.emit_loop(BoundExpr::DynamicVReg(num_seqs_gpr), 1, |prog, seq_ctr, _off| {
-            let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprBinOp { dst: byte_off, a: seq_ctr, b: GprOperand::Imm(stride as i64), op: GprOp::Mul });
-
-            // Read active_flag[seq]
-            let flag = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::ScalarLoad { dst: flag, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(36))) });
-
-            // If inactive (flag == 0), skip the copy + increment (3 instructions)
-            prog.emit(VmInstr::GprCondAction {
-                cond: GprCondition::CmpEq(flag, 0),
-                action: GprBranchAction::Skip(3),
-            });
-            let skip_patch = prog.instrs.len() - 1;
-
-            // Read last_sampled_token[seq] at offset +48
-            let token = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::ScalarLoad { dst: token, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(48))) });
-
-            // Store to decode_input[compact_idx]
-            let dst_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprBinOp { dst: dst_off, a: compact_idx, b: GprOperand::Imm(4), op: GprOp::Mul });
-            prog.emit(VmInstr::ScalarStore { base: decode_input_ptr, offset: OffsetExpr::ScalarVReg(dst_off), src: token });
-
-            // compact_idx += 1
-            prog.emit(VmInstr::GprBinOp { dst: compact_idx, a: compact_idx, b: GprOperand::Imm(1), op: GprOp::Add });
-
-            // Patch: the Skip count should be 4 (token load + store offset + store + increment)
-            // But wait: GprCondAction is already counted. Instructions AFTER GprCondAction that
-            // should be skipped = token load(1) + dst_off(2) + store(3) + increment(4) = 4.
-            let actual_skip = prog.instrs.len() - skip_patch - 1;
-            if let VmInstr::GprCondAction { action: GprBranchAction::Skip(ref mut n), .. } = prog.instrs[skip_patch] {
-                *n = actual_skip;
-            }
+        prog.emit(VmInstr::GprLoadImm {
+            dst: compact_idx,
+            value: 0,
         });
+        prog.emit_loop(
+            BoundExpr::DynamicVReg(num_seqs_gpr),
+            1,
+            |prog, seq_ctr, _off| {
+                let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprBinOp {
+                    dst: byte_off,
+                    a: seq_ctr,
+                    b: GprOperand::Imm(stride as i64),
+                    op: GprOp::Mul,
+                });
+
+                // Read active_flag[seq]
+                let flag = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+                prog.emit(VmInstr::ScalarLoad {
+                    dst: flag,
+                    base: seq_meta_base,
+                    offset: OffsetExpr::Add(
+                        Box::new(OffsetExpr::ScalarVReg(byte_off)),
+                        Box::new(OffsetExpr::Const(36)),
+                    ),
+                });
+
+                // If inactive (flag == 0), skip the copy + increment (3 instructions)
+                prog.emit(VmInstr::GprCondAction {
+                    cond: GprCondition::CmpEq(flag, 0),
+                    action: GprBranchAction::Skip(3),
+                });
+                let skip_patch = prog.instrs.len() - 1;
+
+                // Read last_sampled_token[seq] at offset +48
+                let token = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+                prog.emit(VmInstr::ScalarLoad {
+                    dst: token,
+                    base: seq_meta_base,
+                    offset: OffsetExpr::Add(
+                        Box::new(OffsetExpr::ScalarVReg(byte_off)),
+                        Box::new(OffsetExpr::Const(48)),
+                    ),
+                });
+
+                // Store to decode_input[compact_idx]
+                let dst_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprBinOp {
+                    dst: dst_off,
+                    a: compact_idx,
+                    b: GprOperand::Imm(4),
+                    op: GprOp::Mul,
+                });
+                prog.emit(VmInstr::ScalarStore {
+                    base: decode_input_ptr,
+                    offset: OffsetExpr::ScalarVReg(dst_off),
+                    src: token,
+                });
+
+                // compact_idx += 1
+                prog.emit(VmInstr::GprBinOp {
+                    dst: compact_idx,
+                    a: compact_idx,
+                    b: GprOperand::Imm(1),
+                    op: GprOp::Add,
+                });
+
+                // Patch: the Skip count should be 4 (token load + store offset + store + increment)
+                // But wait: GprCondAction is already counted. Instructions AFTER GprCondAction that
+                // should be skipped = token load(1) + dst_off(2) + store(3) + increment(4) = 4.
+                let actual_skip = prog.instrs.len() - skip_patch - 1;
+                if let VmInstr::GprCondAction {
+                    action: GprBranchAction::Skip(ref mut n),
+                    ..
+                } = prog.instrs[skip_patch]
+                {
+                    *n = actual_skip;
+                }
+            },
+        );
 
         // ── Step 3d: Forward pass with M = num_active ──
         // Build decode AbiPtrs: same weights/scratch/output, but input = decode_input, M = num_active.
         // output always from scratchpad + mk.logits_scratch_offset.
         let decode_output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        prog.emit(VmInstr::LoadPtr { dst: decode_output_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, mk.logits_scratch_offset) });
+        prog.emit(VmInstr::LoadPtr {
+            dst: decode_output_ptr,
+            src: PtrExpr::VRegPlusConst(scratchpad_batch, mk.logits_scratch_offset),
+        });
 
         let mut decode_abi = AbiPtrs {
             input_ptr: decode_input_ptr,
             weight_ptr: Some(regs.weight_ptr),
             output_ptr: decode_output_ptr,
-            scratch_ptr: if mk.needs_scratch { Some(scratchpad_batch) } else { None },
+            scratch_ptr: if mk.needs_scratch {
+                Some(scratchpad_batch)
+            } else {
+                None
+            },
             gen_loop_counter: None,
             layer_loop_counter: None,
             layer_loop_counter_fresh: None,
@@ -2737,38 +3554,60 @@ fn emit_batch_decode_step_loop(
             rope_cache_offset: mk.rope_req.as_ref().map(|r| r.cache_offset),
             original_weight_vreg: Some(regs.weight_ptr),
         };
-        emit_fusion_groups(
-            &fctx, prog, &mut decode_abi, &batch_resolver,
-        )?;
+        emit_fusion_groups(&fctx, prog, &mut decode_abi, &batch_resolver)?;
 
         // ARCH-REGALLOC-POST-FORWARD-RELOAD: Reload scratchpad_batch after
         // batch decode emit_fusion_groups — same reason as the generate loop reload.
         prog.emit(VmInstr::LoadPtr {
             dst: scratchpad_batch,
-            src: mk.sym_map.resolve("scratchpad_ptr").cloned().expect("ABI: scratchpad_ptr"),
+            src: mk
+                .sym_map
+                .resolve("scratchpad_ptr")
+                .cloned()
+                .expect("ABI: scratchpad_ptr"),
         });
 
         // ── Step 3e: Per-seq argmax + stop condition ──
         // Logits layout: [num_active, mk.vocab_size]. Active seqs are compacted.
         // We iterate seqs again, maintaining a compact_row counter for active seqs.
         let compact_row = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        prog.emit(VmInstr::GprLoadImm { dst: compact_row, value: 0 });
-        let _sampling_caps = SeqSamplingCaps {
-            mk, regs, scratchpad_batch, seq_meta_base,
-            compact_row, num_seqs_gpr, stride, vb,
-        };
-        prog.emit_loop(BoundExpr::DynamicVReg(num_seqs_gpr), 1, |prog, seq_ctr, _off| {
-            emit_batch_per_seq_sampling(prog, seq_ctr, _off, &_sampling_caps);
+        prog.emit(VmInstr::GprLoadImm {
+            dst: compact_row,
+            value: 0,
         });
+        let _sampling_caps = SeqSamplingCaps {
+            mk,
+            regs,
+            scratchpad_batch,
+            seq_meta_base,
+            compact_row,
+            num_seqs_gpr,
+            stride,
+            vb,
+        };
+        prog.emit_loop(
+            BoundExpr::DynamicVReg(num_seqs_gpr),
+            1,
+            |prog, seq_ctr, _off| {
+                emit_batch_per_seq_sampling(prog, seq_ctr, _off, &_sampling_caps);
+            },
+        );
 
         // ── Step 3f: Increment total_gen ──
-        prog.emit(VmInstr::GprBinOp { dst: total_gen, a: total_gen, b: GprOperand::Imm(1), op: GprOp::Add });
+        prog.emit(VmInstr::GprBinOp {
+            dst: total_gen,
+            a: total_gen,
+            b: GprOperand::Imm(1),
+            op: GprOp::Add,
+        });
 
         // ── Outer decode step loop end ──
         prog.emit(VmInstr::LoopEnd);
 
         // Return total number of decode steps completed
-        prog.emit(VmInstr::BreakLoop { return_value: ReturnValue::VReg(total_gen) });
+        prog.emit(VmInstr::BreakLoop {
+            return_value: ReturnValue::VReg(total_gen),
+        });
     } // end if mk.vocab_size > 0
     Ok(())
 }
@@ -2799,7 +3638,11 @@ fn emit_mtp_candidates(
     max_new_tokens_vreg: VRegId,
     width: SimdWidth,
 ) -> Result<(), CompilerError> {
-    let MtpKernelConfig { depth, hidden_size, vocab_size: mtp_vocab } = *mtp;
+    let MtpKernelConfig {
+        depth,
+        hidden_size,
+        vocab_size: mtp_vocab,
+    } = *mtp;
     let elem_bytes = ctx.accum_dtype.elem_bytes();
     let vocab_bytes = vocab_size * elem_bytes;
     let hidden_bytes = hidden_size * elem_bytes;
@@ -2807,34 +3650,37 @@ fn emit_mtp_candidates(
 
     // Find logits producer weight blob offset to compute MTP weight start.
     // 拓扑驱动：从 logits_producer_op_idx 获取，替代 label 搜索。
-    let logits_producer_idx = logits_producer_op_idx
-        .ok_or_else(|| CompilerError::CodegenViolation(
-            "MTP: cannot find logits producer op (no Argmax in graph)".into()
-        ))?;
-    let logits_producer_op = graph.ops.get(logits_producer_idx)
-        .ok_or_else(|| CompilerError::CodegenViolation(
-            "MTP: logits producer op index out of bounds".into()
-        ))?;
+    let logits_producer_idx = logits_producer_op_idx.ok_or_else(|| {
+        CompilerError::CodegenViolation(
+            "MTP: cannot find logits producer op (no Argmax in graph)".into(),
+        )
+    })?;
+    let logits_producer_op = graph.ops.get(logits_producer_idx).ok_or_else(|| {
+        CompilerError::CodegenViolation("MTP: logits producer op index out of bounds".into())
+    })?;
 
-    let logits_producer_blob_offset = logits_producer_op.inputs.get(1)
+    let logits_producer_blob_offset = logits_producer_op
+        .inputs
+        .get(1)
         .and_then(|&wid| resolver.source(wid))
         .and_then(|src| match src {
             TensorPtrSource::Weight { offset } => Some(offset),
             _ => None,
         })
-        .ok_or_else(|| CompilerError::CodegenViolation(
-            "MTP: cannot find logits producer weight offset in resolver".into()
-        ))?;
+        .ok_or_else(|| {
+            CompilerError::CodegenViolation(
+                "MTP: cannot find logits producer weight offset in resolver".into(),
+            )
+        })?;
     let logits_producer_bytes = vocab_size * hidden_size * elem_bytes;
     let mtp_weights_base = logits_producer_blob_offset + logits_producer_bytes;
 
     // Find final_normed tensor source — logits producer's first input.
     let (hidden_ptr_base, hidden_offset) = {
         let fn_tid = logits_producer_op.inputs[0];
-        let src = resolver.source(fn_tid)
-            .ok_or_else(|| CompilerError::CodegenViolation(
-                "MTP: final_normed tensor source not found".into()
-            ))?;
+        let src = resolver.source(fn_tid).ok_or_else(|| {
+            CompilerError::CodegenViolation("MTP: final_normed tensor source not found".into())
+        })?;
         match src {
             TensorPtrSource::ActivationPing => {
                 let ping = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -2844,30 +3690,41 @@ fn emit_mtp_candidates(
                     offset: 0, // will be overridden below with actual alloc offset
                 });
                 // Find the actual ping offset from alloc sentinel slots
-                let ping_off = alloc.slots.iter()
+                let ping_off = alloc
+                    .slots
+                    .iter()
                     .find(|s| s.tensor_id.0 == 0xFFFF_FF00)
                     .map(|s| s.offset)
                     .unwrap_or(0);
                 // Re-emit with correct offset
-                prog.emit(VmInstr::AddPtr { dst: ping, base: scratchpad_ptr, offset: ping_off });
+                prog.emit(VmInstr::AddPtr {
+                    dst: ping,
+                    base: scratchpad_ptr,
+                    offset: ping_off,
+                });
                 (ping, 0usize)
             }
             TensorPtrSource::ActivationPong => {
                 let pong = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                let pong_off = alloc.slots.iter()
+                let pong_off = alloc
+                    .slots
+                    .iter()
                     .find(|s| s.tensor_id.0 == 0xFFFF_FF01)
                     .map(|s| s.offset)
                     .unwrap_or(0);
-                prog.emit(VmInstr::AddPtr { dst: pong, base: scratchpad_ptr, offset: pong_off });
+                prog.emit(VmInstr::AddPtr {
+                    dst: pong,
+                    base: scratchpad_ptr,
+                    offset: pong_off,
+                });
                 (pong, 0usize)
             }
-            TensorPtrSource::Intermediate { offset } => {
-                (scratchpad_ptr, offset)
-            }
+            TensorPtrSource::Intermediate { offset } => (scratchpad_ptr, offset),
             _ => {
-                return Err(CompilerError::CodegenViolation(
-                    format!("MTP: unexpected final_normed source: {:?}", src)
-                ));
+                return Err(CompilerError::CodegenViolation(format!(
+                    "MTP: unexpected final_normed source: {:?}",
+                    src
+                )));
             }
         }
     };
@@ -2875,7 +3732,11 @@ fn emit_mtp_candidates(
     // Compute hidden_ptr = hidden_ptr_base + hidden_offset
     let hidden_ptr = if hidden_offset > 0 {
         let hp = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        prog.emit(VmInstr::AddPtr { dst: hp, base: hidden_ptr_base, offset: hidden_offset });
+        prog.emit(VmInstr::AddPtr {
+            dst: hp,
+            base: hidden_ptr_base,
+            offset: hidden_offset,
+        });
         hp
     } else {
         hidden_ptr_base
@@ -2889,7 +3750,10 @@ fn emit_mtp_candidates(
 
     let lanes = width.f32_lanes().max(1);
     let mtp_depth_vreg = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprLoadImm { dst: mtp_depth_vreg, value: depth });
+    prog.emit(VmInstr::GprLoadImm {
+        dst: mtp_depth_vreg,
+        value: depth,
+    });
 
     // Loop over MTP depths: for k = 0..depth
     prog.emit_loop(BoundExpr::Const(depth), 1, |prog, k_ctr, _k_off| {
@@ -2897,34 +3761,58 @@ fn emit_mtp_candidates(
         // mtp_weight_ptr = weight_ptr + mtp_weights_base + k * proj_bytes
         let k_offset_in_blob = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         prog.emit(VmInstr::GprBinOp {
-            dst: k_offset_in_blob, a: k_ctr, b: GprOperand::Imm(proj_bytes as i64), op: GprOp::Mul,
+            dst: k_offset_in_blob,
+            a: k_ctr,
+            b: GprOperand::Imm(proj_bytes as i64),
+            op: GprOp::Mul,
         });
         let weight_offset_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        prog.emit(VmInstr::GprLoadImm { dst: weight_offset_val, value: mtp_weights_base });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: weight_offset_val,
+            value: mtp_weights_base,
+        });
         let total_weight_off = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         prog.emit(VmInstr::GprBinOp {
-            dst: total_weight_off, a: weight_offset_val, b: GprOperand::VReg(k_offset_in_blob), op: GprOp::Add,
+            dst: total_weight_off,
+            a: weight_offset_val,
+            b: GprOperand::VReg(k_offset_in_blob),
+            op: GprOp::Add,
         });
         let mtp_weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         prog.emit(VmInstr::GprBinOp {
-            dst: mtp_weight_ptr, a: weight_ptr, b: GprOperand::VReg(total_weight_off), op: GprOp::Add,
+            dst: mtp_weight_ptr,
+            a: weight_ptr,
+            b: GprOperand::VReg(total_weight_off),
+            op: GprOp::Add,
         });
 
         // ── Compute logits ptr for this depth ──
         // mtp_logits_ptr = scratchpad + mtp_logits_base_offset + k * vocab_bytes
         let k_vocab_off = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         prog.emit(VmInstr::GprBinOp {
-            dst: k_vocab_off, a: k_ctr, b: GprOperand::Imm(vocab_bytes as i64), op: GprOp::Mul,
+            dst: k_vocab_off,
+            a: k_ctr,
+            b: GprOperand::Imm(vocab_bytes as i64),
+            op: GprOp::Mul,
         });
         let mtp_logits_off = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        prog.emit(VmInstr::GprLoadImm { dst: mtp_logits_off, value: mtp_logits_base_offset });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: mtp_logits_off,
+            value: mtp_logits_base_offset,
+        });
         let mtp_logits_full_off = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         prog.emit(VmInstr::GprBinOp {
-            dst: mtp_logits_full_off, a: mtp_logits_off, b: GprOperand::VReg(k_vocab_off), op: GprOp::Add,
+            dst: mtp_logits_full_off,
+            a: mtp_logits_off,
+            b: GprOperand::VReg(k_vocab_off),
+            op: GprOp::Add,
         });
         let mtp_logits_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         prog.emit(VmInstr::GprBinOp {
-            dst: mtp_logits_ptr, a: scratchpad_ptr, b: GprOperand::VReg(mtp_logits_full_off), op: GprOp::Add,
+            dst: mtp_logits_ptr,
+            a: scratchpad_ptr,
+            b: GprOperand::VReg(mtp_logits_full_off),
+            op: GprOp::Add,
         });
 
         // ── GEMV: logits[v] = sum_h(hidden[h] * weight[v * hidden + h]) ──
@@ -2932,8 +3820,15 @@ fn emit_mtp_candidates(
         // Inner computation: dot product of hidden vector with weight row
         // Use vectorized approach: process hidden vector in SIMD chunks.
         emit_mtp_gemv(
-            prog, hidden_ptr, mtp_weight_ptr, mtp_logits_ptr,
-            hidden_size, vocab_size, elem_bytes, lanes, width,
+            prog,
+            hidden_ptr,
+            mtp_weight_ptr,
+            mtp_logits_ptr,
+            hidden_size,
+            vocab_size,
+            elem_bytes,
+            lanes,
+            width,
         );
 
         // ── Argmax on MTP logits ──
@@ -2950,19 +3845,31 @@ fn emit_mtp_candidates(
         // output_offset = max_new_tokens + decode_counter * depth + k
         let dc_depth = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         prog.emit(VmInstr::GprBinOp {
-            dst: dc_depth, a: decode_counter, b: GprOperand::VReg(mtp_depth_vreg), op: GprOp::Mul,
+            dst: dc_depth,
+            a: decode_counter,
+            b: GprOperand::VReg(mtp_depth_vreg),
+            op: GprOp::Mul,
         });
         let dc_depth_k = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         prog.emit(VmInstr::GprBinOp {
-            dst: dc_depth_k, a: dc_depth, b: GprOperand::VReg(k_ctr), op: GprOp::Add,
+            dst: dc_depth_k,
+            a: dc_depth,
+            b: GprOperand::VReg(k_ctr),
+            op: GprOp::Add,
         });
         let store_idx = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         prog.emit(VmInstr::GprBinOp {
-            dst: store_idx, a: max_new_tokens_vreg, b: GprOperand::VReg(dc_depth_k), op: GprOp::Add,
+            dst: store_idx,
+            a: max_new_tokens_vreg,
+            b: GprOperand::VReg(dc_depth_k),
+            op: GprOp::Add,
         });
         let store_byte_off = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         prog.emit(VmInstr::GprBinOp {
-            dst: store_byte_off, a: store_idx, b: GprOperand::Imm(4), op: GprOp::Mul,
+            dst: store_byte_off,
+            a: store_idx,
+            b: GprOperand::Imm(4),
+            op: GprOp::Mul,
         });
         prog.emit(VmInstr::ScalarStore {
             base: output_tokens_ptr,
@@ -3001,7 +3908,10 @@ fn emit_mtp_gemv(
     let v_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
     prog.emit(VmInstr::LoopBegin {
         counter: v_ctr,
-        offsets: vec![LoopOffset { vreg: v_off, stride: LoopStride::FixedBytes(hidden * elem_bytes) }],
+        offsets: vec![LoopOffset {
+            vreg: v_off,
+            stride: LoopStride::FixedBytes(hidden * elem_bytes),
+        }],
         bound: BoundExpr::Const(vocab),
     });
 
@@ -3021,7 +3931,10 @@ fn emit_mtp_gemv(
         let h_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         prog.emit(VmInstr::LoopBegin {
             counter: h_ctr,
-            offsets: vec![LoopOffset { vreg: h_off, stride: LoopStride::FixedBytes(lanes * elem_bytes) }],
+            offsets: vec![LoopOffset {
+                vreg: h_off,
+                stride: LoopStride::FixedBytes(lanes * elem_bytes),
+            }],
             bound: BoundExpr::Const(hidden_vec_iters),
         });
 
@@ -3032,21 +3945,26 @@ fn emit_mtp_gemv(
             base: input_ptr,
             offset: OffsetExpr::LoopOffset(h_off),
             width,
-            dtype, predicate: None,
+            dtype,
+            predicate: None,
         });
 
         // Load weight[v_off + h_off..v_off + h_off+lanes]
         let weight_vec = prog.alloc_vreg(VRegKind::Vec, width);
         let combined_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         prog.emit(VmInstr::GprBinOp {
-            dst: combined_off, a: v_off, b: GprOperand::VReg(h_off), op: GprOp::Add,
+            dst: combined_off,
+            a: v_off,
+            b: GprOperand::VReg(h_off),
+            op: GprOp::Add,
         });
         prog.emit(VmInstr::VecLoad {
             dst: weight_vec,
             base: weight_ptr,
             offset: OffsetExpr::ScalarVReg(combined_off),
             width,
-            dtype, predicate: None,
+            dtype,
+            predicate: None,
         });
 
         // acc += hidden_vec * weight_vec
@@ -3072,7 +3990,10 @@ fn emit_mtp_gemv(
     // Store result to output[v_ctr]
     let out_byte = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
     prog.emit(VmInstr::GprBinOp {
-        dst: out_byte, a: v_ctr, b: GprOperand::Imm(elem_bytes as i64), op: GprOp::Mul,
+        dst: out_byte,
+        a: v_ctr,
+        b: GprOperand::Imm(elem_bytes as i64),
+        op: GprOp::Mul,
     });
     prog.emit(VmInstr::ScalarStore {
         base: output_ptr,
@@ -3113,23 +4034,40 @@ pub fn emit_mtp_draft_inline(
     // Allocate scratch for logits (vocab_size elements per depth)
     // We reuse a single logits buffer across depths since each is consumed before the next.
     let logits_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::AddPtr { dst: logits_ptr, base: output_tokens_ptr, offset: 0 });
+    prog.emit(VmInstr::AddPtr {
+        dst: logits_ptr,
+        base: output_tokens_ptr,
+        offset: 0,
+    });
 
     prog.emit_loop(BoundExpr::Const(depth), 1, |prog, k_ctr, _k_off| {
         // Compute weight pointer for this depth: weight_ptr + k * proj_bytes
         let k_proj_off = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         prog.emit(VmInstr::GprBinOp {
-            dst: k_proj_off, a: k_ctr, b: GprOperand::Imm(proj_bytes as i64), op: GprOp::Mul,
+            dst: k_proj_off,
+            a: k_ctr,
+            b: GprOperand::Imm(proj_bytes as i64),
+            op: GprOp::Mul,
         });
         let depth_weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         prog.emit(VmInstr::GprBinOp {
-            dst: depth_weight_ptr, a: weight_ptr, b: GprOperand::VReg(k_proj_off), op: GprOp::Add,
+            dst: depth_weight_ptr,
+            a: weight_ptr,
+            b: GprOperand::VReg(k_proj_off),
+            op: GprOp::Add,
         });
 
         // GEMV: logits[v] = sum_h(hidden[h] * weight[v * hidden + h])
         emit_mtp_gemv(
-            prog, hidden_ptr, depth_weight_ptr, logits_ptr,
-            hidden_size, vocab_size, elem_bytes, lanes, width,
+            prog,
+            hidden_ptr,
+            depth_weight_ptr,
+            logits_ptr,
+            hidden_size,
+            vocab_size,
+            elem_bytes,
+            lanes,
+            width,
         );
 
         // Argmax on logits
@@ -3145,7 +4083,10 @@ pub fn emit_mtp_draft_inline(
         // Store candidate: output_tokens[depth_offset + k]
         let k_byte_off = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         prog.emit(VmInstr::GprBinOp {
-            dst: k_byte_off, a: k_ctr, b: GprOperand::Imm(4i64), op: GprOp::Mul,
+            dst: k_byte_off,
+            a: k_ctr,
+            b: GprOperand::Imm(4i64),
+            op: GprOp::Mul,
         });
         prog.emit(VmInstr::ScalarStore {
             base: output_tokens_ptr,
@@ -3177,12 +4118,14 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            hidden, vocab, elem_bytes, lanes, width,
+            &mut prog, input_ptr, weight_ptr, output_ptr, hidden, vocab, elem_bytes, lanes, width,
         );
 
         // Assert: loop structure must be balanced
-        assert!(prog.validate_structure().is_ok(), "emit_mtp_gemv must produce balanced loops");
+        assert!(
+            prog.validate_structure().is_ok(),
+            "emit_mtp_gemv must produce balanced loops"
+        );
     }
 
     // ── Test 2: emit_mtp_gemv emits exactly two loops (outer vocab + inner hidden) ──
@@ -3201,15 +4144,28 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            hidden, vocab, elem_bytes, lanes, width,
+            &mut prog, input_ptr, weight_ptr, output_ptr, hidden, vocab, elem_bytes, lanes, width,
         );
 
         // Assert: count LoopBegin instructions — expect 2 (outer vocab loop + inner hidden loop)
-        let loop_begin_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
-        let loop_end_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopEnd)).count();
-        assert_eq!(loop_begin_count, 2, "emit_mtp_gemv with aligned hidden should have 2 loops");
-        assert_eq!(loop_end_count, 2, "each LoopBegin must have a matching LoopEnd");
+        let loop_begin_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopBegin { .. }))
+            .count();
+        let loop_end_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopEnd))
+            .count();
+        assert_eq!(
+            loop_begin_count, 2,
+            "emit_mtp_gemv with aligned hidden should have 2 loops"
+        );
+        assert_eq!(
+            loop_end_count, 2,
+            "each LoopBegin must have a matching LoopEnd"
+        );
     }
 
     // ── Test 3: emit_mtp_gemv with non-aligned hidden (lanes > hidden) skips inner loop ──
@@ -3228,12 +4184,15 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            hidden, vocab, elem_bytes, lanes, width,
+            &mut prog, input_ptr, weight_ptr, output_ptr, hidden, vocab, elem_bytes, lanes, width,
         );
 
         // Assert: only the outer vocab loop (no inner loop since hidden_vec_iters=0)
-        let loop_begin_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
+        let loop_begin_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopBegin { .. }))
+            .count();
         assert_eq!(loop_begin_count, 1, "no inner loop when hidden < lanes");
         assert!(prog.validate_structure().is_ok());
     }
@@ -3254,16 +4213,25 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            hidden, vocab, elem_bytes, lanes, width,
+            &mut prog, input_ptr, weight_ptr, output_ptr, hidden, vocab, elem_bytes, lanes, width,
         );
 
         // Assert: outer loop step_bytes = hidden * elem_bytes = 256
         let outer_loop = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), offsets, .. } if *v == vocab => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
+            VmInstr::LoopBegin {
+                bound: BoundExpr::Const(v),
+                offsets,
+                ..
+            } if *v == vocab => offsets
+                .first()
+                .and_then(|offset| offset.stride.as_fixed_bytes()),
             _ => None,
         });
-        assert_eq!(outer_loop, Some(hidden * elem_bytes), "outer loop step must be hidden * elem_bytes");
+        assert_eq!(
+            outer_loop,
+            Some(hidden * elem_bytes),
+            "outer loop step must be hidden * elem_bytes"
+        );
     }
 
     // ── Test 5: emit_mtp_gemv contains HReduce with Sum operation ──
@@ -3277,16 +4245,31 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 64, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            64,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: at least one HReduce with Sum
-        let has_hreduce_sum = prog.instrs.iter().any(|i| matches!(
-            i,
-            VmInstr::HReduce { op: ReduceOp::Sum, .. }
-        ));
-        assert!(has_hreduce_sum, "GEMV must reduce accumulator via HReduce::Sum");
+        let has_hreduce_sum = prog.instrs.iter().any(|i| {
+            matches!(
+                i,
+                VmInstr::HReduce {
+                    op: ReduceOp::Sum,
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_hreduce_sum,
+            "GEMV must reduce accumulator via HReduce::Sum"
+        );
     }
 
     // ── Test 6: emit_mtp_gemv includes FMA for accumulation ──
@@ -3300,8 +4283,15 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 64, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            64,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: FMA is used for acc += hidden * weight
@@ -3320,16 +4310,28 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 64, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            64,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: VecLoadConst with zero values for accumulator initialization
-        let has_zero_init = prog.instrs.iter().any(|i| matches!(
-            i,
-            VmInstr::VecLoadConst { values, .. } if values.iter().all(|&v| v == 0u32)
-        ));
-        assert!(has_zero_init, "accumulator must be initialized to zero via VecLoadConst");
+        let has_zero_init = prog.instrs.iter().any(|i| {
+            matches!(
+                i,
+                VmInstr::VecLoadConst { values, .. } if values.iter().all(|&v| v == 0u32)
+            )
+        });
+        assert!(
+            has_zero_init,
+            "accumulator must be initialized to zero via VecLoadConst"
+        );
     }
 
     // ── Test 8: emit_mtp_gemv provenance — all VRegs properly declared ──
@@ -3343,12 +4345,22 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 64, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            64,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: all referenced VRegs must have been declared
-        assert!(prog.validate_provenance().is_ok(), "all VRegs must be declared before use");
+        assert!(
+            prog.validate_provenance().is_ok(),
+            "all VRegs must be declared before use"
+        );
     }
 
     // ── Test 9: emit_mtp_gemv uses F32 dtype for all vec operations ──
@@ -3362,14 +4374,23 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 64, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            64,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: all VecLoad, VecLoadConst, and FMA operations use F32 dtype
         for instr in &prog.instrs {
             match instr {
-                VmInstr::VecLoad { dtype, .. } | VmInstr::VecLoadConst { dtype, .. } | VmInstr::Fma { dtype, .. } => {
+                VmInstr::VecLoad { dtype, .. }
+                | VmInstr::VecLoadConst { dtype, .. }
+                | VmInstr::Fma { dtype, .. } => {
                     assert_eq!(*dtype, QuantPrecision::F32, "GEMV must use F32 dtype");
                 }
                 _ => {}
@@ -3388,8 +4409,15 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 64, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            64,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: at least one ScalarStore using output_ptr as base
@@ -3397,7 +4425,10 @@ mod tests {
             VmInstr::ScalarStore { base, .. } => *base == output_ptr,
             _ => false,
         });
-        assert!(has_output_store, "GEMV must store results to the output_ptr register");
+        assert!(
+            has_output_store,
+            "GEMV must store results to the output_ptr register"
+        );
     }
 
     // ── Test 11: emit_mtp_draft_inline produces valid structure with depth > 1 ──
@@ -3413,9 +4444,9 @@ mod tests {
         // Act
         let result = emit_mtp_draft_inline(
             &mut prog,
-            3,     // depth
-            64,    // hidden_size
-            128,   // vocab_size
+            3,   // depth
+            64,  // hidden_size
+            128, // vocab_size
             hidden_ptr,
             weight_ptr,
             output_tokens_ptr,
@@ -3425,7 +4456,10 @@ mod tests {
 
         // Assert
         assert!(result.is_ok());
-        assert!(prog.validate_structure().is_ok(), "MTP draft inline must produce balanced loops");
+        assert!(
+            prog.validate_structure().is_ok(),
+            "MTP draft inline must produce balanced loops"
+        );
     }
 
     // ── Test 12: emit_mtp_draft_inline with depth=1 still produces valid program ──
@@ -3440,9 +4474,9 @@ mod tests {
         // Act
         let result = emit_mtp_draft_inline(
             &mut prog,
-            1,     // depth
-            32,    // hidden_size
-            64,    // vocab_size
+            1,  // depth
+            32, // hidden_size
+            64, // vocab_size
             hidden_ptr,
             weight_ptr,
             output_tokens_ptr,
@@ -3452,8 +4486,14 @@ mod tests {
 
         // Assert
         assert!(result.is_ok());
-        let has_argmax = prog.instrs.iter().any(|i| matches!(i, VmInstr::Argmax { .. }));
-        assert!(has_argmax, "MTP draft inline must emit Argmax for each depth");
+        let has_argmax = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::Argmax { .. }));
+        assert!(
+            has_argmax,
+            "MTP draft inline must emit Argmax for each depth"
+        );
     }
 
     // ── Test 13: emit_mtp_gemv with Scalar width uses lanes=1 ──
@@ -3472,14 +4512,20 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            hidden, vocab, elem_bytes, lanes, width,
+            &mut prog, input_ptr, weight_ptr, output_ptr, hidden, vocab, elem_bytes, lanes, width,
         );
 
         // Assert: structure still valid, inner loop present (8 iters), outer loop present (4 iters)
         assert!(prog.validate_structure().is_ok());
-        let loop_begin_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
-        assert_eq!(loop_begin_count, 2, "Scalar width should still have both loops");
+        let loop_begin_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopBegin { .. }))
+            .count();
+        assert_eq!(
+            loop_begin_count, 2,
+            "Scalar width should still have both loops"
+        );
     }
 
     #[test]
@@ -3490,13 +4536,24 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            128, 256, 4, 16, SimdWidth::W512,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            128,
+            256,
+            4,
+            16,
+            SimdWidth::W512,
         );
 
         assert!(prog.validate_structure().is_ok());
         assert!(prog.validate_provenance().is_ok());
-        let loop_begin_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
+        let loop_begin_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopBegin { .. }))
+            .count();
         assert_eq!(loop_begin_count, 2);
     }
 
@@ -3508,13 +4565,23 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 1, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            1,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         assert!(prog.validate_structure().is_ok());
         let outer_bound = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), .. } if *v == 1 => Some(true),
+            VmInstr::LoopBegin {
+                bound: BoundExpr::Const(v),
+                ..
+            } if *v == 1 => Some(true),
             _ => None,
         });
         assert!(outer_bound.is_some(), "vocab=1 means outer loop bound is 1");
@@ -3531,13 +4598,25 @@ mod tests {
         let elem_bytes = 4;
 
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            hidden, 32, elem_bytes, lanes, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            hidden,
+            32,
+            elem_bytes,
+            lanes,
+            SimdWidth::W256,
         );
 
         let inner_step = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), offsets, .. }
-                if *v == hidden / lanes => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
+            VmInstr::LoopBegin {
+                bound: BoundExpr::Const(v),
+                offsets,
+                ..
+            } if *v == hidden / lanes => offsets
+                .first()
+                .and_then(|offset| offset.stride.as_fixed_bytes()),
             _ => None,
         });
         assert_eq!(inner_step, Some(lanes * elem_bytes));
@@ -3552,16 +4631,26 @@ mod tests {
         let width = SimdWidth::W128;
 
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 16, 4, 4, width,
+            &mut prog, input_ptr, weight_ptr, output_ptr, 32, 16, 4, 4, width,
         );
 
-        let acc_decl = prog.instrs.iter().filter_map(|i| match i {
-            VmInstr::DeclareVReg { id, kind: VRegKind::Vec, width: w } => Some((id, w)),
-            _ => None,
-        }).collect::<Vec<_>>();
+        let acc_decl = prog
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                VmInstr::DeclareVReg {
+                    id,
+                    kind: VRegKind::Vec,
+                    width: w,
+                } => Some((id, w)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         let has_w128_vec = acc_decl.iter().any(|(_, w)| **w == SimdWidth::W128);
-        assert!(has_w128_vec, "vec VRegs must use the same SimdWidth as the GEMV width parameter");
+        assert!(
+            has_w128_vec,
+            "vec VRegs must use the same SimdWidth as the GEMV width parameter"
+        );
     }
 
     #[test]
@@ -3586,10 +4675,24 @@ mod tests {
         assert!(result.is_ok());
         assert!(prog.validate_structure().is_ok());
         let outer_bound = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(b), offsets, .. } if *b == 0 && offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(1) => Some(true),
+            VmInstr::LoopBegin {
+                bound: BoundExpr::Const(b),
+                offsets,
+                ..
+            } if *b == 0
+                && offsets
+                    .first()
+                    .and_then(|offset| offset.stride.as_fixed_bytes())
+                    == Some(1) =>
+            {
+                Some(true)
+            }
             _ => None,
         });
-        assert!(outer_bound.is_some(), "depth=0 must emit loop with BoundExpr::Const(0)");
+        assert!(
+            outer_bound.is_some(),
+            "depth=0 must emit loop with BoundExpr::Const(0)"
+        );
     }
 
     #[test]
@@ -3613,11 +4716,18 @@ mod tests {
         );
 
         assert!(result.is_ok());
-        let store_count = prog.instrs.iter().filter(|i| match i {
-            VmInstr::ScalarStore { base, .. } if *base == output_tokens_ptr => true,
-            _ => false,
-        }).count();
-        assert!(store_count > 0, "emit_mtp_draft_inline must emit stores to output_tokens_ptr");
+        let store_count = prog
+            .instrs
+            .iter()
+            .filter(|i| match i {
+                VmInstr::ScalarStore { base, .. } if *base == output_tokens_ptr => true,
+                _ => false,
+            })
+            .count();
+        assert!(
+            store_count > 0,
+            "emit_mtp_draft_inline must emit stores to output_tokens_ptr"
+        );
     }
 
     #[test]
@@ -3640,7 +4750,10 @@ mod tests {
         );
 
         assert!(result.is_ok());
-        assert!(prog.validate_provenance().is_ok(), "all VRegs must be declared before use across all 5 depths");
+        assert!(
+            prog.validate_provenance().is_ok(),
+            "all VRegs must be declared before use across all 5 depths"
+        );
     }
 
     #[test]
@@ -3652,15 +4765,29 @@ mod tests {
         let elem_bytes = 4;
 
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 64, elem_bytes, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            64,
+            elem_bytes,
+            8,
+            SimdWidth::W256,
         );
 
         let has_mul_by_elem_bytes = prog.instrs.iter().any(|i| match i {
-            VmInstr::GprBinOp { op: GprOp::Mul, b: GprOperand::Imm(imm), .. } if *imm == elem_bytes as i64 => true,
+            VmInstr::GprBinOp {
+                op: GprOp::Mul,
+                b: GprOperand::Imm(imm),
+                ..
+            } if *imm == elem_bytes as i64 => true,
             _ => false,
         });
-        assert!(has_mul_by_elem_bytes, "output byte offset must be computed as v_ctr * elem_bytes");
+        assert!(
+            has_mul_by_elem_bytes,
+            "output byte offset must be computed as v_ctr * elem_bytes"
+        );
     }
 
     #[test]
@@ -3671,15 +4798,29 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 16, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            16,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         let uses_loop_offset = prog.instrs.iter().any(|i| match i {
-            VmInstr::VecLoad { base, offset: OffsetExpr::LoopOffset(_), .. } if *base == input_ptr => true,
+            VmInstr::VecLoad {
+                base,
+                offset: OffsetExpr::LoopOffset(_),
+                ..
+            } if *base == input_ptr => true,
             _ => false,
         });
-        assert!(uses_loop_offset, "hidden vector load must use LoopOffset for streaming access");
+        assert!(
+            uses_loop_offset,
+            "hidden vector load must use LoopOffset for streaming access"
+        );
     }
 
     #[test]
@@ -3705,11 +4846,22 @@ mod tests {
         );
 
         assert!(result.is_ok());
-        let mul_by_proj = prog.instrs.iter().filter(|i| match i {
-            VmInstr::GprBinOp { op: GprOp::Mul, b: GprOperand::Imm(imm), .. } if *imm == proj_bytes => true,
-            _ => false,
-        }).count();
-        assert!(mul_by_proj >= 1, "weight offset must use multiply by proj_bytes");
+        let mul_by_proj = prog
+            .instrs
+            .iter()
+            .filter(|i| match i {
+                VmInstr::GprBinOp {
+                    op: GprOp::Mul,
+                    b: GprOperand::Imm(imm),
+                    ..
+                } if *imm == proj_bytes => true,
+                _ => false,
+            })
+            .count();
+        assert!(
+            mul_by_proj >= 1,
+            "weight offset must use multiply by proj_bytes"
+        );
     }
 
     #[test]
@@ -3720,16 +4872,30 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 16, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            16,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         let has_combined_offset = prog.instrs.iter().any(|i| match i {
-            VmInstr::GprBinOp { a, b: GprOperand::VReg(_), op: GprOp::Add, .. }
-                if a != &input_ptr && a != &output_ptr => true,
+            VmInstr::GprBinOp {
+                a,
+                b: GprOperand::VReg(_),
+                op: GprOp::Add,
+                ..
+            } if a != &input_ptr && a != &output_ptr => true,
             _ => false,
         });
-        assert!(has_combined_offset, "weight vec load must combine v_off + h_off via Add");
+        assert!(
+            has_combined_offset,
+            "weight vec load must combine v_off + h_off via Add"
+        );
     }
 
     #[test]
@@ -3752,11 +4918,23 @@ mod tests {
         );
 
         assert!(result.is_ok());
-        let weight_add_count = prog.instrs.iter().filter(|i| match i {
-            VmInstr::GprBinOp { a, op: GprOp::Add, b: GprOperand::VReg(_), .. } if *a == weight_ptr => true,
-            _ => false,
-        }).count();
-        assert!(weight_add_count >= 1, "depth_weight_ptr must be computed as weight_ptr + offset");
+        let weight_add_count = prog
+            .instrs
+            .iter()
+            .filter(|i| match i {
+                VmInstr::GprBinOp {
+                    a,
+                    op: GprOp::Add,
+                    b: GprOperand::VReg(_),
+                    ..
+                } if *a == weight_ptr => true,
+                _ => false,
+            })
+            .count();
+        assert!(
+            weight_add_count >= 1,
+            "depth_weight_ptr must be computed as weight_ptr + offset"
+        );
     }
 
     #[test]
@@ -3767,8 +4945,15 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 64, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            64,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         assert!(
@@ -3788,16 +4973,30 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 16, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            16,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: weight VecLoad must use ScalarVReg offset (v_off + h_off combined)
         let weight_load_uses_combined = prog.instrs.iter().any(|i| match i {
-            VmInstr::VecLoad { base, offset: OffsetExpr::ScalarVReg(_), .. } if *base == weight_ptr => true,
+            VmInstr::VecLoad {
+                base,
+                offset: OffsetExpr::ScalarVReg(_),
+                ..
+            } if *base == weight_ptr => true,
             _ => false,
         });
-        assert!(weight_load_uses_combined, "weight VecLoad must use ScalarVReg offset from combined v_off+h_off");
+        assert!(
+            weight_load_uses_combined,
+            "weight VecLoad must use ScalarVReg offset from combined v_off+h_off"
+        );
     }
 
     // ── Test 28: emit_mtp_gemv with hidden exactly equal to lanes produces one inner iteration ──
@@ -3811,16 +5010,37 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            8, 32, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            8,
+            32,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: inner loop bound must be 1 (hidden_vec_iters = 8/8 = 1)
         let inner_bound = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), offsets, .. } if *v == 1 && offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(32) => Some(true),
+            VmInstr::LoopBegin {
+                bound: BoundExpr::Const(v),
+                offsets,
+                ..
+            } if *v == 1
+                && offsets
+                    .first()
+                    .and_then(|offset| offset.stride.as_fixed_bytes())
+                    == Some(32) =>
+            {
+                Some(true)
+            }
             _ => None,
         });
-        assert!(inner_bound.is_some(), "hidden=lanes => inner loop bound=1, step=lanes*elem_bytes=32");
+        assert!(
+            inner_bound.is_some(),
+            "hidden=lanes => inner loop bound=1, step=lanes*elem_bytes=32"
+        );
         assert!(prog.validate_structure().is_ok());
     }
 
@@ -3850,10 +5070,17 @@ mod tests {
         // Assert
         assert!(result.is_ok());
         let has_w128_vec = prog.instrs.iter().any(|i| match i {
-            VmInstr::DeclareVReg { kind: VRegKind::Vec, width: w, .. } if *w == SimdWidth::W128 => true,
+            VmInstr::DeclareVReg {
+                kind: VRegKind::Vec,
+                width: w,
+                ..
+            } if *w == SimdWidth::W128 => true,
             _ => false,
         });
-        assert!(has_w128_vec, "W128 width must propagate to vec register declarations");
+        assert!(
+            has_w128_vec,
+            "W128 width must propagate to vec register declarations"
+        );
     }
 
     // ── Test 30: emit_mtp_gemv with large hidden produces correct inner step_bytes ──
@@ -3867,17 +5094,33 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            256, 512, 4, 16, SimdWidth::W512,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            256,
+            512,
+            4,
+            16,
+            SimdWidth::W512,
         );
 
         // Assert: inner loop step = lanes * elem_bytes = 16 * 4 = 64
         let inner_step = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), offsets, .. }
-                if *v == 256 / 16 => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
+            VmInstr::LoopBegin {
+                bound: BoundExpr::Const(v),
+                offsets,
+                ..
+            } if *v == 256 / 16 => offsets
+                .first()
+                .and_then(|offset| offset.stride.as_fixed_bytes()),
             _ => None,
         });
-        assert_eq!(inner_step, Some(64), "inner loop step must be lanes(16) * elem_bytes(4) = 64");
+        assert_eq!(
+            inner_step,
+            Some(64),
+            "inner loop step must be lanes(16) * elem_bytes(4) = 64"
+        );
     }
 
     // ── Test 31: emit_mtp_draft_inline depth=0 still emits AddPtr for logits_ptr ──
@@ -3908,7 +5151,10 @@ mod tests {
             VmInstr::AddPtr { base, .. } if *base == output_tokens_ptr => true,
             _ => false,
         });
-        assert!(has_addptr, "logits_ptr must be set via AddPtr even when depth=0");
+        assert!(
+            has_addptr,
+            "logits_ptr must be set via AddPtr even when depth=0"
+        );
     }
 
     // ── Test 32: emit_mtp_gemv outer loop bound matches vocab size exactly ──
@@ -3923,17 +5169,37 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, vocab, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            vocab,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: outer loop bound must be exactly vocab=97
         let outer_bound = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), offsets, .. }
-                if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(32 * 4) => Some(*v),
+            VmInstr::LoopBegin {
+                bound: BoundExpr::Const(v),
+                offsets,
+                ..
+            } if offsets
+                .first()
+                .and_then(|offset| offset.stride.as_fixed_bytes())
+                == Some(32 * 4) =>
+            {
+                Some(*v)
+            }
             _ => None,
         });
-        assert_eq!(outer_bound, Some(97), "outer loop bound must equal vocab size");
+        assert_eq!(
+            outer_bound,
+            Some(97),
+            "outer loop bound must equal vocab size"
+        );
     }
 
     // ── Test 33: emit_mtp_draft_inline provenance valid with W512 and depth 3 ──
@@ -3960,8 +5226,14 @@ mod tests {
 
         // Assert
         assert!(result.is_ok());
-        assert!(prog.validate_provenance().is_ok(), "W512 depth=3 must pass provenance validation");
-        assert!(prog.validate_structure().is_ok(), "W512 depth=3 must pass structure validation");
+        assert!(
+            prog.validate_provenance().is_ok(),
+            "W512 depth=3 must pass provenance validation"
+        );
+        assert!(
+            prog.validate_structure().is_ok(),
+            "W512 depth=3 must pass structure validation"
+        );
     }
 
     // ── Test 34: emit_mtp_gemv with minimal vocab=1 stores exactly one scalar result ──
@@ -3975,16 +5247,30 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            16, 1, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            16,
+            1,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: exactly one ScalarStore to output_ptr
-        let store_count = prog.instrs.iter().filter(|i| match i {
-            VmInstr::ScalarStore { base, .. } if *base == output_ptr => true,
-            _ => false,
-        }).count();
-        assert_eq!(store_count, 1, "vocab=1 must produce exactly one output store");
+        let store_count = prog
+            .instrs
+            .iter()
+            .filter(|i| match i {
+                VmInstr::ScalarStore { base, .. } if *base == output_ptr => true,
+                _ => false,
+            })
+            .count();
+        assert_eq!(
+            store_count, 1,
+            "vocab=1 must produce exactly one output store"
+        );
     }
 
     // ── Test 35: emit_mtp_gemv emits correct GprBinOp kinds for offset math ──
@@ -3998,15 +5284,34 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 64, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            64,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: offset math must use both Add (for combining v_off + h_off) and Mul (for elem_bytes)
-        let has_add = prog.instrs.iter().any(|i| matches!(i, VmInstr::GprBinOp { op: GprOp::Add, .. }));
-        let has_mul = prog.instrs.iter().any(|i| matches!(i, VmInstr::GprBinOp { op: GprOp::Mul, .. }));
-        assert!(has_add, "GEMV offset math must include Add for pointer arithmetic");
-        assert!(has_mul, "GEMV offset math must include Mul for byte offset computation");
+        let has_add = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::GprBinOp { op: GprOp::Add, .. }));
+        let has_mul = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::GprBinOp { op: GprOp::Mul, .. }));
+        assert!(
+            has_add,
+            "GEMV offset math must include Add for pointer arithmetic"
+        );
+        assert!(
+            has_mul,
+            "GEMV offset math must include Mul for byte offset computation"
+        );
     }
 
     // ── Test 36: emit_mtp_draft_inline with large hidden and small vocab passes width validation ──
@@ -4050,8 +5355,15 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 16, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            16,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: FMA dst must equal acc (in-place accumulation)
@@ -4059,7 +5371,10 @@ mod tests {
             VmInstr::Fma { dst, acc, .. } => dst == acc,
             _ => true,
         });
-        assert!(all_fma_consistent, "FMA dst must equal acc for in-place accumulation");
+        assert!(
+            all_fma_consistent,
+            "FMA dst must equal acc for in-place accumulation"
+        );
     }
 
     // ── Test 38: emit_mtp_draft_inline depth=1 emits exactly one Argmax ──
@@ -4086,7 +5401,11 @@ mod tests {
 
         // Assert
         assert!(result.is_ok());
-        let argmax_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::Argmax { .. })).count();
+        let argmax_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::Argmax { .. }))
+            .count();
         assert_eq!(argmax_count, 1, "depth=1 must emit exactly one Argmax");
     }
 
@@ -4101,15 +5420,29 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 64, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            64,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: provenance validation confirms all VRegs declared before use
         assert!(prog.validate_provenance().is_ok());
         // Also verify explicit DeclareVReg instructions exist
-        let declare_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::DeclareVReg { .. })).count();
-        assert!(declare_count > 0, "GEMV must emit DeclareVReg for all allocated registers");
+        let declare_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::DeclareVReg { .. }))
+            .count();
+        assert!(
+            declare_count > 0,
+            "GEMV must emit DeclareVReg for all allocated registers"
+        );
     }
 
     // ── Test 40: emit_mtp_draft_inline emits at least one Argmax per depth iteration ──
@@ -4136,7 +5469,11 @@ mod tests {
 
         // Assert: the loop template contains at least one Argmax (executed per depth at runtime)
         assert!(result.is_ok());
-        let argmax_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::Argmax { .. })).count();
+        let argmax_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::Argmax { .. }))
+            .count();
         assert!(
             argmax_count >= 1,
             "depth>0 must emit at least one Argmax in the loop template (found {argmax_count})"
@@ -4189,16 +5526,30 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 16, 4, lanes, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            16,
+            4,
+            lanes,
+            SimdWidth::W256,
         );
 
         // Assert: VecLoadConst for accumulator init must have values.len() == lanes
-        let const_load = prog.instrs.iter().find(|i| matches!(i, VmInstr::VecLoadConst { .. }));
-        assert!(const_load.is_some(), "must have VecLoadConst for accumulator init");
+        let const_load = prog
+            .instrs
+            .iter()
+            .find(|i| matches!(i, VmInstr::VecLoadConst { .. }));
+        assert!(
+            const_load.is_some(),
+            "must have VecLoadConst for accumulator init"
+        );
         if let VmInstr::VecLoadConst { values, .. } = const_load.unwrap() {
             assert_eq!(
-                values.len(), lanes,
+                values.len(),
+                lanes,
                 "VecLoadConst values count must match lanes={lanes}"
             );
         }
@@ -4216,18 +5567,36 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            hidden, 8, 4, 1, SimdWidth::Scalar,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            hidden,
+            8,
+            4,
+            1,
+            SimdWidth::Scalar,
         );
 
         // Assert: inner loop bound = hidden / lanes = 16 / 1 = 16
         let inner_bound = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), offsets, .. }
-                if *v == hidden && offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(4) => Some(*v),
+            VmInstr::LoopBegin {
+                bound: BoundExpr::Const(v),
+                offsets,
+                ..
+            } if *v == hidden
+                && offsets
+                    .first()
+                    .and_then(|offset| offset.stride.as_fixed_bytes())
+                    == Some(4) =>
+            {
+                Some(*v)
+            }
             _ => None,
         });
         assert_eq!(
-            inner_bound, Some(hidden),
+            inner_bound,
+            Some(hidden),
             "Scalar width inner loop bound must equal hidden={hidden}"
         );
     }
@@ -4258,11 +5627,15 @@ mod tests {
         // Assert
         assert!(result.is_ok());
         let outer_bound = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), .. } if *v == depth => Some(*v),
+            VmInstr::LoopBegin {
+                bound: BoundExpr::Const(v),
+                ..
+            } if *v == depth => Some(*v),
             _ => None,
         });
         assert_eq!(
-            outer_bound, Some(depth),
+            outer_bound,
+            Some(depth),
             "outer loop bound must equal depth={depth}"
         );
     }
@@ -4278,8 +5651,15 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 16, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            16,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: at least one VecLoad from input_ptr and one from weight_ptr
@@ -4319,8 +5699,14 @@ mod tests {
 
         // Assert
         assert!(result.is_ok());
-        assert!(prog.validate_structure().is_ok(), "Scalar width MTP must produce balanced loops");
-        assert!(prog.validate_provenance().is_ok(), "Scalar width MTP provenance must be valid");
+        assert!(
+            prog.validate_structure().is_ok(),
+            "Scalar width MTP must produce balanced loops"
+        );
+        assert!(
+            prog.validate_provenance().is_ok(),
+            "Scalar width MTP provenance must be valid"
+        );
     }
 
     // ── Test 47: emit_mtp_gemv passes width consistency validation ──
@@ -4334,8 +5720,15 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            64, 128, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            64,
+            128,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: all vec operations use consistent SimdWidth (W256)
@@ -4386,8 +5779,15 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 16, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            16,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: HReduce src must be the same VReg as FMA dst (the accumulator)
@@ -4436,8 +5836,11 @@ mod tests {
         // Assert: Argmax must reference logits_ptr with correct vocab_bytes
         assert!(result.is_ok());
         let argmax_uses_logits = prog.instrs.iter().any(|i| match i {
-            VmInstr::Argmax { logits_ptr: lp, vocab_bytes: vb, .. }
-                if *vb == vocab_bytes => true,
+            VmInstr::Argmax {
+                logits_ptr: lp,
+                vocab_bytes: vb,
+                ..
+            } if *vb == vocab_bytes => true,
             _ => false,
         });
         assert!(
@@ -4472,7 +5875,11 @@ mod tests {
         // Assert: the depth index byte offset must be k_ctr * 4
         assert!(result.is_ok());
         let has_byte_off_mul = prog.instrs.iter().any(|i| match i {
-            VmInstr::GprBinOp { op: GprOp::Mul, b: GprOperand::Imm(4), .. } => true,
+            VmInstr::GprBinOp {
+                op: GprOp::Mul,
+                b: GprOperand::Imm(4),
+                ..
+            } => true,
             _ => false,
         });
         assert!(
@@ -4495,20 +5902,35 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            hidden, 32, elem_bytes, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            hidden,
+            32,
+            elem_bytes,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: outer loop step_bytes must be hidden * elem_bytes = 192
         let outer_step = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), offsets, .. } if *v == 32 => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
+            VmInstr::LoopBegin {
+                bound: BoundExpr::Const(v),
+                offsets,
+                ..
+            } if *v == 32 => offsets
+                .first()
+                .and_then(|offset| offset.stride.as_fixed_bytes()),
             _ => None,
         });
         assert_eq!(
             outer_step,
             Some(expected_step),
             "outer loop step_bytes must equal hidden({}) * elem_bytes({}) = {}",
-            hidden, elem_bytes, expected_step
+            hidden,
+            elem_bytes,
+            expected_step
         );
     }
 
@@ -4569,7 +5991,9 @@ mod tests {
         // Assert: Argmax vocab_bytes must be 128 (64 * 2) not 256 (64 * 4)
         assert!(result.is_ok());
         let argmax_uses_bf16_bytes = prog.instrs.iter().any(|i| match i {
-            VmInstr::Argmax { vocab_bytes: vb, .. } if *vb == bf16_vocab_bytes => true,
+            VmInstr::Argmax {
+                vocab_bytes: vb, ..
+            } if *vb == bf16_vocab_bytes => true,
             _ => false,
         });
         assert!(
@@ -4624,8 +6048,15 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            20, 32, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            20,
+            32,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: structure must still be balanced even with non-aligned hidden
@@ -4664,7 +6095,9 @@ mod tests {
         // Assert: logits_ptr must be derived from output_tokens_ptr via AddPtr(offset=0)
         assert!(result.is_ok());
         let has_logits_addptr = prog.instrs.iter().any(|i| match i {
-            VmInstr::AddPtr { base, offset: 0, .. } if *base == output_tokens_ptr => true,
+            VmInstr::AddPtr {
+                base, offset: 0, ..
+            } if *base == output_tokens_ptr => true,
             _ => false,
         });
         assert!(
@@ -4684,13 +6117,26 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            128, 256, 4, 4, SimdWidth::W128,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            128,
+            256,
+            4,
+            4,
+            SimdWidth::W128,
         );
 
         // Assert: all four validations must pass simultaneously
-        assert!(prog.validate_structure().is_ok(), "structure must be balanced");
-        assert!(prog.validate_provenance().is_ok(), "provenance must be valid");
+        assert!(
+            prog.validate_structure().is_ok(),
+            "structure must be balanced"
+        );
+        assert!(
+            prog.validate_provenance().is_ok(),
+            "provenance must be valid"
+        );
         assert!(
             prog.validate_width_consistency().is_ok(),
             "W128 width must be consistent across all vec ops"
@@ -4727,7 +6173,13 @@ mod tests {
         // Assert: the depth loop uses step_bytes=1 (emit_loop default for counter)
         assert!(result.is_ok());
         let depth_loop = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(b), offsets, .. } if *b == depth => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
+            VmInstr::LoopBegin {
+                bound: BoundExpr::Const(b),
+                offsets,
+                ..
+            } if *b == depth => offsets
+                .first()
+                .and_then(|offset| offset.stride.as_fixed_bytes()),
             _ => None,
         });
         assert_eq!(
@@ -4748,14 +6200,31 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            0, 16, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            0,
+            16,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: only 1 loop (outer vocab), no inner hidden loop
-        let loop_begin_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
-        assert_eq!(loop_begin_count, 1, "hidden=0 must produce only the outer vocab loop");
-        assert!(prog.validate_structure().is_ok(), "structure must be balanced with hidden=0");
+        let loop_begin_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopBegin { .. }))
+            .count();
+        assert_eq!(
+            loop_begin_count, 1,
+            "hidden=0 must produce only the outer vocab loop"
+        );
+        assert!(
+            prog.validate_structure().is_ok(),
+            "structure must be balanced with hidden=0"
+        );
     }
 
     // ── Test 61: emit_mtp_gemv inner loop is strictly nested inside outer loop ──
@@ -4769,8 +6238,15 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 64, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            64,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: sequence must be LoopBegin(outer), ..., LoopBegin(inner), ..., LoopEnd, ..., LoopEnd
@@ -4778,16 +6254,25 @@ mod tests {
         let mut inner_after_outer = false;
         for instr in &prog.instrs {
             match instr {
-                VmInstr::LoopBegin { bound: BoundExpr::Const(v), .. } if *v == 64 => {
+                VmInstr::LoopBegin {
+                    bound: BoundExpr::Const(v),
+                    ..
+                } if *v == 64 => {
                     outer_seen = true;
                 }
-                VmInstr::LoopBegin { bound: BoundExpr::Const(v), .. } if *v == 4 => {
+                VmInstr::LoopBegin {
+                    bound: BoundExpr::Const(v),
+                    ..
+                } if *v == 4 => {
                     inner_after_outer = outer_seen;
                 }
                 _ => {}
             }
         }
-        assert!(inner_after_outer, "inner hidden loop must appear after outer vocab loop begins");
+        assert!(
+            inner_after_outer,
+            "inner hidden loop must appear after outer vocab loop begins"
+        );
     }
 
     // ── Test 62: emit_mtp_gemv HReduce output feeds directly into ScalarStore ──
@@ -4801,22 +6286,40 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 64, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            64,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: find HReduce dst, then verify a ScalarStore uses that dst as src
         let hreduce_dst = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::HReduce { dst, op: ReduceOp::Sum, .. } => Some(*dst),
+            VmInstr::HReduce {
+                dst,
+                op: ReduceOp::Sum,
+                ..
+            } => Some(*dst),
             _ => None,
         });
         assert!(hreduce_dst.is_some(), "must have HReduce Sum");
         let hreduce_dst = hreduce_dst.unwrap();
         let store_uses_hreduce = prog.instrs.iter().any(|i| match i {
-            VmInstr::ScalarStore { src, base, .. } if *base == output_ptr && *src == hreduce_dst => true,
+            VmInstr::ScalarStore { src, base, .. }
+                if *base == output_ptr && *src == hreduce_dst =>
+            {
+                true
+            }
             _ => false,
         });
-        assert!(store_uses_hreduce, "ScalarStore must consume HReduce output directly");
+        assert!(
+            store_uses_hreduce,
+            "ScalarStore must consume HReduce output directly"
+        );
     }
 
     // ── Test 63: emit_mtp_gemv with elem_bytes=2 produces correct inner step_bytes ──
@@ -4830,24 +6333,49 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 64, 2, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            64,
+            2,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: inner loop step = lanes * elem_bytes = 8 * 2 = 16
         let inner_step = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), offsets, .. }
-                if *v == 32 / 8 => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
+            VmInstr::LoopBegin {
+                bound: BoundExpr::Const(v),
+                offsets,
+                ..
+            } if *v == 32 / 8 => offsets
+                .first()
+                .and_then(|offset| offset.stride.as_fixed_bytes()),
             _ => None,
         });
-        assert_eq!(inner_step, Some(16), "inner step must be lanes(8) * elem_bytes(2) = 16");
+        assert_eq!(
+            inner_step,
+            Some(16),
+            "inner step must be lanes(8) * elem_bytes(2) = 16"
+        );
         // Assert: outer loop step = hidden * elem_bytes = 32 * 2 = 64
         let outer_step = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), offsets, .. }
-                if *v == 64 => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
+            VmInstr::LoopBegin {
+                bound: BoundExpr::Const(v),
+                offsets,
+                ..
+            } if *v == 64 => offsets
+                .first()
+                .and_then(|offset| offset.stride.as_fixed_bytes()),
             _ => None,
         });
-        assert_eq!(outer_step, Some(64), "outer step must be hidden(32) * elem_bytes(2) = 64");
+        assert_eq!(
+            outer_step,
+            Some(64),
+            "outer step must be hidden(32) * elem_bytes(2) = 64"
+        );
     }
 
     // ── Test 64: emit_mtp_draft_inline depth=0 loop body still has Argmax and ScalarStore in template ──
@@ -4876,10 +6404,22 @@ mod tests {
 
         // Assert: loop template body contains Argmax and ScalarStore (emitted at compile time)
         assert!(result.is_ok());
-        let has_argmax = prog.instrs.iter().any(|i| matches!(i, VmInstr::Argmax { .. }));
-        let has_store = prog.instrs.iter().any(|i| matches!(i, VmInstr::ScalarStore { base, .. } if *base == output_tokens_ptr));
-        assert!(has_argmax, "loop template must contain Argmax even with depth=0");
-        assert!(has_store, "loop template must contain ScalarStore to output_tokens_ptr even with depth=0");
+        let has_argmax = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::Argmax { .. }));
+        let has_store = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::ScalarStore { base, .. } if *base == output_tokens_ptr));
+        assert!(
+            has_argmax,
+            "loop template must contain Argmax even with depth=0"
+        );
+        assert!(
+            has_store,
+            "loop template must contain ScalarStore to output_tokens_ptr even with depth=0"
+        );
     }
 
     // ── Test 65: emit_mtp_draft_inline depth=4 emits exactly one outer loop ──
@@ -4907,13 +6447,29 @@ mod tests {
 
         // Assert: one depth loop (bound=4) containing nested GEMV loops (2 per iteration)
         assert!(result.is_ok());
-        let depth_loop_count = prog.instrs.iter().filter(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(b), offsets, .. }
-                if *b == depth
-                    && offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(1) => true,
-            _ => false,
-        }).count();
-        assert_eq!(depth_loop_count, 1, "must have exactly one depth loop with bound=depth and step=1");
+        let depth_loop_count = prog
+            .instrs
+            .iter()
+            .filter(|i| match i {
+                VmInstr::LoopBegin {
+                    bound: BoundExpr::Const(b),
+                    offsets,
+                    ..
+                } if *b == depth
+                    && offsets
+                        .first()
+                        .and_then(|offset| offset.stride.as_fixed_bytes())
+                        == Some(1) =>
+                {
+                    true
+                }
+                _ => false,
+            })
+            .count();
+        assert_eq!(
+            depth_loop_count, 1,
+            "must have exactly one depth loop with bound=depth and step=1"
+        );
     }
 
     // ── Test 66: emit_mtp_gemv with Scalar width and hidden=0 still emits VecLoadConst and HReduce ──
@@ -4927,14 +6483,30 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            0, 4, 4, 1, SimdWidth::Scalar,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            0,
+            4,
+            4,
+            1,
+            SimdWidth::Scalar,
         );
 
         // Assert: accumulator init (VecLoadConst) and HReduce still emitted even with hidden=0
-        let has_acc_init = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecLoadConst { .. }));
-        let has_hreduce = prog.instrs.iter().any(|i| matches!(i, VmInstr::HReduce { .. }));
-        assert!(has_acc_init, "accumulator init must be emitted even with hidden=0");
+        let has_acc_init = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecLoadConst { .. }));
+        let has_hreduce = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::HReduce { .. }));
+        assert!(
+            has_acc_init,
+            "accumulator init must be emitted even with hidden=0"
+        );
         assert!(has_hreduce, "HReduce must be emitted even with hidden=0");
         assert!(prog.validate_provenance().is_ok());
     }
@@ -4964,8 +6536,11 @@ mod tests {
         // Assert: ScalarStore in depth loop must use OffsetExpr::ScalarVReg for byte offset
         assert!(result.is_ok());
         let has_vreg_offset_store = prog.instrs.iter().any(|i| match i {
-            VmInstr::ScalarStore { base, offset: OffsetExpr::ScalarVReg(_), .. }
-                if *base == output_tokens_ptr => true,
+            VmInstr::ScalarStore {
+                base,
+                offset: OffsetExpr::ScalarVReg(_),
+                ..
+            } if *base == output_tokens_ptr => true,
             _ => false,
         });
         assert!(
@@ -4998,15 +6573,27 @@ mod tests {
 
         // Assert: core validations must pass with non-power-of-2 vocab
         assert!(result.is_ok());
-        assert!(prog.validate_structure().is_ok(), "structure must be balanced with vocab=48");
-        assert!(prog.validate_provenance().is_ok(), "provenance must be valid with vocab=48");
-        assert!(prog.validate_width_consistency().is_ok(), "width must be consistent with vocab=48");
+        assert!(
+            prog.validate_structure().is_ok(),
+            "structure must be balanced with vocab=48"
+        );
+        assert!(
+            prog.validate_provenance().is_ok(),
+            "provenance must be valid with vocab=48"
+        );
+        assert!(
+            prog.validate_width_consistency().is_ok(),
+            "width must be consistent with vocab=48"
+        );
         // Verify Argmax vocab_bytes = 48 * 4 = 192 (not rounded to power-of-2)
         let argmax_uses_exact_vocab = prog.instrs.iter().any(|i| match i {
             VmInstr::Argmax { vocab_bytes, .. } if *vocab_bytes == 48 * 4 => true,
             _ => false,
         });
-        assert!(argmax_uses_exact_vocab, "Argmax must use vocab_bytes=192 (48*4), not rounded up");
+        assert!(
+            argmax_uses_exact_vocab,
+            "Argmax must use vocab_bytes=192 (48*4), not rounded up"
+        );
     }
 
     // ── Test 69: emit_mtp_gemv with W128 produces exactly W128-width VecLoadConst ──
@@ -5020,16 +6607,36 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 64, 4, 4, SimdWidth::W128,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            64,
+            4,
+            4,
+            SimdWidth::W128,
         );
 
         // Assert: VecLoadConst must declare with W128 width and have 4 values
-        let vl_const = prog.instrs.iter().find(|i| matches!(i, VmInstr::VecLoadConst { .. }));
-        assert!(vl_const.is_some(), "must have VecLoadConst for accumulator init");
-        if let VmInstr::VecLoadConst { values, width: w, .. } = vl_const.unwrap() {
+        let vl_const = prog
+            .instrs
+            .iter()
+            .find(|i| matches!(i, VmInstr::VecLoadConst { .. }));
+        assert!(
+            vl_const.is_some(),
+            "must have VecLoadConst for accumulator init"
+        );
+        if let VmInstr::VecLoadConst {
+            values, width: w, ..
+        } = vl_const.unwrap()
+        {
             assert_eq!(*w, SimdWidth::W128, "VecLoadConst width must be W128");
-            assert_eq!(values.len(), 4, "VecLoadConst must have 4 values for W128 (lanes=4)");
+            assert_eq!(
+                values.len(),
+                4,
+                "VecLoadConst must have 4 values for W128 (lanes=4)"
+            );
         }
     }
 
@@ -5044,22 +6651,39 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 0, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            0,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: one outer loop with bound=0, no ScalarStore to output
         assert!(prog.validate_structure().is_ok());
         let zero_bound_loop = prog.instrs.iter().any(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(0), .. } => true,
+            VmInstr::LoopBegin {
+                bound: BoundExpr::Const(0),
+                ..
+            } => true,
             _ => false,
         });
         assert!(zero_bound_loop, "vocab=0 must emit outer loop with bound=0");
-        let store_count = prog.instrs.iter().filter(|i| match i {
-            VmInstr::ScalarStore { base, .. } if *base == output_ptr => true,
-            _ => false,
-        }).count();
-        assert!(store_count > 0, "loop template must contain ScalarStore even with vocab=0");
+        let store_count = prog
+            .instrs
+            .iter()
+            .filter(|i| match i {
+                VmInstr::ScalarStore { base, .. } if *base == output_ptr => true,
+                _ => false,
+            })
+            .count();
+        assert!(
+            store_count > 0,
+            "loop template must contain ScalarStore even with vocab=0"
+        );
     }
 
     // ── Test 71: emit_mtp_draft_inline with hidden not aligned to lanes still passes all validations ──
@@ -5086,9 +6710,18 @@ mod tests {
 
         // Assert: all validations pass despite non-aligned hidden
         assert!(result.is_ok());
-        assert!(prog.validate_structure().is_ok(), "structure must be balanced with hidden=20");
-        assert!(prog.validate_provenance().is_ok(), "provenance must be valid with hidden=20");
-        assert!(prog.validate_width_consistency().is_ok(), "width must be consistent with hidden=20");
+        assert!(
+            prog.validate_structure().is_ok(),
+            "structure must be balanced with hidden=20"
+        );
+        assert!(
+            prog.validate_provenance().is_ok(),
+            "provenance must be valid with hidden=20"
+        );
+        assert!(
+            prog.validate_width_consistency().is_ok(),
+            "width must be consistent with hidden=20"
+        );
     }
 
     // ── Test 72: emit_mtp_gemv allocates distinct VRegIds for counter and byte_offset ──
@@ -5102,13 +6735,23 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 64, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            64,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: each LoopBegin must have distinct counter and byte_offset VRegIds
         for instr in &prog.instrs {
-            if let VmInstr::LoopBegin { counter, offsets, .. } = instr {
+            if let VmInstr::LoopBegin {
+                counter, offsets, ..
+            } = instr
+            {
                 for offset in offsets {
                     assert_ne!(
                         counter, &offset.vreg,
@@ -5143,8 +6786,14 @@ mod tests {
 
         // Assert: minimal dimensions must produce valid structure
         assert!(result.is_ok());
-        assert!(prog.validate_structure().is_ok(), "minimal dims must produce balanced loops");
-        assert!(prog.validate_provenance().is_ok(), "minimal dims provenance must be valid");
+        assert!(
+            prog.validate_structure().is_ok(),
+            "minimal dims must produce balanced loops"
+        );
+        assert!(
+            prog.validate_provenance().is_ok(),
+            "minimal dims provenance must be valid"
+        );
     }
 
     // ── Test 74: emit_mtp_gemv emits exactly one VecLoadConst per outer loop iteration ──
@@ -5158,13 +6807,27 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 64, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            64,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: exactly one VecLoadConst (accumulator initialization)
-        let vl_const_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::VecLoadConst { .. })).count();
-        assert_eq!(vl_const_count, 1, "GEMV must emit exactly one VecLoadConst for accumulator init");
+        let vl_const_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::VecLoadConst { .. }))
+            .count();
+        assert_eq!(
+            vl_const_count, 1,
+            "GEMV must emit exactly one VecLoadConst for accumulator init"
+        );
     }
 
     // ── Test 75: emit_mtp_draft_inline depth=1 emits weight offset GprBinOp with Mul ──
@@ -5195,11 +6858,17 @@ mod tests {
         assert!(result.is_ok());
         let proj_bytes = (vocab_size * hidden_size * 4) as i64;
         let has_proj_mul = prog.instrs.iter().any(|i| match i {
-            VmInstr::GprBinOp { op: GprOp::Mul, b: GprOperand::Imm(imm), .. }
-                if *imm == proj_bytes => true,
+            VmInstr::GprBinOp {
+                op: GprOp::Mul,
+                b: GprOperand::Imm(imm),
+                ..
+            } if *imm == proj_bytes => true,
             _ => false,
         });
-        assert!(has_proj_mul, "depth=1 must still emit weight offset = k_ctr * proj_bytes");
+        assert!(
+            has_proj_mul,
+            "depth=1 must still emit weight offset = k_ctr * proj_bytes"
+        );
     }
 
     // ── Test 76: emit_mtp_gemv outer loop uses Counter and ByteOffset register kinds ──
@@ -5213,18 +6882,31 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 64, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            64,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: LoopBegin must use Counter and ByteOffset register kinds
         let outer_loop = prog.instrs.iter().find(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(64), .. } => true,
+            VmInstr::LoopBegin {
+                bound: BoundExpr::Const(64),
+                ..
+            } => true,
             _ => false,
         });
         assert!(outer_loop.is_some(), "must find outer vocab loop");
         // Verify the counter and byte_offset VRegs were declared with correct kinds
-        assert!(prog.validate_provenance().is_ok(), "counter/byte_offset must have correct VReg kinds");
+        assert!(
+            prog.validate_provenance().is_ok(),
+            "counter/byte_offset must have correct VReg kinds"
+        );
     }
 
     // ── Test 77: emit_mtp_draft_inline nested GEMV inner loop bound matches hidden_over_lanes ──
@@ -5255,15 +6937,27 @@ mod tests {
         // Assert: inner GEMV loop must have bound = hidden / lanes = 8
         assert!(result.is_ok());
         let inner_bound = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), offsets, .. }
-                if *v == expected_inner_bound && offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(lanes * 4) => Some(*v),
+            VmInstr::LoopBegin {
+                bound: BoundExpr::Const(v),
+                offsets,
+                ..
+            } if *v == expected_inner_bound
+                && offsets
+                    .first()
+                    .and_then(|offset| offset.stride.as_fixed_bytes())
+                    == Some(lanes * 4) =>
+            {
+                Some(*v)
+            }
             _ => None,
         });
         assert_eq!(
             inner_bound,
             Some(expected_inner_bound),
             "nested GEMV inner loop bound must be hidden({}) / lanes({}) = {}",
-            hidden, lanes, expected_inner_bound
+            hidden,
+            lanes,
+            expected_inner_bound
         );
     }
 
@@ -5278,13 +6972,26 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            33, 64, 4, 16, SimdWidth::W512,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            33,
+            64,
+            4,
+            16,
+            SimdWidth::W512,
         );
 
         // Assert: all four validations pass with W512 and non-aligned hidden
-        assert!(prog.validate_structure().is_ok(), "W512 non-aligned hidden structure must be balanced");
-        assert!(prog.validate_provenance().is_ok(), "W512 non-aligned hidden provenance must be valid");
+        assert!(
+            prog.validate_structure().is_ok(),
+            "W512 non-aligned hidden structure must be balanced"
+        );
+        assert!(
+            prog.validate_provenance().is_ok(),
+            "W512 non-aligned hidden provenance must be valid"
+        );
         assert!(
             prog.validate_width_consistency().is_ok(),
             "W512 width must be consistent with non-aligned hidden"
@@ -5319,22 +7026,40 @@ mod tests {
 
         // Assert: asymmetric dimensions must produce valid structure
         assert!(result.is_ok());
-        assert!(prog.validate_structure().is_ok(), "hidden>vocab structure must be balanced");
-        assert!(prog.validate_provenance().is_ok(), "hidden>vocab provenance must be valid");
+        assert!(
+            prog.validate_structure().is_ok(),
+            "hidden>vocab structure must be balanced"
+        );
+        assert!(
+            prog.validate_provenance().is_ok(),
+            "hidden>vocab provenance must be valid"
+        );
         // GEMV outer loop bound = vocab = 16
         let gemv_outer = prog.instrs.iter().any(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(16), offsets, .. }
-                if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(128 * 4) => true,
+            VmInstr::LoopBegin {
+                bound: BoundExpr::Const(16),
+                offsets,
+                ..
+            } if offsets
+                .first()
+                .and_then(|offset| offset.stride.as_fixed_bytes())
+                == Some(128 * 4) =>
+            {
+                true
+            }
             _ => false,
         });
-        assert!(gemv_outer, "GEMV outer loop bound must be vocab(16), step=hidden*4=512");
+        assert!(
+            gemv_outer,
+            "GEMV outer loop bound must be vocab(16), step=hidden*4=512"
+        );
     }
 
     // ── Test 80: ABI stack offsets have correct 8-byte alignment and contiguous stride ──
     #[test]
     fn test_mega_kernel_abi_stack_offsets_alignment_and_stride() {
         // Arrange: load ABI constants from mega_kernel_abi module
-        use crate::compiler::mega_kernel_abi::{MEGA_KERNEL_STACK_OFFSETS, MEGA_KERNEL_PARAMS};
+        use crate::compiler::mega_kernel_abi::{MEGA_KERNEL_PARAMS, MEGA_KERNEL_STACK_OFFSETS};
 
         // Assert: MEGA_KERNEL_STACK_OFFSETS length must match MEGA_KERNEL_PARAMS minus register params
         let register_params = 6; // rdi, rsi, rdx, rcx, r8, r9
@@ -5346,13 +7071,22 @@ mod tests {
 
         // Assert: every stack offset must be 8-byte aligned (SysV ABI requirement)
         for &off in MEGA_KERNEL_STACK_OFFSETS {
-            assert_eq!(off % 8, 0, "stack offset {} must be 8-byte aligned (SysV ABI)", off);
+            assert_eq!(
+                off % 8,
+                0,
+                "stack offset {} must be 8-byte aligned (SysV ABI)",
+                off
+            );
         }
 
         // Assert: offsets must be contiguous with 8-byte stride starting from [rbp+16]
         for (i, &off) in MEGA_KERNEL_STACK_OFFSETS.iter().enumerate() {
             let expected = 16 + (i as i32) * 8;
-            assert_eq!(off, expected, "stack offset at index {} must be {}, got {}", i, expected, off);
+            assert_eq!(
+                off, expected,
+                "stack offset at index {} must be {}, got {}",
+                i, expected, off
+            );
         }
     }
 
@@ -5366,7 +7100,11 @@ mod tests {
         let core_params = ["input", "weights", "kv_cache", "scratchpad", "telemetry"];
         for param in &core_params {
             let resolved = sym_map.resolve(param);
-            assert!(resolved.is_some(), "SymDimSlotMap must resolve core param '{}'", param);
+            assert!(
+                resolved.is_some(),
+                "SymDimSlotMap must resolve core param '{}'",
+                param
+            );
         }
 
         // Assert: resolved scratchpad must be StackArg (not AbiArg) since it's on the stack
@@ -5388,19 +7126,38 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            0, 0, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            0,
+            0,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: structure must still be balanced (zero-iteration outer loop)
-        assert!(prog.validate_structure().is_ok(), "zero-dim GEMV must produce balanced loops");
-        assert!(prog.validate_provenance().is_ok(), "zero-dim GEMV provenance must be valid");
+        assert!(
+            prog.validate_structure().is_ok(),
+            "zero-dim GEMV must produce balanced loops"
+        );
+        assert!(
+            prog.validate_provenance().is_ok(),
+            "zero-dim GEMV provenance must be valid"
+        );
         // The outer loop has bound=0 and there is no inner loop (hidden=0)
         let outer_loop = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(0), .. } => Some(true),
+            VmInstr::LoopBegin {
+                bound: BoundExpr::Const(0),
+                ..
+            } => Some(true),
             _ => None,
         });
-        assert!(outer_loop.is_some(), "hidden=0, vocab=0 must still emit outer loop with bound=0");
+        assert!(
+            outer_loop.is_some(),
+            "hidden=0, vocab=0 must still emit outer loop with bound=0"
+        );
     }
 
     // ── Test 83: emit_mtp_draft_inline with single-phase depth=1 produces minimal instruction set ──
@@ -5415,20 +7172,41 @@ mod tests {
         // Act
         let result = emit_mtp_draft_inline(
             &mut prog,
-            1, 32, 64,
-            hidden_ptr, weight_ptr, output_tokens_ptr,
-            SimdWidth::W256, QuantPrecision::F32,
+            1,
+            32,
+            64,
+            hidden_ptr,
+            weight_ptr,
+            output_tokens_ptr,
+            SimdWidth::W256,
+            QuantPrecision::F32,
         );
 
         // Assert: depth=1 must produce valid structure with one depth loop
         assert!(result.is_ok());
-        assert!(prog.validate_structure().is_ok(), "depth=1 must produce balanced structure");
+        assert!(
+            prog.validate_structure().is_ok(),
+            "depth=1 must produce balanced structure"
+        );
         // One depth loop (bound=1, step=1) containing GEMV + Argmax + ScalarStore
         let depth_loop = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(1), offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(1) => Some(true),
+            VmInstr::LoopBegin {
+                bound: BoundExpr::Const(1),
+                offsets,
+                ..
+            } if offsets
+                .first()
+                .and_then(|offset| offset.stride.as_fixed_bytes())
+                == Some(1) =>
+            {
+                Some(true)
+            }
             _ => None,
         });
-        assert!(depth_loop.is_some(), "depth=1 must emit exactly one loop with bound=1");
+        assert!(
+            depth_loop.is_some(),
+            "depth=1 must emit exactly one loop with bound=1"
+        );
     }
 
     // ── Test 84: emit_mtp_gemv phase ordering — VecLoadConst always before Fma ──
@@ -5443,14 +7221,30 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 64, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            64,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: VecLoadConst position must be before first Fma position
-        let vl_const_pos = prog.instrs.iter().position(|i| matches!(i, VmInstr::VecLoadConst { .. }));
-        let fma_pos = prog.instrs.iter().position(|i| matches!(i, VmInstr::Fma { .. }));
-        assert!(vl_const_pos.is_some(), "must have VecLoadConst for accumulator init");
+        let vl_const_pos = prog
+            .instrs
+            .iter()
+            .position(|i| matches!(i, VmInstr::VecLoadConst { .. }));
+        let fma_pos = prog
+            .instrs
+            .iter()
+            .position(|i| matches!(i, VmInstr::Fma { .. }));
+        assert!(
+            vl_const_pos.is_some(),
+            "must have VecLoadConst for accumulator init"
+        );
         assert!(fma_pos.is_some(), "must have FMA for dot product");
         assert!(
             vl_const_pos.unwrap() < fma_pos.unwrap(),
@@ -5465,14 +7259,22 @@ mod tests {
         use crate::compiler::mega_kernel_abi::MEGA_KERNEL_STACK_OFFSETS;
 
         // Assert: slot 0 must be 16 (prompt_len at [rbp+16])
-        assert_eq!(MEGA_KERNEL_STACK_OFFSETS[0], 16, "slot 0 must be prompt_len at [rbp+16]");
+        assert_eq!(
+            MEGA_KERNEL_STACK_OFFSETS[0], 16,
+            "slot 0 must be prompt_len at [rbp+16]"
+        );
         // Assert: last slot must be kv_page_header_ptr at [rbp+144]
         assert_eq!(
-            *MEGA_KERNEL_STACK_OFFSETS.last().unwrap(), 144,
+            *MEGA_KERNEL_STACK_OFFSETS.last().unwrap(),
+            144,
             "last slot must be kv_page_header_ptr at [rbp+144]"
         );
         // Assert: total of 17 stack parameters (6 register + 17 stack = 23 total params)
-        assert_eq!(MEGA_KERNEL_STACK_OFFSETS.len(), 17, "must have exactly 17 stack parameters");
+        assert_eq!(
+            MEGA_KERNEL_STACK_OFFSETS.len(),
+            17,
+            "must have exactly 17 stack parameters"
+        );
     }
 
     // ── Test 86: emit_mtp_draft_inline depth loop phase ordering — GEMV before Argmax before ScalarStore ──
@@ -5487,16 +7289,26 @@ mod tests {
         // Act
         let result = emit_mtp_draft_inline(
             &mut prog,
-            2, 32, 64,
-            hidden_ptr, weight_ptr, output_tokens_ptr,
-            SimdWidth::W256, QuantPrecision::F32,
+            2,
+            32,
+            64,
+            hidden_ptr,
+            weight_ptr,
+            output_tokens_ptr,
+            SimdWidth::W256,
+            QuantPrecision::F32,
         );
 
         // Assert: phase ordering must be GEMV (LoopBegin) → Argmax → ScalarStore
         assert!(result.is_ok());
         let gemv_loop_pos = prog.instrs.iter().position(|i| matches!(i, VmInstr::LoopBegin { bound: BoundExpr::Const(2), offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(1)));
-        let argmax_pos = prog.instrs.iter().position(|i| matches!(i, VmInstr::Argmax { .. }));
-        let store_pos = prog.instrs.iter().position(|i| matches!(i, VmInstr::ScalarStore { base, .. } if *base == output_tokens_ptr));
+        let argmax_pos = prog
+            .instrs
+            .iter()
+            .position(|i| matches!(i, VmInstr::Argmax { .. }));
+        let store_pos = prog.instrs.iter().position(
+            |i| matches!(i, VmInstr::ScalarStore { base, .. } if *base == output_tokens_ptr),
+        );
         assert!(gemv_loop_pos.is_some(), "must have depth loop (bound=2)");
         assert!(argmax_pos.is_some(), "must have Argmax after GEMV");
         assert!(store_pos.is_some(), "must have ScalarStore after Argmax");
@@ -5519,13 +7331,24 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            64, 128, 4, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            64,
+            128,
+            4,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: hidden VecLoad must use LoopOffset (streaming), not ScalarVReg (manual offset)
         let hidden_loads_loop_offset = prog.instrs.iter().any(|i| match i {
-            VmInstr::VecLoad { base, offset: OffsetExpr::LoopOffset(_), .. } if *base == input_ptr => true,
+            VmInstr::VecLoad {
+                base,
+                offset: OffsetExpr::LoopOffset(_),
+                ..
+            } if *base == input_ptr => true,
             _ => false,
         });
         assert!(
@@ -5547,16 +7370,24 @@ mod tests {
         // Act
         let result = emit_mtp_draft_inline(
             &mut prog,
-            2, 32, 64,
-            hidden_ptr, weight_ptr, output_tokens_ptr,
-            SimdWidth::W256, QuantPrecision::BF16,
+            2,
+            32,
+            64,
+            hidden_ptr,
+            weight_ptr,
+            output_tokens_ptr,
+            SimdWidth::W256,
+            QuantPrecision::BF16,
         );
 
         // Assert: weight offset multiplication must use proj_bytes = vocab*hidden*2 (not *4)
         assert!(result.is_ok());
         let has_bf16_proj_mul = prog.instrs.iter().any(|i| match i {
-            VmInstr::GprBinOp { op: GprOp::Mul, b: GprOperand::Imm(imm), .. }
-                if *imm == expected_proj_bytes => true,
+            VmInstr::GprBinOp {
+                op: GprOp::Mul,
+                b: GprOperand::Imm(imm),
+                ..
+            } if *imm == expected_proj_bytes => true,
             _ => false,
         });
         assert!(
@@ -5578,23 +7409,49 @@ mod tests {
 
         // Act
         emit_mtp_gemv(
-            &mut prog, input_ptr, weight_ptr, output_ptr,
-            32, 64, 1, 8, SimdWidth::W256,
+            &mut prog,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            32,
+            64,
+            1,
+            8,
+            SimdWidth::W256,
         );
 
         // Assert: inner loop step must be lanes * elem_bytes = 8
         let inner_step = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(v), offsets, .. }
-                if *v == 32 / 8 => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
+            VmInstr::LoopBegin {
+                bound: BoundExpr::Const(v),
+                offsets,
+                ..
+            } if *v == 32 / 8 => offsets
+                .first()
+                .and_then(|offset| offset.stride.as_fixed_bytes()),
             _ => None,
         });
-        assert_eq!(inner_step, Some(8), "inner step must be lanes(8) * elem_bytes(1) = 8");
+        assert_eq!(
+            inner_step,
+            Some(8),
+            "inner step must be lanes(8) * elem_bytes(1) = 8"
+        );
         // Assert: outer loop step must be hidden * elem_bytes = 32
         let outer_step = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(64), offsets, .. } => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
+            VmInstr::LoopBegin {
+                bound: BoundExpr::Const(64),
+                offsets,
+                ..
+            } => offsets
+                .first()
+                .and_then(|offset| offset.stride.as_fixed_bytes()),
             _ => None,
         });
-        assert_eq!(outer_step, Some(32), "outer step must be hidden(32) * elem_bytes(1) = 32");
+        assert_eq!(
+            outer_step,
+            Some(32),
+            "outer step must be hidden(32) * elem_bytes(1) = 32"
+        );
     }
 
     // ── Test 90: emit_mtp_draft_inline depth=0 and vocab=0 still produces valid zero-iteration loop ──
@@ -5609,18 +7466,39 @@ mod tests {
         // Act
         let result = emit_mtp_draft_inline(
             &mut prog,
-            0, 32, 0,
-            hidden_ptr, weight_ptr, output_tokens_ptr,
-            SimdWidth::W256, QuantPrecision::F32,
+            0,
+            32,
+            0,
+            hidden_ptr,
+            weight_ptr,
+            output_tokens_ptr,
+            SimdWidth::W256,
+            QuantPrecision::F32,
         );
 
         // Assert: structure must be balanced even with both depth=0 and vocab=0
         assert!(result.is_ok());
-        assert!(prog.validate_structure().is_ok(), "zero-depth zero-vocab must produce balanced structure");
-        assert!(prog.validate_provenance().is_ok(), "provenance must be valid with zero-depth zero-vocab");
+        assert!(
+            prog.validate_structure().is_ok(),
+            "zero-depth zero-vocab must produce balanced structure"
+        );
+        assert!(
+            prog.validate_provenance().is_ok(),
+            "provenance must be valid with zero-depth zero-vocab"
+        );
         // The depth loop has bound=0, inner GEMV loop has vocab=0 bound — template body still valid
         let zero_depth_loop = prog.instrs.iter().any(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(0), offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(1) => true,
+            VmInstr::LoopBegin {
+                bound: BoundExpr::Const(0),
+                offsets,
+                ..
+            } if offsets
+                .first()
+                .and_then(|offset| offset.stride.as_fixed_bytes())
+                == Some(1) =>
+            {
+                true
+            }
             _ => false,
         });
         assert!(zero_depth_loop, "must emit depth loop with bound=0");
@@ -5637,12 +7515,25 @@ mod tests {
         let vocab_size = 32000;
 
         // Act
-        let config = MtpKernelConfig { depth, hidden_size, vocab_size };
+        let config = MtpKernelConfig {
+            depth,
+            hidden_size,
+            vocab_size,
+        };
 
         // Assert: all fields must match construction values
-        assert_eq!(config.depth, depth, "MtpKernelConfig.depth must match input");
-        assert_eq!(config.hidden_size, hidden_size, "MtpKernelConfig.hidden_size must match input");
-        assert_eq!(config.vocab_size, vocab_size, "MtpKernelConfig.vocab_size must match input");
+        assert_eq!(
+            config.depth, depth,
+            "MtpKernelConfig.depth must match input"
+        );
+        assert_eq!(
+            config.hidden_size, hidden_size,
+            "MtpKernelConfig.hidden_size must match input"
+        );
+        assert_eq!(
+            config.vocab_size, vocab_size,
+            "MtpKernelConfig.vocab_size must match input"
+        );
     }
 
     // ── Test 92: BusinessConfig default values match SPEC expectations ──
@@ -5658,18 +7549,39 @@ mod tests {
         assert!(
             matches!(
                 &default.output_modes[0],
-                OutputMode::Generate { max_new_tokens: 512, eos_token_id: 2 }
+                OutputMode::Generate {
+                    max_new_tokens: 512,
+                    eos_token_id: 2
+                }
             ),
             "default output mode must be Generate(512, eos=2)"
         );
         // Assert: default disabled features
-        assert!(!default.guardrail_enabled, "guardrail must be disabled by default");
-        assert!(default.semantic_gatekeeper.is_none(), "SG must be None by default");
-        assert!(default.intent_anchor_layer.is_none(), "intent anchor must be None by default");
-        assert!(default.cot_step_hook.is_none(), "CoT step hook must be None by default");
+        assert!(
+            !default.guardrail_enabled,
+            "guardrail must be disabled by default"
+        );
+        assert!(
+            default.semantic_gatekeeper.is_none(),
+            "SG must be None by default"
+        );
+        assert!(
+            default.intent_anchor_layer.is_none(),
+            "intent anchor must be None by default"
+        );
+        assert!(
+            default.cot_step_hook.is_none(),
+            "CoT step hook must be None by default"
+        );
         // Assert: default session/multimodal/debug flags
-        assert!(!default.session_enabled, "session must be disabled by default");
-        assert!(!default.multimodal_enabled, "multimodal must be disabled by default");
+        assert!(
+            !default.session_enabled,
+            "session must be disabled by default"
+        );
+        assert!(
+            !default.multimodal_enabled,
+            "multimodal must be disabled by default"
+        );
         assert!(!default.debug_jit, "debug_jit must be disabled by default");
     }
 
@@ -5680,7 +7592,10 @@ mod tests {
         use crate::compiler::mega_kernel_abi::{OutputMode, PoolMode};
 
         // Act: construct each variant
-        let generate = OutputMode::Generate { max_new_tokens: 100, eos_token_id: 50256 };
+        let generate = OutputMode::Generate {
+            max_new_tokens: 100,
+            eos_token_id: 50256,
+        };
         let classify_binary = OutputMode::ClassifyBinary {
             positive_token_id: 1,
             negative_token_id: 0,
@@ -5695,14 +7610,20 @@ mod tests {
 
         // Assert: each variant must carry its specific data fields
         match &generate {
-            OutputMode::Generate { max_new_tokens, eos_token_id } => {
+            OutputMode::Generate {
+                max_new_tokens,
+                eos_token_id,
+            } => {
                 assert_eq!(*max_new_tokens, 100);
                 assert_eq!(*eos_token_id, 50256);
             }
             _ => panic!("Generate variant must match"),
         }
         match &classify_binary {
-            OutputMode::ClassifyBinary { positive_token_id, negative_token_id } => {
+            OutputMode::ClassifyBinary {
+                positive_token_id,
+                negative_token_id,
+            } => {
                 assert_eq!(*positive_token_id, 1);
                 assert_eq!(*negative_token_id, 0);
             }
@@ -5716,9 +7637,15 @@ mod tests {
             _ => panic!("ClassifyMultiway variant must match"),
         }
         match &encode {
-            OutputMode::EncodeToLayer { anchor_layer, pool_mode } => {
+            OutputMode::EncodeToLayer {
+                anchor_layer,
+                pool_mode,
+            } => {
                 assert_eq!(*anchor_layer, 12);
-                assert!(matches!(pool_mode, PoolMode::MeanPool), "pool_mode must be MeanPool");
+                assert!(
+                    matches!(pool_mode, PoolMode::MeanPool),
+                    "pool_mode must be MeanPool"
+                );
             }
             _ => panic!("EncodeToLayer variant must match"),
         }
@@ -5737,9 +7664,17 @@ mod tests {
         // Per-layer stride: attn_norm(1024) + w_q(65536) + w_k(32768) + w_v(32768)
         //   + w_o(65536) + w_q_norm(256) + w_k_norm(256) + ffn_norm(1024)
         //   + w_gate(524288) + w_up(524288) + w_down(524288) = 1739904
-        let layer_stride = 256*4 + 4*64*256*4 + 2*64*256*4 + 2*64*256*4
-            + 256*(4*64)*4 + 64*4 + 64*4 + 256*4
-            + 512*256*4 + 512*256*4 + 256*512*4;
+        let layer_stride = 256 * 4
+            + 4 * 64 * 256 * 4
+            + 2 * 64 * 256 * 4
+            + 2 * 64 * 256 * 4
+            + 256 * (4 * 64) * 4
+            + 64 * 4
+            + 64 * 4
+            + 256 * 4
+            + 512 * 256 * 4
+            + 512 * 256 * 4
+            + 256 * 512 * 4;
         let final_norm_bytes = 256 * 4;
         let final_norm_offset = layer_0_offset + 4 * layer_stride;
         let logits_producer_offset = final_norm_offset + final_norm_bytes;
@@ -5751,17 +7686,28 @@ mod tests {
             layer_0_offset,
             layer_stride,
             per_layer: PerLayerWeightLayout {
-                attn_norm_offset: 0, attn_norm_bytes: 1024,
-                w_q_offset: 1024, w_q_bytes: 65536,
-                w_k_offset: 66560, w_k_bytes: 32768,
-                w_v_offset: 99328, w_v_bytes: 32768,
-                w_o_offset: 132096, w_o_bytes: 65536,
-                w_q_norm_offset: 197632, w_q_norm_bytes: 256,
-                w_k_norm_offset: 197888, w_k_norm_bytes: 256,
-                ffn_norm_offset: 198144, ffn_norm_bytes: 1024,
-                w_gate_offset: 199168, w_gate_bytes: 524288,
-                w_up_offset: 723456, w_up_bytes: 524288,
-                w_down_offset: 1247744, w_down_bytes: 524288,
+                attn_norm_offset: 0,
+                attn_norm_bytes: 1024,
+                w_q_offset: 1024,
+                w_q_bytes: 65536,
+                w_k_offset: 66560,
+                w_k_bytes: 32768,
+                w_v_offset: 99328,
+                w_v_bytes: 32768,
+                w_o_offset: 132096,
+                w_o_bytes: 65536,
+                w_q_norm_offset: 197632,
+                w_q_norm_bytes: 256,
+                w_k_norm_offset: 197888,
+                w_k_norm_bytes: 256,
+                ffn_norm_offset: 198144,
+                ffn_norm_bytes: 1024,
+                w_gate_offset: 199168,
+                w_gate_bytes: 524288,
+                w_up_offset: 723456,
+                w_up_bytes: 524288,
+                w_down_offset: 1247744,
+                w_down_bytes: 524288,
             },
             final_norm_offset,
             final_norm_bytes,
@@ -5778,13 +7724,26 @@ mod tests {
         assert!(stride > 0, "layer_stride must be positive");
         for i in 1..4 {
             let diff = offsets[i] - offsets[i - 1];
-            assert_eq!(diff, stride, "layer_base_offset({}) - layer_base_offset({}) must equal layer_stride ({})", i, i - 1, stride);
+            assert_eq!(
+                diff,
+                stride,
+                "layer_base_offset({}) - layer_base_offset({}) must equal layer_stride ({})",
+                i,
+                i - 1,
+                stride
+            );
         }
         // Assert: layer 0 offset must equal layer_0_offset field
-        assert_eq!(offsets[0], layout.layer_0_offset, "layer_base_offset(0) must equal layer_0_offset");
+        assert_eq!(
+            offsets[0], layout.layer_0_offset,
+            "layer_base_offset(0) must equal layer_0_offset"
+        );
         // Assert: total_bytes must exceed all layer offsets
         let last_layer_end = offsets[3] + stride;
-        assert!(layout.total_bytes > last_layer_end, "total_bytes must exceed last layer weight region");
+        assert!(
+            layout.total_bytes > last_layer_end,
+            "total_bytes must exceed last layer weight region"
+        );
     }
 
     // ── Test 96: PerLayerWeightLayout offsets are monotonically increasing ──
@@ -5826,17 +7785,28 @@ mod tests {
         let o10 = o9 + w_up_bytes;
 
         let pl = PerLayerWeightLayout {
-            attn_norm_offset: o0, attn_norm_bytes,
-            w_q_offset: o1, w_q_bytes,
-            w_k_offset: o2, w_k_bytes,
-            w_v_offset: o3, w_v_bytes,
-            w_o_offset: o4, w_o_bytes,
-            w_q_norm_offset: o5, w_q_norm_bytes,
-            w_k_norm_offset: o6, w_k_norm_bytes,
-            ffn_norm_offset: o7, ffn_norm_bytes,
-            w_gate_offset: o8, w_gate_bytes,
-            w_up_offset: o9, w_up_bytes,
-            w_down_offset: o10, w_down_bytes,
+            attn_norm_offset: o0,
+            attn_norm_bytes,
+            w_q_offset: o1,
+            w_q_bytes,
+            w_k_offset: o2,
+            w_k_bytes,
+            w_v_offset: o3,
+            w_v_bytes,
+            w_o_offset: o4,
+            w_o_bytes,
+            w_q_norm_offset: o5,
+            w_q_norm_bytes,
+            w_k_norm_offset: o6,
+            w_k_norm_bytes,
+            ffn_norm_offset: o7,
+            ffn_norm_bytes,
+            w_gate_offset: o8,
+            w_gate_bytes,
+            w_up_offset: o9,
+            w_up_bytes,
+            w_down_offset: o10,
+            w_down_bytes,
         };
 
         // Act: collect all offset pairs in order
@@ -5859,9 +7829,15 @@ mod tests {
             let prev_end = offsets[i - 1].0 + offsets[i - 1].1;
             let curr_start = offsets[i].0;
             assert_eq!(
-                curr_start, prev_end,
+                curr_start,
+                prev_end,
                 "per-layer offset[{}] ({}) must equal prev_end (offset[{}].0={} + offset[{}].1={})",
-                i, curr_start, i - 1, offsets[i - 1].0, i - 1, offsets[i - 1].1
+                i,
+                curr_start,
+                i - 1,
+                offsets[i - 1].0,
+                i - 1,
+                offsets[i - 1].1
             );
         }
         // Assert: first offset must be 0
@@ -5875,17 +7851,31 @@ mod tests {
         use crate::compiler::mega_kernel_abi::{MEGA_KERNEL_PARAMS, MEGA_KERNEL_STACK_OFFSETS};
 
         // Assert: total ABI params must be 23 (6 register + 17 stack)
-        assert_eq!(MEGA_KERNEL_PARAMS.len(), 23, "MEGA_KERNEL_PARAMS must have exactly 23 entries (6 register + 17 stack)");
+        assert_eq!(
+            MEGA_KERNEL_PARAMS.len(),
+            23,
+            "MEGA_KERNEL_PARAMS must have exactly 23 entries (6 register + 17 stack)"
+        );
 
         // Assert: first 6 params are register params (names must contain pointer/usize semantics)
         let register_names = &MEGA_KERNEL_PARAMS[0..6];
-        assert_eq!(register_names[0], "input_ids_ptr", "arg 0 must be input_ids_ptr");
-        assert_eq!(register_names[1], "weight_blob_ptr", "arg 1 must be weight_blob_ptr");
+        assert_eq!(
+            register_names[0], "input_ids_ptr",
+            "arg 0 must be input_ids_ptr"
+        );
+        assert_eq!(
+            register_names[1], "weight_blob_ptr",
+            "arg 1 must be weight_blob_ptr"
+        );
         assert_eq!(register_names[5], "batch_size", "arg 5 must be batch_size");
 
         // Assert: stack param count must match stack offsets count
         let stack_params = &MEGA_KERNEL_PARAMS[6..];
-        assert_eq!(stack_params.len(), MEGA_KERNEL_STACK_OFFSETS.len(), "stack param names must match stack offset count");
+        assert_eq!(
+            stack_params.len(),
+            MEGA_KERNEL_STACK_OFFSETS.len(),
+            "stack param names must match stack offset count"
+        );
 
         // Assert: kv_page_header_ptr is the new final stack parameter.
         assert_eq!(stack_params.last().copied(), Some("kv_page_header_ptr"));
@@ -5912,19 +7902,32 @@ mod tests {
         let callback_table = sym_map.resolve("callback_table_ptr");
 
         // Assert: both must resolve to valid PtrExpr
-        assert!(hook_ctx.is_some(), "SymDimSlotMap must resolve hook_ctx_ptr");
-        assert!(callback_table.is_some(), "SymDimSlotMap must resolve callback_table_ptr");
+        assert!(
+            hook_ctx.is_some(),
+            "SymDimSlotMap must resolve hook_ctx_ptr"
+        );
+        assert!(
+            callback_table.is_some(),
+            "SymDimSlotMap must resolve callback_table_ptr"
+        );
 
         // Assert: hook_ctx_ptr must be a StackArg (resolved from mega-kernel ABI)
         match hook_ctx.unwrap() {
-            PtrExpr::StackArg(offset) => assert_eq!(*offset, 80, "hook_ctx_ptr must be at [rbp+80]"),
-            PtrExpr::AbiArg(arg) => panic!("hook_ctx_ptr should not be a register arg (got AbiArg({}))", arg),
+            PtrExpr::StackArg(offset) => {
+                assert_eq!(*offset, 80, "hook_ctx_ptr must be at [rbp+80]")
+            }
+            PtrExpr::AbiArg(arg) => panic!(
+                "hook_ctx_ptr should not be a register arg (got AbiArg({}))",
+                arg
+            ),
             _ => panic!("hook_ctx_ptr must be StackArg or AbiArg"),
         }
 
         // Assert: callback_table_ptr must be a StackArg (resolved from mega-kernel ABI)
         match callback_table.unwrap() {
-            PtrExpr::StackArg(offset) => assert_eq!(*offset, 120, "callback_table_ptr must be at [rbp+120]"),
+            PtrExpr::StackArg(offset) => {
+                assert_eq!(*offset, 120, "callback_table_ptr must be at [rbp+120]")
+            }
             _ => panic!("callback_table_ptr must be StackArg"),
         }
     }
@@ -5956,17 +7959,28 @@ mod tests {
             layer_0_offset,
             layer_stride: 1739968,
             per_layer: PerLayerWeightLayout {
-                attn_norm_offset: 0, attn_norm_bytes: 4096 * 4,
-                w_q_offset: 16384, w_q_bytes: 32 * 128 * 4096 * 4,
-                w_k_offset: 16384 + 32 * 128 * 4096 * 4, w_k_bytes: 32 * 128 * 4096 * 4,
-                w_v_offset: 16384 + 2 * 32 * 128 * 4096 * 4, w_v_bytes: 32 * 128 * 4096 * 4,
-                w_o_offset: 16384 + 3 * 32 * 128 * 4096 * 4, w_o_bytes: 4096 * 32 * 128 * 4,
-                w_q_norm_offset: 16384 + 3 * 32 * 128 * 4096 * 4 + 4096 * 32 * 128 * 4, w_q_norm_bytes: 128 * 4,
-                w_k_norm_offset: 16384 + 3 * 32 * 128 * 4096 * 4 + 4096 * 32 * 128 * 4 + 512, w_k_norm_bytes: 128 * 4,
-                ffn_norm_offset: 16384 + 3 * 32 * 128 * 4096 * 4 + 4096 * 32 * 128 * 4 + 1024, ffn_norm_bytes: 4096 * 4,
-                w_gate_offset: 0, w_gate_bytes: 11008 * 4096 * 4,
-                w_up_offset: 11008 * 4096 * 4, w_up_bytes: 11008 * 4096 * 4,
-                w_down_offset: 2 * 11008 * 4096 * 4, w_down_bytes: 4096 * 11008 * 4,
+                attn_norm_offset: 0,
+                attn_norm_bytes: 4096 * 4,
+                w_q_offset: 16384,
+                w_q_bytes: 32 * 128 * 4096 * 4,
+                w_k_offset: 16384 + 32 * 128 * 4096 * 4,
+                w_k_bytes: 32 * 128 * 4096 * 4,
+                w_v_offset: 16384 + 2 * 32 * 128 * 4096 * 4,
+                w_v_bytes: 32 * 128 * 4096 * 4,
+                w_o_offset: 16384 + 3 * 32 * 128 * 4096 * 4,
+                w_o_bytes: 4096 * 32 * 128 * 4,
+                w_q_norm_offset: 16384 + 3 * 32 * 128 * 4096 * 4 + 4096 * 32 * 128 * 4,
+                w_q_norm_bytes: 128 * 4,
+                w_k_norm_offset: 16384 + 3 * 32 * 128 * 4096 * 4 + 4096 * 32 * 128 * 4 + 512,
+                w_k_norm_bytes: 128 * 4,
+                ffn_norm_offset: 16384 + 3 * 32 * 128 * 4096 * 4 + 4096 * 32 * 128 * 4 + 1024,
+                ffn_norm_bytes: 4096 * 4,
+                w_gate_offset: 0,
+                w_gate_bytes: 11008 * 4096 * 4,
+                w_up_offset: 11008 * 4096 * 4,
+                w_up_bytes: 11008 * 4096 * 4,
+                w_down_offset: 2 * 11008 * 4096 * 4,
+                w_down_bytes: 4096 * 11008 * 4,
             },
             final_norm_offset,
             final_norm_bytes,
@@ -5976,13 +7990,28 @@ mod tests {
         };
 
         // Assert: embed must start at offset 0
-        assert_eq!(layout.embed_offset, 0, "embed weight offset must be 0 (start of weight blob)");
+        assert_eq!(
+            layout.embed_offset, 0,
+            "embed weight offset must be 0 (start of weight blob)"
+        );
         // Assert: embed_bytes must equal vocab_size × hidden × elem_bytes
-        assert_eq!(layout.embed_bytes, expected_embed_bytes, "embed_bytes must equal vocab({}) * hidden({}) * elem_bytes({})", vocab_size, hidden, elem_bytes);
+        assert_eq!(
+            layout.embed_bytes, expected_embed_bytes,
+            "embed_bytes must equal vocab({}) * hidden({}) * elem_bytes({})",
+            vocab_size, hidden, elem_bytes
+        );
         // Assert: layer_0_offset must follow immediately after embed
-        assert_eq!(layout.layer_0_offset, layout.embed_offset + layout.embed_bytes, "layer_0 must start after embed region");
+        assert_eq!(
+            layout.layer_0_offset,
+            layout.embed_offset + layout.embed_bytes,
+            "layer_0 must start after embed region"
+        );
         // Assert: logits producer must be the last weight region
-        assert_eq!(layout.total_bytes, layout.logits_producer_offset + layout.logits_producer_bytes, "total_bytes must equal logits_producer_offset + logits_producer_bytes");
+        assert_eq!(
+            layout.total_bytes,
+            layout.logits_producer_offset + layout.logits_producer_bytes,
+            "total_bytes must equal logits_producer_offset + logits_producer_bytes"
+        );
     }
 
     // ── Test 100: MtpKernelConfig Debug trait output contains all three fields ──
@@ -6001,12 +8030,30 @@ mod tests {
         let debug_str = format!("{:?}", config);
 
         // Assert: Debug output must contain all field names and values
-        assert!(debug_str.contains("depth"), "Debug output must contain 'depth'");
-        assert!(debug_str.contains("hidden_size"), "Debug output must contain 'hidden_size'");
-        assert!(debug_str.contains("vocab_size"), "Debug output must contain 'vocab_size'");
-        assert!(debug_str.contains("5"), "Debug output must contain depth value 5");
-        assert!(debug_str.contains("2048"), "Debug output must contain hidden_size value 2048");
-        assert!(debug_str.contains("50257"), "Debug output must contain vocab_size value 50257");
+        assert!(
+            debug_str.contains("depth"),
+            "Debug output must contain 'depth'"
+        );
+        assert!(
+            debug_str.contains("hidden_size"),
+            "Debug output must contain 'hidden_size'"
+        );
+        assert!(
+            debug_str.contains("vocab_size"),
+            "Debug output must contain 'vocab_size'"
+        );
+        assert!(
+            debug_str.contains("5"),
+            "Debug output must contain depth value 5"
+        );
+        assert!(
+            debug_str.contains("2048"),
+            "Debug output must contain hidden_size value 2048"
+        );
+        assert!(
+            debug_str.contains("50257"),
+            "Debug output must contain vocab_size value 50257"
+        );
     }
 
     // ── Test 101: Empty VmProgram passes structure and provenance validation ──
@@ -6016,14 +8063,22 @@ mod tests {
         let prog = VmProgram::new();
 
         // Assert: empty program must pass all four core validations
-        assert!(prog.validate_structure().is_ok(),
-            "empty VmProgram must have valid structure (no unbalanced loops)");
-        assert!(prog.validate_provenance().is_ok(),
-            "empty VmProgram must have valid provenance (no undeclared VRegs)");
-        assert!(prog.validate_type_consistency().is_ok(),
-            "empty VmProgram must have consistent types");
-        assert!(prog.validate_value_domains().is_ok(),
-            "empty VmProgram must have valid value domains");
+        assert!(
+            prog.validate_structure().is_ok(),
+            "empty VmProgram must have valid structure (no unbalanced loops)"
+        );
+        assert!(
+            prog.validate_provenance().is_ok(),
+            "empty VmProgram must have valid provenance (no undeclared VRegs)"
+        );
+        assert!(
+            prog.validate_type_consistency().is_ok(),
+            "empty VmProgram must have consistent types"
+        );
+        assert!(
+            prog.validate_value_domains().is_ok(),
+            "empty VmProgram must have valid value domains"
+        );
     }
 
     // ── Test 102: VmProgram with single LoadPtr + GprLoadImm passes structure ──
@@ -6032,17 +8087,29 @@ mod tests {
         // Arrange: build a minimal program with prologue-style instructions
         let mut prog = VmProgram::new();
         let ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        prog.emit(VmInstr::LoadPtr { dst: ptr_vreg, src: PtrExpr::AbiArg(0) });
+        prog.emit(VmInstr::LoadPtr {
+            dst: ptr_vreg,
+            src: PtrExpr::AbiArg(0),
+        });
         let imm_vreg = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        prog.emit(VmInstr::GprLoadImm { dst: imm_vreg, value: 42 });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: imm_vreg,
+            value: 42,
+        });
 
         // Assert: two-instruction program must pass all validations
-        assert!(prog.validate_structure().is_ok(),
-            "two-instr program must have valid structure");
-        assert!(prog.validate_provenance().is_ok(),
-            "all VRegs must be declared before use");
-        assert!(prog.validate_value_domains().is_ok(),
-            "value domains must be consistent (Ptr used as Ptr, Scalar as Scalar)");
+        assert!(
+            prog.validate_structure().is_ok(),
+            "two-instr program must have valid structure"
+        );
+        assert!(
+            prog.validate_provenance().is_ok(),
+            "all VRegs must be declared before use"
+        );
+        assert!(
+            prog.validate_value_domains().is_ok(),
+            "value domains must be consistent (Ptr used as Ptr, Scalar as Scalar)"
+        );
     }
 
     // ── Test 103: SymDimSlotMap resolves page_table_ptr to correct stack offset ──
@@ -6055,7 +8122,10 @@ mod tests {
         let page_table = sym_map.resolve("page_table_ptr");
 
         // Assert: page_table_ptr must resolve (SPEC/18 REQ-PA)
-        assert!(page_table.is_some(), "SymDimSlotMap must resolve page_table_ptr");
+        assert!(
+            page_table.is_some(),
+            "SymDimSlotMap must resolve page_table_ptr"
+        );
         // Assert: page_table_ptr must be a StackArg at the expected offset
         match page_table.unwrap() {
             PtrExpr::StackArg(offset) => {
@@ -6077,8 +8147,14 @@ mod tests {
         let eos_token_id = sym_map.resolve("eos_token_id");
 
         // Assert: both sampling parameters must resolve
-        assert!(max_new_tokens.is_some(), "SymDimSlotMap must resolve max_new_tokens");
-        assert!(eos_token_id.is_some(), "SymDimSlotMap must resolve eos_token_id");
+        assert!(
+            max_new_tokens.is_some(),
+            "SymDimSlotMap must resolve max_new_tokens"
+        );
+        assert!(
+            eos_token_id.is_some(),
+            "SymDimSlotMap must resolve eos_token_id"
+        );
         // Assert: both must be StackArg (passed on stack, not in registers)
         assert!(
             matches!(max_new_tokens.unwrap(), PtrExpr::StackArg(_)),
@@ -6124,14 +8200,19 @@ mod tests {
         let byte_offset = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         prog.emit(VmInstr::LoopBegin {
             counter,
-            offsets: vec![LoopOffset { vreg: byte_offset, stride: LoopStride::FixedBytes(32) }],
+            offsets: vec![LoopOffset {
+                vreg: byte_offset,
+                stride: LoopStride::FixedBytes(32),
+            }],
             bound: BoundExpr::Const(4),
         });
         prog.emit(VmInstr::LoopEnd);
 
         // Assert: balanced loop must pass structure validation
-        assert!(prog.validate_structure().is_ok(),
-            "balanced LoopBegin/LoopEnd must pass structure validation");
+        assert!(
+            prog.validate_structure().is_ok(),
+            "balanced LoopBegin/LoopEnd must pass structure validation"
+        );
 
         // Arrange: build an unbalanced program (missing LoopEnd)
         let mut prog2 = VmProgram::new();
@@ -6139,14 +8220,19 @@ mod tests {
         let byte_offset2 = prog2.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         prog2.emit(VmInstr::LoopBegin {
             counter: counter2,
-            offsets: vec![LoopOffset { vreg: byte_offset2, stride: LoopStride::FixedBytes(32) }],
+            offsets: vec![LoopOffset {
+                vreg: byte_offset2,
+                stride: LoopStride::FixedBytes(32),
+            }],
             bound: BoundExpr::Const(4),
         });
         // Intentionally NOT emitting LoopEnd
 
         // Assert: unbalanced loop must fail structure validation
-        assert!(prog2.validate_structure().is_err(),
-            "unbalanced LoopBegin without LoopEnd must fail structure validation");
+        assert!(
+            prog2.validate_structure().is_err(),
+            "unbalanced LoopBegin without LoopEnd must fail structure validation"
+        );
     }
 
     // ── Test 108: BufferLayout zero-sized allocation has zero total_scratchpad_bytes ──
@@ -6174,11 +8260,26 @@ mod tests {
         };
 
         // Assert: all offsets and sizes must be zero for an empty layout
-        assert_eq!(layout.logits_offset, 0, "empty layout logits_offset must be 0");
-        assert_eq!(layout.logits_bytes, 0, "empty layout logits_bytes must be 0");
-        assert_eq!(layout.sampling_workspace_offset, 0, "empty layout sampling_workspace_offset must be 0");
-        assert_eq!(layout.sampling_workspace_bytes, 0, "empty layout sampling_workspace_bytes must be 0");
-        assert_eq!(layout.total_scratchpad_bytes, 0, "empty layout total_scratchpad_bytes must be 0");
+        assert_eq!(
+            layout.logits_offset, 0,
+            "empty layout logits_offset must be 0"
+        );
+        assert_eq!(
+            layout.logits_bytes, 0,
+            "empty layout logits_bytes must be 0"
+        );
+        assert_eq!(
+            layout.sampling_workspace_offset, 0,
+            "empty layout sampling_workspace_offset must be 0"
+        );
+        assert_eq!(
+            layout.sampling_workspace_bytes, 0,
+            "empty layout sampling_workspace_bytes must be 0"
+        );
+        assert_eq!(
+            layout.total_scratchpad_bytes, 0,
+            "empty layout total_scratchpad_bytes must be 0"
+        );
     }
 
     // ── Test 109: VmProgram BranchIfPtrNonNull and BranchIfGprZero use correct VReg kinds ──
@@ -6187,17 +8288,33 @@ mod tests {
         // Arrange: build a program with branch instructions matching mega-kernel ForwardPhaseDispatch pattern
         let mut prog = VmProgram::new();
         let ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        prog.emit(VmInstr::LoadPtr { dst: ptr_vreg, src: PtrExpr::StackArg(16) });
-        prog.emit(VmInstr::BranchIfPtrNonNull { ptr: ptr_vreg, target_label: 100 });
+        prog.emit(VmInstr::LoadPtr {
+            dst: ptr_vreg,
+            src: PtrExpr::StackArg(16),
+        });
+        prog.emit(VmInstr::BranchIfPtrNonNull {
+            ptr: ptr_vreg,
+            target_label: 100,
+        });
         let scalar_vreg = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        prog.emit(VmInstr::LoadPtr { dst: scalar_vreg, src: PtrExpr::StackArg(80) });
-        prog.emit(VmInstr::BranchIfGprZero { value: scalar_vreg, target_label: 200 });
+        prog.emit(VmInstr::LoadPtr {
+            dst: scalar_vreg,
+            src: PtrExpr::StackArg(80),
+        });
+        prog.emit(VmInstr::BranchIfGprZero {
+            value: scalar_vreg,
+            target_label: 200,
+        });
 
         // Assert: branch instructions must not violate value domains
-        assert!(prog.validate_value_domains().is_ok(),
-            "BranchIfPtrNonNull (Ptr) and BranchIfGprZero (Scalar) must use correct VReg kinds");
-        assert!(prog.validate_provenance().is_ok(),
-            "all branch VRegs must be declared before use");
+        assert!(
+            prog.validate_value_domains().is_ok(),
+            "BranchIfPtrNonNull (Ptr) and BranchIfGprZero (Scalar) must use correct VReg kinds"
+        );
+        assert!(
+            prog.validate_provenance().is_ok(),
+            "all branch VRegs must be declared before use"
+        );
     }
 
     // ── Test 110: GprOperand VReg variant references must be valid declared VRegs ──
@@ -6209,44 +8326,68 @@ mod tests {
         let a = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         let b = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         prog.emit(VmInstr::GprBinOp {
-            dst, a, b: GprOperand::VReg(b), op: GprOp::Add,
+            dst,
+            a,
+            b: GprOperand::VReg(b),
+            op: GprOp::Add,
         });
 
         // Assert: provenance must pass — all three VRegs (dst, a, b) declared
-        assert!(prog.validate_provenance().is_ok(),
-            "GprBinOp with VReg operand must have all VRegs declared");
+        assert!(
+            prog.validate_provenance().is_ok(),
+            "GprBinOp with VReg operand must have all VRegs declared"
+        );
 
         // Assert: GprOperand::Imm variant also works
         let dst2 = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         let a2 = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         prog.emit(VmInstr::GprBinOp {
-            dst: dst2, a: a2, b: GprOperand::Imm(4), op: GprOp::Shl,
+            dst: dst2,
+            a: a2,
+            b: GprOperand::Imm(4),
+            op: GprOp::Shl,
         });
-        assert!(prog.validate_provenance().is_ok(),
-            "GprBinOp with Imm operand must have dst and a declared");
+        assert!(
+            prog.validate_provenance().is_ok(),
+            "GprBinOp with Imm operand must have dst and a declared"
+        );
     }
 
     // ── Test 111: MK_SERIAL selected for SM61 (GTX 1060, 9 SMs) ──
     #[test]
     fn test_mk_serial_selected_for_sm61() {
         let variant = select_mk_variant(61, 9);
-        assert_eq!(variant, MkVariant::Serial, "SM61 (Pascal) should select MK_SERIAL");
+        assert_eq!(
+            variant,
+            MkVariant::Serial,
+            "SM61 (Pascal) should select MK_SERIAL"
+        );
     }
 
     // ── Test 112: MK_GRID_SYNC selected for SM80 (A100, 108 SMs) ──
     #[test]
     fn test_mk_grid_sync_selected_for_sm80() {
         let variant = select_mk_variant(80, 108);
-        assert!(matches!(variant, MkVariant::GridSync { total_ctas: 108 }),
-            "SM80 (Ampere) should select MK_GRID_SYNC with total_ctas=108");
+        assert!(
+            matches!(variant, MkVariant::GridSync { total_ctas: 108 }),
+            "SM80 (Ampere) should select MK_GRID_SYNC with total_ctas=108"
+        );
     }
 
     // ── Test 113: MK_CLUSTER selected for SM90 (H100, 132 SMs) ──
     #[test]
     fn test_mk_cluster_selected_for_sm90() {
         let variant = select_mk_variant(90, 132);
-        assert!(matches!(variant, MkVariant::Cluster6x2 { cluster_size: 8, num_clusters: 16 }),
-            "SM90 (Hopper) should select MK_CLUSTER_6x2 with cluster_size=8, num_clusters=16");
+        assert!(
+            matches!(
+                variant,
+                MkVariant::Cluster6x2 {
+                    cluster_size: 8,
+                    num_clusters: 16
+                }
+            ),
+            "SM90 (Hopper) should select MK_CLUSTER_6x2 with cluster_size=8, num_clusters=16"
+        );
     }
 
     // ── Test 114: MK_SERIAL selected for SM75 (Turing 2080, 48 SMs — edge case <60) ──
@@ -6254,16 +8395,26 @@ mod tests {
     fn test_mk_serial_selected_for_sm75_small_gpu() {
         // SM75 with < 60 SMs still gets Serial (e.g., mobile Turing)
         let variant = select_mk_variant(75, 48);
-        assert!(matches!(variant, MkVariant::GridSync { total_ctas: 48 }),
-            "SM75 >= 70 should get GridSync even with < 60 SMs");
+        assert!(
+            matches!(variant, MkVariant::GridSync { total_ctas: 48 }),
+            "SM75 >= 70 should get GridSync even with < 60 SMs"
+        );
     }
 
     // ── Test 115: MK_CLUSTER minimum 1 cluster for small SM90 GPU ──
     #[test]
     fn test_mk_cluster_min_one_cluster() {
         let variant = select_mk_variant(90, 4);
-        assert!(matches!(variant, MkVariant::Cluster6x2 { num_clusters: 1, .. }),
-            "Very small SM90 GPU should have at least 1 cluster");
+        assert!(
+            matches!(
+                variant,
+                MkVariant::Cluster6x2 {
+                    num_clusters: 1,
+                    ..
+                }
+            ),
+            "Very small SM90 GPU should have at least 1 cluster"
+        );
     }
 
     // ── Test 116: emit_compact_serial produces LoopBegin/LoopEnd with correct structure ──
@@ -6272,18 +8423,27 @@ mod tests {
         let mut prog = VmProgram::new();
         let batch_ctx_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let seq_count = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        prog.emit(VmInstr::GprLoadImm { dst: seq_count, value: 4 });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: seq_count,
+            value: 4,
+        });
 
         emit_compact_serial(&mut prog, batch_ctx_ptr, seq_count);
 
         // Should contain LoopBegin + LoopEnd pair
-        let has_loop_begin = prog.instrs.iter().any(|i| matches!(i, VmInstr::LoopBegin { .. }));
+        let has_loop_begin = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::LoopBegin { .. }));
         let has_loop_end = prog.instrs.iter().any(|i| matches!(i, VmInstr::LoopEnd));
         assert!(has_loop_begin, "compact should contain LoopBegin");
         assert!(has_loop_end, "compact should contain LoopEnd");
 
         // Should contain GprCondAction (active_flag check)
-        let has_cond = prog.instrs.iter().any(|i| matches!(i, VmInstr::GprCondAction { .. }));
+        let has_cond = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::GprCondAction { .. }));
         assert!(has_cond, "compact should check active_flag");
     }
 
@@ -6293,23 +8453,39 @@ mod tests {
         let mut prog = VmProgram::new();
         let batch_ctx_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let survivor_count = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        prog.emit(VmInstr::GprLoadImm { dst: survivor_count, value: 2 });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: survivor_count,
+            value: 2,
+        });
 
         emit_request_queue_refill(&mut prog, batch_ctx_ptr, survivor_count);
 
         // Should contain AtomicAdd (read_idx increment)
-        let has_atomic = prog.instrs.iter().any(|i| matches!(i, VmInstr::AtomicAdd { elem_width: 8, .. }));
-        assert!(has_atomic, "refill should contain AtomicAdd for u64 read_idx");
+        let has_atomic = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::AtomicAdd { elem_width: 8, .. }));
+        assert!(
+            has_atomic,
+            "refill should contain AtomicAdd for u64 read_idx"
+        );
 
         // Should contain ScalarLoad for write_idx check
         let has_write_idx_load = prog.instrs.iter().any(|i| {
-            if let VmInstr::ScalarLoad { offset: OffsetExpr::Const(off), .. } = i {
+            if let VmInstr::ScalarLoad {
+                offset: OffsetExpr::Const(off),
+                ..
+            } = i
+            {
                 *off == request_queue_offsets::WRITE_IDX as usize
             } else {
                 false
             }
         });
-        assert!(has_write_idx_load, "refill should load write_idx to check queue emptiness");
+        assert!(
+            has_write_idx_load,
+            "refill should load write_idx to check queue emptiness"
+        );
     }
 
     // ── Test 118: SmPartitionConfig SM61 → MK_SERIAL, all CTAs decode ──
@@ -6336,7 +8512,13 @@ mod tests {
     #[test]
     fn test_sm_partition_config_sm90_cluster() {
         let config = SmPartitionConfig::for_sm(90, 132);
-        assert!(matches!(config.variant, MkVariant::Cluster6x2 { cluster_size: 8, num_clusters: 16 }));
+        assert!(matches!(
+            config.variant,
+            MkVariant::Cluster6x2 {
+                cluster_size: 8,
+                num_clusters: 16
+            }
+        ));
         assert_eq!(config.total_ctas, 128); // 8 * 16
         assert_eq!(config.decode_ctas, 96); // 6 * 16
         assert_eq!(config.prefill_ctas, 32); // 2 * 16
@@ -6350,16 +8532,30 @@ mod tests {
         let seq_id = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         let token_id = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         let gen_idx = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        prog.emit(VmInstr::GprLoadImm { dst: seq_id, value: 0 });
-        prog.emit(VmInstr::GprLoadImm { dst: token_id, value: 42 });
-        prog.emit(VmInstr::GprLoadImm { dst: gen_idx, value: 0 });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: seq_id,
+            value: 0,
+        });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: token_id,
+            value: 42,
+        });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: gen_idx,
+            value: 0,
+        });
 
         emit_output_token_write(&mut prog, batch_ctx_ptr, seq_id, token_id, gen_idx, false);
 
-        let stores = prog.instrs.iter()
+        let stores = prog
+            .instrs
+            .iter()
             .filter(|i| matches!(i, VmInstr::ScalarStore { .. }))
             .count();
-        assert!(stores >= 2, "should store at least seq_id and token_id, got {stores} stores");
+        assert!(
+            stores >= 2,
+            "should store at least seq_id and token_id, got {stores} stores"
+        );
     }
 
     // ── Test 122: emit_dual_batch_meta_swap produces AtomicAdd for epoch ──
@@ -6370,8 +8566,16 @@ mod tests {
 
         emit_dual_batch_meta_swap(&mut prog, batch_ctx_ptr);
 
-        let has_atomic = prog.instrs.iter()
-            .any(|i| matches!(i, VmInstr::AtomicAdd { elem_width: 4, value: 1, .. }));
+        let has_atomic = prog.instrs.iter().any(|i| {
+            matches!(
+                i,
+                VmInstr::AtomicAdd {
+                    elem_width: 4,
+                    value: 1,
+                    ..
+                }
+            )
+        });
         assert!(has_atomic, "epoch swap should contain AtomicAdd u32 +1");
     }
 
@@ -6384,24 +8588,46 @@ mod tests {
         let local_next_id = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         let dst_page_id = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
 
-        emit_page_alloc_serial(&mut prog, batch_ctx_ptr, local_free_count, local_next_id, dst_page_id);
+        emit_page_alloc_serial(
+            &mut prog,
+            batch_ctx_ptr,
+            local_free_count,
+            local_next_id,
+            dst_page_id,
+        );
 
         // Must have GprCondAction for fast-path check (local_free_count == 0)
-        let cond_actions = prog.instrs.iter()
+        let cond_actions = prog
+            .instrs
+            .iter()
             .filter(|i| matches!(i, VmInstr::GprCondAction { .. }))
             .count();
         assert!(cond_actions >= 2, "page alloc should have at least 2 conditional actions (fast-path skip + slow-path skip), got {cond_actions}");
 
         // Must have AtomicAdd for global pool grab
-        let has_atomic = prog.instrs.iter()
-            .any(|i| matches!(i, VmInstr::AtomicAdd { elem_width: 8, value: 32, .. }));
-        assert!(has_atomic, "page alloc slow-path should contain AtomicAdd u64 +32 for batch grab");
+        let has_atomic = prog.instrs.iter().any(|i| {
+            matches!(
+                i,
+                VmInstr::AtomicAdd {
+                    elem_width: 8,
+                    value: 32,
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_atomic,
+            "page alloc slow-path should contain AtomicAdd u64 +32 for batch grab"
+        );
 
         // Must update local_free_count and local_next_id
         let bin_ops = prog.instrs.iter()
             .filter(|i| matches!(i, VmInstr::GprBinOp { dst, .. } if *dst == local_free_count || *dst == local_next_id))
             .count();
-        assert!(bin_ops >= 3, "page alloc should update local_free_count and local_next_id in both paths");
+        assert!(
+            bin_ops >= 3,
+            "page alloc should update local_free_count and local_next_id in both paths"
+        );
     }
 
     // ── Test: emit_page_free_serial increments local count ──
@@ -6417,16 +8643,19 @@ mod tests {
         let add_ops = prog.instrs.iter()
             .filter(|i| matches!(i, VmInstr::GprBinOp { dst, op: GprOp::Add, b: GprOperand::Imm(1), .. } if *dst == local_free_count))
             .count();
-        assert_eq!(add_ops, 1, "page free should increment local_free_count by 1");
+        assert_eq!(
+            add_ops, 1,
+            "page free should increment local_free_count by 1"
+        );
     }
 
     // ── PTX Mega-Kernel Integration Tests (SPEC 32) ──
 
     // Helper: build a VmProgram with ForwardPhaseDispatch logic, lower to PTX, return IR string.
     fn build_forward_phase_dispatch_ptx(sm_version: u32) -> String {
-        use super::super::gpu_lower::{GpuLower, GpuDialect};
-        use super::super::stack_frame::StackFrame;
+        use super::super::gpu_lower::{GpuDialect, GpuLower};
         use super::super::reg_alloc::RegAllocation;
+        use super::super::stack_frame::StackFrame;
 
         let mut prog = VmProgram::new();
 
@@ -6460,31 +8689,48 @@ mod tests {
 
         // Fall-through: dedicated prefill path
         let _prefill_placeholder = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        prog.emit(VmInstr::GprLoadImm { dst: _prefill_placeholder, value: 1 });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: _prefill_placeholder,
+            value: 1,
+        });
 
         // Mixed path entry (reuses prefill forward pass for MK_SERIAL)
-        prog.emit(VmInstr::MarkLabel { label_id: MIXED_PATH_LABEL });
+        prog.emit(VmInstr::MarkLabel {
+            label_id: MIXED_PATH_LABEL,
+        });
 
         // Prefill/mixed path placeholder
         let _placeholder = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        prog.emit(VmInstr::GprLoadImm { dst: _placeholder, value: 2 });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: _placeholder,
+            value: 2,
+        });
 
         // Decode entry label
-        prog.emit(VmInstr::MarkLabel { label_id: DECODE_ENTRY_LABEL });
+        prog.emit(VmInstr::MarkLabel {
+            label_id: DECODE_ENTRY_LABEL,
+        });
 
         // Build GPU lower
         let mut lower = GpuLower::new(GpuDialect::Ptx { sm_version });
         let frame = StackFrame {
-            total_size: 0, alignment: 0, callee_save_area: 0,
-            spill_area: 0, scratchpad_area: 0, uses_red_zone: false,
+            total_size: 0,
+            alignment: 0,
+            callee_save_area: 0,
+            spill_area: 0,
+            scratchpad_area: 0,
+            uses_red_zone: false,
         };
         let alloc = RegAllocation {
             mapping: std::collections::HashMap::new(),
-            spills: vec![], callee_saved_used: vec![],
+            spills: vec![],
+            callee_saved_used: vec![],
         };
 
         lower.set_vreg_kind_map(&prog);
-        lower.emit_prologue(&frame, &alloc, prog.vreg_counts_by_kind()).unwrap();
+        lower
+            .emit_prologue(&frame, &alloc, prog.vreg_counts_by_kind())
+            .unwrap();
 
         for instr in &prog.instrs {
             lower.lower_instr(instr, &alloc).unwrap();
@@ -6500,48 +8746,68 @@ mod tests {
         let ir = build_forward_phase_dispatch_ptx(61);
 
         // Must load total_prefill_tokens (u32) from BatchContext
-        assert!(ir.contains("ld.global.u32"),
-            "ForwardPhaseDispatch should emit ld.global.u32 for loading total_prefill_tokens: {ir}");
+        assert!(
+            ir.contains("ld.global.u32"),
+            "ForwardPhaseDispatch should emit ld.global.u32 for loading total_prefill_tokens: {ir}"
+        );
 
         // Must have comparisons for three-way branch (eq + lt.u32)
-        assert!(ir.contains("setp.eq.u32"),
-            "ForwardPhaseDispatch should emit setp.eq.u32 for batch_m==0 check: {ir}");
-        assert!(ir.contains("setp.lt.u32"),
-            "ForwardPhaseDispatch should emit setp.lt.u32 for batch_m<=threshold check: {ir}");
+        assert!(
+            ir.contains("setp.eq.u32"),
+            "ForwardPhaseDispatch should emit setp.eq.u32 for batch_m==0 check: {ir}"
+        );
+        assert!(
+            ir.contains("setp.lt.u32"),
+            "ForwardPhaseDispatch should emit setp.lt.u32 for batch_m<=threshold check: {ir}"
+        );
 
         // Must have labels for decode entry (101) and mixed path (102)
-        assert!(ir.contains("LABEL_101:"),
-            "ForwardPhaseDispatch should emit LABEL_101 for decode entry: {ir}");
-        assert!(ir.contains("LABEL_102:"),
-            "ForwardPhaseDispatch should emit LABEL_102 for mixed path: {ir}");
+        assert!(
+            ir.contains("LABEL_101:"),
+            "ForwardPhaseDispatch should emit LABEL_101 for decode entry: {ir}"
+        );
+        assert!(
+            ir.contains("LABEL_102:"),
+            "ForwardPhaseDispatch should emit LABEL_102 for mixed path: {ir}"
+        );
     }
 
     // Helper: build a VmProgram with request queue refill logic, lower to PTX, return IR string.
     fn build_request_queue_refill_ptx(sm_version: u32) -> String {
-        use super::super::gpu_lower::{GpuLower, GpuDialect};
-        use super::super::stack_frame::StackFrame;
+        use super::super::gpu_lower::{GpuDialect, GpuLower};
         use super::super::reg_alloc::RegAllocation;
+        use super::super::stack_frame::StackFrame;
 
         let mut prog = VmProgram::new();
         let batch_ctx_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let survivor_count = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        prog.emit(VmInstr::GprLoadImm { dst: survivor_count, value: 2 });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: survivor_count,
+            value: 2,
+        });
 
         emit_request_queue_refill(&mut prog, batch_ctx_ptr, survivor_count);
 
         // Lower to PTX
         let mut lower = GpuLower::new(GpuDialect::Ptx { sm_version });
         let frame = StackFrame {
-            total_size: 0, alignment: 0, callee_save_area: 0,
-            spill_area: 0, scratchpad_area: 0, uses_red_zone: false,
+            total_size: 0,
+            alignment: 0,
+            callee_save_area: 0,
+            spill_area: 0,
+            scratchpad_area: 0,
+            uses_red_zone: false,
         };
         let alloc = RegAllocation {
             mapping: std::collections::HashMap::new(),
-            spills: vec![], callee_saved_used: vec![],
+            spills: vec![],
+            callee_saved_used: vec![],
         };
 
         lower.set_vreg_kind_map(&prog);
-        lower.emit_prologue(&frame, &alloc, prog.vreg_counts_by_kind()).unwrap();
+        lower
+            .emit_prologue(&frame, &alloc, prog.vreg_counts_by_kind())
+            .unwrap();
 
         for instr in &prog.instrs {
             let _ = lower.lower_instr(instr, &alloc);
@@ -6557,28 +8823,41 @@ mod tests {
         let ir = build_request_queue_refill_ptx(61);
 
         // Must contain atom.global.add.u64 for read_idx increment
-        assert!(ir.contains("atom.global.add.u64"),
-            "RequestQueue refill should emit atom.global.add.u64 for read_idx increment: {ir}");
+        assert!(
+            ir.contains("atom.global.add.u64"),
+            "RequestQueue refill should emit atom.global.add.u64 for read_idx increment: {ir}"
+        );
 
         // Must load request_queue_ptr via ld.global (u32 for scalar vreg, u64 for pointer vreg)
-        assert!(ir.contains("ld.global."),
-            "RequestQueue refill should emit ld.global for loading pointer fields: {ir}");
+        assert!(
+            ir.contains("ld.global."),
+            "RequestQueue refill should emit ld.global for loading pointer fields: {ir}"
+        );
     }
 
     // Helper: build a VmProgram with output streaming logic, lower to PTX, return IR string.
     fn build_output_stream_ptx(sm_version: u32) -> String {
-        use super::super::gpu_lower::{GpuLower, GpuDialect};
-        use super::super::stack_frame::StackFrame;
+        use super::super::gpu_lower::{GpuDialect, GpuLower};
         use super::super::reg_alloc::RegAllocation;
+        use super::super::stack_frame::StackFrame;
 
         let mut prog = VmProgram::new();
         let batch_ctx_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let seq_id = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         let token_id = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         let gen_idx = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        prog.emit(VmInstr::GprLoadImm { dst: seq_id, value: 0 });
-        prog.emit(VmInstr::GprLoadImm { dst: token_id, value: 42 });
-        prog.emit(VmInstr::GprLoadImm { dst: gen_idx, value: 0 });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: seq_id,
+            value: 0,
+        });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: token_id,
+            value: 42,
+        });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: gen_idx,
+            value: 0,
+        });
 
         // Emit output token write (stores seq_id, token_id, is_final to output ring)
         emit_output_token_write(&mut prog, batch_ctx_ptr, seq_id, token_id, gen_idx, false);
@@ -6601,16 +8880,23 @@ mod tests {
         // Lower to PTX
         let mut lower = GpuLower::new(GpuDialect::Ptx { sm_version });
         let frame = StackFrame {
-            total_size: 0, alignment: 0, callee_save_area: 0,
-            spill_area: 0, scratchpad_area: 0, uses_red_zone: false,
+            total_size: 0,
+            alignment: 0,
+            callee_save_area: 0,
+            spill_area: 0,
+            scratchpad_area: 0,
+            uses_red_zone: false,
         };
         let alloc = RegAllocation {
             mapping: std::collections::HashMap::new(),
-            spills: vec![], callee_saved_used: vec![],
+            spills: vec![],
+            callee_saved_used: vec![],
         };
 
         lower.set_vreg_kind_map(&prog);
-        lower.emit_prologue(&frame, &alloc, prog.vreg_counts_by_kind()).unwrap();
+        lower
+            .emit_prologue(&frame, &alloc, prog.vreg_counts_by_kind())
+            .unwrap();
 
         for instr in &prog.instrs {
             let _ = lower.lower_instr(instr, &alloc);
@@ -6626,12 +8912,16 @@ mod tests {
         let ir = build_output_stream_ptx(61);
 
         // Must contain st.global.u32 for output ring write (seq_id/token_id stores)
-        assert!(ir.contains("st.global.u32"),
-            "Output streaming should emit st.global.u32 for output ring write: {ir}");
+        assert!(
+            ir.contains("st.global.u32"),
+            "Output streaming should emit st.global.u32 for output ring write: {ir}"
+        );
 
         // Must contain atom.global.add.u64 for write_idx increment
-        assert!(ir.contains("atom.global.add.u64"),
-            "Output streaming should emit atom.global.add.u64 for write_idx increment: {ir}");
+        assert!(
+            ir.contains("atom.global.add.u64"),
+            "Output streaming should emit atom.global.add.u64 for write_idx increment: {ir}"
+        );
     }
 
     // ── Test 126: MkVariant selection for all SM paths ──
@@ -6649,26 +8939,37 @@ mod tests {
 
         // SM80, 60 SMs → GridSync { total_ctas: 60 }
         let v80 = select_mk_variant(80, 60);
-        assert!(matches!(v80, MkVariant::GridSync { total_ctas: 60 }),
-            "SM80 with 60 SMs should select GridSync {{ total_ctas=60 }}, got {:?}", v80);
+        assert!(
+            matches!(v80, MkVariant::GridSync { total_ctas: 60 }),
+            "SM80 with 60 SMs should select GridSync {{ total_ctas=60 }}, got {:?}",
+            v80
+        );
 
         // SM61, 9 SMs → Serial
         let v61 = select_mk_variant(61, 9);
-        assert_eq!(v61, MkVariant::Serial,
-            "SM61 with 9 SMs should select Serial, got {:?}", v61);
+        assert_eq!(
+            v61,
+            MkVariant::Serial,
+            "SM61 with 9 SMs should select Serial, got {:?}",
+            v61
+        );
 
         // SM52, 4 SMs → Serial
         let v52 = select_mk_variant(52, 4);
-        assert_eq!(v52, MkVariant::Serial,
-            "SM52 with 4 SMs should select Serial, got {:?}", v52);
+        assert_eq!(
+            v52,
+            MkVariant::Serial,
+            "SM52 with 4 SMs should select Serial, got {:?}",
+            v52
+        );
     }
 
     // ── SPEC 32 Ring Barrier PTX Tests (Phase 1.4, REQ-MKO-002) ──
 
     fn build_ring_barrier_arrive_ptx(sm_version: u32) -> String {
-        use super::super::gpu_lower::{GpuLower, GpuDialect};
-        use super::super::stack_frame::StackFrame;
+        use super::super::gpu_lower::{GpuDialect, GpuLower};
         use super::super::reg_alloc::RegAllocation;
+        use super::super::stack_frame::StackFrame;
 
         let mut prog = VmProgram::new();
         let barrier_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -6676,16 +8977,23 @@ mod tests {
 
         let mut lower = GpuLower::new(GpuDialect::Ptx { sm_version });
         let frame = StackFrame {
-            total_size: 0, alignment: 0, callee_save_area: 0,
-            spill_area: 0, scratchpad_area: 0, uses_red_zone: false,
+            total_size: 0,
+            alignment: 0,
+            callee_save_area: 0,
+            spill_area: 0,
+            scratchpad_area: 0,
+            uses_red_zone: false,
         };
         let alloc = RegAllocation {
             mapping: std::collections::HashMap::new(),
-            spills: vec![], callee_saved_used: vec![],
+            spills: vec![],
+            callee_saved_used: vec![],
         };
 
         lower.set_vreg_kind_map(&prog);
-        lower.emit_prologue(&frame, &alloc, prog.vreg_counts_by_kind()).unwrap();
+        lower
+            .emit_prologue(&frame, &alloc, prog.vreg_counts_by_kind())
+            .unwrap();
         for instr in &prog.instrs {
             let _ = lower.lower_instr(instr, &alloc);
         }
@@ -6694,9 +9002,9 @@ mod tests {
     }
 
     fn build_ring_barrier_wait_ptx(sm_version: u32, expected: u32) -> String {
-        use super::super::gpu_lower::{GpuLower, GpuDialect};
-        use super::super::stack_frame::StackFrame;
+        use super::super::gpu_lower::{GpuDialect, GpuLower};
         use super::super::reg_alloc::RegAllocation;
+        use super::super::stack_frame::StackFrame;
 
         let mut prog = VmProgram::new();
         let barrier_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -6704,16 +9012,23 @@ mod tests {
 
         let mut lower = GpuLower::new(GpuDialect::Ptx { sm_version });
         let frame = StackFrame {
-            total_size: 0, alignment: 0, callee_save_area: 0,
-            spill_area: 0, scratchpad_area: 0, uses_red_zone: false,
+            total_size: 0,
+            alignment: 0,
+            callee_save_area: 0,
+            spill_area: 0,
+            scratchpad_area: 0,
+            uses_red_zone: false,
         };
         let alloc = RegAllocation {
             mapping: std::collections::HashMap::new(),
-            spills: vec![], callee_saved_used: vec![],
+            spills: vec![],
+            callee_saved_used: vec![],
         };
 
         lower.set_vreg_kind_map(&prog);
-        lower.emit_prologue(&frame, &alloc, prog.vreg_counts_by_kind()).unwrap();
+        lower
+            .emit_prologue(&frame, &alloc, prog.vreg_counts_by_kind())
+            .unwrap();
         for instr in &prog.instrs {
             let _ = lower.lower_instr(instr, &alloc);
         }
@@ -6724,63 +9039,87 @@ mod tests {
     #[test]
     fn test_ptx_sm61_ring_barrier_arrive_contains_atom_add() {
         let ir = build_ring_barrier_arrive_ptx(61);
-        assert!(ir.contains("atom.global.add.u32"),
-            "Ring barrier arrive should emit atom.global.add.u32: {ir}");
+        assert!(
+            ir.contains("atom.global.add.u32"),
+            "Ring barrier arrive should emit atom.global.add.u32: {ir}"
+        );
     }
 
     #[test]
     fn test_ptx_sm61_ring_barrier_arrive_contains_membar() {
         let ir = build_ring_barrier_arrive_ptx(61);
-        assert!(ir.contains("membar.gl") || ir.contains("bar.sync"),
-            "Ring barrier arrive should emit memory fence: {ir}");
+        assert!(
+            ir.contains("membar.gl") || ir.contains("bar.sync"),
+            "Ring barrier arrive should emit memory fence: {ir}"
+        );
     }
 
     #[test]
     fn test_ptx_sm61_ring_barrier_wait_loads_counter() {
         let ir = build_ring_barrier_wait_ptx(61, 9);
-        assert!(ir.contains("ld.global."),
-            "Ring barrier wait should load barrier counter via ld.global: {ir}");
+        assert!(
+            ir.contains("ld.global."),
+            "Ring barrier wait should load barrier counter via ld.global: {ir}"
+        );
     }
 
     #[test]
     fn test_ptx_sm61_ring_barrier_wait_resets_counter() {
         let ir = build_ring_barrier_wait_ptx(61, 9);
-        assert!(ir.contains("st.global."),
-            "Ring barrier wait should reset counter via st.global: {ir}");
+        assert!(
+            ir.contains("st.global."),
+            "Ring barrier wait should reset counter via st.global: {ir}"
+        );
     }
 
     #[test]
     fn test_ptx_sm61_ring_barrier_arrive_produces_valid_ptx() {
         let ir = build_ring_barrier_arrive_ptx(61);
-        assert!(ir.contains(".version 6.5"), "SM61 PTX should use version 6.5: {ir}");
-        assert!(ir.contains(".target sm_61"), "SM61 PTX should target sm_61: {ir}");
+        assert!(
+            ir.contains(".version 6.5"),
+            "SM61 PTX should use version 6.5: {ir}"
+        );
+        assert!(
+            ir.contains(".target sm_61"),
+            "SM61 PTX should target sm_61: {ir}"
+        );
     }
 
     // ── SPEC 32 Compact Serial PTX Tests (Phase 3.3, REQ-MKO-003) ──
 
     fn build_compact_serial_ptx(sm_version: u32) -> String {
-        use super::super::gpu_lower::{GpuLower, GpuDialect};
-        use super::super::stack_frame::StackFrame;
+        use super::super::gpu_lower::{GpuDialect, GpuLower};
         use super::super::reg_alloc::RegAllocation;
+        use super::super::stack_frame::StackFrame;
 
         let mut prog = VmProgram::new();
         let batch_ctx_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let seq_count = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        prog.emit(VmInstr::GprLoadImm { dst: seq_count, value: 4 });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: seq_count,
+            value: 4,
+        });
         emit_compact_serial(&mut prog, batch_ctx_ptr, seq_count);
 
         let mut lower = GpuLower::new(GpuDialect::Ptx { sm_version });
         let frame = StackFrame {
-            total_size: 0, alignment: 0, callee_save_area: 0,
-            spill_area: 0, scratchpad_area: 0, uses_red_zone: false,
+            total_size: 0,
+            alignment: 0,
+            callee_save_area: 0,
+            spill_area: 0,
+            scratchpad_area: 0,
+            uses_red_zone: false,
         };
         let alloc = RegAllocation {
             mapping: std::collections::HashMap::new(),
-            spills: vec![], callee_saved_used: vec![],
+            spills: vec![],
+            callee_saved_used: vec![],
         };
 
         lower.set_vreg_kind_map(&prog);
-        lower.emit_prologue(&frame, &alloc, prog.vreg_counts_by_kind()).unwrap();
+        lower
+            .emit_prologue(&frame, &alloc, prog.vreg_counts_by_kind())
+            .unwrap();
         for instr in &prog.instrs {
             let _ = lower.lower_instr(instr, &alloc);
         }
@@ -6791,30 +9130,37 @@ mod tests {
     #[test]
     fn test_ptx_sm61_compact_serial_loads_seq_meta() {
         let ir = build_compact_serial_ptx(61);
-        assert!(ir.contains("ld.global."),
-            "Compact serial should load seq_meta_base via ld.global: {ir}");
+        assert!(
+            ir.contains("ld.global."),
+            "Compact serial should load seq_meta_base via ld.global: {ir}"
+        );
     }
 
     #[test]
     fn test_ptx_sm61_compact_serial_has_loop_structure() {
         let ir = build_compact_serial_ptx(61);
         // LoopBegin/LoopEnd generates bra (branch) instructions
-        assert!(ir.contains("bra"),
-            "Compact serial should have loop branch instructions: {ir}");
+        assert!(
+            ir.contains("bra"),
+            "Compact serial should have loop branch instructions: {ir}"
+        );
     }
 
     #[test]
     fn test_ptx_sm61_compact_serial_valid_ptx_version() {
         let ir = build_compact_serial_ptx(61);
-        assert!(ir.contains(".version 6.5"), "SM61 PTX should use version 6.5: {ir}");
+        assert!(
+            ir.contains(".version 6.5"),
+            "SM61 PTX should use version 6.5: {ir}"
+        );
     }
 
     // ── SPEC 32 DualBatchMeta Swap PTX Tests (Phase 3.4, REQ-MKO-004) ──
 
     fn build_dual_batch_swap_ptx(sm_version: u32) -> String {
-        use super::super::gpu_lower::{GpuLower, GpuDialect};
-        use super::super::stack_frame::StackFrame;
+        use super::super::gpu_lower::{GpuDialect, GpuLower};
         use super::super::reg_alloc::RegAllocation;
+        use super::super::stack_frame::StackFrame;
 
         let mut prog = VmProgram::new();
         let batch_ctx_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -6822,16 +9168,23 @@ mod tests {
 
         let mut lower = GpuLower::new(GpuDialect::Ptx { sm_version });
         let frame = StackFrame {
-            total_size: 0, alignment: 0, callee_save_area: 0,
-            spill_area: 0, scratchpad_area: 0, uses_red_zone: false,
+            total_size: 0,
+            alignment: 0,
+            callee_save_area: 0,
+            spill_area: 0,
+            scratchpad_area: 0,
+            uses_red_zone: false,
         };
         let alloc = RegAllocation {
             mapping: std::collections::HashMap::new(),
-            spills: vec![], callee_saved_used: vec![],
+            spills: vec![],
+            callee_saved_used: vec![],
         };
 
         lower.set_vreg_kind_map(&prog);
-        lower.emit_prologue(&frame, &alloc, prog.vreg_counts_by_kind()).unwrap();
+        lower
+            .emit_prologue(&frame, &alloc, prog.vreg_counts_by_kind())
+            .unwrap();
         for instr in &prog.instrs {
             let _ = lower.lower_instr(instr, &alloc);
         }
@@ -6842,22 +9195,32 @@ mod tests {
     #[test]
     fn test_ptx_sm61_dual_batch_swap_loads_epoch_ptr() {
         let ir = build_dual_batch_swap_ptx(61);
-        assert!(ir.contains("ld.global."),
-            "DualBatchMeta swap should load epoch_ptr via ld.global: {ir}");
+        assert!(
+            ir.contains("ld.global."),
+            "DualBatchMeta swap should load epoch_ptr via ld.global: {ir}"
+        );
     }
 
     #[test]
     fn test_ptx_sm61_dual_batch_swap_increments_epoch() {
         let ir = build_dual_batch_swap_ptx(61);
-        assert!(ir.contains("atom.global.add.u32"),
-            "DualBatchMeta swap should emit atom.global.add.u32 for epoch: {ir}");
+        assert!(
+            ir.contains("atom.global.add.u32"),
+            "DualBatchMeta swap should emit atom.global.add.u32 for epoch: {ir}"
+        );
     }
 
     #[test]
     fn test_ptx_sm61_dual_batch_swap_valid_ptx() {
         let ir = build_dual_batch_swap_ptx(61);
-        assert!(ir.contains(".version 6.5"), "SM61 PTX should use version 6.5: {ir}");
-        assert!(ir.contains(".target sm_61"), "SM61 PTX should target sm_61: {ir}");
+        assert!(
+            ir.contains(".version 6.5"),
+            "SM61 PTX should use version 6.5: {ir}"
+        );
+        assert!(
+            ir.contains(".target sm_61"),
+            "SM61 PTX should target sm_61: {ir}"
+        );
     }
 
     // ── SPEC 32 REQ-MKO-004: OutputRingBuffer + Streaming Output Tests ──
@@ -6883,7 +9246,10 @@ mod tests {
         assert_eq!(buf.capacity(), 1024 * 8);
         assert_eq!(buf.sub_ring_for_cta(0), 0);
         assert_eq!(buf.sub_ring_for_cta(1), 1024 * OutputRingBuffer::ENTRY_SIZE);
-        assert_eq!(buf.sub_ring_for_cta(3), 3 * 1024 * OutputRingBuffer::ENTRY_SIZE);
+        assert_eq!(
+            buf.sub_ring_for_cta(3),
+            3 * 1024 * OutputRingBuffer::ENTRY_SIZE
+        );
     }
 
     #[test]
@@ -6903,18 +9269,29 @@ mod tests {
         let token_id = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         let gen_idx = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         let write_count = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        prog.emit(VmInstr::GprLoadImm { dst: write_count, value: 0 });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: write_count,
+            value: 0,
+        });
 
         let before = prog.len();
         emit_streaming_output_serial(
-            &mut prog, batch_ctx_ptr, seq_id, token_id, gen_idx, false, write_count,
+            &mut prog,
+            batch_ctx_ptr,
+            seq_id,
+            token_id,
+            gen_idx,
+            false,
+            write_count,
         );
         let after = prog.len();
 
         // Should emit multiple instructions (loads, stores, arithmetic, doorbell)
-        assert!(after > before + 5,
+        assert!(
+            after > before + 5,
             "emit_streaming_output_serial should emit >5 instructions, got {} new",
-            after - before);
+            after - before
+        );
     }
 
     #[test]
@@ -6928,9 +9305,11 @@ mod tests {
         let after = prog.len();
 
         // Should emit at least 2 instructions: ScalarLoad (doorbell_ptr) + ScalarStore (count)
-        assert!(after - before >= 2,
+        assert!(
+            after - before >= 2,
             "emit_doorbell_update should emit >=2 instructions (load ptr + store count), got {}",
-            after - before);
+            after - before
+        );
     }
 
     #[test]
@@ -7007,31 +9386,42 @@ mod tests {
     #[test]
     fn test_decode_m_dimension_is_one_for_all_profiles() {
         for profile in [
-            HardwareProfile::CudaSM100, HardwareProfile::CudaSM90,
-            HardwareProfile::CudaSM80, HardwareProfile::CpuAvx2,
-            HardwareProfile::CpuAvx512, HardwareProfile::ArmNeoverse,
+            HardwareProfile::CudaSM100,
+            HardwareProfile::CudaSM90,
+            HardwareProfile::CudaSM80,
+            HardwareProfile::CpuAvx2,
+            HardwareProfile::CpuAvx512,
+            HardwareProfile::ArmNeoverse,
             HardwareProfile::Generic,
         ] {
             let p = decode_fusion_params(&profile);
-            assert_eq!(p.gemm_tile.0, 1,
-                "Decode M must be 1 for {:?}, got {}", profile, p.gemm_tile.0);
+            assert_eq!(
+                p.gemm_tile.0, 1,
+                "Decode M must be 1 for {:?}, got {}",
+                profile, p.gemm_tile.0
+            );
         }
     }
 
     #[test]
     fn test_prefill_tile_m_greater_than_decode() {
         let profiles = [
-            HardwareProfile::CudaSM100, HardwareProfile::CudaSM90,
-            HardwareProfile::CudaSM80, HardwareProfile::CpuAvx2,
+            HardwareProfile::CudaSM100,
+            HardwareProfile::CudaSM90,
+            HardwareProfile::CudaSM80,
+            HardwareProfile::CpuAvx2,
             HardwareProfile::CpuAvx512,
         ];
         for profile in &profiles {
             let prefill = prefill_fusion_params(profile);
             let decode = decode_fusion_params(profile);
-            assert!(prefill.gemm_tile.0 > decode.gemm_tile.0,
+            assert!(
+                prefill.gemm_tile.0 > decode.gemm_tile.0,
                 "Prefill M ({}) should > Decode M ({}) for {:?}",
-                prefill.gemm_tile.0, decode.gemm_tile.0, profile);
+                prefill.gemm_tile.0,
+                decode.gemm_tile.0,
+                profile
+            );
         }
     }
-
 }

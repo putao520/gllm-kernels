@@ -84,11 +84,11 @@ macro_rules! quant_primitive_kquant {
             $crate::quant_primitive_kquant!(scalar, q4_k, dot, $block_ptr, $other_ptr)
         }
     };
-    
+
     // ------------------------------------------------------------------------
     // Q8_K Decoding
     // ------------------------------------------------------------------------
-    
+
      (scalar, q8_k, decode, $block_ptr:expr, $out_ptr:expr) => {
         {
              let block = unsafe { &*$block_ptr };

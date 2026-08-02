@@ -1,7 +1,7 @@
 //! Model weights — device-side weight storage with layer-indexed access.
 
-use crate::types::{InferenceError, ModelArch, ModelConfig};
 use crate::inference::tensor::DeviceTensor;
+use crate::types::{InferenceError, ModelArch, ModelConfig};
 
 /// Per-layer weight set for a transformer layer (decoder or encoder).
 pub struct LayerWeights {
@@ -190,14 +190,26 @@ mod tests {
         let kv_dim = config.num_kv_heads * config.head_dim;
 
         for (i, layer) in weights.layers.iter().enumerate() {
-            assert_eq!(layer.wq.num_elements(), h * q_dim,
-                "wq size mismatch at layer {i}");
-            assert_eq!(layer.wk.num_elements(), h * kv_dim,
-                "wk size mismatch at layer {i}");
-            assert_eq!(layer.wv.num_elements(), h * kv_dim,
-                "wv size mismatch at layer {i}");
-            assert_eq!(layer.wo.num_elements(), q_dim * h,
-                "wo size mismatch at layer {i}");
+            assert_eq!(
+                layer.wq.num_elements(),
+                h * q_dim,
+                "wq size mismatch at layer {i}"
+            );
+            assert_eq!(
+                layer.wk.num_elements(),
+                h * kv_dim,
+                "wk size mismatch at layer {i}"
+            );
+            assert_eq!(
+                layer.wv.num_elements(),
+                h * kv_dim,
+                "wv size mismatch at layer {i}"
+            );
+            assert_eq!(
+                layer.wo.num_elements(),
+                q_dim * h,
+                "wo size mismatch at layer {i}"
+            );
         }
     }
 
@@ -212,12 +224,21 @@ mod tests {
         let inter = config.intermediate_size;
 
         for (i, layer) in weights.layers.iter().enumerate() {
-            assert_eq!(layer.w_gate.num_elements(), h * inter,
-                "w_gate size mismatch at layer {i}");
-            assert_eq!(layer.w_up.num_elements(), h * inter,
-                "w_up size mismatch at layer {i}");
-            assert_eq!(layer.w_down.num_elements(), inter * h,
-                "w_down size mismatch at layer {i}");
+            assert_eq!(
+                layer.w_gate.num_elements(),
+                h * inter,
+                "w_gate size mismatch at layer {i}"
+            );
+            assert_eq!(
+                layer.w_up.num_elements(),
+                h * inter,
+                "w_up size mismatch at layer {i}"
+            );
+            assert_eq!(
+                layer.w_down.num_elements(),
+                inter * h,
+                "w_down size mismatch at layer {i}"
+            );
         }
     }
 
@@ -231,14 +252,26 @@ mod tests {
         let h = config.hidden_size;
 
         for (i, layer) in weights.layers.iter().enumerate() {
-            assert_eq!(layer.attn_norm.num_elements(), h,
-                "attn_norm size mismatch at layer {i}");
-            assert_eq!(layer.attn_norm_bias.num_elements(), 0,
-                "attn_norm_bias should be zero-sized for RMSNorm at layer {i}");
-            assert_eq!(layer.ffn_norm.num_elements(), h,
-                "ffn_norm size mismatch at layer {i}");
-            assert_eq!(layer.ffn_norm_bias.num_elements(), 0,
-                "ffn_norm_bias should be zero-sized for RMSNorm at layer {i}");
+            assert_eq!(
+                layer.attn_norm.num_elements(),
+                h,
+                "attn_norm size mismatch at layer {i}"
+            );
+            assert_eq!(
+                layer.attn_norm_bias.num_elements(),
+                0,
+                "attn_norm_bias should be zero-sized for RMSNorm at layer {i}"
+            );
+            assert_eq!(
+                layer.ffn_norm.num_elements(),
+                h,
+                "ffn_norm size mismatch at layer {i}"
+            );
+            assert_eq!(
+                layer.ffn_norm_bias.num_elements(),
+                0,
+                "ffn_norm_bias should be zero-sized for RMSNorm at layer {i}"
+            );
         }
     }
 
@@ -253,10 +286,16 @@ mod tests {
 
         let weights = ModelWeights::alloc_cpu(&config).unwrap();
         for (i, layer) in weights.layers.iter().enumerate() {
-            assert_eq!(layer.attn_norm_bias.num_elements(), h,
-                "GPT-2 attn_norm_bias should have hidden_size elements at layer {i}");
-            assert_eq!(layer.ffn_norm_bias.num_elements(), h,
-                "GPT-2 ffn_norm_bias should have hidden_size elements at layer {i}");
+            assert_eq!(
+                layer.attn_norm_bias.num_elements(),
+                h,
+                "GPT-2 attn_norm_bias should have hidden_size elements at layer {i}"
+            );
+            assert_eq!(
+                layer.ffn_norm_bias.num_elements(),
+                h,
+                "GPT-2 ffn_norm_bias should have hidden_size elements at layer {i}"
+            );
         }
     }
 
@@ -268,8 +307,10 @@ mod tests {
         let config = tiny_config(); // has_qkv_bias: false
         let weights = ModelWeights::alloc_cpu(&config).unwrap();
         for (i, layer) in weights.layers.iter().enumerate() {
-            assert!(layer.qkv_bias.is_none(),
-                "qkv_bias should be None at layer {i} when has_qkv_bias=false");
+            assert!(
+                layer.qkv_bias.is_none(),
+                "qkv_bias should be None at layer {i} when has_qkv_bias=false"
+            );
         }
     }
 
@@ -286,10 +327,15 @@ mod tests {
 
         let weights = ModelWeights::alloc_cpu(&config).unwrap();
         for (i, layer) in weights.layers.iter().enumerate() {
-            let bias = layer.qkv_bias.as_ref()
+            let bias = layer
+                .qkv_bias
+                .as_ref()
                 .unwrap_or_else(|| panic!("qkv_bias should exist at layer {i}"));
-            assert_eq!(bias.num_elements(), expected_bias_elems,
-                "qkv_bias size mismatch at layer {i}");
+            assert_eq!(
+                bias.num_elements(),
+                expected_bias_elems,
+                "qkv_bias size mismatch at layer {i}"
+            );
         }
     }
 
@@ -337,14 +383,26 @@ mod tests {
 
         let weights = ModelWeights::alloc_cpu(&config).unwrap();
         for (i, layer) in weights.layers.iter().enumerate() {
-            assert_eq!(layer.wq.num_elements(), h * q_dim,
-                "wq should use full q_dim at layer {i}");
-            assert_eq!(layer.wk.num_elements(), h * kv_dim,
-                "wk should use reduced kv_dim at layer {i}");
-            assert_eq!(layer.wv.num_elements(), h * kv_dim,
-                "wv should use reduced kv_dim at layer {i}");
-            assert_eq!(layer.wo.num_elements(), q_dim * h,
-                "wo should use full q_dim at layer {i}");
+            assert_eq!(
+                layer.wq.num_elements(),
+                h * q_dim,
+                "wq should use full q_dim at layer {i}"
+            );
+            assert_eq!(
+                layer.wk.num_elements(),
+                h * kv_dim,
+                "wk should use reduced kv_dim at layer {i}"
+            );
+            assert_eq!(
+                layer.wv.num_elements(),
+                h * kv_dim,
+                "wv should use reduced kv_dim at layer {i}"
+            );
+            assert_eq!(
+                layer.wo.num_elements(),
+                q_dim * h,
+                "wo should use full q_dim at layer {i}"
+            );
         }
     }
 }

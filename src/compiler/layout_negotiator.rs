@@ -6,13 +6,13 @@
 //! 核心原则: 不是找全局最大公约布局。是流水线时序级联协商。
 //! 每个自然数据搬运点都是"免费变换窗口"，协商器识别并利用这些窗口。
 
-use std::collections::HashMap;
-use crate::compiler::graph::{CompilerGraph, Op, OpId};
-use crate::compiler::fusion::{FusionGroup, FusionMode};
-use crate::compiler::semantic_dag::{SemanticDAG, OpClass};
 use crate::compiler::accel_registry::{AccelerationRegistry, LayoutConstraint};
+use crate::compiler::fusion::{FusionGroup, FusionMode};
+use crate::compiler::graph::{CompilerGraph, Op, OpId};
 use crate::compiler::pain_point::OpBottleneckMap;
+use crate::compiler::semantic_dag::{OpClass, SemanticDAG};
 use crate::dispatch::device_profile::DeviceProfile;
+use std::collections::HashMap;
 
 /// 两个相邻阶段之间的数据搬运类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,15 +199,24 @@ fn negotiate_group(
     // 收集每个 op 的加速指令和偏好
     let mut preferred: Vec<OpPreferredLayout> = Vec::with_capacity(ops.len());
     for &op_id in ops {
-        let op_class = dag.node(op_id).map(|n| n.op_class).unwrap_or(OpClass::Opaque);
-        let bn = bottleneck_map.gemm_bottlenecks.get(&op_id)
+        let op_class = dag
+            .node(op_id)
+            .map(|n| n.op_class)
+            .unwrap_or(OpClass::Opaque);
+        let bn = bottleneck_map
+            .gemm_bottlenecks
+            .get(&op_id)
             .map(|gb| gb.bottleneck)
-            .unwrap_or(crate::compiler::pain_point::BottleneckType::MemoryBound { bandwidth_utilization: 0.5 });
+            .unwrap_or(crate::compiler::pain_point::BottleneckType::MemoryBound {
+                bandwidth_utilization: 0.5,
+            });
 
         let best = registry.best_for(op_class, device, bn);
         let (input_layout, weight_layout, output_layout, accel_id) = match best {
             Some(decl) => {
-                let input = decl.input_layouts.first()
+                let input = decl
+                    .input_layouts
+                    .first()
                     .cloned()
                     .unwrap_or(LayoutConstraint::Any);
                 let wl = decl.input_layouts.get(1).cloned();
@@ -218,12 +227,12 @@ fn negotiate_group(
 
         // §0.2.11 模型感知覆写: 从 CompilerGraph 提取 per-op 模型参数
         // 替换 AccelerationRegistry 中的占位符零值
-        let (output_layout, weight_layout) = model_aware_layout_overrides(
-            op_id, graph, output_layout, weight_layout,
-        );
+        let (output_layout, weight_layout) =
+            model_aware_layout_overrides(op_id, graph, output_layout, weight_layout);
 
         // REQ-DTYPE-004: 从 graph 推导 op 的 dtype
-        let op_dtype = graph.op(op_id)
+        let op_dtype = graph
+            .op(op_id)
             .and_then(|op| op.inputs.first())
             .and_then(|&tid| graph.tensor(tid))
             .map(|t| t.dtype.to_quant_precision());
@@ -253,13 +262,16 @@ fn negotiate_group(
         };
         total_benefit += benefit;
 
-        op_layouts.insert(pref.op_id, OpLayoutAssignment {
-            input_layout: pref.input_layout.clone(),
-            weight_layout: pref.weight_layout.clone(),
-            output_layout: pref.output_layout.clone(),
-            accel_id: pref.accel_id,
-            dtype: pref.dtype,
-        });
+        op_layouts.insert(
+            pref.op_id,
+            OpLayoutAssignment {
+                input_layout: pref.input_layout.clone(),
+                weight_layout: pref.weight_layout.clone(),
+                output_layout: pref.output_layout.clone(),
+                accel_id: pref.accel_id,
+                dtype: pref.dtype,
+            },
+        );
 
         // Step 3: 与下一个 op 的布局协商 + REQ-DTYPE-004 dtype 协商
         if i + 1 < ops.len() {
@@ -278,7 +290,11 @@ fn negotiate_group(
                         // Same byte width but different dtype (e.g. F16↔BF16) — PackMap stride remap
                         DtypeTransformMethod::PackMap
                     };
-                    let xform = DtypeTransform { source: src, target: dst, method };
+                    let xform = DtypeTransform {
+                        source: src,
+                        target: dst,
+                        method,
+                    };
                     dtype_transforms.push(xform.clone());
                     Some(xform)
                 }
@@ -301,7 +317,14 @@ fn negotiate_group(
                         } else {
                             pref.output_layout.clone()
                         };
-                        let layout_cost = if !layout_compatible && compromise == LayoutConstraint::Any { 0.0 } else if !layout_compatible { 1.0 } else { 0.0 };
+                        let layout_cost =
+                            if !layout_compatible && compromise == LayoutConstraint::Any {
+                                0.0
+                            } else if !layout_compatible {
+                                1.0
+                            } else {
+                                0.0
+                            };
                         // dtype 变换零成本 (编译时 bake)
                         total_transform_cost += layout_cost;
                         inter_op_transforms.push(InterOpTransform {
@@ -317,11 +340,14 @@ fn negotiate_group(
                         });
                     }
                 }
-                MovementType::RegisterToMemory | MovementType::MemoryToMemory | MovementType::GpuGlobalToShared => {
+                MovementType::RegisterToMemory
+                | MovementType::MemoryToMemory
+                | MovementType::GpuGlobalToShared => {
                     // 免费变换窗口: 下游用自己的偏好布局
                     // store/copy 本来就要发生, 改变 stride/layout = 零额外成本
                     // REQ-DTYPE-004: dtype 变换也是零成本 (VecWiden/VecNarrow 编译时 bake)
-                    let needs_layout_xform = !pref.output_layout.compatible_with(&next.input_layout);
+                    let needs_layout_xform =
+                        !pref.output_layout.compatible_with(&next.input_layout);
                     let needs_dtype_xform = dtype_xform.is_some();
                     if needs_layout_xform || needs_dtype_xform {
                         inter_op_transforms.push(InterOpTransform {
@@ -329,7 +355,11 @@ fn negotiate_group(
                             consumer: next.op_id,
                             transform: LayoutTransform {
                                 source: pref.output_layout.clone(),
-                                target: if needs_layout_xform { next.input_layout.clone() } else { pref.output_layout.clone() },
+                                target: if needs_layout_xform {
+                                    next.input_layout.clone()
+                                } else {
+                                    pref.output_layout.clone()
+                                },
                                 cost: 0.0, // 免费!
                             },
                             movement,
@@ -369,22 +399,31 @@ fn model_aware_layout_overrides(
 
     let out = match op.op_resolved(graph) {
         // MHA 的输出是 HeadSplit — 从 Op AttentionSpec 提取真实参数
-        Some(Op::MultiHeadAttention(spec)) => {
-            match output_layout {
-                LayoutConstraint::HeadSplit { num_heads: 0, head_dim: 0 } |
-                LayoutConstraint::Any => {
-                    LayoutConstraint::HeadSplit { num_heads: spec.geometry.num_q_heads, head_dim: spec.geometry.head_dim }
-                }
-                other => other,
+        Some(Op::MultiHeadAttention(spec)) => match output_layout {
+            LayoutConstraint::HeadSplit {
+                num_heads: 0,
+                head_dim: 0,
             }
-        }
+            | LayoutConstraint::Any => LayoutConstraint::HeadSplit {
+                num_heads: spec.geometry.num_q_heads,
+                head_dim: spec.geometry.head_dim,
+            },
+            other => other,
+        },
         // QKV 投影 GEMM: 如果是 QKV 三兄弟，输出应该是 HeadSplit
         Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) => {
             if is_qkv_op(op_id, graph) {
-                let (_, n, _) = op.op_gemm_dims(graph).unwrap_or((crate::compiler::graph::SymDim::Concrete(1), 0, 0));
+                let (_, n, _) = op.op_gemm_dims(graph).unwrap_or((
+                    crate::compiler::graph::SymDim::Concrete(1),
+                    0,
+                    0,
+                ));
                 let head_dim = extract_head_dim_from_graph(graph).unwrap_or(n);
                 let num_heads = n / head_dim.max(1);
-                LayoutConstraint::HeadSplit { num_heads, head_dim }
+                LayoutConstraint::HeadSplit {
+                    num_heads,
+                    head_dim,
+                }
             } else {
                 output_layout
             }
@@ -394,7 +433,10 @@ fn model_aware_layout_overrides(
 
     // weight_layout: PanelPacked 的 kc 应从 op 的 K 维度推导
     let wl = weight_layout.map(|wl| {
-        let is_gemm_like = matches!(op.op_resolved(graph), Some(Op::Gemm(_)) | Some(Op::GemmBias(_)));
+        let is_gemm_like = matches!(
+            op.op_resolved(graph),
+            Some(Op::Gemm(_)) | Some(Op::GemmBias(_))
+        );
         let k_dim = op.op_gemm_dims(graph).map(|(_, _, k)| k);
         match (is_gemm_like, k_dim, &wl) {
             (true, Some(k), LayoutConstraint::PanelPacked { mr, nr: _ }) => {
@@ -416,16 +458,31 @@ fn is_qkv_op(op_id: OpId, graph: &CompilerGraph) -> bool {
         Some(o) => o,
         None => return false,
     };
-    if !matches!(op.op_resolved(graph), Some(Op::Gemm(_)) | Some(Op::GemmBias(_))) {
+    if !matches!(
+        op.op_resolved(graph),
+        Some(Op::Gemm(_)) | Some(Op::GemmBias(_))
+    ) {
         return false;
     }
-    let Some(&input_tid) = op.inputs.first() else { return false };
+    let Some(&input_tid) = op.inputs.first() else {
+        return false;
+    };
     // 统计共享同一输入的 GEMM 数量（通过 tensor.consumers 索引）
-    let sibling_count = graph.tensor(input_tid)
-        .map(|t| t.consumers.iter()
-            .filter(|&&c| graph.op(c).is_some_and(|o| matches!(o.op_resolved(graph),
-                Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_)))))
-            .count())
+    let sibling_count = graph
+        .tensor(input_tid)
+        .map(|t| {
+            t.consumers
+                .iter()
+                .filter(|&&c| {
+                    graph.op(c).is_some_and(|o| {
+                        matches!(
+                            o.op_resolved(graph),
+                            Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_))
+                        )
+                    })
+                })
+                .count()
+        })
         .unwrap_or(0);
     sibling_count >= 3
 }
@@ -435,12 +492,11 @@ fn is_qkv_op(op_id: OpId, graph: &CompilerGraph) -> bool {
 /// ARCH-JIT-DATA-YIELDS: short-circuit find_map — stops at first match.
 /// This is a single targeted lookup, not a pre-scan bool flag.
 fn extract_head_dim_from_graph(graph: &CompilerGraph) -> Option<usize> {
-    graph.ops.iter()
-        .find_map(|op| match op.op_resolved(graph) {
-            Some(Op::MultiHeadAttention(spec)) => Some(spec.geometry.head_dim),
-            Some(Op::RoPE(spec)) => Some(spec.head_dim),
-            _ => None,
-        })
+    graph.ops.iter().find_map(|op| match op.op_resolved(graph) {
+        Some(Op::MultiHeadAttention(spec)) => Some(spec.geometry.head_dim),
+        Some(Op::RoPE(spec)) => Some(spec.head_dim),
+        _ => None,
+    })
 }
 
 /// 单个 op 的偏好布局 (协商前)
@@ -501,10 +557,14 @@ fn find_compromise(a: &LayoutConstraint, b: &LayoutConstraint) -> LayoutConstrai
     }
 
     // RowMajor 和 HeadSplit 互相兼容 (只是 reshape)
-    if matches!(a, LayoutConstraint::RowMajor { .. }) && matches!(b, LayoutConstraint::HeadSplit { .. }) {
+    if matches!(a, LayoutConstraint::RowMajor { .. })
+        && matches!(b, LayoutConstraint::HeadSplit { .. })
+    {
         return b.clone();
     }
-    if matches!(a, LayoutConstraint::HeadSplit { .. }) && matches!(b, LayoutConstraint::RowMajor { .. }) {
+    if matches!(a, LayoutConstraint::HeadSplit { .. })
+        && matches!(b, LayoutConstraint::RowMajor { .. })
+    {
         return a.clone();
     }
 
@@ -551,7 +611,12 @@ mod tests {
 
         let graph = CompilerGraph::new();
         let result = LayoutNegotiator::negotiate(
-            &[group], &registry, &device, &dag, &bottleneck_map, &graph,
+            &[group],
+            &registry,
+            &device,
+            &dag,
+            &bottleneck_map,
+            &graph,
         );
         assert_eq!(result.group_assignments.len(), 1);
         assert_eq!(result.total_transform_cost, 0.0);
@@ -574,7 +639,10 @@ mod tests {
     #[test]
     fn test_find_compromise_rowmajor_headsplit() {
         let a = LayoutConstraint::RowMajor { align_bytes: 64 };
-        let b = LayoutConstraint::HeadSplit { num_heads: 32, head_dim: 128 };
+        let b = LayoutConstraint::HeadSplit {
+            num_heads: 32,
+            head_dim: 128,
+        };
         let c = find_compromise(&a, &b);
         assert!(matches!(c, LayoutConstraint::HeadSplit { .. }));
     }
@@ -720,7 +788,10 @@ mod tests {
     #[test]
     fn test_find_compromise_headsplit_to_rowmajor() {
         // Arrange
-        let a = LayoutConstraint::HeadSplit { num_heads: 16, head_dim: 64 };
+        let a = LayoutConstraint::HeadSplit {
+            num_heads: 16,
+            head_dim: 64,
+        };
         let b = LayoutConstraint::RowMajor { align_bytes: 32 };
 
         // Act
@@ -773,7 +844,12 @@ mod tests {
 
         // Act
         let result = LayoutNegotiator::negotiate(
-            &[group], &registry, &device, &dag, &bottleneck_map, &graph,
+            &[group],
+            &registry,
+            &device,
+            &dag,
+            &bottleneck_map,
+            &graph,
         );
 
         // Assert
@@ -824,7 +900,12 @@ mod tests {
 
         // Act
         let result = LayoutNegotiator::negotiate(
-            &[group_a, group_b], &registry, &device, &dag, &bottleneck_map, &graph,
+            &[group_a, group_b],
+            &registry,
+            &device,
+            &dag,
+            &bottleneck_map,
+            &graph,
         );
 
         // Assert
@@ -893,7 +974,12 @@ mod tests {
 
         // Act
         let result = LayoutNegotiator::negotiate(
-            &[group], &registry, &device, &dag, &bottleneck_map, &graph,
+            &[group],
+            &registry,
+            &device,
+            &dag,
+            &bottleneck_map,
+            &graph,
         );
 
         // Assert: both ops get layout assignments
@@ -908,13 +994,38 @@ mod tests {
     #[test]
     fn test_model_aware_mha_overrides_headsplit() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, KvSource, LayerCondition, MlaSpec, NormSpec, Op, QuantGemmSpec,
+            RopeSpec, SinksSpec, SymDim,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let tin = graph.add_tensor_concrete("q", &[1, 4096], DType::F32);
         let tout = graph.add_tensor_concrete("out", &[1, 4096], DType::F32);
-        let _op_id = graph.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 32, head_dim: 128 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), kv_cache_layer: 0, kv_write: false  }),
+        let _op_id = graph.add_op(
+            Op::MultiHeadAttention(AttentionSpec {
+                geometry: AttentionGeometry {
+                    num_q_heads: 32,
+                    num_kv_heads: 32,
+                    head_dim: 128,
+                },
+                mask: if true {
+                    AttentionMask::Causal
+                } else {
+                    AttentionMask::Full
+                },
+                kv_source: KvSource::FromTensor,
+                sinks: if false {
+                    SinksSpec::Learnable
+                } else {
+                    SinksSpec::None
+                },
+                seq_len: SymDim::Concrete(1),
+                kv_cache_layer: 0,
+                kv_write: false,
+            }),
             vec![tin],
             vec![tout],
             "mha",
@@ -924,12 +1035,21 @@ mod tests {
         let (out_layout, wl) = model_aware_layout_overrides(
             OpId(0),
             &graph,
-            LayoutConstraint::HeadSplit { num_heads: 0, head_dim: 0 },
+            LayoutConstraint::HeadSplit {
+                num_heads: 0,
+                head_dim: 0,
+            },
             None,
         );
 
         // Assert
-        assert_eq!(out_layout, LayoutConstraint::HeadSplit { num_heads: 32, head_dim: 128 });
+        assert_eq!(
+            out_layout,
+            LayoutConstraint::HeadSplit {
+                num_heads: 32,
+                head_dim: 128
+            }
+        );
         assert!(wl.is_none());
     }
 
@@ -938,14 +1058,26 @@ mod tests {
     #[test]
     fn test_model_aware_non_qkv_gemm_unchanged() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, KvSource, LayerCondition, MlaSpec, NormSpec, Op, QuantGemmSpec,
+            RopeSpec, SinksSpec, SymDim,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let a = graph.add_tensor_concrete("a", &[1, 64], DType::F32);
         let b = graph.add_tensor_concrete("b", &[64, 128], DType::F32);
         let c = graph.add_tensor_concrete("c", &[1, 128], DType::F32);
-        let _op_id = graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
+        let _op_id = graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 128,
+                k: 64,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, b],
             vec![c],
             "gemm_non_qkv",
@@ -970,14 +1102,26 @@ mod tests {
     #[test]
     fn test_model_aware_gemm_panel_packed_weight_override() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, KvSource, LayerCondition, MlaSpec, NormSpec, Op, QuantGemmSpec,
+            RopeSpec, SinksSpec, SymDim,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let a = graph.add_tensor_concrete("a", &[1, 256], DType::F32);
         let b = graph.add_tensor_concrete("b", &[256, 512], DType::F32);
         let c = graph.add_tensor_concrete("c", &[1, 512], DType::F32);
-        let _op_id = graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }),
+        let _op_id = graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, b],
             vec![c],
             "gemm_weight",
@@ -1049,7 +1193,12 @@ mod tests {
 
         // Act
         let result = LayoutNegotiator::negotiate(
-            &[group], &registry, &device, &dag, &bottleneck_map, &graph,
+            &[group],
+            &registry,
+            &device,
+            &dag,
+            &bottleneck_map,
+            &graph,
         );
 
         // Assert: Both ops are ElemWise (Any layout from registry), so they are compatible.
@@ -1058,18 +1207,23 @@ mod tests {
         // The total transform cost is 0 because Any is compatible with Any
         assert_eq!(ga.total_transform_cost, 0.0);
         // Verify classify_movement produced RegisterToMemory for ElemWise+EpilogueInjection
-        let movement = classify_movement(OpClass::ElemWise, OpClass::ElemWise, 0, &FusionGroup {
-            id: 0,
-            anchor: OpId(0),
-            epilogue: vec![OpId(1)],
-            mode: FusionMode::EpilogueInjection,
-            ops: vec![OpId(0), OpId(1)],
-            multi_output: crate::compiler::graph::MultiOutputConfig::single(),
-            dominant_dtype: None,
-            marker: GroupMarker::None,
-            is_layer_group: false,
-            hetero_layer_type: None,
-        });
+        let movement = classify_movement(
+            OpClass::ElemWise,
+            OpClass::ElemWise,
+            0,
+            &FusionGroup {
+                id: 0,
+                anchor: OpId(0),
+                epilogue: vec![OpId(1)],
+                mode: FusionMode::EpilogueInjection,
+                ops: vec![OpId(0), OpId(1)],
+                multi_output: crate::compiler::graph::MultiOutputConfig::single(),
+                dominant_dtype: None,
+                marker: GroupMarker::None,
+                is_layer_group: false,
+                hetero_layer_type: None,
+            },
+        );
         assert_eq!(movement, MovementType::RegisterToMemory);
     }
 
@@ -1161,28 +1315,55 @@ mod tests {
     #[test]
     fn test_model_aware_mha_any_promoted_to_headsplit() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, KvSource, LayerCondition, MlaSpec, NormSpec, Op, QuantGemmSpec,
+            RopeSpec, SinksSpec, SymDim,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let tin = graph.add_tensor_concrete("q", &[1, 2048], DType::F32);
         let tout = graph.add_tensor_concrete("out", &[1, 2048], DType::F32);
-        let _op_id = graph.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 8, num_kv_heads: 8, head_dim: 256 }, mask: if false { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), kv_cache_layer: 0, kv_write: false  }),
+        let _op_id = graph.add_op(
+            Op::MultiHeadAttention(AttentionSpec {
+                geometry: AttentionGeometry {
+                    num_q_heads: 8,
+                    num_kv_heads: 8,
+                    head_dim: 256,
+                },
+                mask: if false {
+                    AttentionMask::Causal
+                } else {
+                    AttentionMask::Full
+                },
+                kv_source: KvSource::FromTensor,
+                sinks: if false {
+                    SinksSpec::Learnable
+                } else {
+                    SinksSpec::None
+                },
+                seq_len: SymDim::Concrete(1),
+                kv_cache_layer: 0,
+                kv_write: false,
+            }),
             vec![tin],
             vec![tout],
             "mha",
         );
 
         // Act: input layout is Any, should be promoted
-        let (out_layout, _) = model_aware_layout_overrides(
-            OpId(0),
-            &graph,
-            LayoutConstraint::Any,
-            None,
-        );
+        let (out_layout, _) =
+            model_aware_layout_overrides(OpId(0), &graph, LayoutConstraint::Any, None);
 
         // Assert
-        assert_eq!(out_layout, LayoutConstraint::HeadSplit { num_heads: 8, head_dim: 256 });
+        assert_eq!(
+            out_layout,
+            LayoutConstraint::HeadSplit {
+                num_heads: 8,
+                head_dim: 256
+            }
+        );
     }
 
     /// @trace TEST-LN-24 [req:REQ-LAYOUT] [level:unit]
@@ -1190,7 +1371,11 @@ mod tests {
     #[test]
     fn test_is_qkv_op_three_sibling_gemms() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, KvSource, LayerCondition, MlaSpec, NormSpec, Op, QuantGemmSpec,
+            RopeSpec, SinksSpec, SymDim,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1202,15 +1387,54 @@ mod tests {
         let ok_ = graph.add_tensor_concrete("ok", &[1, 512], DType::F32);
         let ov = graph.add_tensor_concrete("ov", &[1, 512], DType::F32);
 
-        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), vec![input, wq], vec![oq], "q_proj");
-        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), vec![input, wk], vec![ok_], "k_proj");
-        let v_op = graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), vec![input, wv], vec![ov], "v_proj");
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, wq],
+            vec![oq],
+            "q_proj",
+        );
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, wk],
+            vec![ok_],
+            "k_proj",
+        );
+        let v_op = graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, wv],
+            vec![ov],
+            "v_proj",
+        );
 
         // Act
         let result = is_qkv_op(v_op, &graph);
 
         // Assert
-        assert!(result, "Three Gemm ops sharing the same input should be detected as QKV");
+        assert!(
+            result,
+            "Three Gemm ops sharing the same input should be detected as QKV"
+        );
     }
 
     /// @trace TEST-LN-25 [req:REQ-LAYOUT] [level:unit]
@@ -1218,7 +1442,11 @@ mod tests {
     #[test]
     fn test_is_qkv_op_single_gemm_returns_false() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, KvSource, LayerCondition, MlaSpec, NormSpec, Op, QuantGemmSpec,
+            RopeSpec, SinksSpec, SymDim,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1226,7 +1454,15 @@ mod tests {
         let weight = graph.add_tensor_concrete("weight", &[64, 128], DType::F32);
         let output = graph.add_tensor_concrete("output", &[1, 128], DType::F32);
 
-        let op_id = graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
+        let op_id = graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 128,
+                k: 64,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![input, weight],
             vec![output],
             "single_gemm",
@@ -1236,7 +1472,10 @@ mod tests {
         let result = is_qkv_op(op_id, &graph);
 
         // Assert
-        assert!(!result, "Single Gemm without sibling ops should not be detected as QKV");
+        assert!(
+            !result,
+            "Single Gemm without sibling ops should not be detected as QKV"
+        );
     }
 
     /// @trace TEST-LN-26 [req:REQ-LAYOUT] [level:unit]
@@ -1244,13 +1483,24 @@ mod tests {
     #[test]
     fn test_extract_head_dim_from_rope() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, KvSource, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, KvSource, MlaSpec, NormSpec, Op, QuantGemmSpec, RopeSpec,
+            SinksSpec,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let q = graph.add_tensor_concrete("q", &[1, 8, 64], DType::F32);
         let oq = graph.add_tensor_concrete("oq", &[1, 8, 64], DType::F32);
-        graph.add_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }),
+        graph.add_op(
+            Op::RoPE(RopeSpec {
+                num_heads: 8,
+                head_dim: 64,
+                theta: 10000.0,
+                partial: 1.0,
+                rope_scaling: None,
+            }),
             vec![q],
             vec![oq],
             "rope",
@@ -1268,14 +1518,26 @@ mod tests {
     #[test]
     fn test_extract_head_dim_missing_returns_none() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, KvSource, LayerCondition, MlaSpec, NormSpec, Op, QuantGemmSpec,
+            RopeSpec, SinksSpec, SymDim,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let a = graph.add_tensor_concrete("a", &[1, 64], DType::F32);
         let b = graph.add_tensor_concrete("b", &[64, 128], DType::F32);
         let c = graph.add_tensor_concrete("c", &[1, 128], DType::F32);
-        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 128,
+                k: 64,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, b],
             vec![c],
             "gemm_only",
@@ -1296,7 +1558,10 @@ mod tests {
         // Arrange
         let transform = LayoutTransform {
             source: LayoutConstraint::RowMajor { align_bytes: 64 },
-            target: LayoutConstraint::HeadSplit { num_heads: 8, head_dim: 64 },
+            target: LayoutConstraint::HeadSplit {
+                num_heads: 8,
+                head_dim: 64,
+            },
             cost: 0.0,
         };
         let iot = InterOpTransform {
@@ -1311,8 +1576,17 @@ mod tests {
         assert_eq!(iot.producer, OpId(10));
         assert_eq!(iot.consumer, OpId(20));
         assert_eq!(iot.movement, MovementType::MemoryToMemory);
-        assert_eq!(iot.transform.source, LayoutConstraint::RowMajor { align_bytes: 64 });
-        assert_eq!(iot.transform.target, LayoutConstraint::HeadSplit { num_heads: 8, head_dim: 64 });
+        assert_eq!(
+            iot.transform.source,
+            LayoutConstraint::RowMajor { align_bytes: 64 }
+        );
+        assert_eq!(
+            iot.transform.target,
+            LayoutConstraint::HeadSplit {
+                num_heads: 8,
+                head_dim: 64
+            }
+        );
         assert_eq!(iot.transform.cost, 0.0);
     }
 
@@ -1375,7 +1649,10 @@ mod tests {
         // Assert: weight_layout is None, accel_id is None
         assert!(assignment.weight_layout.is_none());
         assert!(assignment.accel_id.is_none());
-        assert_eq!(assignment.input_layout, LayoutConstraint::RowMajor { align_bytes: 64 });
+        assert_eq!(
+            assignment.input_layout,
+            LayoutConstraint::RowMajor { align_bytes: 64 }
+        );
         assert_eq!(assignment.output_layout, LayoutConstraint::Any);
     }
 
@@ -1393,7 +1670,9 @@ mod tests {
         };
 
         // Assert: all fields populated correctly
-        let wl = assignment.weight_layout.expect("weight_layout should be Some");
+        let wl = assignment
+            .weight_layout
+            .expect("weight_layout should be Some");
         assert_eq!(wl, LayoutConstraint::PanelPacked { mr: 6, nr: 256 });
         assert_eq!(assignment.accel_id, Some("avx512_gemm"));
     }
@@ -1404,13 +1683,16 @@ mod tests {
     fn test_group_layout_assignment_clone_preserves_data() {
         // Arrange
         let mut op_layouts = HashMap::new();
-        op_layouts.insert(OpId(0), OpLayoutAssignment {
-            input_layout: LayoutConstraint::Any,
-            weight_layout: None,
-            output_layout: LayoutConstraint::Any,
-            accel_id: None,
-            dtype: None,
-        });
+        op_layouts.insert(
+            OpId(0),
+            OpLayoutAssignment {
+                input_layout: LayoutConstraint::Any,
+                weight_layout: None,
+                output_layout: LayoutConstraint::Any,
+                accel_id: None,
+                dtype: None,
+            },
+        );
         let original = GroupLayoutAssignment {
             group_id: 7,
             op_layouts: op_layouts.clone(),
@@ -1479,7 +1761,11 @@ mod tests {
     #[test]
     fn test_is_qkv_op_two_sibling_gemms_returns_false() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, KvSource, LayerCondition, MlaSpec, NormSpec, Op, QuantGemmSpec,
+            RopeSpec, SinksSpec, SymDim,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1489,14 +1775,41 @@ mod tests {
         let o1 = graph.add_tensor_concrete("o1", &[1, 256], DType::F32);
         let o2 = graph.add_tensor_concrete("o2", &[1, 256], DType::F32);
 
-        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![input, w1], vec![o1], "proj1");
-        let op2 = graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![input, w2], vec![o2], "proj2");
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, w1],
+            vec![o1],
+            "proj1",
+        );
+        let op2 = graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, w2],
+            vec![o2],
+            "proj2",
+        );
 
         // Act
         let result = is_qkv_op(op2, &graph);
 
         // Assert: need >= 3 siblings, 2 is not enough
-        assert!(!result, "Two sibling Gemm ops should not be detected as QKV (need >= 3)");
+        assert!(
+            !result,
+            "Two sibling Gemm ops should not be detected as QKV (need >= 3)"
+        );
     }
 
     /// @trace TEST-LN-37 [req:REQ-LAYOUT] [level:unit]
@@ -1505,27 +1818,51 @@ mod tests {
     #[test]
     fn test_model_aware_mha_preserves_existing_headsplit() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, KvSource, LayerCondition, MlaSpec, NormSpec, Op, QuantGemmSpec,
+            RopeSpec, SinksSpec, SymDim,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let tin = graph.add_tensor_concrete("q", &[1, 4096], DType::F32);
         let tout = graph.add_tensor_concrete("out", &[1, 4096], DType::F32);
-        let _op_id = graph.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 32, head_dim: 128 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), kv_cache_layer: 0, kv_write: false  }),
+        let _op_id = graph.add_op(
+            Op::MultiHeadAttention(AttentionSpec {
+                geometry: AttentionGeometry {
+                    num_q_heads: 32,
+                    num_kv_heads: 32,
+                    head_dim: 128,
+                },
+                mask: if true {
+                    AttentionMask::Causal
+                } else {
+                    AttentionMask::Full
+                },
+                kv_source: KvSource::FromTensor,
+                sinks: if false {
+                    SinksSpec::Learnable
+                } else {
+                    SinksSpec::None
+                },
+                seq_len: SymDim::Concrete(1),
+                kv_cache_layer: 0,
+                kv_write: false,
+            }),
             vec![tin],
             vec![tout],
             "mha",
         );
 
-        let existing_layout = LayoutConstraint::HeadSplit { num_heads: 16, head_dim: 256 };
+        let existing_layout = LayoutConstraint::HeadSplit {
+            num_heads: 16,
+            head_dim: 256,
+        };
 
         // Act: pass an already-populated HeadSplit (non-zero)
-        let (out_layout, _) = model_aware_layout_overrides(
-            OpId(0),
-            &graph,
-            existing_layout.clone(),
-            None,
-        );
+        let (out_layout, _) =
+            model_aware_layout_overrides(OpId(0), &graph, existing_layout.clone(), None);
 
         // Assert: existing layout is preserved unchanged
         assert_eq!(out_layout, existing_layout);
@@ -1536,13 +1873,38 @@ mod tests {
     #[test]
     fn test_extract_head_dim_from_mha() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, KvSource, LayerCondition, MlaSpec, NormSpec, Op, QuantGemmSpec,
+            RopeSpec, SinksSpec, SymDim,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let tin = graph.add_tensor_concrete("q", &[1, 4096], DType::F32);
         let tout = graph.add_tensor_concrete("out", &[1, 4096], DType::F32);
-        graph.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 8, head_dim: 128 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), kv_cache_layer: 0, kv_write: false  }),
+        graph.add_op(
+            Op::MultiHeadAttention(AttentionSpec {
+                geometry: AttentionGeometry {
+                    num_q_heads: 32,
+                    num_kv_heads: 8,
+                    head_dim: 128,
+                },
+                mask: if true {
+                    AttentionMask::Causal
+                } else {
+                    AttentionMask::Full
+                },
+                kv_source: KvSource::FromTensor,
+                sinks: if false {
+                    SinksSpec::Learnable
+                } else {
+                    SinksSpec::None
+                },
+                seq_len: SymDim::Concrete(1),
+                kv_cache_layer: 0,
+                kv_write: false,
+            }),
             vec![tin],
             vec![tout],
             "mha",
@@ -1563,7 +1925,11 @@ mod tests {
     #[test]
     fn test_model_aware_gemmbias_non_qkv_preserves_layout() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, KvSource, LayerCondition, MlaSpec, NormSpec, Op, QuantGemmSpec,
+            RopeSpec, SinksSpec, SymDim,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1571,7 +1937,15 @@ mod tests {
         let b = graph.add_tensor_concrete("b", &[128, 256], DType::F32);
         let bias = graph.add_tensor_concrete("bias", &[256], DType::F32);
         let c = graph.add_tensor_concrete("c", &[1, 256], DType::F32);
-        graph.add_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 128, dtype: DType::F32, trans_b: false, has_bias: true }),
+        graph.add_op(
+            Op::GemmBias(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 128,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: true,
+            }),
             vec![a, b, bias],
             vec![c],
             "gemm_bias_non_qkv",
@@ -1580,12 +1954,7 @@ mod tests {
         let layout = LayoutConstraint::RowMajor { align_bytes: 128 };
 
         // Act
-        let (out_layout, wl) = model_aware_layout_overrides(
-            OpId(0),
-            &graph,
-            layout.clone(),
-            None,
-        );
+        let (out_layout, wl) = model_aware_layout_overrides(OpId(0), &graph, layout.clone(), None);
 
         // Assert: single GemmBias is not QKV, layout preserved
         assert_eq!(out_layout, layout);
@@ -1599,14 +1968,39 @@ mod tests {
     fn test_model_aware_gemmbias_qkv_gets_headsplit() {
         // Arrange: build a graph with an MHA to extract head_dim, then 3 GemmBias
         // sharing the same input tensor.
-        use crate::compiler::graph::{CompilerGraph, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, KvSource, LayerCondition, MlaSpec, NormSpec, Op, QuantGemmSpec,
+            RopeSpec, SinksSpec, SymDim,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         // MHA provides head_dim=64 for extract_head_dim_from_graph
         let mq = graph.add_tensor_concrete("mq", &[1, 512], DType::F32);
         let mo = graph.add_tensor_concrete("mo", &[1, 512], DType::F32);
-        graph.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 8, num_kv_heads: 8, head_dim: 64 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), kv_cache_layer: 0, kv_write: false  }),
+        graph.add_op(
+            Op::MultiHeadAttention(AttentionSpec {
+                geometry: AttentionGeometry {
+                    num_q_heads: 8,
+                    num_kv_heads: 8,
+                    head_dim: 64,
+                },
+                mask: if true {
+                    AttentionMask::Causal
+                } else {
+                    AttentionMask::Full
+                },
+                kv_source: KvSource::FromTensor,
+                sinks: if false {
+                    SinksSpec::Learnable
+                } else {
+                    SinksSpec::None
+                },
+                seq_len: SymDim::Concrete(1),
+                kv_cache_layer: 0,
+                kv_write: false,
+            }),
             vec![mq],
             vec![mo],
             "mha_ref",
@@ -1624,20 +2018,58 @@ mod tests {
         let o2 = graph.add_tensor_concrete("o2", &[1, 512], DType::F32);
         let o3 = graph.add_tensor_concrete("o3", &[1, 512], DType::F32);
 
-        graph.add_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: true }), vec![input, w1, b1], vec![o1], "q_proj");
-        graph.add_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: true }), vec![input, w2, b2], vec![o2], "k_proj");
-        let v_op = graph.add_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: true }), vec![input, w3, b3], vec![o3], "v_proj");
-
-        // Act
-        let (out_layout, _) = model_aware_layout_overrides(
-            v_op,
-            &graph,
-            LayoutConstraint::Any,
-            None,
+        graph.add_op(
+            Op::GemmBias(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: true,
+            }),
+            vec![input, w1, b1],
+            vec![o1],
+            "q_proj",
+        );
+        graph.add_op(
+            Op::GemmBias(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: true,
+            }),
+            vec![input, w2, b2],
+            vec![o2],
+            "k_proj",
+        );
+        let v_op = graph.add_op(
+            Op::GemmBias(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: true,
+            }),
+            vec![input, w3, b3],
+            vec![o3],
+            "v_proj",
         );
 
+        // Act
+        let (out_layout, _) =
+            model_aware_layout_overrides(v_op, &graph, LayoutConstraint::Any, None);
+
         // Assert: QKV GemmBias gets HeadSplit with num_heads=512/64=8, head_dim=64
-        assert_eq!(out_layout, LayoutConstraint::HeadSplit { num_heads: 8, head_dim: 64 });
+        assert_eq!(
+            out_layout,
+            LayoutConstraint::HeadSplit {
+                num_heads: 8,
+                head_dim: 64
+            }
+        );
     }
 
     /// @trace TEST-LN-41 [req:REQ-LAYOUT] [level:unit]
@@ -1646,7 +2078,11 @@ mod tests {
     #[test]
     fn test_model_aware_gemmbias_panel_packed_weight() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, KvSource, LayerCondition, MlaSpec, NormSpec, Op, QuantGemmSpec,
+            RopeSpec, SinksSpec, SymDim,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1654,7 +2090,15 @@ mod tests {
         let b = graph.add_tensor_concrete("b", &[192, 384], DType::F32);
         let bias = graph.add_tensor_concrete("bias", &[384], DType::F32);
         let c = graph.add_tensor_concrete("c", &[1, 384], DType::F32);
-        graph.add_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 384, k: 192, dtype: DType::F32, trans_b: false, has_bias: true }),
+        graph.add_op(
+            Op::GemmBias(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 384,
+                k: 192,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: true,
+            }),
             vec![a, b, bias],
             vec![c],
             "gemm_bias_weight",
@@ -1679,13 +2123,23 @@ mod tests {
     #[test]
     fn test_model_aware_rmsnorm_passthrough() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, KvSource, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, KvSource, MlaSpec, NormSpec, Op, QuantGemmSpec, RopeSpec,
+            SinksSpec,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let input = graph.add_tensor_concrete("x", &[1, 256], DType::F32);
         let output = graph.add_tensor_concrete("out", &[1, 256], DType::F32);
-        graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }),
+        graph.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-6,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
             vec![input],
             vec![output],
             "rms_norm",
@@ -1726,17 +2180,17 @@ mod tests {
     #[test]
     fn test_is_qkv_op_non_gemm_returns_false() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, KvSource, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, KvSource, MlaSpec, NormSpec, Op, QuantGemmSpec, RopeSpec,
+            SinksSpec,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let input = graph.add_tensor_concrete("x", &[1, 64], DType::F32);
         let output = graph.add_tensor_concrete("out", &[1, 64], DType::F32);
-        let op_id = graph.add_op(Op::Silu,
-            vec![input],
-            vec![output],
-            "silu",
-        );
+        let op_id = graph.add_op(Op::Silu, vec![input], vec![output], "silu");
 
         // Act
         let result = is_qkv_op(op_id, &graph);
@@ -1750,16 +2204,29 @@ mod tests {
     #[test]
     fn test_is_qkv_op_gemm_no_inputs() {
         // Arrange: manually construct a graph with a Gemm that has no inputs
-        use crate::compiler::graph::{CompilerGraph, CompilerOp, LayerCondition, KvSource, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            CompilerOp, DualRopeSpec, GemmSpec, KvSource, LayerCondition, MlaSpec, NormSpec, Op,
+            QuantGemmSpec, RopeSpec, SinksSpec, SymDim,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         // Add a Gemm with no inputs (edge case)
-        let op_node = CompilerOp::new_from_op(OpId(0), Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
+        let op_node = CompilerOp::new_from_op(
+            OpId(0),
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 64,
+                k: 64,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![], // no inputs
             vec![],
             "orphan_gemm",
-            LayerCondition::Always
+            LayerCondition::Always,
         );
         graph.ops.push(op_node);
         let op_id = OpId(0);
@@ -1777,14 +2244,39 @@ mod tests {
     #[test]
     fn test_extract_head_dim_mha_priority_over_rope() {
         // Arrange: graph with MHA first, then RoPE with different head_dim
-        use crate::compiler::graph::{CompilerGraph, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, KvSource, LayerCondition, MlaSpec, NormSpec, Op, QuantGemmSpec,
+            RopeSpec, SinksSpec, SymDim,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         // MHA with head_dim=96
         let mq = graph.add_tensor_concrete("mq", &[1, 768], DType::F32);
         let mo = graph.add_tensor_concrete("mo", &[1, 768], DType::F32);
-        graph.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 8, num_kv_heads: 8, head_dim: 96 }, mask: if false { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), kv_cache_layer: 0, kv_write: false  }),
+        graph.add_op(
+            Op::MultiHeadAttention(AttentionSpec {
+                geometry: AttentionGeometry {
+                    num_q_heads: 8,
+                    num_kv_heads: 8,
+                    head_dim: 96,
+                },
+                mask: if false {
+                    AttentionMask::Causal
+                } else {
+                    AttentionMask::Full
+                },
+                kv_source: KvSource::FromTensor,
+                sinks: if false {
+                    SinksSpec::Learnable
+                } else {
+                    SinksSpec::None
+                },
+                seq_len: SymDim::Concrete(1),
+                kv_cache_layer: 0,
+                kv_write: false,
+            }),
             vec![mq],
             vec![mo],
             "mha_first",
@@ -1793,7 +2285,14 @@ mod tests {
         // RoPE with head_dim=64 (different from MHA)
         let rq = graph.add_tensor_concrete("rq", &[1, 512], DType::F32);
         let ro = graph.add_tensor_concrete("ro", &[1, 512], DType::F32);
-        graph.add_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }),
+        graph.add_op(
+            Op::RoPE(RopeSpec {
+                num_heads: 8,
+                head_dim: 64,
+                theta: 10000.0,
+                partial: 1.0,
+                rope_scaling: None,
+            }),
             vec![rq],
             vec![ro],
             "rope_second",
@@ -1803,7 +2302,11 @@ mod tests {
         let head_dim = extract_head_dim_from_graph(&graph);
 
         // Assert: MHA (head_dim=96) is first in ops iteration, so it takes priority
-        assert_eq!(head_dim, Some(96), "MHA head_dim should take priority over RoPE");
+        assert_eq!(
+            head_dim,
+            Some(96),
+            "MHA head_dim should take priority over RoPE"
+        );
     }
 
     /// @trace TEST-LN-47 [req:REQ-LAYOUT] [level:unit]
@@ -1812,7 +2315,9 @@ mod tests {
     #[test]
     fn test_negotiate_group_with_bottleneck_entry() {
         // Arrange
-        use crate::compiler::pain_point::{GemmBottleneck, BottleneckType, GemmRole, ExecPattern, ParallelismDesc};
+        use crate::compiler::pain_point::{
+            BottleneckType, ExecPattern, GemmBottleneck, GemmRole, ParallelismDesc,
+        };
 
         let registry = AccelerationRegistry::new();
         let device = DeviceProfile::detect();
@@ -1837,17 +2342,25 @@ mod tests {
         });
 
         let mut gemm_bottlenecks = HashMap::new();
-        gemm_bottlenecks.insert(OpId(0), GemmBottleneck {
-            gemm_role: GemmRole::GateUpProjection,
-            shape: (1, 128, 256),
-            arithmetic_intensity: 0.5,
-            ridge_point: 10.0,
-            bottleneck: BottleneckType::MemoryBound { bandwidth_utilization: 0.8 },
-            optimal_fusion: crate::compiler::pain_point::FusionPriority::EpilogueInjection,
-            fusion_benefits: HashMap::new(),
-            exec_pattern: ExecPattern::ScalarLoop,
-            parallelism: ParallelismDesc::SimdVectorize { element_width: 8, unroll_factor: 1 },
-        });
+        gemm_bottlenecks.insert(
+            OpId(0),
+            GemmBottleneck {
+                gemm_role: GemmRole::GateUpProjection,
+                shape: (1, 128, 256),
+                arithmetic_intensity: 0.5,
+                ridge_point: 10.0,
+                bottleneck: BottleneckType::MemoryBound {
+                    bandwidth_utilization: 0.8,
+                },
+                optimal_fusion: crate::compiler::pain_point::FusionPriority::EpilogueInjection,
+                fusion_benefits: HashMap::new(),
+                exec_pattern: ExecPattern::ScalarLoop,
+                parallelism: ParallelismDesc::SimdVectorize {
+                    element_width: 8,
+                    unroll_factor: 1,
+                },
+            },
+        );
 
         let bottleneck_map = OpBottleneckMap {
             gemm_bottlenecks,
@@ -1869,7 +2382,12 @@ mod tests {
 
         // Act
         let result = LayoutNegotiator::negotiate(
-            &[group], &registry, &device, &dag, &bottleneck_map, &graph,
+            &[group],
+            &registry,
+            &device,
+            &dag,
+            &bottleneck_map,
+            &graph,
         );
 
         // Assert: group assignment produced with no panic
@@ -1886,7 +2404,11 @@ mod tests {
     fn test_model_aware_gemm_qkv_head_dim_extraction() {
         // Arrange: graph with MHA head_dim=80, then 3 Gemm ops (QKV) with n=640
         // num_heads = 640 / 80 = 8
-        use crate::compiler::graph::{CompilerGraph, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, KvSource, LayerCondition, MlaSpec, NormSpec, Op, QuantGemmSpec,
+            RopeSpec, SinksSpec, SymDim,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1894,7 +2416,28 @@ mod tests {
         // MHA provides head_dim=80
         let mq = graph.add_tensor_concrete("mq", &[1, 640], DType::F32);
         let mo = graph.add_tensor_concrete("mo", &[1, 640], DType::F32);
-        graph.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 8, num_kv_heads: 8, head_dim: 80 }, mask: if false { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), kv_cache_layer: 0, kv_write: false  }),
+        graph.add_op(
+            Op::MultiHeadAttention(AttentionSpec {
+                geometry: AttentionGeometry {
+                    num_q_heads: 8,
+                    num_kv_heads: 8,
+                    head_dim: 80,
+                },
+                mask: if false {
+                    AttentionMask::Causal
+                } else {
+                    AttentionMask::Full
+                },
+                kv_source: KvSource::FromTensor,
+                sinks: if false {
+                    SinksSpec::Learnable
+                } else {
+                    SinksSpec::None
+                },
+                seq_len: SymDim::Concrete(1),
+                kv_cache_layer: 0,
+                kv_write: false,
+            }),
             vec![mq],
             vec![mo],
             "mha_for_hd",
@@ -1909,22 +2452,57 @@ mod tests {
         let o2 = graph.add_tensor_concrete("o2", &[1, 640], DType::F32);
         let o3 = graph.add_tensor_concrete("o3", &[1, 640], DType::F32);
 
-        let q_op = graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 640, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), vec![input, w1], vec![o1], "q_proj");
-        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 640, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), vec![input, w2], vec![o2], "k_proj");
-        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 640, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), vec![input, w3], vec![o3], "v_proj");
+        let q_op = graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 640,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, w1],
+            vec![o1],
+            "q_proj",
+        );
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 640,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, w2],
+            vec![o2],
+            "k_proj",
+        );
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 640,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, w3],
+            vec![o3],
+            "v_proj",
+        );
 
         // Act: query the first QKV gemm
-        let (out_layout, _) = model_aware_layout_overrides(
-            q_op,
-            &graph,
-            LayoutConstraint::Any,
-            None,
-        );
+        let (out_layout, _) =
+            model_aware_layout_overrides(q_op, &graph, LayoutConstraint::Any, None);
 
         // Assert: num_heads = 640 / 80 = 8
         assert_eq!(
             out_layout,
-            LayoutConstraint::HeadSplit { num_heads: 8, head_dim: 80 },
+            LayoutConstraint::HeadSplit {
+                num_heads: 8,
+                head_dim: 80
+            },
             "QKV Gemm should compute num_heads from n/head_dim"
         );
     }
@@ -1941,7 +2519,10 @@ mod tests {
         let b = LayoutConstraint::ColMajor { align_bytes: 64 };
 
         // Act & Assert
-        assert!(!a.compatible_with(&b), "Different ColMajor alignments should not be compatible");
+        assert!(
+            !a.compatible_with(&b),
+            "Different ColMajor alignments should not be compatible"
+        );
     }
 
     /// @trace TEST-LN-50 [req:REQ-LAYOUT] [level:unit]
@@ -1953,7 +2534,10 @@ mod tests {
         let b = LayoutConstraint::PanelPacked { mr: 6, nr: 16 };
 
         // Act & Assert
-        assert!(a.compatible_with(&b), "Identical PanelPacked layouts should be compatible");
+        assert!(
+            a.compatible_with(&b),
+            "Identical PanelPacked layouts should be compatible"
+        );
     }
 
     /// @trace TEST-LN-51 [req:REQ-LAYOUT] [level:unit]
@@ -1965,7 +2549,10 @@ mod tests {
         let b = LayoutConstraint::PanelPacked { mr: 14, nr: 32 };
 
         // Act & Assert
-        assert!(!a.compatible_with(&b), "ColMajor and PanelPacked should be incompatible");
+        assert!(
+            !a.compatible_with(&b),
+            "ColMajor and PanelPacked should be incompatible"
+        );
     }
 
     /// @trace TEST-LN-52 [req:REQ-LAYOUT] [level:unit]
@@ -2014,14 +2601,26 @@ mod tests {
     #[test]
     fn test_model_aware_gemm_non_panel_weight_passthrough() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, KvSource, LayerCondition, MlaSpec, NormSpec, Op, QuantGemmSpec,
+            RopeSpec, SinksSpec, SymDim,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let a = graph.add_tensor_concrete("a", &[1, 64], DType::F32);
         let b = graph.add_tensor_concrete("b", &[64, 128], DType::F32);
         let c = graph.add_tensor_concrete("c", &[1, 128], DType::F32);
-        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 128,
+                k: 64,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, b],
             vec![c],
             "gemm_colmaj_wt",
@@ -2056,9 +2655,8 @@ mod tests {
         let graph = CompilerGraph::new();
 
         // Act
-        let result = LayoutNegotiator::negotiate(
-            &[], &registry, &device, &dag, &bottleneck_map, &graph,
-        );
+        let result =
+            LayoutNegotiator::negotiate(&[], &registry, &device, &dag, &bottleneck_map, &graph);
 
         // Assert
         assert!(result.group_assignments.is_empty());
@@ -2072,7 +2670,11 @@ mod tests {
     #[test]
     fn test_is_qkv_op_first_sibling_detected() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, KvSource, LayerCondition, MlaSpec, NormSpec, Op, QuantGemmSpec,
+            RopeSpec, SinksSpec, SymDim,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -2084,9 +2686,45 @@ mod tests {
         let o2 = graph.add_tensor_concrete("o2", &[1, 256], DType::F32);
         let o3 = graph.add_tensor_concrete("o3", &[1, 256], DType::F32);
 
-        let q_op = graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![input, w1], vec![o1], "q_proj");
-        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![input, w2], vec![o2], "k_proj");
-        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![input, w3], vec![o3], "v_proj");
+        let q_op = graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, w1],
+            vec![o1],
+            "q_proj",
+        );
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, w2],
+            vec![o2],
+            "k_proj",
+        );
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, w3],
+            vec![o3],
+            "v_proj",
+        );
 
         // Act
         let result = is_qkv_op(q_op, &graph);
@@ -2207,7 +2845,12 @@ mod tests {
 
         // Act
         let result = LayoutNegotiator::negotiate(
-            &[group.clone()], &registry, &device, &dag, &bottleneck_map, &graph,
+            &[group.clone()],
+            &registry,
+            &device,
+            &dag,
+            &bottleneck_map,
+            &graph,
         );
 
         // Assert
@@ -2251,8 +2894,14 @@ mod tests {
     #[test]
     fn test_find_compromise_both_headsplit_different_returns_any() {
         // Arrange
-        let a = LayoutConstraint::HeadSplit { num_heads: 8, head_dim: 64 };
-        let b = LayoutConstraint::HeadSplit { num_heads: 16, head_dim: 128 };
+        let a = LayoutConstraint::HeadSplit {
+            num_heads: 8,
+            head_dim: 64,
+        };
+        let b = LayoutConstraint::HeadSplit {
+            num_heads: 16,
+            head_dim: 128,
+        };
 
         // Act
         let result = find_compromise(&a, &b);
@@ -2306,12 +2955,20 @@ mod tests {
 
         // Act
         let result = LayoutNegotiator::negotiate(
-            &[group], &registry, &device, &dag, &bottleneck_map, &graph,
+            &[group],
+            &registry,
+            &device,
+            &dag,
+            &bottleneck_map,
+            &graph,
         );
 
         // Assert: no panic, valid output with Any layout
         assert_eq!(result.group_assignments.len(), 1);
-        let layout = result.group_assignments[0].op_layouts.get(&OpId(99)).unwrap();
+        let layout = result.group_assignments[0]
+            .op_layouts
+            .get(&OpId(99))
+            .unwrap();
         assert_eq!(layout.input_layout, LayoutConstraint::Any);
         assert_eq!(layout.output_layout, LayoutConstraint::Any);
     }
@@ -2322,13 +2979,16 @@ mod tests {
     fn test_layout_assignment_zero_cost_with_benefit_is_free() {
         // Arrange
         let mut op_layouts = HashMap::new();
-        op_layouts.insert(OpId(0), OpLayoutAssignment {
-            input_layout: LayoutConstraint::Any,
-            weight_layout: None,
-            output_layout: LayoutConstraint::Any,
-            accel_id: None,
-            dtype: None,
-        });
+        op_layouts.insert(
+            OpId(0),
+            OpLayoutAssignment {
+                input_layout: LayoutConstraint::Any,
+                weight_layout: None,
+                output_layout: LayoutConstraint::Any,
+                accel_id: None,
+                dtype: None,
+            },
+        );
         let assignment = LayoutAssignment {
             group_assignments: vec![GroupLayoutAssignment {
                 group_id: 0,
@@ -2362,7 +3022,7 @@ mod tests {
             consumer: OpId(6),
             transform,
             movement: MovementType::GpuGlobalToShared,
-        dtype_transform: None,
+            dtype_transform: None,
         };
 
         // Act & Assert
@@ -2436,7 +3096,12 @@ mod tests {
 
         // Act
         let result = LayoutNegotiator::negotiate(
-            &[group], &registry, &device, &dag, &bottleneck_map, &graph,
+            &[group],
+            &registry,
+            &device,
+            &dag,
+            &bottleneck_map,
+            &graph,
         );
 
         // Assert
@@ -2452,7 +3117,11 @@ mod tests {
     #[test]
     fn test_model_aware_gemmbias_colmajor_weight_passthrough() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, KvSource, LayerCondition, MlaSpec, NormSpec, Op, QuantGemmSpec,
+            RopeSpec, SinksSpec, SymDim,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -2460,7 +3129,15 @@ mod tests {
         let b = graph.add_tensor_concrete("b", &[64, 128], DType::F32);
         let bias = graph.add_tensor_concrete("bias", &[128], DType::F32);
         let c = graph.add_tensor_concrete("c", &[1, 128], DType::F32);
-        graph.add_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, dtype: DType::F32, trans_b: false, has_bias: true }),
+        graph.add_op(
+            Op::GemmBias(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 128,
+                k: 64,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: true,
+            }),
             vec![a, b, bias],
             vec![c],
             "gemm_bias_colmaj_wt",
@@ -2490,7 +3167,10 @@ mod tests {
         let b = LayoutConstraint::AmxTileBF16 { rows: 16, cols: 32 };
 
         // Act & Assert
-        assert!(a.compatible_with(&b), "Identical AmxTileBF16 layouts should be compatible");
+        assert!(
+            a.compatible_with(&b),
+            "Identical AmxTileBF16 layouts should be compatible"
+        );
     }
 
     /// @trace TEST-LN-70 [req:REQ-LAYOUT] [level:unit]
@@ -2503,7 +3183,10 @@ mod tests {
         let b = LayoutConstraint::AmxTileBF16 { rows: 8, cols: 16 };
 
         // Act & Assert
-        assert!(!a.compatible_with(&b), "AmxTileBF16 with different dims should not be compatible");
+        assert!(
+            !a.compatible_with(&b),
+            "AmxTileBF16 with different dims should not be compatible"
+        );
     }
 
     /// @trace TEST-LN-71 [req:REQ-LAYOUT] [level:unit]
@@ -2511,11 +3194,22 @@ mod tests {
     #[test]
     fn test_compatible_with_identical_shared_mem_tile() {
         // Arrange
-        let a = LayoutConstraint::SharedMemTile { tile_rows: 16, tile_cols: 16, padding_bytes: 4 };
-        let b = LayoutConstraint::SharedMemTile { tile_rows: 16, tile_cols: 16, padding_bytes: 4 };
+        let a = LayoutConstraint::SharedMemTile {
+            tile_rows: 16,
+            tile_cols: 16,
+            padding_bytes: 4,
+        };
+        let b = LayoutConstraint::SharedMemTile {
+            tile_rows: 16,
+            tile_cols: 16,
+            padding_bytes: 4,
+        };
 
         // Act & Assert
-        assert!(a.compatible_with(&b), "Identical SharedMemTile layouts should be compatible");
+        assert!(
+            a.compatible_with(&b),
+            "Identical SharedMemTile layouts should be compatible"
+        );
     }
 
     /// @trace TEST-LN-72 [req:REQ-LAYOUT] [level:unit]
@@ -2523,11 +3217,20 @@ mod tests {
     #[test]
     fn test_compatible_with_identical_tma_aligned_2d() {
         // Arrange
-        let a = LayoutConstraint::TmaAligned2D { tile_m: 128, tile_n: 128 };
-        let b = LayoutConstraint::TmaAligned2D { tile_m: 128, tile_n: 128 };
+        let a = LayoutConstraint::TmaAligned2D {
+            tile_m: 128,
+            tile_n: 128,
+        };
+        let b = LayoutConstraint::TmaAligned2D {
+            tile_m: 128,
+            tile_n: 128,
+        };
 
         // Act & Assert
-        assert!(a.compatible_with(&b), "Identical TmaAligned2D layouts should be compatible");
+        assert!(
+            a.compatible_with(&b),
+            "Identical TmaAligned2D layouts should be compatible"
+        );
     }
 
     /// @trace TEST-LN-73 [req:REQ-LAYOUT] [level:unit]
@@ -2539,8 +3242,14 @@ mod tests {
         let vnni = LayoutConstraint::VnniPacked4;
 
         // Act & Assert
-        assert!(!row.compatible_with(&vnni), "RowMajor and VnniPacked4 should not be compatible");
-        assert!(!vnni.compatible_with(&row), "VnniPacked4 and RowMajor should not be compatible");
+        assert!(
+            !row.compatible_with(&vnni),
+            "RowMajor and VnniPacked4 should not be compatible"
+        );
+        assert!(
+            !vnni.compatible_with(&row),
+            "VnniPacked4 and RowMajor should not be compatible"
+        );
     }
 
     /// @trace TEST-LN-74 [req:REQ-LAYOUT] [level:unit]
@@ -2550,7 +3259,10 @@ mod tests {
     fn test_find_compromise_panelpacked_vs_headsplit() {
         // Arrange
         let a = LayoutConstraint::PanelPacked { mr: 14, nr: 32 };
-        let b = LayoutConstraint::HeadSplit { num_heads: 8, head_dim: 64 };
+        let b = LayoutConstraint::HeadSplit {
+            num_heads: 8,
+            head_dim: 64,
+        };
 
         // Act
         let result = find_compromise(&a, &b);
@@ -2609,7 +3321,11 @@ mod tests {
     #[test]
     fn test_model_aware_gemm_qkv_without_mha_fallback_head_dim() {
         // Arrange: 3 Gemm ops sharing input, but no MHA/RoPE in the graph
-        use crate::compiler::graph::{CompilerGraph, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, KvSource, LayerCondition, MlaSpec, NormSpec, Op, QuantGemmSpec,
+            RopeSpec, SinksSpec, SymDim,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -2621,23 +3337,58 @@ mod tests {
         let o2 = graph.add_tensor_concrete("o2", &[1, 512], DType::F32);
         let o3 = graph.add_tensor_concrete("o3", &[1, 512], DType::F32);
 
-        let q_op = graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![input, w1], vec![o1], "q_proj");
-        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![input, w2], vec![o2], "k_proj");
-        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![input, w3], vec![o3], "v_proj");
+        let q_op = graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, w1],
+            vec![o1],
+            "q_proj",
+        );
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, w2],
+            vec![o2],
+            "k_proj",
+        );
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, w3],
+            vec![o3],
+            "v_proj",
+        );
 
         // Act: no MHA/RoPE => extract_head_dim_from_graph returns None
         // => head_dim = n = 512, num_heads = 512 / 512 = 1
-        let (out_layout, _) = model_aware_layout_overrides(
-            q_op,
-            &graph,
-            LayoutConstraint::Any,
-            None,
-        );
+        let (out_layout, _) =
+            model_aware_layout_overrides(q_op, &graph, LayoutConstraint::Any, None);
 
         // Assert: fallback uses n as head_dim, so num_heads = n/n = 1
         assert_eq!(
             out_layout,
-            LayoutConstraint::HeadSplit { num_heads: 1, head_dim: 512 },
+            LayoutConstraint::HeadSplit {
+                num_heads: 1,
+                head_dim: 512
+            },
             "QKV Gemm without MHA/RoPE should fall back to head_dim=n, num_heads=1"
         );
     }
@@ -2684,7 +3435,12 @@ mod tests {
 
         // Act
         let result = LayoutNegotiator::negotiate(
-            &[group_a, group_b], &registry, &device, &dag, &bottleneck_map, &graph,
+            &[group_a, group_b],
+            &registry,
+            &device,
+            &dag,
+            &bottleneck_map,
+            &graph,
         );
 
         // Assert: each group has its own independent op_layouts
@@ -2692,10 +3448,18 @@ mod tests {
         assert_eq!(result.group_assignments[0].group_id, 10);
         assert_eq!(result.group_assignments[1].group_id, 20);
         // group_a has OpId(0), group_b has OpId(1) — no overlap
-        assert!(result.group_assignments[0].op_layouts.contains_key(&OpId(0)));
-        assert!(!result.group_assignments[0].op_layouts.contains_key(&OpId(1)));
-        assert!(result.group_assignments[1].op_layouts.contains_key(&OpId(1)));
-        assert!(!result.group_assignments[1].op_layouts.contains_key(&OpId(0)));
+        assert!(result.group_assignments[0]
+            .op_layouts
+            .contains_key(&OpId(0)));
+        assert!(!result.group_assignments[0]
+            .op_layouts
+            .contains_key(&OpId(1)));
+        assert!(result.group_assignments[1]
+            .op_layouts
+            .contains_key(&OpId(1)));
+        assert!(!result.group_assignments[1]
+            .op_layouts
+            .contains_key(&OpId(0)));
     }
 
     // ── 10 new tests (wave-12x90) ────────────────────────────────────────
@@ -2706,11 +3470,22 @@ mod tests {
     #[test]
     fn test_compatible_with_shared_mem_tile_different_rows() {
         // Arrange
-        let a = LayoutConstraint::SharedMemTile { tile_rows: 16, tile_cols: 16, padding_bytes: 4 };
-        let b = LayoutConstraint::SharedMemTile { tile_rows: 32, tile_cols: 16, padding_bytes: 4 };
+        let a = LayoutConstraint::SharedMemTile {
+            tile_rows: 16,
+            tile_cols: 16,
+            padding_bytes: 4,
+        };
+        let b = LayoutConstraint::SharedMemTile {
+            tile_rows: 32,
+            tile_cols: 16,
+            padding_bytes: 4,
+        };
 
         // Act & Assert
-        assert!(!a.compatible_with(&b), "SharedMemTile with different tile_rows should not be compatible");
+        assert!(
+            !a.compatible_with(&b),
+            "SharedMemTile with different tile_rows should not be compatible"
+        );
     }
 
     /// @trace TEST-LN-80 [req:REQ-LAYOUT] [level:unit]
@@ -2719,11 +3494,20 @@ mod tests {
     #[test]
     fn test_compatible_with_tma_aligned_2d_different_tile_n() {
         // Arrange
-        let a = LayoutConstraint::TmaAligned2D { tile_m: 128, tile_n: 128 };
-        let b = LayoutConstraint::TmaAligned2D { tile_m: 128, tile_n: 64 };
+        let a = LayoutConstraint::TmaAligned2D {
+            tile_m: 128,
+            tile_n: 128,
+        };
+        let b = LayoutConstraint::TmaAligned2D {
+            tile_m: 128,
+            tile_n: 64,
+        };
 
         // Act & Assert
-        assert!(!a.compatible_with(&b), "TmaAligned2D with different tile_n should not be compatible");
+        assert!(
+            !a.compatible_with(&b),
+            "TmaAligned2D with different tile_n should not be compatible"
+        );
     }
 
     /// @trace TEST-LN-81 [req:REQ-LAYOUT] [level:unit]
@@ -2733,11 +3517,21 @@ mod tests {
     fn test_compatible_with_amx_tile_vs_shared_mem_tile() {
         // Arrange
         let amx = LayoutConstraint::AmxTileBF16 { rows: 16, cols: 32 };
-        let smem = LayoutConstraint::SharedMemTile { tile_rows: 16, tile_cols: 32, padding_bytes: 0 };
+        let smem = LayoutConstraint::SharedMemTile {
+            tile_rows: 16,
+            tile_cols: 32,
+            padding_bytes: 0,
+        };
 
         // Act & Assert: both directions
-        assert!(!amx.compatible_with(&smem), "AmxTileBF16 and SharedMemTile should not be compatible");
-        assert!(!smem.compatible_with(&amx), "SharedMemTile and AmxTileBF16 should not be compatible");
+        assert!(
+            !amx.compatible_with(&smem),
+            "AmxTileBF16 and SharedMemTile should not be compatible"
+        );
+        assert!(
+            !smem.compatible_with(&amx),
+            "SharedMemTile and AmxTileBF16 should not be compatible"
+        );
     }
 
     /// @trace TEST-LN-82 [req:REQ-LAYOUT] [level:unit]
@@ -2746,7 +3540,10 @@ mod tests {
     #[test]
     fn test_find_compromise_tma_vs_rowmajor() {
         // Arrange
-        let a = LayoutConstraint::TmaAligned2D { tile_m: 128, tile_n: 128 };
+        let a = LayoutConstraint::TmaAligned2D {
+            tile_m: 128,
+            tile_n: 128,
+        };
         let b = LayoutConstraint::RowMajor { align_bytes: 128 };
 
         // Act
@@ -2762,26 +3559,34 @@ mod tests {
     #[test]
     fn test_model_aware_gemm_any_output_non_qkv() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, KvSource, LayerCondition, MlaSpec, NormSpec, Op, QuantGemmSpec,
+            RopeSpec, SinksSpec, SymDim,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let a = graph.add_tensor_concrete("a", &[1, 64], DType::F32);
         let b = graph.add_tensor_concrete("b", &[64, 128], DType::F32);
         let c = graph.add_tensor_concrete("c", &[1, 128], DType::F32);
-        let op_id = graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
+        let op_id = graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 128,
+                k: 64,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, b],
             vec![c],
             "single_gemm",
         );
 
         // Act: output is Any, non-QKV single gemm
-        let (out_layout, _) = model_aware_layout_overrides(
-            op_id,
-            &graph,
-            LayoutConstraint::Any,
-            None,
-        );
+        let (out_layout, _) =
+            model_aware_layout_overrides(op_id, &graph, LayoutConstraint::Any, None);
 
         // Assert: single Gemm is not QKV, so Any output is preserved
         assert_eq!(out_layout, LayoutConstraint::Any);
@@ -2839,7 +3644,12 @@ mod tests {
 
         // Act
         let result = LayoutNegotiator::negotiate(
-            &[group], &registry, &device, &dag, &bottleneck_map, &graph,
+            &[group],
+            &registry,
+            &device,
+            &dag,
+            &bottleneck_map,
+            &graph,
         );
 
         // Assert: two ElemWise ops with Any layout, Standalone => RegisterToMemory
@@ -2874,7 +3684,10 @@ mod tests {
         // Arrange: simulate a free transform window (RegisterToMemory with cost 0)
         let t = LayoutTransform {
             source: LayoutConstraint::RowMajor { align_bytes: 64 },
-            target: LayoutConstraint::HeadSplit { num_heads: 32, head_dim: 128 },
+            target: LayoutConstraint::HeadSplit {
+                num_heads: 32,
+                head_dim: 128,
+            },
             cost: 0.0,
         };
 
@@ -2883,7 +3696,10 @@ mod tests {
 
         // Assert: cost is exactly 0.0 (free transformation window)
         assert_eq!(cloned.cost, 0.0);
-        assert!(cloned.source != cloned.target, "Source and target differ (layout change occurred)");
+        assert!(
+            cloned.source != cloned.target,
+            "Source and target differ (layout change occurred)"
+        );
     }
 
     /// @trace TEST-LN-86 [req:REQ-LAYOUT] [level:unit]
@@ -2892,7 +3708,11 @@ mod tests {
     #[test]
     fn test_is_qkv_op_quant_gemm_siblings_counted() {
         // Arrange: 2 regular Gemm + 1 QuantGemm sharing the same input
-        use crate::compiler::graph::{CompilerGraph, CompilerOp, LayerCondition, KvSource, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            CompilerOp, DualRopeSpec, GemmSpec, KvSource, LayerCondition, MlaSpec, NormSpec, Op,
+            QuantGemmSpec, RopeSpec, SinksSpec, SymDim,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -2904,17 +3724,54 @@ mod tests {
         let o2 = graph.add_tensor_concrete("o2", &[1, 256], DType::F32);
         let o3 = graph.add_tensor_concrete("o3", &[1, 256], DType::F32);
 
-        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![input, w1], vec![o1], "q_proj");
-        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![input, w2], vec![o2], "k_proj");
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, w1],
+            vec![o1],
+            "q_proj",
+        );
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, w2],
+            vec![o2],
+            "k_proj",
+        );
 
         // Third sibling is a QuantGemm — added via graph.add_op to maintain tensor.consumers index.
-        graph.add_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, quant_type: crate::quant::QuantType::F32 }), vec![input, w3], vec![o3], "v_proj");
+        graph.add_op(
+            Op::QuantGemm(QuantGemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                quant_type: crate::quant::QuantType::F32,
+            }),
+            vec![input, w3],
+            vec![o3],
+            "v_proj",
+        );
 
         // Act: check the first Gemm (OpId(0)) — should see 3 siblings (2 Gemm + 1 QuantGemm)
         let result = is_qkv_op(OpId(0), &graph);
 
         // Assert: QuantGemm is counted, so >= 3 siblings => true
-        assert!(result, "QuantGemm should be counted as sibling, making 3 total => QKV detected");
+        assert!(
+            result,
+            "QuantGemm should be counted as sibling, making 3 total => QKV detected"
+        );
     }
 
     /// @trace TEST-LN-87 [req:REQ-LAYOUT] [level:unit]
@@ -2923,7 +3780,11 @@ mod tests {
     #[test]
     fn test_extract_head_dim_silu_rmsnorm_returns_none() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, KvSource, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, KvSource, MlaSpec, NormSpec, Op, QuantGemmSpec, RopeSpec,
+            SinksSpec,
+        };
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -2933,13 +3794,26 @@ mod tests {
 
         let z = graph.add_tensor_concrete("z", &[1, 256], DType::F32);
         let w = graph.add_tensor_concrete("w", &[1, 256], DType::F32);
-        graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }), vec![z], vec![w], "norm");
+        graph.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-6,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![z],
+            vec![w],
+            "norm",
+        );
 
         // Act
         let head_dim = extract_head_dim_from_graph(&graph);
 
         // Assert
-        assert_eq!(head_dim, None, "Silu and RmsNorm should not provide head_dim");
+        assert_eq!(
+            head_dim, None,
+            "Silu and RmsNorm should not provide head_dim"
+        );
     }
 
     /// @trace TEST-LN-88 [req:REQ-LAYOUT] [level:unit]
@@ -2952,7 +3826,7 @@ mod tests {
             group_id: 0,
             op_layouts: HashMap::new(),
             inter_op_transforms: Vec::new(),
-                dtype_transforms: Vec::new(),
+            dtype_transforms: Vec::new(),
             total_benefit: 2.0,
             total_transform_cost: 0.0,
         };
@@ -2960,7 +3834,7 @@ mod tests {
             group_id: 1,
             op_layouts: HashMap::new(),
             inter_op_transforms: Vec::new(),
-                dtype_transforms: Vec::new(),
+            dtype_transforms: Vec::new(),
             total_benefit: 3.0,
             total_transform_cost: 1.5,
         };
@@ -2968,7 +3842,7 @@ mod tests {
             group_id: 2,
             op_layouts: HashMap::new(),
             inter_op_transforms: Vec::new(),
-                dtype_transforms: Vec::new(),
+            dtype_transforms: Vec::new(),
             total_benefit: 5.0,
             total_transform_cost: 0.5,
         };

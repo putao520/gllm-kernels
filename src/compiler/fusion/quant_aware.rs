@@ -5,8 +5,8 @@
 //! Core principle: same-precision ops attract (fuse freely), cross-precision
 //! ops need explicit cast insertion at group boundaries.
 
-use crate::quant::QuantType;
 use crate::compiler::trace::QuantPrecision;
+use crate::quant::QuantType;
 
 /// Fusion decision for quant-aware analysis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,10 +54,15 @@ pub fn fusion_cost(quant_a: Option<QuantType>, quant_b: Option<QuantType>) -> f3
         (Some(a), Some(b)) if a == b => 0.0,
         (Some(_), None) | (None, Some(_)) => 0.5,
         (Some(a), Some(b)) => {
-            if both_classic(a, b) { 0.5 }
-            else if one_is_kquant(a, b) { 1.5 }
-            else if either_is_iq(a, b) { 3.0 }
-            else { 1.0 }
+            if both_classic(a, b) {
+                0.5
+            } else if one_is_kquant(a, b) {
+                1.5
+            } else if either_is_iq(a, b) {
+                3.0
+            } else {
+                1.0
+            }
         }
     }
 }
@@ -67,8 +72,15 @@ fn both_classic(a: QuantType, b: QuantType) -> bool {
 }
 
 fn is_classic(qt: QuantType) -> bool {
-    matches!(qt, QuantType::Q4_0 | QuantType::Q4_1 | QuantType::Q5_0
-        | QuantType::Q5_1 | QuantType::Q8_0 | QuantType::Q8_1)
+    matches!(
+        qt,
+        QuantType::Q4_0
+            | QuantType::Q4_1
+            | QuantType::Q5_0
+            | QuantType::Q5_1
+            | QuantType::Q8_0
+            | QuantType::Q8_1
+    )
 }
 
 fn one_is_kquant(a: QuantType, b: QuantType) -> bool {
@@ -76,8 +88,15 @@ fn one_is_kquant(a: QuantType, b: QuantType) -> bool {
 }
 
 fn is_kquant(qt: QuantType) -> bool {
-    matches!(qt, QuantType::Q2K | QuantType::Q3K | QuantType::Q4K
-        | QuantType::Q5K | QuantType::Q6K | QuantType::Q8K)
+    matches!(
+        qt,
+        QuantType::Q2K
+            | QuantType::Q3K
+            | QuantType::Q4K
+            | QuantType::Q5K
+            | QuantType::Q6K
+            | QuantType::Q8K
+    )
 }
 
 fn either_is_iq(a: QuantType, b: QuantType) -> bool {
@@ -85,9 +104,18 @@ fn either_is_iq(a: QuantType, b: QuantType) -> bool {
 }
 
 fn is_iq(qt: QuantType) -> bool {
-    matches!(qt, QuantType::IQ1S | QuantType::IQ1M | QuantType::IQ2XXS
-        | QuantType::IQ2XS | QuantType::IQ2S | QuantType::IQ3XXS
-        | QuantType::IQ3S | QuantType::IQ4NL | QuantType::IQ4XS)
+    matches!(
+        qt,
+        QuantType::IQ1S
+            | QuantType::IQ1M
+            | QuantType::IQ2XXS
+            | QuantType::IQ2XS
+            | QuantType::IQ2S
+            | QuantType::IQ3XXS
+            | QuantType::IQ3S
+            | QuantType::IQ4NL
+            | QuantType::IQ4XS
+    )
 }
 
 /// Greedy fusion group selection: consecutive same-precision ops form a group.
@@ -133,9 +161,7 @@ pub fn select_fusion_groups(
 ///
 /// 参数 `group_dtypes` 是每个融合组的 dominant_dtype 列表。
 /// 返回值是应合并的 (left_group_idx, right_group_idx) 对列表。
-pub fn detect_widen_narrow_chains(
-    group_dtypes: &[Option<QuantPrecision>],
-) -> Vec<(usize, usize)> {
+pub fn detect_widen_narrow_chains(group_dtypes: &[Option<QuantPrecision>]) -> Vec<(usize, usize)> {
     use crate::compiler::trace::QuantPrecision;
 
     let mut merges = Vec::new();
@@ -152,8 +178,8 @@ pub fn detect_widen_narrow_chains(
         // 即 left 输出窄 dtype (BF16)，right 输入也窄 dtype (BF16)
         // 但中间经过 F32 计算 → 形成 BF16→F32→BF16 冗余链
         match (left, right) {
-            (Some(QuantPrecision::F32), Some(QuantPrecision::BF16)) |
-            (Some(QuantPrecision::F32), Some(QuantPrecision::F16)) => {
+            (Some(QuantPrecision::F32), Some(QuantPrecision::BF16))
+            | (Some(QuantPrecision::F32), Some(QuantPrecision::F16)) => {
                 // F32→BF16/F16 narrowing at boundary
                 // 检查下一个边界是否是 widening（BF16/F16→F32）
                 if i + 2 < group_dtypes.len() {
@@ -166,8 +192,8 @@ pub fn detect_widen_narrow_chains(
                     }
                 }
             }
-            (Some(QuantPrecision::BF16), Some(QuantPrecision::F32)) |
-            (Some(QuantPrecision::F16), Some(QuantPrecision::F32)) => {
+            (Some(QuantPrecision::BF16), Some(QuantPrecision::F32))
+            | (Some(QuantPrecision::F16), Some(QuantPrecision::F32)) => {
                 // BF16/F16→F32 widening at boundary
                 // 检查前一个边界是否是 narrowing
                 if i > 0 {
@@ -220,9 +246,9 @@ mod tests {
         // Simulates: Q4_0 layers → Q4_0 layers → Q6K lm_head
         let ops = vec![
             Some(QuantType::Q4_0), // layer.q_proj
-            None,                   // layer.norm (F32)
+            None,                  // layer.norm (F32)
             Some(QuantType::Q4_0), // layer.k_proj
-            None,                   // layer.swiglu (F32)
+            None,                  // layer.swiglu (F32)
             Some(QuantType::Q6K),  // lm_head
         ];
         let groups = select_fusion_groups(&ops);
@@ -234,7 +260,10 @@ mod tests {
 
     #[test]
     fn fusion_cost_same_is_zero() {
-        assert_eq!(fusion_cost(Some(QuantType::Q4_0), Some(QuantType::Q4_0)), 0.0);
+        assert_eq!(
+            fusion_cost(Some(QuantType::Q4_0), Some(QuantType::Q4_0)),
+            0.0
+        );
         assert_eq!(fusion_cost(None, None), 0.0);
     }
 
@@ -344,8 +373,11 @@ mod tests {
         let merges = detect_widen_narrow_chains(&dtypes);
         assert!(!merges.is_empty(), "should detect F32→BF16→F32 chain");
         // The merge should be for the BF16→F32 boundary
-        assert!(merges.iter().any(|&(l, r)| l == 1 && r == 2),
-            "expected merge at (1, 2), got {:?}", merges);
+        assert!(
+            merges.iter().any(|&(l, r)| l == 1 && r == 2),
+            "expected merge at (1, 2), got {:?}",
+            merges
+        );
     }
 
     #[test]

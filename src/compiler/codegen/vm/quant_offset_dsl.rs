@@ -49,14 +49,11 @@ pub enum BinOpKind {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum QuantOffsetDsl {
     // ── 输入偏移 (使用 block_bytes / 量化格式参数) ──────────────────────
-
     /// 常量偏移值
     Const(i64),
 
     /// 第 n 个 block 的起始偏移: n * block_bytes
-    BlockIndex {
-        block_bytes: usize,
-    },
+    BlockIndex { block_bytes: usize },
 
     /// scale 数组中的偏移: n * block_bytes + scale_offset * scale_elem_bytes
     ScaleOffset {
@@ -80,7 +77,6 @@ pub enum QuantOffsetDsl {
     },
 
     // ── 输出偏移 (使用 compute_dtype.elem_bytes) ─────────────────────
-
     /// 输出缓冲区 block 级偏移: block_idx * block_size * compute_elem_bytes
     /// REQ-LC-008: 输出偏移使用 compute_dtype.elem_bytes(), 不是 block_bytes
     OutputBlockOffset {
@@ -101,7 +97,6 @@ pub enum QuantOffsetDsl {
     },
 
     // ── 组合运算 ───────────────────────────────────────────────────────
-
     /// 二元运算组合
     BinOp {
         op: BinOpKind,
@@ -181,8 +176,9 @@ impl QuantOffsetDsl {
             DataLayout::PackedNibbles { .. } => lanes as i64,
             DataLayout::Bytes { .. } => lanes as i64,
             DataLayout::NibbleWithHighBits { .. } => (lanes / 2) as i64,
-            DataLayout::CodebookIndex { index_bits, .. } =>
-                ((lanes * (*index_bits as usize) + 7) / 8) as i64,
+            DataLayout::CodebookIndex { index_bits, .. } => {
+                ((lanes * (*index_bits as usize) + 7) / 8) as i64
+            }
             // Q3_K: specialized decode, data_step handled by Q3KDecodeStep VmInstr.
             // Placeholder: lanes bytes per iteration (8 qs bytes for 8 elements).
             DataLayout::TwoBitConditionalBias { .. } => lanes as i64,
@@ -191,7 +187,10 @@ impl QuantOffsetDsl {
 
     /// 行字节数 (量化格式) — 一行 hidden_dim 个元素占用多少字节.
     /// 输入偏移: (hidden_dim / block_size) * block_bytes.
-    pub fn derive_row_stride_bytes(desc: &crate::quant_format::QuantFormatDescriptor, hidden_dim: usize) -> usize {
+    pub fn derive_row_stride_bytes(
+        desc: &crate::quant_format::QuantFormatDescriptor,
+        hidden_dim: usize,
+    ) -> usize {
         (hidden_dim / desc.block_size) * desc.block_bytes
     }
 
@@ -231,10 +230,7 @@ impl QuantOffsetDsl {
     }
 
     /// 输出 block 级偏移: block_idx * block_size * compute_elem_bytes (REQ-LC-008).
-    pub fn derive_output_block_offset(
-        block_size: usize,
-        compute_elem_bytes: usize,
-    ) -> Self {
+    pub fn derive_output_block_offset(block_size: usize, compute_elem_bytes: usize) -> Self {
         QuantOffsetDsl::OutputBlockOffset {
             block_size,
             compute_elem_bytes,
@@ -273,28 +269,32 @@ impl QuantOffsetDsl {
     fn evaluate_with_context(&self, ctx: &QuantOffsetContext) -> i64 {
         match self {
             QuantOffsetDsl::Const(v) => *v,
-            QuantOffsetDsl::BlockIndex { block_bytes } => {
-                (ctx.block_idx * block_bytes) as i64
-            }
-            QuantOffsetDsl::ScaleOffset { block_bytes, scale_elem_bytes } => {
-                (ctx.block_idx * block_bytes + scale_elem_bytes) as i64
-            }
-            QuantOffsetDsl::ZeroPointOffset { block_bytes, zp_elem_bytes } => {
-                (ctx.block_idx * block_bytes + zp_elem_bytes) as i64
-            }
-            QuantOffsetDsl::DataOffset { data_byte_advance, sub_block_idx } => {
-                (*sub_block_idx * data_byte_advance) as i64
-            }
+            QuantOffsetDsl::BlockIndex { block_bytes } => (ctx.block_idx * block_bytes) as i64,
+            QuantOffsetDsl::ScaleOffset {
+                block_bytes,
+                scale_elem_bytes,
+            } => (ctx.block_idx * block_bytes + scale_elem_bytes) as i64,
+            QuantOffsetDsl::ZeroPointOffset {
+                block_bytes,
+                zp_elem_bytes,
+            } => (ctx.block_idx * block_bytes + zp_elem_bytes) as i64,
+            QuantOffsetDsl::DataOffset {
+                data_byte_advance,
+                sub_block_idx,
+            } => (*sub_block_idx * data_byte_advance) as i64,
             // 输出偏移 (REQ-LC-008): 使用 compute_elem_bytes, 不是 block_bytes
-            QuantOffsetDsl::OutputBlockOffset { block_size, compute_elem_bytes } => {
-                (ctx.block_idx * block_size * compute_elem_bytes) as i64
-            }
-            QuantOffsetDsl::OutputRowStride { hidden_dim, compute_elem_bytes } => {
-                (*hidden_dim * compute_elem_bytes) as i64
-            }
-            QuantOffsetDsl::SubBlockOutputStep { lanes, compute_elem_bytes } => {
-                (*lanes * compute_elem_bytes) as i64
-            }
+            QuantOffsetDsl::OutputBlockOffset {
+                block_size,
+                compute_elem_bytes,
+            } => (ctx.block_idx * block_size * compute_elem_bytes) as i64,
+            QuantOffsetDsl::OutputRowStride {
+                hidden_dim,
+                compute_elem_bytes,
+            } => (*hidden_dim * compute_elem_bytes) as i64,
+            QuantOffsetDsl::SubBlockOutputStep {
+                lanes,
+                compute_elem_bytes,
+            } => (*lanes * compute_elem_bytes) as i64,
             QuantOffsetDsl::BinOp { op, lhs, rhs } => {
                 let lv = lhs.evaluate_with_context(ctx);
                 let rv = rhs.evaluate_with_context(ctx);
@@ -303,7 +303,11 @@ impl QuantOffsetDsl {
                     BinOpKind::Sub => lv - rv,
                     BinOpKind::Mul => lv * rv,
                     BinOpKind::Div => {
-                        if rv == 0 { 0 } else { lv / rv }
+                        if rv == 0 {
+                            0
+                        } else {
+                            lv / rv
+                        }
                     }
                     BinOpKind::Shl => lv << rv,
                     BinOpKind::Shr => lv >> rv,
@@ -378,7 +382,10 @@ mod tests {
 
     #[test]
     fn test_scale_offset() {
-        let off = QuantOffsetDsl::ScaleOffset { block_bytes: 18, scale_elem_bytes: 2 };
+        let off = QuantOffsetDsl::ScaleOffset {
+            block_bytes: 18,
+            scale_elem_bytes: 2,
+        };
         assert_eq!(off.evaluate(0), 2);
         assert_eq!(off.evaluate(1), 20);
         assert_eq!(off.evaluate(3), 56);
@@ -387,7 +394,10 @@ mod tests {
 
     #[test]
     fn test_zero_point_offset() {
-        let off = QuantOffsetDsl::ZeroPointOffset { block_bytes: 18, zp_elem_bytes: 1 };
+        let off = QuantOffsetDsl::ZeroPointOffset {
+            block_bytes: 18,
+            zp_elem_bytes: 1,
+        };
         assert_eq!(off.evaluate(0), 1);
         assert_eq!(off.evaluate(1), 19);
         assert_eq!(off.evaluate(3), 55);
@@ -396,7 +406,10 @@ mod tests {
 
     #[test]
     fn test_data_offset() {
-        let off = QuantOffsetDsl::DataOffset { data_byte_advance: 4, sub_block_idx: 3 };
+        let off = QuantOffsetDsl::DataOffset {
+            data_byte_advance: 4,
+            sub_block_idx: 3,
+        };
         assert_eq!(off.evaluate(0), 12); // 3 * 4
         assert_eq!(off.evaluate(5), 12); // block_idx irrelevant for DataOffset
         assert!(off.is_input_offset());
@@ -404,7 +417,10 @@ mod tests {
 
     #[test]
     fn test_output_block_offset() {
-        let off = QuantOffsetDsl::OutputBlockOffset { block_size: 32, compute_elem_bytes: 4 };
+        let off = QuantOffsetDsl::OutputBlockOffset {
+            block_size: 32,
+            compute_elem_bytes: 4,
+        };
         assert_eq!(off.evaluate(0), 0);
         assert_eq!(off.evaluate(1), 128); // 1 * 32 * 4
         assert_eq!(off.evaluate(3), 384); // 3 * 32 * 4
@@ -414,14 +430,20 @@ mod tests {
 
     #[test]
     fn test_output_row_stride() {
-        let off = QuantOffsetDsl::OutputRowStride { hidden_dim: 4096, compute_elem_bytes: 4 };
+        let off = QuantOffsetDsl::OutputRowStride {
+            hidden_dim: 4096,
+            compute_elem_bytes: 4,
+        };
         assert_eq!(off.evaluate(0), 16384); // 4096 * 4
         assert!(off.is_output_offset());
     }
 
     #[test]
     fn test_sub_block_output_step() {
-        let off = QuantOffsetDsl::SubBlockOutputStep { lanes: 8, compute_elem_bytes: 4 };
+        let off = QuantOffsetDsl::SubBlockOutputStep {
+            lanes: 8,
+            compute_elem_bytes: 4,
+        };
         assert_eq!(off.evaluate(0), 32); // 8 * 4
         assert!(off.is_output_offset());
     }
@@ -468,9 +490,9 @@ mod tests {
             lhs: Box::new(inner),
             rhs: Box::new(QuantOffsetDsl::Const(4)),
         };
-        assert_eq!(off.evaluate(0), 8);     // (0+2)*4
-        assert_eq!(off.evaluate(1), 80);    // (18+2)*4
-        assert_eq!(off.evaluate(3), 224);   // (54+2)*4
+        assert_eq!(off.evaluate(0), 8); // (0+2)*4
+        assert_eq!(off.evaluate(1), 80); // (18+2)*4
+        assert_eq!(off.evaluate(3), 224); // (54+2)*4
     }
 
     #[test]
@@ -507,14 +529,20 @@ mod tests {
 
     #[test]
     fn test_eval_quant_offset_scale_offset() {
-        let dsl = QuantOffsetDsl::ScaleOffset { block_bytes: 18, scale_elem_bytes: 2 };
+        let dsl = QuantOffsetDsl::ScaleOffset {
+            block_bytes: 18,
+            scale_elem_bytes: 2,
+        };
         let ctx = QuantOffsetContext::new(1, 0, 0);
         assert_eq!(eval_quant_offset(&dsl, &ctx), 20);
     }
 
     #[test]
     fn test_eval_quant_offset_zero_point_offset() {
-        let dsl = QuantOffsetDsl::ZeroPointOffset { block_bytes: 18, zp_elem_bytes: 1 };
+        let dsl = QuantOffsetDsl::ZeroPointOffset {
+            block_bytes: 18,
+            zp_elem_bytes: 1,
+        };
         let ctx = QuantOffsetContext::new(3, 0, 0);
         assert_eq!(eval_quant_offset(&dsl, &ctx), 55);
     }
@@ -616,18 +644,50 @@ mod tests {
     #[test]
     fn test_block_bytes_returns_none_for_non_block_variants() {
         assert!(QuantOffsetDsl::Const(5).block_bytes().is_none());
-        assert!(QuantOffsetDsl::OutputBlockOffset { block_size: 32, compute_elem_bytes: 4 }.block_bytes().is_none());
-        assert!(QuantOffsetDsl::OutputRowStride { hidden_dim: 512, compute_elem_bytes: 4 }.block_bytes().is_none());
-        assert!(QuantOffsetDsl::SubBlockOutputStep { lanes: 8, compute_elem_bytes: 4 }.block_bytes().is_none());
-        assert!(QuantOffsetDsl::DataOffset { data_byte_advance: 4, sub_block_idx: 0 }.block_bytes().is_none());
+        assert!(QuantOffsetDsl::OutputBlockOffset {
+            block_size: 32,
+            compute_elem_bytes: 4
+        }
+        .block_bytes()
+        .is_none());
+        assert!(QuantOffsetDsl::OutputRowStride {
+            hidden_dim: 512,
+            compute_elem_bytes: 4
+        }
+        .block_bytes()
+        .is_none());
+        assert!(QuantOffsetDsl::SubBlockOutputStep {
+            lanes: 8,
+            compute_elem_bytes: 4
+        }
+        .block_bytes()
+        .is_none());
+        assert!(QuantOffsetDsl::DataOffset {
+            data_byte_advance: 4,
+            sub_block_idx: 0
+        }
+        .block_bytes()
+        .is_none());
     }
 
     #[test]
     fn test_is_const_false_for_all_non_const() {
         assert!(!QuantOffsetDsl::BlockIndex { block_bytes: 18 }.is_const());
-        assert!(!QuantOffsetDsl::ScaleOffset { block_bytes: 18, scale_elem_bytes: 2 }.is_const());
-        assert!(!QuantOffsetDsl::ZeroPointOffset { block_bytes: 18, zp_elem_bytes: 1 }.is_const());
-        assert!(!QuantOffsetDsl::OutputBlockOffset { block_size: 32, compute_elem_bytes: 4 }.is_const());
+        assert!(!QuantOffsetDsl::ScaleOffset {
+            block_bytes: 18,
+            scale_elem_bytes: 2
+        }
+        .is_const());
+        assert!(!QuantOffsetDsl::ZeroPointOffset {
+            block_bytes: 18,
+            zp_elem_bytes: 1
+        }
+        .is_const());
+        assert!(!QuantOffsetDsl::OutputBlockOffset {
+            block_size: 32,
+            compute_elem_bytes: 4
+        }
+        .is_const());
     }
 
     #[test]
@@ -665,7 +725,10 @@ mod tests {
 
     #[test]
     fn test_eval_quant_offset_data_offset_with_context() {
-        let dsl = QuantOffsetDsl::DataOffset { data_byte_advance: 4, sub_block_idx: 2 };
+        let dsl = QuantOffsetDsl::DataOffset {
+            data_byte_advance: 4,
+            sub_block_idx: 2,
+        };
         let ctx = QuantOffsetContext::with_sub_block(10, 2);
         assert_eq!(eval_quant_offset(&dsl, &ctx), 8); // 2 * 4
     }

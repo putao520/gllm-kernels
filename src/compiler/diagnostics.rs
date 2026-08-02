@@ -8,10 +8,10 @@
 
 use std::fmt;
 
-use crate::types::CompilerError;
 use crate::compiler::graph::{CompilerGraph, OpId, TensorId};
 use crate::compiler::semantics;
 use crate::dispatch::device_profile::DeviceProfile;
+use crate::types::CompilerError;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // §1 REQ-FALLBACK-001: Fallback whitelist
@@ -66,8 +66,12 @@ impl fmt::Display for FallbackWhitelist {
         match self {
             Self::HfToModelScope => write!(f, "A2: HF→ModelScope ({})", self.spec_ref()),
             Self::OnnxFusionToAtomic => write!(f, "A3: ONNX Fusion→Atomic ({})", self.spec_ref()),
-            Self::HwFusionToStandalone => write!(f, "A4: HW Fusion→Standalone ({})", self.spec_ref()),
-            Self::ReshapeTransposeMetadataNop => write!(f, "A5: Reshape/Transpose NOP ({})", self.spec_ref()),
+            Self::HwFusionToStandalone => {
+                write!(f, "A4: HW Fusion→Standalone ({})", self.spec_ref())
+            }
+            Self::ReshapeTransposeMetadataNop => {
+                write!(f, "A5: Reshape/Transpose NOP ({})", self.spec_ref())
+            }
             Self::Reserved(r) => write!(f, "Reserved: {r}"),
         }
     }
@@ -95,7 +99,11 @@ pub struct FallbackError {
 impl FallbackError {
     /// Create a new FallbackError with all required fields.
     // @trace REQ-FALLBACK-002 [entity:ENT-COMPILER-GRAPH] [api:POST /compile]
-    pub fn new(trigger: impl Into<String>, attempted_path: impl Into<String>, suggestion: impl Into<String>) -> Self {
+    pub fn new(
+        trigger: impl Into<String>,
+        attempted_path: impl Into<String>,
+        suggestion: impl Into<String>,
+    ) -> Self {
         Self {
             trigger: trigger.into(),
             attempted_path: attempted_path.into(),
@@ -138,7 +146,10 @@ pub enum IrPosition {
     /// Violation at a specific tensor slot.
     Slot { tensor_id: TensorId, name: String },
     /// Violation on an edge (producer -> consumer).
-    Edge { producer_op: OpId, consumer_op: OpId },
+    Edge {
+        producer_op: OpId,
+        consumer_op: OpId,
+    },
 }
 
 impl fmt::Display for IrPosition {
@@ -146,8 +157,15 @@ impl fmt::Display for IrPosition {
         match self {
             Self::Op { op_id, op_label } => write!(f, "op '{}' (id={})", op_label, op_id.0),
             Self::Slot { tensor_id, name } => write!(f, "slot '{}' (id={})", name, tensor_id.0),
-            Self::Edge { producer_op, consumer_op } => {
-                write!(f, "edge producer={} → consumer={}", producer_op.0, consumer_op.0)
+            Self::Edge {
+                producer_op,
+                consumer_op,
+            } => {
+                write!(
+                    f,
+                    "edge producer={} → consumer={}",
+                    producer_op.0, consumer_op.0
+                )
             }
         }
     }
@@ -424,7 +442,10 @@ pub fn pre_check(graph: &CompilerGraph) -> Vec<IrError> {
         if !is_side_effect && op.outputs.is_empty() {
             errors.push(IrError::new(
                 "op_has_output",
-                IrPosition::Op { op_id: op.id, op_label: op.label.clone() },
+                IrPosition::Op {
+                    op_id: op.id,
+                    op_label: op.label.clone(),
+                },
                 ">= 1 output tensor",
                 "0 output tensors",
             ));
@@ -432,7 +453,10 @@ pub fn pre_check(graph: &CompilerGraph) -> Vec<IrError> {
         if is_side_effect && !op.outputs.is_empty() {
             errors.push(IrError::new(
                 "side_effect_op_has_no_output",
-                IrPosition::Op { op_id: op.id, op_label: op.label.clone() },
+                IrPosition::Op {
+                    op_id: op.id,
+                    op_label: op.label.clone(),
+                },
                 "0 output tensors (pure side-effect)",
                 format!("{} output tensor(s)", op.outputs.len()),
             ));
@@ -445,7 +469,10 @@ pub fn pre_check(graph: &CompilerGraph) -> Vec<IrError> {
             if graph.tensor(input_tid).is_none() {
                 errors.push(IrError::new(
                     "input_tensor_exists",
-                    IrPosition::Slot { tensor_id: input_tid, name: format!("input_of_{}", op.label) },
+                    IrPosition::Slot {
+                        tensor_id: input_tid,
+                        name: format!("input_of_{}", op.label),
+                    },
                     format!("tensor id {} exists", input_tid.0),
                     "tensor not found in graph",
                 ));
@@ -459,7 +486,10 @@ pub fn pre_check(graph: &CompilerGraph) -> Vec<IrError> {
             if graph.tensor(output_tid).is_none() {
                 errors.push(IrError::new(
                     "output_tensor_exists",
-                    IrPosition::Slot { tensor_id: output_tid, name: format!("output_of_{}", op.label) },
+                    IrPosition::Slot {
+                        tensor_id: output_tid,
+                        name: format!("output_of_{}", op.label),
+                    },
                     format!("tensor id {} exists", output_tid.0),
                     "tensor not found in graph",
                 ));
@@ -478,8 +508,14 @@ pub fn pre_check(graph: &CompilerGraph) -> Vec<IrError> {
                         if !producer.outputs.contains(&input_tid) {
                             errors.push(IrError::new(
                                 "producer_declares_output",
-                                IrPosition::Edge { producer_op: producer_id, consumer_op: op.id },
-                                format!("producer op '{}' declares tensor {} as output", producer.label, input_tid.0),
+                                IrPosition::Edge {
+                                    producer_op: producer_id,
+                                    consumer_op: op.id,
+                                },
+                                format!(
+                                    "producer op '{}' declares tensor {} as output",
+                                    producer.label, input_tid.0
+                                ),
                                 format!("tensor {} not in producer outputs", input_tid.0),
                             ));
                         }
@@ -522,7 +558,11 @@ pub fn pass_post_verify(
             "output_tensor_count_not_decreased",
             pass_name,
             format!("{} tensors before pass", tensor_count_before),
-            format!("{} tensors after pass (lost {})", tensor_count_after, tensor_count_before - tensor_count_after),
+            format!(
+                "{} tensors after pass (lost {})",
+                tensor_count_after,
+                tensor_count_before - tensor_count_after
+            ),
         ));
     }
 
@@ -556,14 +596,15 @@ pub fn codegen_emit_check(
     match result {
         Ok(()) => Ok(()),
         Err(CompilerError::CodegenViolation(msg)) => {
-            let cg_err = CodegenError::from_violation(
-                &msg,
-                source_op,
-                format!("{:?}", device_profile.arch),
-            );
+            let cg_err =
+                CodegenError::from_violation(&msg, source_op, format!("{:?}", device_profile.arch));
             Err(cg_err.to_compiler_error())
         }
-        Err(CompilerError::RegisterOverflow { needed, available, context }) => {
+        Err(CompilerError::RegisterOverflow {
+            needed,
+            available,
+            context,
+        }) => {
             let cg_err = CodegenError::new(
                 format!("RegisterOverflow: need {needed}, have {available}"),
                 source_op.to_string(),
@@ -609,13 +650,11 @@ pub fn check_fallback_authorized(
         | FallbackWhitelist::OnnxFusionToAtomic
         | FallbackWhitelist::HwFusionToStandalone
         | FallbackWhitelist::ReshapeTransposeMetadataNop => Ok(()),
-        FallbackWhitelist::Reserved(reason) => {
-            Err(FallbackError::new(
-                trigger,
-                format!("Reserved fallback: {reason}"),
-                "Request SPEC authorization for this fallback path before use",
-            ))
-        }
+        FallbackWhitelist::Reserved(reason) => Err(FallbackError::new(
+            trigger,
+            format!("Reserved fallback: {reason}"),
+            "Request SPEC authorization for this fallback path before use",
+        )),
     }
 }
 
@@ -628,10 +667,22 @@ pub fn detect_silent_fallback_patterns(source: &str) -> Vec<FallbackError> {
     let mut violations = Vec::new();
     let forbidden_patterns = [
         ("emit_nop_raw", "emit_nop_raw() — silent NOP instead of Err"),
-        ("match _ => Ok(())", "match _ => Ok(()) — catch-all success instead of Err"),
-        ("eprintln!(\"[WARN]\",", "eprintln!([WARN]...) — warning instead of Err"),
-        ("unwrap_or(default)", "unwrap_or(default) — silent default instead of Err"),
-        ("unwrap_or(Default::default())", "unwrap_or(Default::default()) — silent default instead of Err"),
+        (
+            "match _ => Ok(())",
+            "match _ => Ok(()) — catch-all success instead of Err",
+        ),
+        (
+            "eprintln!(\"[WARN]\",",
+            "eprintln!([WARN]...) — warning instead of Err",
+        ),
+        (
+            "unwrap_or(default)",
+            "unwrap_or(default) — silent default instead of Err",
+        ),
+        (
+            "unwrap_or(Default::default())",
+            "unwrap_or(Default::default()) — silent default instead of Err",
+        ),
     ];
 
     for (pattern, description) in &forbidden_patterns {
@@ -661,16 +712,32 @@ mod tests {
     // @trace REQ-FALLBACK-001 [entity:ENT-COMPILER-GRAPH] [api:POST /compile]
     fn test_fallback_whitelist_has_five_items() {
         let items = FallbackWhitelist::authorized_items();
-        assert_eq!(items.len(), 4, "REQ-FALLBACK-001: exactly 4 concrete whitelist items (A2/A3/A4/A5)");
+        assert_eq!(
+            items.len(),
+            4,
+            "REQ-FALLBACK-001: exactly 4 concrete whitelist items (A2/A3/A4/A5)"
+        );
     }
 
     #[test]
     // @trace REQ-FALLBACK-001 [entity:ENT-COMPILER-GRAPH] [api:POST /compile]
     fn test_fallback_whitelist_spec_refs() {
-        assert_eq!(FallbackWhitelist::HfToModelScope.spec_ref(), "REQ-LOADER-016");
-        assert_eq!(FallbackWhitelist::OnnxFusionToAtomic.spec_ref(), "ARCH-ONNX");
-        assert_eq!(FallbackWhitelist::HwFusionToStandalone.spec_ref(), "ARCH-DETAILED-DESIGNS");
-        assert_eq!(FallbackWhitelist::ReshapeTransposeMetadataNop.spec_ref(), "NO-SILENT-FALLBACK exception");
+        assert_eq!(
+            FallbackWhitelist::HfToModelScope.spec_ref(),
+            "REQ-LOADER-016"
+        );
+        assert_eq!(
+            FallbackWhitelist::OnnxFusionToAtomic.spec_ref(),
+            "ARCH-ONNX"
+        );
+        assert_eq!(
+            FallbackWhitelist::HwFusionToStandalone.spec_ref(),
+            "ARCH-DETAILED-DESIGNS"
+        );
+        assert_eq!(
+            FallbackWhitelist::ReshapeTransposeMetadataNop.spec_ref(),
+            "NO-SILENT-FALLBACK exception"
+        );
     }
 
     #[test]
@@ -735,7 +802,11 @@ mod tests {
         let err = FallbackError::new("trigger", "path", "fix");
         let compiler_err = err.to_compiler_error();
         match compiler_err {
-            CompilerError::UnauthorizedFallback { trigger, attempted_path, suggestion } => {
+            CompilerError::UnauthorizedFallback {
+                trigger,
+                attempted_path,
+                suggestion,
+            } => {
                 assert_eq!(trigger, "trigger");
                 assert_eq!(attempted_path, "path");
                 assert_eq!(suggestion, "fix");
@@ -749,7 +820,10 @@ mod tests {
     fn test_detect_silent_fallback_patterns_clean() {
         let clean_source = "let x = some_function();\nOk(x)\n";
         let violations = detect_silent_fallback_patterns(clean_source);
-        assert!(violations.is_empty(), "Clean source should have no violations");
+        assert!(
+            violations.is_empty(),
+            "Clean source should have no violations"
+        );
     }
 
     #[test]
@@ -782,12 +856,18 @@ mod tests {
     fn test_ir_error_display_contains_prefix() {
         let err = IrError::new(
             "input_tensor_exists",
-            IrPosition::Op { op_id: OpId(42), op_label: "test_op".to_string() },
+            IrPosition::Op {
+                op_id: OpId(42),
+                op_label: "test_op".to_string(),
+            },
             "tensor exists",
             "tensor not found",
         );
         let msg = format!("{}", err);
-        assert!(msg.starts_with("IR-ERR:"), "IR error must start with IR-ERR prefix");
+        assert!(
+            msg.starts_with("IR-ERR:"),
+            "IR error must start with IR-ERR prefix"
+        );
     }
 
     #[test]
@@ -795,7 +875,10 @@ mod tests {
     fn test_ir_error_contains_position() {
         let err = IrError::new(
             "precondition",
-            IrPosition::Op { op_id: OpId(1), op_label: "gemm_0".to_string() },
+            IrPosition::Op {
+                op_id: OpId(1),
+                op_label: "gemm_0".to_string(),
+            },
             "expected",
             "actual",
         );
@@ -808,7 +891,10 @@ mod tests {
     fn test_ir_error_contains_expected_actual() {
         let err = IrError::new(
             "dtype_match",
-            IrPosition::Slot { tensor_id: TensorId(5), name: "weight".to_string() },
+            IrPosition::Slot {
+                tensor_id: TensorId(5),
+                name: "weight".to_string(),
+            },
             "BF16",
             "F32",
         );
@@ -820,7 +906,10 @@ mod tests {
     #[test]
     // @trace REQ-FAIL-TRIANG-001 [entity:ENT-COMPILER-GRAPH] [api:POST /compile]
     fn test_ir_position_edge_display() {
-        let pos = IrPosition::Edge { producer_op: OpId(1), consumer_op: OpId(2) };
+        let pos = IrPosition::Edge {
+            producer_op: OpId(1),
+            consumer_op: OpId(2),
+        };
         let msg = format!("{}", pos);
         assert!(msg.contains("producer=1"));
         assert!(msg.contains("consumer=2"));
@@ -831,13 +920,21 @@ mod tests {
     fn test_ir_error_to_compiler_error() {
         let err = IrError::new(
             "test_precondition",
-            IrPosition::Op { op_id: OpId(0), op_label: "op0".to_string() },
+            IrPosition::Op {
+                op_id: OpId(0),
+                op_label: "op0".to_string(),
+            },
             "expected_val",
             "actual_val",
         );
         let ce = err.to_compiler_error();
         match ce {
-            CompilerError::IrLayer { precondition, position, expected, actual } => {
+            CompilerError::IrLayer {
+                precondition,
+                position,
+                expected,
+                actual,
+            } => {
                 assert_eq!(precondition, "test_precondition");
                 assert!(position.contains("op0"));
                 assert_eq!(expected, "expected_val");
@@ -858,14 +955,12 @@ mod tests {
     #[test]
     // @trace REQ-FAIL-TRIANG-002 [entity:ENT-COMPILER-GRAPH] [api:POST /compile]
     fn test_pass_error_display_contains_prefix() {
-        let err = PassError::new(
-            "invariant_name",
-            "pass_name",
-            "input",
-            "output",
-        );
+        let err = PassError::new("invariant_name", "pass_name", "input", "output");
         let msg = format!("{}", err);
-        assert!(msg.starts_with("PASS-ERR:"), "PASS error must start with PASS-ERR prefix");
+        assert!(
+            msg.starts_with("PASS-ERR:"),
+            "PASS error must start with PASS-ERR prefix"
+        );
     }
 
     #[test]
@@ -878,22 +973,28 @@ mod tests {
             "5 tensors",
         );
         let msg = format!("{}", err);
-        assert!(msg.contains("tensor_count_preserved"), "Must contain invariant name");
-        assert!(msg.contains("DeadVRegElimination"), "Must contain pass name");
+        assert!(
+            msg.contains("tensor_count_preserved"),
+            "Must contain invariant name"
+        );
+        assert!(
+            msg.contains("DeadVRegElimination"),
+            "Must contain pass name"
+        );
     }
 
     #[test]
     // @trace REQ-FAIL-TRIANG-002 [entity:ENT-COMPILER-GRAPH] [api:POST /compile]
     fn test_pass_error_to_compiler_error() {
-        let err = PassError::new(
-            "invariant",
-            "pass",
-            "input_diff",
-            "output_diff",
-        );
+        let err = PassError::new("invariant", "pass", "input_diff", "output_diff");
         let ce = err.to_compiler_error();
         match ce {
-            CompilerError::PassLayer { invariant, pass_name, input_diff, output_diff } => {
+            CompilerError::PassLayer {
+                invariant,
+                pass_name,
+                input_diff,
+                output_diff,
+            } => {
                 assert_eq!(invariant, "invariant");
                 assert_eq!(pass_name, "pass");
                 assert_eq!(input_diff, "input_diff");
@@ -940,7 +1041,10 @@ mod tests {
     fn test_codegen_error_display_contains_prefix() {
         let err = CodegenError::new("VecFma", "RmsNorm", "Cpu", None);
         let msg = format!("{}", err);
-        assert!(msg.starts_with("CG-ERR:"), "CODEGEN error must start with CG-ERR prefix");
+        assert!(
+            msg.starts_with("CG-ERR:"),
+            "CODEGEN error must start with CG-ERR prefix"
+        );
     }
 
     #[test]
@@ -959,7 +1063,11 @@ mod tests {
             "VecFma",
             "Gemm",
             "Cpu",
-            Some(RegisterState { allocated: 32, available: 16, spilled: 8 }),
+            Some(RegisterState {
+                allocated: 32,
+                available: 16,
+                spilled: 8,
+            }),
         );
         let msg = format!("{}", err);
         assert!(msg.contains("allocated=32"), "Must contain register state");
@@ -973,11 +1081,20 @@ mod tests {
             "VecFma",
             "Gemm",
             "x86_64",
-            Some(RegisterState { allocated: 32, available: 16, spilled: 8 }),
+            Some(RegisterState {
+                allocated: 32,
+                available: 16,
+                spilled: 8,
+            }),
         );
         let ce = err.to_compiler_error();
         match ce {
-            CompilerError::CodegenLayer { vminstr, source_op, device_profile, register_state } => {
+            CompilerError::CodegenLayer {
+                vminstr,
+                source_op,
+                device_profile,
+                register_state,
+            } => {
                 assert_eq!(vminstr, "VecFma");
                 assert_eq!(source_op, "Gemm");
                 assert_eq!(device_profile, "x86_64");
@@ -1000,7 +1117,11 @@ mod tests {
     #[test]
     // @trace REQ-FAIL-TRIANG-003 [entity:ENT-COMPILER-GRAPH] [api:POST /compile]
     fn test_register_state_display() {
-        let rs = RegisterState { allocated: 10, available: 16, spilled: 2 };
+        let rs = RegisterState {
+            allocated: 10,
+            available: 16,
+            spilled: 2,
+        };
         let msg = format!("{}", rs);
         assert!(msg.contains("allocated=10"));
         assert!(msg.contains("available=16"));

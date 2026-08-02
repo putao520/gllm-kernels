@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::instr::*;
-use super::reg_alloc::{LiveInterval, LifecycleTag, RegAllocation};
+use super::reg_alloc::{LifecycleTag, LiveInterval, RegAllocation};
 use super::reg_conflict::detect_reg_conflicts;
 use crate::types::CompilerError;
 
@@ -58,21 +58,53 @@ pub enum SpillViolation {
 impl std::fmt::Display for SpillViolation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SlotOverlap { a_vreg, a_offset, a_end, b_vreg, b_offset, b_end } => {
-                write!(f, "spill slot overlap: v{} [{}, {}) overlaps v{} [{}, {})",
-                    a_vreg.0, a_offset, a_end, b_vreg.0, b_offset, b_end)
+            Self::SlotOverlap {
+                a_vreg,
+                a_offset,
+                a_end,
+                b_vreg,
+                b_offset,
+                b_end,
+            } => {
+                write!(
+                    f,
+                    "spill slot overlap: v{} [{}, {}) overlaps v{} [{}, {})",
+                    a_vreg.0, a_offset, a_end, b_vreg.0, b_offset, b_end
+                )
             }
-            Self::ReadBeforeWrite { vreg, slot_idx, first_read_pos, first_write_pos } => {
-                write!(f, "spill v{} (slot {}) read at instr[{}] before write at instr[{}]",
-                    vreg.0, slot_idx, first_read_pos, first_write_pos)
+            Self::ReadBeforeWrite {
+                vreg,
+                slot_idx,
+                first_read_pos,
+                first_write_pos,
+            } => {
+                write!(
+                    f,
+                    "spill v{} (slot {}) read at instr[{}] before write at instr[{}]",
+                    vreg.0, slot_idx, first_read_pos, first_write_pos
+                )
             }
-            Self::MissingSpillStore { vreg, slot_idx, read_pos } => {
-                write!(f, "spill v{} (slot {}) has read at instr[{}] but no write (missing spill store)",
-                    vreg.0, slot_idx, read_pos)
+            Self::MissingSpillStore {
+                vreg,
+                slot_idx,
+                read_pos,
+            } => {
+                write!(
+                    f,
+                    "spill v{} (slot {}) has read at instr[{}] but no write (missing spill store)",
+                    vreg.0, slot_idx, read_pos
+                )
             }
-            Self::MissingReloadLoad { vreg, slot_idx, write_pos } => {
-                write!(f, "spill v{} (slot {}) has write at instr[{}] but no read (missing reload load)",
-                    vreg.0, slot_idx, write_pos)
+            Self::MissingReloadLoad {
+                vreg,
+                slot_idx,
+                write_pos,
+            } => {
+                write!(
+                    f,
+                    "spill v{} (slot {}) has write at instr[{}] but no read (missing reload load)",
+                    vreg.0, slot_idx, write_pos
+                )
             }
         }
     }
@@ -111,15 +143,32 @@ pub enum OffsetViolation {
 impl std::fmt::Display for OffsetViolation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::OffsetMismatch { instr_idx, instr_name, expected_offset, actual_offset, block_bytes, elem_bytes } => {
+            Self::OffsetMismatch {
+                instr_idx,
+                instr_name,
+                expected_offset,
+                actual_offset,
+                block_bytes,
+                elem_bytes,
+            } => {
                 write!(f, "verify: {} at instr[{}] expected offset={} but actual Const offset={} (block_bytes={}, elem_bytes={})",
                     instr_name, instr_idx, expected_offset, actual_offset, block_bytes, elem_bytes)
             }
-            Self::MisalignedBlock { instr_idx, offset, block_bytes, elem_bytes } => {
+            Self::MisalignedBlock {
+                instr_idx,
+                offset,
+                block_bytes,
+                elem_bytes,
+            } => {
                 write!(f, "verify: QuantBlockLoad at instr[{}] offset={} not aligned to elem_bytes={} (within-block offset, block_bytes={})",
                     instr_idx, offset, elem_bytes, block_bytes)
             }
-            Self::BlockElemConfusion { instr_idx, offset, block_bytes, elem_bytes } => {
+            Self::BlockElemConfusion {
+                instr_idx,
+                offset,
+                block_bytes,
+                elem_bytes,
+            } => {
                 write!(f, "verify: QuantBlockLoad at instr[{}] offset={} aligns to elem_bytes={} but should align to block_bytes={}",
                     instr_idx, offset, elem_bytes, block_bytes)
             }
@@ -174,19 +223,35 @@ pub enum LifecycleViolation {
 impl std::fmt::Display for LifecycleViolation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvariantWritten { vreg, loop_begin, loop_end, write_pos } => {
+            Self::InvariantWritten {
+                vreg,
+                loop_begin,
+                loop_end,
+                write_pos,
+            } => {
                 write!(f,
                     "verify: LoopInvariant VRegId({}) has write at instr[{}] inside loop [{}, {}]. \
                      LoopInvariant values must not be modified inside the loop body.",
                     vreg.0, write_pos, loop_begin, loop_end)
             }
-            Self::CarriedMissingPhi { vreg, loop_begin, loop_end } => {
-                write!(f,
+            Self::CarriedMissingPhi {
+                vreg,
+                loop_begin,
+                loop_end,
+            } => {
+                write!(
+                    f,
                     "verify: LoopCarried VRegId({}) has no phi/update inside loop [{}, {}]. \
                      Loop-carried values must be updated each iteration before LoopEnd.",
-                    vreg.0, loop_begin, loop_end)
+                    vreg.0, loop_begin, loop_end
+                )
             }
-            Self::BodyLocalEscape { vreg, loop_begin, loop_end, escape_pos } => {
+            Self::BodyLocalEscape {
+                vreg,
+                loop_begin,
+                loop_end,
+                escape_pos,
+            } => {
                 write!(f,
                     "verify: BodyLocal VRegId({}) defined inside loop [{}, {}] but used at instr[{}] after LoopEnd. \
                      BodyLocal values must not escape the loop body.",
@@ -226,9 +291,7 @@ impl VerifyReport {
 
     /// 违规总数
     pub fn total_count(&self) -> usize {
-        self.spill_violations.len()
-            + self.offset_violations.len()
-            + self.lifecycle_violations.len()
+        self.spill_violations.len() + self.offset_violations.len() + self.lifecycle_violations.len()
     }
 }
 
@@ -320,7 +383,11 @@ pub fn verify_after_alloc(
         return Err(CompilerError::CodegenViolation(format!(
             "spill consistency violations ({}): {}",
             violations.len(),
-            violations.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("; ")
+            violations
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
         )));
     }
     verify_loop_lifecycle_safety(prog, intervals)?;
@@ -337,9 +404,8 @@ fn verify_loop_lifecycle_safety(
     intervals: &[LiveInterval],
 ) -> Result<(), CompilerError> {
     // Build interval lookup
-    let interval_map: std::collections::HashMap<VRegId, &LiveInterval> = intervals.iter()
-        .map(|iv| (iv.vreg, iv))
-        .collect();
+    let interval_map: std::collections::HashMap<VRegId, &LiveInterval> =
+        intervals.iter().map(|iv| (iv.vreg, iv)).collect();
 
     // Build loop ranges: (LoopBegin index, LoopEnd index)
     let mut loop_ranges: Vec<(usize, usize)> = Vec::new();
@@ -400,9 +466,8 @@ fn verify_loop_lifecycle_safety(
             }
 
             // Verify there is at least one write to this VReg inside the loop body
-            let has_write = (loop_begin + 1..loop_end).any(|j| {
-                collect_dst_vreg(&prog.instrs[j]) == Some(iv.vreg)
-            });
+            let has_write = (loop_begin + 1..loop_end)
+                .any(|j| collect_dst_vreg(&prog.instrs[j]) == Some(iv.vreg));
 
             if !has_write {
                 return Err(CompilerError::CodegenViolation(format!(
@@ -438,9 +503,8 @@ fn verify_spill_consistency(
 
     let mut violations: Vec<SpillViolation> = Vec::new();
 
-    let interval_map: std::collections::HashMap<VRegId, &LiveInterval> = intervals.iter()
-        .map(|iv| (iv.vreg, iv))
-        .collect();
+    let interval_map: std::collections::HashMap<VRegId, &LiveInterval> =
+        intervals.iter().map(|iv| (iv.vreg, iv)).collect();
 
     // ── Check 1: Spill/reload 配对 + 时序正确 ──────────────────────────
     // 对于每个 spilled VReg，在程序中找到首次写入（spill store）和首次读取（reload load）。
@@ -535,14 +599,16 @@ fn verify_spill_consistency(
 
 /// 检查指令是否为对指定 VReg 的纯写入（不读取旧值）。
 fn is_pure_write_to(instr: &VmInstr, vreg: VRegId) -> bool {
-        match instr.category() {
+    match instr.category() {
         super::vm_instr_category::InstrCategory::Memory => is_pure_write_to_memorya(instr, vreg),
         super::vm_instr_category::InstrCategory::Arith => is_pure_write_to_aritha(instr, vreg),
         super::vm_instr_category::InstrCategory::Control => is_pure_write_to_controla(instr, vreg),
         super::vm_instr_category::InstrCategory::Tile => is_pure_write_to_tilea(instr, vreg),
         super::vm_instr_category::InstrCategory::Quant => is_pure_write_to_quanta(instr, vreg),
         super::vm_instr_category::InstrCategory::GpuComm => is_pure_write_to_gpucomma(instr, vreg),
-        super::vm_instr_category::InstrCategory::Sampling => is_pure_write_to_samplinga(instr, vreg),
+        super::vm_instr_category::InstrCategory::Sampling => {
+            is_pure_write_to_samplinga(instr, vreg)
+        }
         _ => false,
     }
 }
@@ -581,7 +647,9 @@ fn is_pure_write_to_aritha(instr: &VmInstr, vreg: VRegId) -> bool {
         VmInstr::GprLoadImm { dst, .. } => *dst == vreg,
         VmInstr::VecLoadConst { dst, .. } => *dst == vreg,
         VmInstr::VecBinOp { dst, a, b, .. } => *dst == vreg && *a != vreg && *b != vreg,
-        VmInstr::Fma { dst, acc, a, b, .. } => *dst == vreg && *acc != vreg && *a != vreg && *b != vreg,
+        VmInstr::Fma { dst, acc, a, b, .. } => {
+            *dst == vreg && *acc != vreg && *a != vreg && *b != vreg
+        }
         _ => is_pure_write_to_arithb(instr, vreg),
     }
 }
@@ -591,13 +659,17 @@ fn is_pure_write_to_arithb(instr: &VmInstr, vreg: VRegId) -> bool {
     match instr {
         VmInstr::VecCmp { dst, a, b, .. } => *dst == vreg && *a != vreg && *b != vreg,
         VmInstr::VecCast { dst, src, .. } => *dst == vreg && *src != vreg,
-        VmInstr::ConditionalSelect { dst, mask, true_val, false_val, .. } => {
-                        *dst == vreg && *mask != vreg && *true_val != vreg && *false_val != vreg
-                    },
+        VmInstr::ConditionalSelect {
+            dst,
+            mask,
+            true_val,
+            false_val,
+            ..
+        } => *dst == vreg && *mask != vreg && *true_val != vreg && *false_val != vreg,
         VmInstr::GprBinOp { dst, a, b, .. } => {
-                        let other_ok = *a != vreg && (b.vreg() != Some(vreg));
-                        *dst == vreg && other_ok
-                    },
+            let other_ok = *a != vreg && (b.vreg() != Some(vreg));
+            *dst == vreg && other_ok
+        }
         VmInstr::GprUnaryOp { dst, src, .. } => *dst == vreg && *src != vreg,
         VmInstr::VecShuffle { dst, .. } => *dst == vreg,
         VmInstr::VecExtractLane { dst, .. } => *dst == vreg,
@@ -609,9 +681,9 @@ fn is_pure_write_to_arithb(instr: &VmInstr, vreg: VRegId) -> bool {
 fn is_pure_write_to_controla(instr: &VmInstr, vreg: VRegId) -> bool {
     // Control cluster a (1 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
     match instr {
-        VmInstr::LoopBegin { counter, offsets, .. } => {
-            *counter == vreg || offsets.iter().any(|offset| offset.vreg == vreg)
-        },
+        VmInstr::LoopBegin {
+            counter, offsets, ..
+        } => *counter == vreg || offsets.iter().any(|offset| offset.vreg == vreg),
         _ => false,
     }
 }
@@ -628,23 +700,60 @@ fn is_pure_write_to_quanta(instr: &VmInstr, vreg: VRegId) -> bool {
     // Quant cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
     // BCE-20260630-L2-BODY: arm body 决策链 extract_function → VmProgram::pure_write_check
     match instr {
-        VmInstr::QuantLoadBytesVec { dst, base, .. } => VmProgram::pure_write_check(*dst, vreg, &[*base]),
+        VmInstr::QuantLoadBytesVec { dst, base, .. } => {
+            VmProgram::pure_write_check(*dst, vreg, &[*base])
+        }
         VmInstr::QuantBroadcastInt { dst, .. } => *dst == vreg,
-        VmInstr::QuantExtractBits { dst, src, .. } => VmProgram::pure_write_check(*dst, vreg, &[*src]),
-        VmInstr::QuantCodebookLookup { dst, indices, .. } => VmProgram::pure_write_check(*dst, vreg, &[*indices]),
-        VmInstr::QuantInterleave { dst, lo, hi, .. } => VmProgram::pure_write_check(*dst, vreg, &[*lo, *hi]),
-        VmInstr::QuantConcatSeq { dst, lo, hi, .. } => VmProgram::pure_write_check(*dst, vreg, &[*lo, *hi]),
-        VmInstr::Q3KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } =>
-            VmProgram::pure_write_check(*dst, vreg, &[*block_base, *lane_offset, *d_vreg]),
-        VmInstr::Q6KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } =>
-            VmProgram::pure_write_check(*dst, vreg, &[*block_base, *lane_offset, *d_vreg]),
-        VmInstr::Q5DecodeStep { dst, block_base, lane_offset, d_vreg, .. } =>
-            VmProgram::pure_write_check(*dst, vreg, &[*block_base, *lane_offset, *d_vreg]),
-        VmInstr::Q5KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } =>
-            VmProgram::pure_write_check(*dst, vreg, &[*block_base, *lane_offset, *d_vreg]),
-        VmInstr::Q4KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } =>
-            VmProgram::pure_write_check(*dst, vreg, &[*block_base, *lane_offset, *d_vreg]),
-        VmInstr::QuantScalarCvtLoad { dst, base, .. } => VmProgram::pure_write_check(*dst, vreg, &[*base]),
+        VmInstr::QuantExtractBits { dst, src, .. } => {
+            VmProgram::pure_write_check(*dst, vreg, &[*src])
+        }
+        VmInstr::QuantCodebookLookup { dst, indices, .. } => {
+            VmProgram::pure_write_check(*dst, vreg, &[*indices])
+        }
+        VmInstr::QuantInterleave { dst, lo, hi, .. } => {
+            VmProgram::pure_write_check(*dst, vreg, &[*lo, *hi])
+        }
+        VmInstr::QuantConcatSeq { dst, lo, hi, .. } => {
+            VmProgram::pure_write_check(*dst, vreg, &[*lo, *hi])
+        }
+        VmInstr::Q3KDecodeStep {
+            dst,
+            block_base,
+            lane_offset,
+            d_vreg,
+            ..
+        } => VmProgram::pure_write_check(*dst, vreg, &[*block_base, *lane_offset, *d_vreg]),
+        VmInstr::Q6KDecodeStep {
+            dst,
+            block_base,
+            lane_offset,
+            d_vreg,
+            ..
+        } => VmProgram::pure_write_check(*dst, vreg, &[*block_base, *lane_offset, *d_vreg]),
+        VmInstr::Q5DecodeStep {
+            dst,
+            block_base,
+            lane_offset,
+            d_vreg,
+            ..
+        } => VmProgram::pure_write_check(*dst, vreg, &[*block_base, *lane_offset, *d_vreg]),
+        VmInstr::Q5KDecodeStep {
+            dst,
+            block_base,
+            lane_offset,
+            d_vreg,
+            ..
+        } => VmProgram::pure_write_check(*dst, vreg, &[*block_base, *lane_offset, *d_vreg]),
+        VmInstr::Q4KDecodeStep {
+            dst,
+            block_base,
+            lane_offset,
+            d_vreg,
+            ..
+        } => VmProgram::pure_write_check(*dst, vreg, &[*block_base, *lane_offset, *d_vreg]),
+        VmInstr::QuantScalarCvtLoad { dst, base, .. } => {
+            VmProgram::pure_write_check(*dst, vreg, &[*base])
+        }
         _ => is_pure_write_to_quantb(instr, vreg),
     }
 }
@@ -652,10 +761,20 @@ fn is_pure_write_to_quanta(instr: &VmInstr, vreg: VRegId) -> bool {
 fn is_pure_write_to_quantb(instr: &VmInstr, vreg: VRegId) -> bool {
     // Quant cluster b (3 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
     match instr {
-        VmInstr::QuantDequantFma { dst, weight, activation, scale, zero_point, .. } => {
-                        *dst == vreg && *weight != vreg && *activation != vreg
-                            && *scale != vreg && *zero_point != vreg
-                    },
+        VmInstr::QuantDequantFma {
+            dst,
+            weight,
+            activation,
+            scale,
+            zero_point,
+            ..
+        } => {
+            *dst == vreg
+                && *weight != vreg
+                && *activation != vreg
+                && *scale != vreg
+                && *zero_point != vreg
+        }
         VmInstr::QuantBlockLoad { dst, .. } => *dst == vreg,
         VmInstr::QuantBiPlaneLoad { dst, .. } => *dst == vreg,
         _ => false,
@@ -677,22 +796,32 @@ fn is_pure_write_to_samplinga(instr: &VmInstr, vreg: VRegId) -> bool {
     // Sampling cluster a (7 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
     match instr {
         VmInstr::Argmax { dst, .. } => *dst == vreg,
-        VmInstr::SoftmaxReduceMax { dst, logits_ptr, .. } => *dst == vreg && *logits_ptr != vreg,
-        VmInstr::SoftmaxExpSum { sum_dst, logits_ptr, max_val, .. } => {
-                        *sum_dst == vreg && *logits_ptr != vreg && *max_val != vreg
-                    },
-        VmInstr::SampleMultinomial { dst, probs_ptr, rng_state_ptr, .. } => {
-                        *dst == vreg && *probs_ptr != vreg && *rng_state_ptr != vreg
-                    },
+        VmInstr::SoftmaxReduceMax {
+            dst, logits_ptr, ..
+        } => *dst == vreg && *logits_ptr != vreg,
+        VmInstr::SoftmaxExpSum {
+            sum_dst,
+            logits_ptr,
+            max_val,
+            ..
+        } => *sum_dst == vreg && *logits_ptr != vreg && *max_val != vreg,
+        VmInstr::SampleMultinomial {
+            dst,
+            probs_ptr,
+            rng_state_ptr,
+            ..
+        } => *dst == vreg && *probs_ptr != vreg && *rng_state_ptr != vreg,
         VmInstr::WarpPRNG { dst, rng_state_ptr } => *dst == vreg && *rng_state_ptr != vreg,
-        VmInstr::BatchPerSeqArgmax { dst, seq_id, logits_flat_ptr, .. } => {
-                        *dst == vreg && *seq_id != vreg && *logits_flat_ptr != vreg
-                    },
+        VmInstr::BatchPerSeqArgmax {
+            dst,
+            seq_id,
+            logits_flat_ptr,
+            ..
+        } => *dst == vreg && *seq_id != vreg && *logits_flat_ptr != vreg,
         VmInstr::SeqIdLookup { dst, .. } => *dst == vreg,
         _ => false,
     }
 }
-
 
 /// 检查指令是否读取指定 VReg。
 fn reads_vreg(instr: &VmInstr, vreg: VRegId) -> bool {
@@ -718,13 +847,20 @@ fn reads_vreg(instr: &VmInstr, vreg: VRegId) -> bool {
 fn verify_quant_offset_sanity(prog: &VmProgram) -> Result<(), CompilerError> {
     for (i, instr) in prog.instrs.iter().enumerate() {
         match instr {
-            VmInstr::QuantBlockLoad { base: _, offset, unpack, .. } => {
+            VmInstr::QuantBlockLoad {
+                base: _,
+                offset,
+                unpack,
+                ..
+            } => {
                 // Compute elem_bytes from unpack mode (storage element size in bytes)
                 let elem_bytes = match unpack {
                     BlockUnpackMode::Int8 => 1,
                     BlockUnpackMode::F16Broadcast => 2,
-                    BlockUnpackMode::SignedNibbleLow | BlockUnpackMode::UnsignedNibbleLow
-                    | BlockUnpackMode::SignedNibbleHigh | BlockUnpackMode::UnsignedNibbleHigh => 1,
+                    BlockUnpackMode::SignedNibbleLow
+                    | BlockUnpackMode::UnsignedNibbleLow
+                    | BlockUnpackMode::SignedNibbleHigh
+                    | BlockUnpackMode::UnsignedNibbleHigh => 1,
                     BlockUnpackMode::Bitpack2 { .. } => 1,
                     BlockUnpackMode::Mxfp4 { .. } | BlockUnpackMode::Nvfp4 { .. } => 1,
                     BlockUnpackMode::QhBitExpand { .. } => 1,
@@ -787,7 +923,10 @@ fn verify_offset_alignment(
                 verify_offset_alignment(inner, alignment, instr_idx, instr_name)?;
             }
         }
-        OffsetExpr::LoopOffset(_) | OffsetExpr::ScalarVReg(_) | OffsetExpr::ThreadOffset(_, _) | OffsetExpr::ThreadCoord(_, _) => {
+        OffsetExpr::LoopOffset(_)
+        | OffsetExpr::ScalarVReg(_)
+        | OffsetExpr::ThreadOffset(_, _)
+        | OffsetExpr::ThreadCoord(_, _) => {
             // Dynamic offsets can't be verified at compile time
         }
     }
@@ -809,9 +948,8 @@ pub fn verify_quant_offsets(
     let mut violations: Vec<OffsetViolation> = Vec::new();
 
     // Build lookup from instr_idx to spec
-    let spec_map: std::collections::HashMap<usize, &QuantOffsetSpec> = spec_values.iter()
-        .map(|s| (s.instr_idx, s))
-        .collect();
+    let spec_map: std::collections::HashMap<usize, &QuantOffsetSpec> =
+        spec_values.iter().map(|s| (s.instr_idx, s)).collect();
 
     for (i, instr) in prog.instrs.iter().enumerate() {
         match instr {
@@ -822,8 +960,10 @@ pub fn verify_quant_offsets(
                 let elem_bytes = match unpack {
                     BlockUnpackMode::Int8 => 1,
                     BlockUnpackMode::F16Broadcast => 2,
-                    BlockUnpackMode::SignedNibbleLow | BlockUnpackMode::UnsignedNibbleLow
-                    | BlockUnpackMode::SignedNibbleHigh | BlockUnpackMode::UnsignedNibbleHigh => 1,
+                    BlockUnpackMode::SignedNibbleLow
+                    | BlockUnpackMode::UnsignedNibbleLow
+                    | BlockUnpackMode::SignedNibbleHigh
+                    | BlockUnpackMode::UnsignedNibbleHigh => 1,
                     BlockUnpackMode::Bitpack2 { .. } => 1,
                     BlockUnpackMode::Mxfp4 { .. } | BlockUnpackMode::Nvfp4 { .. } => 1,
                     BlockUnpackMode::QhBitExpand { .. } => 1,
@@ -901,7 +1041,7 @@ pub fn verify_quant_offsets(
 ///    LoopInvariant → 验证确认没有任何写入操作。
 /// 2. **LoopCarried 验证**: VReg 定义在循环外，循环内读取+写入 → 结构上为
 ///    LoopCarried → 验证循环体内至少有一次更新写入（phi 节点等价）。
-/// 3. **BodyLocal 验证**: VReg 定义在循环内 → 结构上为 BodyLocal → 
+/// 3. **BodyLocal 验证**: VReg 定义在循环内 → 结构上为 BodyLocal →
 ///    验证不逃逸出循环（LoopEnd 后无使用）。
 ///
 /// 返回所有违反的列表（非 fail-fast），供调用方聚合报告。
@@ -1021,7 +1161,8 @@ pub fn verify_loop_lifecycle(prog: &VmProgram) -> Vec<LifecycleViolation> {
 
             // VReg 定义在循环前，循环内读+写 → 结构 LoopCarried
             // 验证循环体内至少有一次写入
-            let has_write = write_positions.get(&vreg)
+            let has_write = write_positions
+                .get(&vreg)
                 .map(|writes| writes.iter().any(|&w| w > loop_begin && w < loop_end))
                 .unwrap_or(false);
 
@@ -1148,7 +1289,7 @@ fn verify_vreg_def_before_use(prog: &VmProgram) -> Result<(), CompilerError> {
 
 /// 收集指令中所有被读取（use）的 VRegId。
 fn collect_src_vregs(instr: &VmInstr) -> Vec<VRegId> {
-        match instr.category() {
+    match instr.category() {
         super::vm_instr_category::InstrCategory::Memory => collect_src_vregs_memorya(instr),
         super::vm_instr_category::InstrCategory::Arith => collect_src_vregs_aritha(instr),
         super::vm_instr_category::InstrCategory::Control => collect_src_vregs_controla(instr),
@@ -1163,28 +1304,32 @@ fn collect_src_vregs(instr: &VmInstr) -> Vec<VRegId> {
 fn collect_src_vregs_memorya(instr: &VmInstr) -> Vec<VRegId> {
     // Memory cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
     match instr {
-        VmInstr::VecLoad {
-            base, offset, .. } => {
-                        let mut v = vec![*base];
-                        v.extend(offset_vregs(offset));
-                        v
-                    },
+        VmInstr::VecLoad { base, offset, .. } => {
+            let mut v = vec![*base];
+            v.extend(offset_vregs(offset));
+            v
+        }
         VmInstr::VecStore {
-            base, src, offset, .. } => {
-                        let mut v = vec![*base, *src];
-                        v.extend(offset_vregs(offset));
-                        v
-                    },
+            base, src, offset, ..
+        } => {
+            let mut v = vec![*base, *src];
+            v.extend(offset_vregs(offset));
+            v
+        }
         VmInstr::VecNarrow { dst: _, src, .. } => vec![*src],
         VmInstr::VecWiden { dst: _, src, .. } => vec![*src],
         VmInstr::Mov { dst: _, src, .. } => vec![*src],
         VmInstr::Broadcast { .. } => vec![],
         VmInstr::LoadPtr { dst: _, src } => ptr_expr_vregs(src),
-        VmInstr::ScalarLoad { dst: _, base, offset } => {
-                        let mut v = vec![*base];
-                        v.extend(offset_vregs(offset));
-                        v
-                    },
+        VmInstr::ScalarLoad {
+            dst: _,
+            base,
+            offset,
+        } => {
+            let mut v = vec![*base];
+            v.extend(offset_vregs(offset));
+            v
+        }
         _ => collect_src_vregs_memoryb(instr),
     }
 }
@@ -1193,30 +1338,53 @@ fn collect_src_vregs_memoryb(instr: &VmInstr) -> Vec<VRegId> {
     // Memory cluster b (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
     match instr {
         VmInstr::ScalarStore { base, src, offset } => {
-                        let mut v = vec![*base, *src];
-                        v.extend(offset_vregs(offset));
-                        v
-                    },
-        VmInstr::ScalarToIndex { dst: _, src, stride: _ } => vec![*src],
+            let mut v = vec![*base, *src];
+            v.extend(offset_vregs(offset));
+            v
+        }
+        VmInstr::ScalarToIndex {
+            dst: _,
+            src,
+            stride: _,
+        } => vec![*src],
         VmInstr::IndexToScalar { dst: _, src } => vec![*src],
-        VmInstr::IntMulStride { dst: _, src, stride: _ } => vec![*src],
-        VmInstr::ScalarByteLoad { dst: _, base, offset } => {
-                        let mut v = vec![*base];
-                        v.extend(offset_vregs(offset));
-                        v
-                    },
-        VmInstr::AddPtr { dst: _, base, offset: _ } => vec![*base],
-        VmInstr::MemCopy { dst: _, src, bytes: _, dtype: _, guard: _, effect: _ } => vec![*src],
+        VmInstr::IntMulStride {
+            dst: _,
+            src,
+            stride: _,
+        } => vec![*src],
+        VmInstr::ScalarByteLoad {
+            dst: _,
+            base,
+            offset,
+        } => {
+            let mut v = vec![*base];
+            v.extend(offset_vregs(offset));
+            v
+        }
+        VmInstr::AddPtr {
+            dst: _,
+            base,
+            offset: _,
+        } => vec![*base],
+        VmInstr::MemCopy {
+            dst: _,
+            src,
+            bytes: _,
+            dtype: _,
+            guard: _,
+            effect: _,
+        } => vec![*src],
         VmInstr::Prefetch {
             base,
             offset,
             distance: _,
             hint: _,
         } => {
-                        let mut v = vec![*base];
-                        v.extend(offset_vregs(offset));
-                        v
-                    },
+            let mut v = vec![*base];
+            v.extend(offset_vregs(offset));
+            v
+        }
         _ => collect_src_vregs_memoryc(instr),
     }
 }
@@ -1230,17 +1398,26 @@ fn collect_src_vregs_memoryc(instr: &VmInstr) -> Vec<VRegId> {
             value: _,
             elem_width: _,
         } => {
-                        let mut v = vec![*base];
-                        v.extend(offset_vregs(offset));
-                        v
-                    },
+            let mut v = vec![*base];
+            v.extend(offset_vregs(offset));
+            v
+        }
         VmInstr::MemFence { order: _ } => vec![],
         VmInstr::StoreConstToStack { .. } => vec![],
         VmInstr::ActivationSwap { .. } => vec![],
         VmInstr::VecScalarStore { .. } => vec![],
-        VmInstr::GatherLoad { dst, base, indices, .. } => vec![*dst, *base, *indices],
-        VmInstr::ScatterStore { base, indices, src, .. } => vec![*base, *indices, *src],
-        VmInstr::TableLookup { dst, base, row_index, .. } => vec![*dst, *base, *row_index],
+        VmInstr::GatherLoad {
+            dst, base, indices, ..
+        } => vec![*dst, *base, *indices],
+        VmInstr::ScatterStore {
+            base, indices, src, ..
+        } => vec![*base, *indices, *src],
+        VmInstr::TableLookup {
+            dst,
+            base,
+            row_index,
+            ..
+        } => vec![*dst, *base, *row_index],
         _ => collect_src_vregs_memoryd(instr),
     }
 }
@@ -1248,7 +1425,12 @@ fn collect_src_vregs_memoryc(instr: &VmInstr) -> Vec<VRegId> {
 fn collect_src_vregs_memoryd(instr: &VmInstr) -> Vec<VRegId> {
     // Memory cluster d (1 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
     match instr {
-        VmInstr::AtomicCAS { ptr, expected, desired, .. } => vec![*ptr, *expected, *desired],
+        VmInstr::AtomicCAS {
+            ptr,
+            expected,
+            desired,
+            ..
+        } => vec![*ptr, *expected, *desired],
         _ => unreachable!("Memory category mismatch in collect_src_vregs"),
     }
 }
@@ -1259,9 +1441,21 @@ fn collect_src_vregs_aritha(instr: &VmInstr) -> Vec<VRegId> {
         VmInstr::VecBinOp { dst: _, a, b, .. } => vec![*a, *b],
         VmInstr::VecShiftImm { dst: _, a, .. } => vec![*a],
         VmInstr::VecUnaryOp { dst: _, a, op: _ } => vec![*a],
-        VmInstr::VecCmp { dst: _, a, b, pred: _ } => vec![*a, *b],
-        VmInstr::VecCast { dst: _, src, from_bits: _, to_bits: _ } => vec![*src],
-        VmInstr::Fma { dst: _, acc, a, b, .. } => vec![*acc, *a, *b],
+        VmInstr::VecCmp {
+            dst: _,
+            a,
+            b,
+            pred: _,
+        } => vec![*a, *b],
+        VmInstr::VecCast {
+            dst: _,
+            src,
+            from_bits: _,
+            to_bits: _,
+        } => vec![*src],
+        VmInstr::Fma {
+            dst: _, acc, a, b, ..
+        } => vec![*acc, *a, *b],
         VmInstr::HReduce { dst: _, src, op: _ } => vec![*src],
         VmInstr::Accumulate { acc, src } => vec![*acc, *src],
         _ => collect_src_vregs_arithb(instr),
@@ -1277,21 +1471,36 @@ fn collect_src_vregs_arithb(instr: &VmInstr) -> Vec<VRegId> {
             true_val,
             false_val,
         } => vec![*mask, *true_val, *false_val],
-        VmInstr::Transcendental { dst: _, src, func: _ } => vec![*src],
-        VmInstr::GprBinOp { dst: _, a, b, op: _ } => {
-                        let mut v = vec![*a];
-                        if let GprOperand::VReg(vr) = b { v.push(*vr); }
-                        v
-                    },
+        VmInstr::Transcendental {
+            dst: _,
+            src,
+            func: _,
+        } => vec![*src],
+        VmInstr::GprBinOp {
+            dst: _,
+            a,
+            b,
+            op: _,
+        } => {
+            let mut v = vec![*a];
+            if let GprOperand::VReg(vr) = b {
+                v.push(*vr);
+            }
+            v
+        }
         VmInstr::GprLoadImm { .. } => vec![],
         VmInstr::DotProduct { acc, a, b, .. } => vec![*acc, *a, *b],
-        VmInstr::ScaleApply { acc, scale, zero, .. } => vec![*acc, *scale, *zero],
+        VmInstr::ScaleApply {
+            acc, scale, zero, ..
+        } => vec![*acc, *scale, *zero],
         VmInstr::GprUnaryOp { src, .. } => vec![*src],
         VmInstr::VecShuffle { src, mask, .. } => {
-                        let mut v = vec![*src];
-                        if let VecShuffleMask::Dynamic { ctrl } = mask { v.push(*ctrl); }
-                        v
-                    },
+            let mut v = vec![*src];
+            if let VecShuffleMask::Dynamic { ctrl } = mask {
+                v.push(*ctrl);
+            }
+            v
+        }
         _ => collect_src_vregs_arithc(instr),
     }
 }
@@ -1300,7 +1509,11 @@ fn collect_src_vregs_arithc(instr: &VmInstr) -> Vec<VRegId> {
     // Arith cluster c (3 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
     match instr {
         VmInstr::VecExtractLane { src, .. } => vec![*src],
-        VmInstr::VecInsertLane { src_vec, src_scalar, .. } => vec![*src_vec, *src_scalar],
+        VmInstr::VecInsertLane {
+            src_vec,
+            src_scalar,
+            ..
+        } => vec![*src_vec, *src_scalar],
         VmInstr::VecLoadConst { .. } => vec![],
         _ => unreachable!("Arith category mismatch in collect_src_vregs"),
     }
@@ -1310,20 +1523,33 @@ fn collect_src_vregs_controla(instr: &VmInstr) -> Vec<VRegId> {
     // Control cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
     match instr {
         VmInstr::GprCondAction { cond, action } => {
-                        let mut v = cond.vregs();
-                        v.extend(action.vregs());
-                        v
-                    },
-        VmInstr::ConditionalSkip { mask, skip_count: _ } => vec![*mask],
+            let mut v = cond.vregs();
+            v.extend(action.vregs());
+            v
+        }
+        VmInstr::ConditionalSkip {
+            mask,
+            skip_count: _,
+        } => vec![*mask],
         VmInstr::IndirectJump { index, targets: _ } => vec![*index],
         VmInstr::LoadLayerWeightOffset { layer_idx_reg, .. } => vec![*layer_idx_reg],
         VmInstr::ConditionalExit {
             condition,
             output: _,
         } => vec![*condition],
-        VmInstr::BranchIfPtrNonNull { ptr, target_label: _ } => vec![*ptr],
-        VmInstr::BranchIfGprZero { value, target_label: _ } => vec![*value],
-        VmInstr::BranchIfGprLtU { a, b, target_label: _ } => vec![*a, *b],
+        VmInstr::BranchIfPtrNonNull {
+            ptr,
+            target_label: _,
+        } => vec![*ptr],
+        VmInstr::BranchIfGprZero {
+            value,
+            target_label: _,
+        } => vec![*value],
+        VmInstr::BranchIfGprLtU {
+            a,
+            b,
+            target_label: _,
+        } => vec![*a, *b],
         VmInstr::UnconditionalBranch { .. } => vec![],
         _ => collect_src_vregs_controlb(instr),
     }
@@ -1348,26 +1574,33 @@ fn collect_src_vregs_tilea(instr: &VmInstr) -> Vec<VRegId> {
         VmInstr::TileConfig { .. } => vec![],
         VmInstr::TileRelease => vec![],
         // TileLoad: base_ptr (memory base) + k_offset (K-loop offset reg) are read.
-        VmInstr::TileLoad { base_ptr, k_offset, .. } => vec![*base_ptr, *k_offset],
+        VmInstr::TileLoad {
+            base_ptr, k_offset, ..
+        } => vec![*base_ptr, *k_offset],
         // TileMma: a, b read; c is accumulator dst (def, tracked separately).
         VmInstr::TileMma { a, b, .. } => vec![*a, *b],
         // TileStore: src_tile (read) + base_ptr + out_offset (memory addressing, read).
-        VmInstr::TileStore { src_tile, base_ptr, out_offset, .. } => vec![*src_tile, *base_ptr, *out_offset],
+        VmInstr::TileStore {
+            src_tile,
+            base_ptr,
+            out_offset,
+            ..
+        } => vec![*src_tile, *base_ptr, *out_offset],
         VmInstr::TmemAlloc { .. } => vec![],
         VmInstr::TmemLoad { dst, .. } => {
-                        let mut v = vec![*dst];
-                        if let VmInstr::TmemLoad { offset, .. } = instr {
-                            v.extend(offset_vregs(offset));
-                        }
-                        v
-                    },
+            let mut v = vec![*dst];
+            if let VmInstr::TmemLoad { offset, .. } = instr {
+                v.extend(offset_vregs(offset));
+            }
+            v
+        }
         VmInstr::TmemStore { src, .. } => {
-                        let mut v = vec![*src];
-                        if let VmInstr::TmemStore { offset, .. } = instr {
-                            v.extend(offset_vregs(offset));
-                        }
-                        v
-                    },
+            let mut v = vec![*src];
+            if let VmInstr::TmemStore { offset, .. } = instr {
+                v.extend(offset_vregs(offset));
+            }
+            v
+        }
         _ => collect_src_vregs_tileb(instr),
     }
 }
@@ -1400,20 +1633,52 @@ fn collect_src_vregs_quantb(instr: &VmInstr) -> Vec<VRegId> {
     match instr {
         VmInstr::QuantCodebookLookup { indices, .. } => vec![*indices],
         VmInstr::QuantExtractBits { src, .. } => vec![*src],
-        VmInstr::QuantDequantFma { dst, weight, activation, scale, zero_point, .. } => vec![*dst, *weight, *activation, *scale, *zero_point],
+        VmInstr::QuantDequantFma {
+            dst,
+            weight,
+            activation,
+            scale,
+            zero_point,
+            ..
+        } => vec![*dst, *weight, *activation, *scale, *zero_point],
         VmInstr::QuantInterleave { lo, hi, .. } => vec![*lo, *hi],
         VmInstr::QuantConcatSeq { lo, hi, .. } => vec![*lo, *hi],
-        VmInstr::Q3KDecodeStep { block_base, lane_offset, d_vreg, .. } => vec![*block_base, *lane_offset, *d_vreg],
-        VmInstr::Q6KDecodeStep { block_base, lane_offset, d_vreg, .. } => vec![*block_base, *lane_offset, *d_vreg],
-        VmInstr::Q5DecodeStep { block_base, lane_offset, d_vreg, .. } => vec![*block_base, *lane_offset, *d_vreg],
-        VmInstr::Q5KDecodeStep { block_base, lane_offset, d_vreg, .. } => vec![*block_base, *lane_offset, *d_vreg],
-        VmInstr::Q4KDecodeStep { block_base, lane_offset, d_vreg, .. } => vec![*block_base, *lane_offset, *d_vreg],
+        VmInstr::Q3KDecodeStep {
+            block_base,
+            lane_offset,
+            d_vreg,
+            ..
+        } => vec![*block_base, *lane_offset, *d_vreg],
+        VmInstr::Q6KDecodeStep {
+            block_base,
+            lane_offset,
+            d_vreg,
+            ..
+        } => vec![*block_base, *lane_offset, *d_vreg],
+        VmInstr::Q5DecodeStep {
+            block_base,
+            lane_offset,
+            d_vreg,
+            ..
+        } => vec![*block_base, *lane_offset, *d_vreg],
+        VmInstr::Q5KDecodeStep {
+            block_base,
+            lane_offset,
+            d_vreg,
+            ..
+        } => vec![*block_base, *lane_offset, *d_vreg],
+        VmInstr::Q4KDecodeStep {
+            block_base,
+            lane_offset,
+            d_vreg,
+            ..
+        } => vec![*block_base, *lane_offset, *d_vreg],
         VmInstr::QuantScalarCvtLoad { base, .. } => vec![*base],
         VmInstr::QuantBlockLoad { base, offset, .. } => {
-                        let mut v = vec![*base];
-                        v.extend(offset_vregs(offset));
-                        v
-                    },
+            let mut v = vec![*base];
+            v.extend(offset_vregs(offset));
+            v
+        }
         _ => collect_src_vregs_quantc(instr),
     }
 }
@@ -1421,15 +1686,64 @@ fn collect_src_vregs_quantb(instr: &VmInstr) -> Vec<VRegId> {
 fn collect_src_vregs_quantc(instr: &VmInstr) -> Vec<VRegId> {
     // Quant cluster c (7 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
     match instr {
-        VmInstr::QuantBiPlaneLoad { qs_base, extra_base, .. } => vec![*qs_base, *extra_base],
-        VmInstr::BitwiseGemm { dst, sign_bits, input_sign_bits, scale, .. } => vec![*dst, *sign_bits, *input_sign_bits, *scale],
-        VmInstr::SparseGemm { acc, a_sparse, b_dense, sparse_mask_ptr, .. } => vec![*acc, *a_sparse, *b_dense, *sparse_mask_ptr],
-        VmInstr::SparseFp8Gemm { acc, a_sparse, b_dense, sparse_mask_ptr, .. } => vec![*acc, *a_sparse, *b_dense, *sparse_mask_ptr],
-        VmInstr::NativeFp4Gemm { acc, a, b, scale_a, scale_b, .. } => vec![*acc, *a, *b, *scale_a, *scale_b],
-        VmInstr::NativeFp6Gemm { acc, a, b, scale_a, scale_b, .. } => vec![*acc, *a, *b, *scale_a, *scale_b],
-        VmInstr::TwoCtaFp4Gemm { acc, a, b, scale_a, scale_b, .. } => vec![*acc, *a, *b, *scale_a, *scale_b],
+        VmInstr::QuantBiPlaneLoad {
+            qs_base,
+            extra_base,
+            ..
+        } => vec![*qs_base, *extra_base],
+        VmInstr::BitwiseGemm {
+            dst,
+            sign_bits,
+            input_sign_bits,
+            scale,
+            ..
+        } => vec![*dst, *sign_bits, *input_sign_bits, *scale],
+        VmInstr::SparseGemm {
+            acc,
+            a_sparse,
+            b_dense,
+            sparse_mask_ptr,
+            ..
+        } => vec![*acc, *a_sparse, *b_dense, *sparse_mask_ptr],
+        VmInstr::SparseFp8Gemm {
+            acc,
+            a_sparse,
+            b_dense,
+            sparse_mask_ptr,
+            ..
+        } => vec![*acc, *a_sparse, *b_dense, *sparse_mask_ptr],
+        VmInstr::NativeFp4Gemm {
+            acc,
+            a,
+            b,
+            scale_a,
+            scale_b,
+            ..
+        } => vec![*acc, *a, *b, *scale_a, *scale_b],
+        VmInstr::NativeFp6Gemm {
+            acc,
+            a,
+            b,
+            scale_a,
+            scale_b,
+            ..
+        } => vec![*acc, *a, *b, *scale_a, *scale_b],
+        VmInstr::TwoCtaFp4Gemm {
+            acc,
+            a,
+            b,
+            scale_a,
+            scale_b,
+            ..
+        } => vec![*acc, *a, *b, *scale_a, *scale_b],
         VmInstr::NativeFp8Gemm { acc, a, b, .. } => vec![*acc, *a, *b],
-        VmInstr::HwQuantDequant { dst, packed_weight, block_scale, global_scale, .. } => vec![*dst, *packed_weight, *block_scale, *global_scale],
+        VmInstr::HwQuantDequant {
+            dst,
+            packed_weight,
+            block_scale,
+            global_scale,
+            ..
+        } => vec![*dst, *packed_weight, *block_scale, *global_scale],
         _ => unreachable!("Quant category mismatch in collect_src_vregs"),
     }
 }
@@ -1445,12 +1759,12 @@ fn collect_src_vregs_gpucomma(instr: &VmInstr) -> Vec<VRegId> {
         VmInstr::PageTableKVWriteQuant { .. } => vec![],
         VmInstr::SharedMemAlloc { .. } => vec![],
         VmInstr::SharedMemStore { src, .. } => {
-                        let mut v = vec![*src];
-                        if let VmInstr::SharedMemStore { dst_offset, .. } = instr {
-                            v.extend(offset_vregs(dst_offset));
-                        }
-                        v
-                    },
+            let mut v = vec![*src];
+            if let VmInstr::SharedMemStore { dst_offset, .. } = instr {
+                v.extend(offset_vregs(dst_offset));
+            }
+            v
+        }
         _ => collect_src_vregs_gpucommb(instr),
     }
 }
@@ -1459,25 +1773,27 @@ fn collect_src_vregs_gpucommb(instr: &VmInstr) -> Vec<VRegId> {
     // GpuComm cluster b (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
     match instr {
         VmInstr::SharedMemLoad { dst, .. } => {
-                        let mut v = vec![*dst];
-                        if let VmInstr::SharedMemLoad { src_offset, .. } = instr {
-                            v.extend(offset_vregs(src_offset));
-                        }
-                        v
-                    },
+            let mut v = vec![*dst];
+            if let VmInstr::SharedMemLoad { src_offset, .. } = instr {
+                v.extend(offset_vregs(src_offset));
+            }
+            v
+        }
         VmInstr::SharedMemAsyncStore { src, .. } => {
-                        let mut v = vec![*src];
-                        if let VmInstr::SharedMemAsyncStore { dst_offset, .. } = instr {
-                            v.extend(offset_vregs(dst_offset));
-                        }
-                        v
-                    },
+            let mut v = vec![*src];
+            if let VmInstr::SharedMemAsyncStore { dst_offset, .. } = instr {
+                v.extend(offset_vregs(dst_offset));
+            }
+            v
+        }
         VmInstr::SharedMemAsyncWaitGroup { .. } => vec![],
         VmInstr::WeightPrefetchAsync { weight_base, .. } => vec![*weight_base],
         VmInstr::WeightPrefetchWait { .. } => vec![],
         VmInstr::BlockSync => vec![],
         VmInstr::WarpReduce { src, dst, .. } => vec![*src, *dst],
-        VmInstr::SharedMemSwizzle { dst: _, raw_addr, .. } => vec![*raw_addr],
+        VmInstr::SharedMemSwizzle {
+            dst: _, raw_addr, ..
+        } => vec![*raw_addr],
         _ => collect_src_vregs_gpucommc(instr),
     }
 }
@@ -1490,15 +1806,17 @@ fn collect_src_vregs_gpucommc(instr: &VmInstr) -> Vec<VRegId> {
         VmInstr::WarpBarrierWait { .. } => vec![],
         VmInstr::TmaDescriptorInit { .. } => vec![],
         VmInstr::BarrierInit { .. } => vec![],
-        VmInstr::Tma2DCopy { coord_x, coord_y, .. } => vec![*coord_x, *coord_y],
+        VmInstr::Tma2DCopy {
+            coord_x, coord_y, ..
+        } => vec![*coord_x, *coord_y],
         VmInstr::ClusterBarrierInit { .. } => vec![],
         VmInstr::ClusterStore { src, .. } => {
-                        let mut v = vec![*src];
-                        if let VmInstr::ClusterStore { offset, .. } = instr {
-                            v.extend(offset_vregs(offset));
-                        }
-                        v
-                    },
+            let mut v = vec![*src];
+            if let VmInstr::ClusterStore { offset, .. } = instr {
+                v.extend(offset_vregs(offset));
+            }
+            v
+        }
         _ => collect_src_vregs_gpucommd(instr),
     }
 }
@@ -1507,26 +1825,79 @@ fn collect_src_vregs_gpucommd(instr: &VmInstr) -> Vec<VRegId> {
     // GpuComm cluster d (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
     match instr {
         VmInstr::ClusterLoad { dst, .. } => {
-                        let mut v = vec![];
-                        if let VmInstr::ClusterLoad { offset, .. } = instr {
-                            v.extend(offset_vregs(offset));
-                        }
-                        v
-                    },
+            let mut v = vec![];
+            if let VmInstr::ClusterLoad { offset, .. } = instr {
+                v.extend(offset_vregs(offset));
+            }
+            v
+        }
         #[cfg(feature = "nccl")]
-        VmInstr::AllReduceChunk { sendbuf, recvbuf, count, rank, world_size, chunk_idx, .. } => vec![*sendbuf, *recvbuf, *count, *rank, *world_size, *chunk_idx],
+        VmInstr::AllReduceChunk {
+            sendbuf,
+            recvbuf,
+            count,
+            rank,
+            world_size,
+            chunk_idx,
+            ..
+        } => vec![*sendbuf, *recvbuf, *count, *rank, *world_size, *chunk_idx],
         #[cfg(feature = "nccl")]
         VmInstr::CommBarrier { thread_count, .. } => vec![*thread_count],
         #[cfg(feature = "nccl")]
         VmInstr::NvlinkAsyncCopy { dst, src, len, .. } => vec![*dst, *src, *len],
         #[cfg(feature = "nccl")]
-        VmInstr::RemotePageLookup { dst, seq_id, page_index, routing_table_base } => vec![*dst, *seq_id, *page_index, *routing_table_base],
+        VmInstr::RemotePageLookup {
+            dst,
+            seq_id,
+            page_index,
+            routing_table_base,
+        } => vec![*dst, *seq_id, *page_index, *routing_table_base],
         #[cfg(feature = "nccl")]
-        VmInstr::P2pPageFetch { local_buf, peer_buf, page_size, barrier } => vec![*local_buf, *peer_buf, *page_size, *barrier],
+        VmInstr::P2pPageFetch {
+            local_buf,
+            peer_buf,
+            page_size,
+            barrier,
+        } => vec![*local_buf, *peer_buf, *page_size, *barrier],
         #[cfg(feature = "nccl")]
-        VmInstr::RdmaPageFetch { local_buf, remote_addr, rkey, page_size, sq_desc, doorbell, cq_addr } => vec![*local_buf, *remote_addr, *rkey, *page_size, *sq_desc, *doorbell, *cq_addr],
+        VmInstr::RdmaPageFetch {
+            local_buf,
+            remote_addr,
+            rkey,
+            page_size,
+            sq_desc,
+            doorbell,
+            cq_addr,
+        } => vec![
+            *local_buf,
+            *remote_addr,
+            *rkey,
+            *page_size,
+            *sq_desc,
+            *doorbell,
+            *cq_addr,
+        ],
         #[cfg(feature = "nccl")]
-        VmInstr::RdmaPageFetchCompressed { local_buf, scratch_buf, page_size, remote_addr, rkey, sq_desc, doorbell, cq_addr, .. } => vec![*local_buf, *scratch_buf, *page_size, *remote_addr, *rkey, *sq_desc, *doorbell, *cq_addr],
+        VmInstr::RdmaPageFetchCompressed {
+            local_buf,
+            scratch_buf,
+            page_size,
+            remote_addr,
+            rkey,
+            sq_desc,
+            doorbell,
+            cq_addr,
+            ..
+        } => vec![
+            *local_buf,
+            *scratch_buf,
+            *page_size,
+            *remote_addr,
+            *rkey,
+            *sq_desc,
+            *doorbell,
+            *cq_addr,
+        ],
         _ => collect_src_vregs_gpucomme(instr),
     }
 }
@@ -1535,13 +1906,33 @@ fn collect_src_vregs_gpucomme(instr: &VmInstr) -> Vec<VRegId> {
     // GpuComm cluster e (4 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
     match instr {
         #[cfg(feature = "nccl")]
-        VmInstr::RemotePageAttn { q_buf, k_remote_buf, v_remote_buf, output_buf, shared_buf, barrier, tile_bytes } => vec![*q_buf, *k_remote_buf, *v_remote_buf, *output_buf, *shared_buf, *barrier, *tile_bytes],
+        VmInstr::RemotePageAttn {
+            q_buf,
+            k_remote_buf,
+            v_remote_buf,
+            output_buf,
+            shared_buf,
+            barrier,
+            tile_bytes,
+        } => vec![
+            *q_buf,
+            *k_remote_buf,
+            *v_remote_buf,
+            *output_buf,
+            *shared_buf,
+            *barrier,
+            *tile_bytes,
+        ],
         #[cfg(feature = "nccl")]
         VmInstr::PageMigrationLock { dst, entry_addr } => vec![*dst, *entry_addr],
         #[cfg(feature = "nccl")]
         VmInstr::PageMigrationUnlock { entry_addr } => vec![*entry_addr],
         #[cfg(feature = "nccl")]
-        VmInstr::PageLocationUpdate { entry_addr, new_location, .. } => vec![*entry_addr, *new_location],
+        VmInstr::PageLocationUpdate {
+            entry_addr,
+            new_location,
+            ..
+        } => vec![*entry_addr, *new_location],
         _ => unreachable!("GpuComm category mismatch in collect_src_vregs"),
     }
 }
@@ -1555,7 +1946,13 @@ fn collect_src_vregs_samplinga(instr: &VmInstr) -> Vec<VRegId> {
             counter,
             input_ids_ptr,
             prompt_len_bytes,
-        } => vec![*token_id, *output_buf, *counter, *input_ids_ptr, *prompt_len_bytes],
+        } => vec![
+            *token_id,
+            *output_buf,
+            *counter,
+            *input_ids_ptr,
+            *prompt_len_bytes,
+        ],
         VmInstr::CheckStopCondition {
             token_id,
             counter,
@@ -1575,11 +1972,27 @@ fn collect_src_vregs_samplinga(instr: &VmInstr) -> Vec<VRegId> {
             vocab_bytes: _,
             width: _,
         } => vec![*logits_ptr, *temp_ptr],
-        VmInstr::BatchSeqIdLookup { dst: _, pt_offset_out: _, token_index, batch_ctx_ptr } => vec![*token_index, *batch_ctx_ptr],
-        VmInstr::BatchPerSeqArgmax { dst: _, seq_id, logits_flat_ptr, .. } => vec![*seq_id, *logits_flat_ptr],
-        VmInstr::BatchPerSeqStopCheck { seq_id, token_id, batch_ctx_ptr } => vec![*seq_id, *token_id, *batch_ctx_ptr],
+        VmInstr::BatchSeqIdLookup {
+            dst: _,
+            pt_offset_out: _,
+            token_index,
+            batch_ctx_ptr,
+        } => vec![*token_index, *batch_ctx_ptr],
+        VmInstr::BatchPerSeqArgmax {
+            dst: _,
+            seq_id,
+            logits_flat_ptr,
+            ..
+        } => vec![*seq_id, *logits_flat_ptr],
+        VmInstr::BatchPerSeqStopCheck {
+            seq_id,
+            token_id,
+            batch_ctx_ptr,
+        } => vec![*seq_id, *token_id, *batch_ctx_ptr],
         // GPU-Resident 采样指令 — source vregs
-        VmInstr::SoftmaxReduceMax { dst: _, logits_ptr, .. } => vec![*logits_ptr],
+        VmInstr::SoftmaxReduceMax {
+            dst: _, logits_ptr, ..
+        } => vec![*logits_ptr],
         _ => collect_src_vregs_samplingb(instr),
     }
 }
@@ -1587,13 +2000,42 @@ fn collect_src_vregs_samplinga(instr: &VmInstr) -> Vec<VRegId> {
 fn collect_src_vregs_samplingb(instr: &VmInstr) -> Vec<VRegId> {
     // Sampling cluster b (7 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
     match instr {
-        VmInstr::SoftmaxExpSum { sum_dst: _, logits_ptr, max_val, .. } => vec![*logits_ptr, *max_val],
-        VmInstr::SoftmaxNormalize { logits_ptr, sum_val, .. } => vec![*logits_ptr, *sum_val],
-        VmInstr::SampleTopKFilter { probs_ptr, indices_ptr: _, k_ptr, .. } => vec![*probs_ptr, *k_ptr],
-        VmInstr::SampleTopPFilter { probs_ptr, p_ptr, .. } => vec![*probs_ptr, *p_ptr],
-        VmInstr::SampleMultinomial { dst: _, probs_ptr, rng_state_ptr, .. } => vec![*probs_ptr, *rng_state_ptr],
-        VmInstr::WarpPRNG { dst: _, rng_state_ptr } => vec![*rng_state_ptr],
-        VmInstr::SeqIdLookup { token_index, seq_meta_base, num_seqs, .. } => vec![*token_index, *seq_meta_base, *num_seqs],
+        VmInstr::SoftmaxExpSum {
+            sum_dst: _,
+            logits_ptr,
+            max_val,
+            ..
+        } => vec![*logits_ptr, *max_val],
+        VmInstr::SoftmaxNormalize {
+            logits_ptr,
+            sum_val,
+            ..
+        } => vec![*logits_ptr, *sum_val],
+        VmInstr::SampleTopKFilter {
+            probs_ptr,
+            indices_ptr: _,
+            k_ptr,
+            ..
+        } => vec![*probs_ptr, *k_ptr],
+        VmInstr::SampleTopPFilter {
+            probs_ptr, p_ptr, ..
+        } => vec![*probs_ptr, *p_ptr],
+        VmInstr::SampleMultinomial {
+            dst: _,
+            probs_ptr,
+            rng_state_ptr,
+            ..
+        } => vec![*probs_ptr, *rng_state_ptr],
+        VmInstr::WarpPRNG {
+            dst: _,
+            rng_state_ptr,
+        } => vec![*rng_state_ptr],
+        VmInstr::SeqIdLookup {
+            token_index,
+            seq_meta_base,
+            num_seqs,
+            ..
+        } => vec![*token_index, *seq_meta_base, *num_seqs],
         _ => unreachable!("Sampling category mismatch in collect_src_vregs"),
     }
 }
@@ -1616,8 +2058,18 @@ fn collect_src_vregs_misca(instr: &VmInstr) -> Vec<VRegId> {
         VmInstr::Comment(_) => vec![],
         VmInstr::DeclareVReg { .. } => vec![],
         VmInstr::HotpatchSlot { .. } => vec![],
-        VmInstr::Lz4Decode { src_ptr, dst_ptr, compressed_size, .. } => vec![*src_ptr, *dst_ptr, *compressed_size],
-        VmInstr::BitPackRleDecode { src_ptr, dst_ptr, compressed_size, .. } => vec![*src_ptr, *dst_ptr, *compressed_size],
+        VmInstr::Lz4Decode {
+            src_ptr,
+            dst_ptr,
+            compressed_size,
+            ..
+        } => vec![*src_ptr, *dst_ptr, *compressed_size],
+        VmInstr::BitPackRleDecode {
+            src_ptr,
+            dst_ptr,
+            compressed_size,
+            ..
+        } => vec![*src_ptr, *dst_ptr, *compressed_size],
         _ => collect_src_vregs_miscb(instr),
     }
 }
@@ -1633,7 +2085,6 @@ fn collect_src_vregs_miscb(instr: &VmInstr) -> Vec<VRegId> {
         _ => unreachable!("Misc category mismatch in collect_src_vregs"),
     }
 }
-
 
 /// 收集指令的 dst VRegId（如果有）。
 fn collect_dst_vreg(instr: &VmInstr) -> Option<VRegId> {
@@ -1660,9 +2111,12 @@ fn collect_dst_vreg(instr: &VmInstr) -> Option<VRegId> {
         | VmInstr::GprBinOp { dst, .. }
         | VmInstr::GprLoadImm { dst, .. }
         | VmInstr::LoadLayerWeightOffset { dst, .. }
-        | VmInstr::LoadCallbackEntry { fn_ptr_out: dst, .. }
+        | VmInstr::LoadCallbackEntry {
+            fn_ptr_out: dst, ..
+        }
         | VmInstr::NativeCall { ret_val: dst, .. } => Some(*dst),
-        VmInstr::SharedMemLoad { dst, .. } | VmInstr::WarpReduce { dst, .. }
+        VmInstr::SharedMemLoad { dst, .. }
+        | VmInstr::WarpReduce { dst, .. }
         | VmInstr::QuantBroadcastInt { dst, .. }
         | VmInstr::QuantScalarCvtLoad { dst, .. }
         | VmInstr::QuantBlockLoad { dst, .. }
@@ -1732,7 +2186,7 @@ fn ptr_expr_vregs(expr: &PtrExpr) -> Vec<VRegId> {
 }
 
 fn instr_name(instr: &VmInstr) -> &'static str {
-        match instr.category() {
+    match instr.category() {
         super::vm_instr_category::InstrCategory::Memory => instr_name_memorya(instr),
         super::vm_instr_category::InstrCategory::Arith => instr_name_aritha(instr),
         super::vm_instr_category::InstrCategory::Control => instr_name_controla(instr),
@@ -1799,7 +2253,6 @@ fn instr_name_misca(instr: &VmInstr) -> &'static str {
     }
 }
 
-
 // ── 规则 5: LoopOffset 只在活跃 loop 内使用 ──────────────────────────────
 
 fn verify_loop_offset_scope(prog: &VmProgram) -> Result<(), CompilerError> {
@@ -1808,9 +2261,7 @@ fn verify_loop_offset_scope(prog: &VmProgram) -> Result<(), CompilerError> {
     for (i, instr) in prog.instrs.iter().enumerate() {
         match instr {
             VmInstr::LoopBegin {
-                counter,
-                offsets,
-                ..
+                counter, offsets, ..
             } => {
                 active_loop_vregs.insert(*counter);
                 active_loop_vregs.extend(offsets.iter().map(|offset| offset.vreg));
@@ -1925,7 +2376,7 @@ pub fn verify_numerical_sanity(
         };
         if test_scale.is_nan() || test_scale.is_infinite() {
             return Err(CompilerError::CodegenViolation(
-                "verify_numerical_sanity: scale produces NaN/Inf".to_string()
+                "verify_numerical_sanity: scale produces NaN/Inf".to_string(),
             ));
         }
     }
@@ -1936,16 +2387,23 @@ pub fn verify_numerical_sanity(
 
 #[cfg(test)]
 mod tests {
-    use crate::compiler::trace::QuantPrecision;
     use super::*;
+    use crate::compiler::trace::QuantPrecision;
 
     #[test]
     fn test_no_nested_skip_allows_single() {
         let mut prog = VmProgram::new();
         let ptr = VRegId(0);
-        prog.emit(VmInstr::GprCondAction { cond: GprCondition::IsNull(ptr), action: GprBranchAction::Skip(3) });
-        prog.emit(VmInstr::MemFence { order: MemFenceOrder::Release });
-        prog.emit(VmInstr::MemFence { order: MemFenceOrder::Acquire });
+        prog.emit(VmInstr::GprCondAction {
+            cond: GprCondition::IsNull(ptr),
+            action: GprBranchAction::Skip(3),
+        });
+        prog.emit(VmInstr::MemFence {
+            order: MemFenceOrder::Release,
+        });
+        prog.emit(VmInstr::MemFence {
+            order: MemFenceOrder::Acquire,
+        });
         assert!(verify_no_nested_gpr_skip(&prog).is_ok());
     }
 
@@ -1955,8 +2413,14 @@ mod tests {
         let mut prog = VmProgram::new();
         let ptr = VRegId(0);
         let ptr2 = VRegId(1);
-        prog.emit(VmInstr::GprCondAction { cond: GprCondition::IsNull(ptr), action: GprBranchAction::Skip(3) });
-        prog.emit(VmInstr::GprCondAction { cond: GprCondition::IsNull(ptr2), action: GprBranchAction::Skip(1) });
+        prog.emit(VmInstr::GprCondAction {
+            cond: GprCondition::IsNull(ptr),
+            action: GprBranchAction::Skip(3),
+        });
+        prog.emit(VmInstr::GprCondAction {
+            cond: GprCondition::IsNull(ptr2),
+            action: GprBranchAction::Skip(1),
+        });
         let result = verify_no_nested_gpr_skip(&prog);
         assert!(result.is_ok());
     }
@@ -1965,7 +2429,9 @@ mod tests {
     fn test_loop_pairing_valid() {
         let mut prog = VmProgram::new();
         prog.emit_loop(BoundExpr::Const(4), 32, |prog, _, _| {
-            prog.emit(VmInstr::MemFence { order: MemFenceOrder::Release });
+            prog.emit(VmInstr::MemFence {
+                order: MemFenceOrder::Release,
+            });
         });
         assert!(verify_loop_pairing(&prog).is_ok());
     }
@@ -2000,9 +2466,29 @@ mod tests {
         let a = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let b = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        prog.emit(VmInstr::VecLoad { dst: a, base: VRegId(0), offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None, });
-        prog.emit(VmInstr::VecLoad { dst: b, base: VRegId(0), offset: OffsetExpr::Const(32), width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None, });
-        prog.emit(VmInstr::VecBinOp { dst, a, b, op: VecOp::Add, dtype: QuantPrecision::F32, });
+        prog.emit(VmInstr::VecLoad {
+            dst: a,
+            base: VRegId(0),
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
+        });
+        prog.emit(VmInstr::VecLoad {
+            dst: b,
+            base: VRegId(0),
+            offset: OffsetExpr::Const(32),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
+        });
+        prog.emit(VmInstr::VecBinOp {
+            dst,
+            a,
+            b,
+            op: VecOp::Add,
+            dtype: QuantPrecision::F32,
+        });
         assert!(verify_vreg_def_before_use(&prog).is_ok());
     }
 
@@ -2012,7 +2498,14 @@ mod tests {
         let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         prog.emit_loop(BoundExpr::Const(4), 32, |prog, _, byte_off| {
             let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-            prog.emit(VmInstr::VecLoad { dst, base, offset: OffsetExpr::LoopOffset(byte_off), width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None, });
+            prog.emit(VmInstr::VecLoad {
+                dst,
+                base,
+                offset: OffsetExpr::LoopOffset(byte_off),
+                width: SimdWidth::W256,
+                dtype: QuantPrecision::F32,
+                predicate: None,
+            });
         });
         assert!(verify_loop_offset_scope(&prog).is_ok());
     }
@@ -2026,7 +2519,8 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         // Q4_0 block_bytes=18, offset 18 is aligned
         prog.emit(VmInstr::QuantBlockLoad {
-            dst, base,
+            dst,
+            base,
             offset: OffsetExpr::Const(18),
             unpack: BlockUnpackMode::SignedNibbleLow,
             width: SimdWidth::W256,
@@ -2041,7 +2535,8 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         // F16Broadcast: elem_bytes=2, offset 7 is NOT aligned to elem_bytes
         prog.emit(VmInstr::QuantBlockLoad {
-            dst, base,
+            dst,
+            base,
             offset: OffsetExpr::Const(7),
             unpack: BlockUnpackMode::F16Broadcast,
             width: SimdWidth::W256,
@@ -2057,7 +2552,8 @@ mod tests {
         let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::QuantBlockLoad {
-            dst, base,
+            dst,
+            base,
             offset: OffsetExpr::Const(0),
             unpack: BlockUnpackMode::SignedNibbleLow,
             width: SimdWidth::W256,
@@ -2074,7 +2570,14 @@ mod tests {
         // ptr defined outside loop, used inside — LoopInvariant
         prog.emit_loop(BoundExpr::Const(4), 32, |prog, _, _| {
             let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-            prog.emit(VmInstr::VecLoad { dst, base: ptr, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32 , predicate: None,});
+            prog.emit(VmInstr::VecLoad {
+                dst,
+                base: ptr,
+                offset: OffsetExpr::Const(0),
+                width: SimdWidth::W256,
+                dtype: QuantPrecision::F32,
+                predicate: None,
+            });
         });
 
         // Compute intervals manually to tag ptr as LoopInvariant
@@ -2179,13 +2682,24 @@ mod tests {
         let report = VerifyReport {
             has_violations: true,
             spill_violations: vec![SpillViolation::MissingSpillStore {
-                vreg: VRegId(1), slot_idx: 0, read_pos: 5,
+                vreg: VRegId(1),
+                slot_idx: 0,
+                read_pos: 5,
             }],
-            offset_violations: vec![OffsetViolation::MisalignedBlock {
-                instr_idx: 3, offset: 5, block_bytes: 18, elem_bytes: 4,
-            }, OffsetViolation::MisalignedBlock {
-                instr_idx: 7, offset: 9, block_bytes: 18, elem_bytes: 4,
-            }],
+            offset_violations: vec![
+                OffsetViolation::MisalignedBlock {
+                    instr_idx: 3,
+                    offset: 5,
+                    block_bytes: 18,
+                    elem_bytes: 4,
+                },
+                OffsetViolation::MisalignedBlock {
+                    instr_idx: 7,
+                    offset: 9,
+                    block_bytes: 18,
+                    elem_bytes: 4,
+                },
+            ],
             lifecycle_violations: vec![],
         };
         assert_eq!(report.total_count(), 3);
@@ -2217,7 +2731,11 @@ mod tests {
         let violations = verify_quant_offsets(&prog, &specs);
 
         // Assert: no violations
-        assert!(violations.is_empty(), "expected no violations, got {:?}", violations);
+        assert!(
+            violations.is_empty(),
+            "expected no violations, got {:?}",
+            violations
+        );
     }
 
     #[test]
@@ -2235,7 +2753,11 @@ mod tests {
             width: SimdWidth::W256,
         });
         // Find the actual index of QuantBlockLoad
-        let qbl_idx = prog.instrs.iter().position(|i| matches!(i, VmInstr::QuantBlockLoad { .. })).unwrap();
+        let qbl_idx = prog
+            .instrs
+            .iter()
+            .position(|i| matches!(i, VmInstr::QuantBlockLoad { .. }))
+            .unwrap();
         let specs = vec![QuantOffsetSpec {
             instr_idx: qbl_idx,
             expected_offset: 36,
@@ -2247,9 +2769,21 @@ mod tests {
         let violations = verify_quant_offsets(&prog, &specs);
 
         // Assert: OffsetMismatch detected among violations
-        let mismatch = violations.iter().find(|v| matches!(v, OffsetViolation::OffsetMismatch { .. }));
-        assert!(mismatch.is_some(), "expected OffsetMismatch, got {} violations", violations.len());
-        if let Some(OffsetViolation::OffsetMismatch { instr_idx, expected_offset, actual_offset, .. }) = mismatch {
+        let mismatch = violations
+            .iter()
+            .find(|v| matches!(v, OffsetViolation::OffsetMismatch { .. }));
+        assert!(
+            mismatch.is_some(),
+            "expected OffsetMismatch, got {} violations",
+            violations.len()
+        );
+        if let Some(OffsetViolation::OffsetMismatch {
+            instr_idx,
+            expected_offset,
+            actual_offset,
+            ..
+        }) = mismatch
+        {
             assert_eq!(*instr_idx, qbl_idx);
             assert_eq!(*expected_offset, 36);
             assert_eq!(*actual_offset, 18);
@@ -2277,7 +2811,11 @@ mod tests {
         let violations = verify_quant_offsets(&prog, &[]);
 
         // Assert: no violations — within-block offset aligned to elem_bytes is valid
-        assert!(violations.is_empty(), "expected no violations for within-block offset aligned to elem_bytes, got {:?}", violations);
+        assert!(
+            violations.is_empty(),
+            "expected no violations for within-block offset aligned to elem_bytes, got {:?}",
+            violations
+        );
     }
 
     #[test]
@@ -2286,7 +2824,11 @@ mod tests {
         let mut prog = VmProgram::new();
         let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         // ptr is declared before the loop
-        prog.emit(VmInstr::DeclareVReg { id: ptr, kind: VRegKind::Ptr, width: SimdWidth::Scalar });
+        prog.emit(VmInstr::DeclareVReg {
+            id: ptr,
+            kind: VRegKind::Ptr,
+            width: SimdWidth::Scalar,
+        });
         // loop that reads ptr (in VecLoad base) and writes ptr (via AddPtr)
         prog.emit_loop(BoundExpr::Const(4), 32, |prog, _, _| {
             let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
@@ -2295,7 +2837,8 @@ mod tests {
                 base: ptr,
                 offset: OffsetExpr::Const(0),
                 width: SimdWidth::W256,
-                dtype: QuantPrecision::F32, predicate: None,
+                dtype: QuantPrecision::F32,
+                predicate: None,
             });
             // Writing to ptr inside the loop — this makes it structurally LoopCarried,
             // not LoopInvariant. But verify_loop_lifecycle checks for InvariantWritten
@@ -2309,8 +2852,17 @@ mod tests {
         // Let's build a simpler case: read inside, explicit write inside.
         let mut prog2 = VmProgram::new();
         let val = prog2.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        prog2.emit(VmInstr::DeclareVReg { id: val, kind: VRegKind::Vec, width: SimdWidth::W256 });
-        prog2.emit(VmInstr::Broadcast { dst: val, src: ScalarExpr::Const(1.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
+        prog2.emit(VmInstr::DeclareVReg {
+            id: val,
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+        });
+        prog2.emit(VmInstr::Broadcast {
+            dst: val,
+            src: ScalarExpr::Const(1.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+        });
         prog2.emit_loop(BoundExpr::Const(4), 32, |prog, _, _| {
             let other = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
             // Read val as src 'a'
@@ -2336,7 +2888,11 @@ mod tests {
         // actually Broadcast is before the loop, and VecBinOp reads val inside loop.
         // The write to val is before the loop (Broadcast), not inside. So val is read-only inside.
         // This should be clean — no violations because it's genuinely LoopInvariant.
-        assert!(violations.is_empty(), "expected no violations, got {:?}", violations);
+        assert!(
+            violations.is_empty(),
+            "expected no violations, got {:?}",
+            violations
+        );
     }
 
     #[test]
@@ -2350,7 +2906,12 @@ mod tests {
         // Instead, test a clean loop where everything is correct.
         let mut prog = VmProgram::new();
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::Const(0.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
+        prog.emit(VmInstr::Broadcast {
+            dst: acc,
+            src: ScalarExpr::Const(0.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+        });
         prog.emit_loop(BoundExpr::Const(4), 32, |prog, _, _| {
             let loaded = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
             prog.emit(VmInstr::VecBinOp {
@@ -2364,7 +2925,11 @@ mod tests {
 
         // Act: acc is read (as 'a') and written (as dst) inside loop → LoopCarried with phi → clean
         let violations = verify_loop_lifecycle(&prog);
-        assert!(violations.is_empty(), "expected no violations, got {:?}", violations);
+        assert!(
+            violations.is_empty(),
+            "expected no violations, got {:?}",
+            violations
+        );
     }
 
     #[test]
@@ -2390,13 +2955,18 @@ mod tests {
             bound: BoundExpr::Const(4),
         });
         // DeclareVReg inside loop so def_pos falls within loop body
-        prog.emit(VmInstr::DeclareVReg { id: inner_val, kind: VRegKind::Vec, width: SimdWidth::W256 });
+        prog.emit(VmInstr::DeclareVReg {
+            id: inner_val,
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+        });
         prog.emit(VmInstr::VecLoad {
             dst: inner_val,
             base,
             offset: OffsetExpr::Const(0),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32, predicate: None,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         prog.emit(VmInstr::LoopEnd);
 
@@ -2413,9 +2983,21 @@ mod tests {
         let violations = verify_loop_lifecycle(&prog);
 
         // Assert: BodyLocalEscape detected among violations
-        let escape = violations.iter().find(|v| matches!(v, LifecycleViolation::BodyLocalEscape { .. }));
-        assert!(escape.is_some(), "expected BodyLocalEscape, got {} violations", violations.len());
-        if let Some(LifecycleViolation::BodyLocalEscape { vreg, loop_begin, loop_end, escape_pos }) = escape {
+        let escape = violations
+            .iter()
+            .find(|v| matches!(v, LifecycleViolation::BodyLocalEscape { .. }));
+        assert!(
+            escape.is_some(),
+            "expected BodyLocalEscape, got {} violations",
+            violations.len()
+        );
+        if let Some(LifecycleViolation::BodyLocalEscape {
+            vreg,
+            loop_begin,
+            loop_end,
+            escape_pos,
+        }) = escape
+        {
             assert_eq!(*vreg, inner_val);
             assert!(loop_begin < loop_end);
             assert!(*escape_pos > *loop_end);
@@ -2429,9 +3011,25 @@ mod tests {
         let a = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let b = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        prog.emit(VmInstr::Broadcast { dst: a, src: ScalarExpr::Const(1.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
-        prog.emit(VmInstr::Broadcast { dst: b, src: ScalarExpr::Const(2.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
-        prog.emit(VmInstr::VecBinOp { dst, a, b, op: VecOp::Add, dtype: QuantPrecision::F32 });
+        prog.emit(VmInstr::Broadcast {
+            dst: a,
+            src: ScalarExpr::Const(1.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+        });
+        prog.emit(VmInstr::Broadcast {
+            dst: b,
+            src: ScalarExpr::Const(2.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+        });
+        prog.emit(VmInstr::VecBinOp {
+            dst,
+            a,
+            b,
+            op: VecOp::Add,
+            dtype: QuantPrecision::F32,
+        });
 
         // Act
         let violations = verify_loop_lifecycle(&prog);
@@ -2461,7 +3059,11 @@ mod tests {
         // Assert: error for count=0
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("count=0"), "error should mention count=0: {}", err_msg);
+        assert!(
+            err_msg.contains("count=0"),
+            "error should mention count=0: {}",
+            err_msg
+        );
     }
 
     #[test]
@@ -2477,7 +3079,8 @@ mod tests {
             base,
             offset: OffsetExpr::LoopOffset(fake_loop_vreg),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32, predicate: None,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
 
         // Act
@@ -2486,7 +3089,11 @@ mod tests {
         // Assert: error for LoopOffset outside loop
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("outside loop"), "error should mention outside loop: {}", err_msg);
+        assert!(
+            err_msg.contains("outside loop"),
+            "error should mention outside loop: {}",
+            err_msg
+        );
     }
 
     #[test]
@@ -2497,15 +3104,39 @@ mod tests {
         let a = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let b = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        prog.emit(VmInstr::VecLoad { dst: a, base: ptr, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32 , predicate: None,});
-        prog.emit(VmInstr::VecLoad { dst: b, base: ptr, offset: OffsetExpr::Const(32), width: SimdWidth::W256, dtype: QuantPrecision::F32 , predicate: None,});
-        prog.emit(VmInstr::VecBinOp { dst, a, b, op: VecOp::Add, dtype: QuantPrecision::F32 });
+        prog.emit(VmInstr::VecLoad {
+            dst: a,
+            base: ptr,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
+        });
+        prog.emit(VmInstr::VecLoad {
+            dst: b,
+            base: ptr,
+            offset: OffsetExpr::Const(32),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
+        });
+        prog.emit(VmInstr::VecBinOp {
+            dst,
+            a,
+            b,
+            op: VecOp::Add,
+            dtype: QuantPrecision::F32,
+        });
 
         // Act
         let result = verify_vm_program(&prog);
 
         // Assert: should pass all rules
-        assert!(result.is_ok(), "valid program should pass verification: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "valid program should pass verification: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -2522,9 +3153,17 @@ mod tests {
         let s = format!("{}", v);
 
         // Assert: Display contains key information
-        assert!(s.contains("instr[7]"), "display should contain instr index: {}", s);
+        assert!(
+            s.contains("instr[7]"),
+            "display should contain instr index: {}",
+            s
+        );
         assert!(s.contains("13"), "display should contain offset: {}", s);
-        assert!(s.contains("18"), "display should contain block_bytes: {}", s);
+        assert!(
+            s.contains("18"),
+            "display should contain block_bytes: {}",
+            s
+        );
     }
 
     #[test]
@@ -2542,7 +3181,11 @@ mod tests {
         // Assert
         assert!(s.contains("v11"), "display should mention vreg: {}", s);
         assert!(s.contains("slot 3"), "display should mention slot: {}", s);
-        assert!(s.contains("missing spill store"), "display should describe violation: {}", s);
+        assert!(
+            s.contains("missing spill store"),
+            "display should describe violation: {}",
+            s
+        );
     }
 
     #[test]
@@ -2558,9 +3201,17 @@ mod tests {
         let s = format!("{}", v);
 
         // Assert
-        assert!(s.contains("VRegId(6)"), "display should mention vreg: {}", s);
+        assert!(
+            s.contains("VRegId(6)"),
+            "display should mention vreg: {}",
+            s
+        );
         assert!(s.contains("phi"), "display should mention phi: {}", s);
-        assert!(s.contains("[5, 30]"), "display should contain loop range: {}", s);
+        assert!(
+            s.contains("[5, 30]"),
+            "display should contain loop range: {}",
+            s
+        );
     }
 
     // ── 13 additional tests ──────────────────────────────────────────────
@@ -2574,7 +3225,11 @@ mod tests {
         };
         let s = format!("{}", v);
         assert!(s.contains("v8"), "display should mention vreg: {}", s);
-        assert!(s.contains("missing reload"), "display should describe missing reload: {}", s);
+        assert!(
+            s.contains("missing reload"),
+            "display should describe missing reload: {}",
+            s
+        );
     }
 
     #[test]
@@ -2586,9 +3241,21 @@ mod tests {
             elem_bytes: 1,
         };
         let s = format!("{}", v);
-        assert!(s.contains("instr[12]"), "display should contain instr index: {}", s);
-        assert!(s.contains("elem_bytes=1"), "display should contain elem_bytes: {}", s);
-        assert!(s.contains("block_bytes=18"), "display should contain block_bytes: {}", s);
+        assert!(
+            s.contains("instr[12]"),
+            "display should contain instr index: {}",
+            s
+        );
+        assert!(
+            s.contains("elem_bytes=1"),
+            "display should contain elem_bytes: {}",
+            s
+        );
+        assert!(
+            s.contains("block_bytes=18"),
+            "display should contain block_bytes: {}",
+            s
+        );
     }
 
     #[test]
@@ -2596,7 +3263,9 @@ mod tests {
         let report = VerifyReport {
             has_violations: true,
             spill_violations: vec![SpillViolation::MissingSpillStore {
-                vreg: VRegId(1), slot_idx: 0, read_pos: 5,
+                vreg: VRegId(1),
+                slot_idx: 0,
+                read_pos: 5,
             }],
             offset_violations: vec![],
             lifecycle_violations: vec![],
@@ -2613,13 +3282,18 @@ mod tests {
         let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::QuantBlockLoad {
-            dst, base,
+            dst,
+            base,
             offset: OffsetExpr::Const(0),
             unpack: BlockUnpackMode::SignedNibbleLow,
             width: SimdWidth::W256,
         });
         let violations = verify_quant_offsets(&prog, &[]);
-        assert!(violations.is_empty(), "zero offset aligned to any block_bytes: {:?}", violations);
+        assert!(
+            violations.is_empty(),
+            "zero offset aligned to any block_bytes: {:?}",
+            violations
+        );
     }
 
     #[test]
@@ -2630,7 +3304,9 @@ mod tests {
                 Box::new(OffsetExpr::Const(36)),
                 Box::new(OffsetExpr::Const(18)),
             ),
-            18, 0, "test",
+            18,
+            0,
+            "test",
         );
         assert!(result.is_ok(), "Add of aligned offsets should pass");
     }
@@ -2639,19 +3315,21 @@ mod tests {
     fn test_verify_offset_alignment_loop_offset_always_ok() {
         // LoopOffset is dynamic — can't be verified at compile time
         let vreg = VRegId(5);
-        let result = verify_offset_alignment(
-            &OffsetExpr::LoopOffset(vreg), 18, 0, "test",
+        let result = verify_offset_alignment(&OffsetExpr::LoopOffset(vreg), 18, 0, "test");
+        assert!(
+            result.is_ok(),
+            "LoopOffset should always pass alignment check"
         );
-        assert!(result.is_ok(), "LoopOffset should always pass alignment check");
     }
 
     #[test]
     fn test_verify_offset_alignment_scalar_vreg_always_ok() {
         let vreg = VRegId(7);
-        let result = verify_offset_alignment(
-            &OffsetExpr::ScalarVReg(vreg), 18, 0, "test",
+        let result = verify_offset_alignment(&OffsetExpr::ScalarVReg(vreg), 18, 0, "test");
+        assert!(
+            result.is_ok(),
+            "ScalarVReg should always pass alignment check"
         );
-        assert!(result.is_ok(), "ScalarVReg should always pass alignment check");
     }
 
     #[test]
@@ -2663,15 +3341,21 @@ mod tests {
             prog.emit_loop(BoundExpr::Const(2), 16, |prog, _, _| {
                 let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
                 prog.emit(VmInstr::VecLoad {
-                    dst, base,
+                    dst,
+                    base,
                     offset: OffsetExpr::Const(0),
                     width: SimdWidth::W256,
-                    dtype: QuantPrecision::F32, predicate: None,
+                    dtype: QuantPrecision::F32,
+                    predicate: None,
                 });
             });
         });
         let violations = verify_loop_lifecycle(&prog);
-        assert!(violations.is_empty(), "nested loops with body-local VRegs should be clean: {:?}", violations);
+        assert!(
+            violations.is_empty(),
+            "nested loops with body-local VRegs should be clean: {:?}",
+            violations
+        );
     }
 
     #[test]
@@ -2681,14 +3365,19 @@ mod tests {
         let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::QuantLoadBytesVec {
-            dst, base,
+            dst,
+            base,
             offset: 16,
             count: 4,
             signed: false,
             width: SimdWidth::W256,
         });
         let result = verify_quant_offset_sanity(&prog);
-        assert!(result.is_ok(), "valid QuantLoadBytesVec should pass: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "valid QuantLoadBytesVec should pass: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -2698,7 +3387,8 @@ mod tests {
         let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::QuantLoadBytesVec {
-            dst, base,
+            dst,
+            base,
             offset: 2048,
             count: 4,
             signed: false,
@@ -2707,7 +3397,11 @@ mod tests {
         let result = verify_quant_offset_sanity(&prog);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("1024"), "error should mention offset limit: {}", err);
+        assert!(
+            err.contains("1024"),
+            "error should mention offset limit: {}",
+            err
+        );
     }
 
     #[test]
@@ -2727,7 +3421,11 @@ mod tests {
     fn test_verify_vm_program_empty_program() {
         let prog = VmProgram::new();
         let result = verify_vm_program(&prog);
-        assert!(result.is_ok(), "empty program should pass verification: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "empty program should pass verification: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -2735,9 +3433,14 @@ mod tests {
         // Mul(Const(1), 36) with block_bytes=18 — factor is multiple of block_bytes
         let result = verify_offset_alignment(
             &OffsetExpr::Mul(Box::new(OffsetExpr::Const(1)), 36),
-            18, 0, "test",
+            18,
+            0,
+            "test",
         );
-        assert!(result.is_ok(), "Mul by factor that is multiple of block_bytes should pass");
+        assert!(
+            result.is_ok(),
+            "Mul by factor that is multiple of block_bytes should pass"
+        );
     }
 
     // ── Wave 12k70: additional tests ──────────────────────────────────────
@@ -2746,8 +3449,12 @@ mod tests {
     #[test]
     fn spill_violation_clone_slot_overlap() {
         let v = SpillViolation::SlotOverlap {
-            a_vreg: VRegId(1), a_offset: 0, a_end: 16,
-            b_vreg: VRegId(2), b_offset: 8, b_end: 24,
+            a_vreg: VRegId(1),
+            a_offset: 0,
+            a_end: 16,
+            b_vreg: VRegId(2),
+            b_offset: 8,
+            b_end: 24,
         };
         let cloned = v.clone();
         let s = format!("{:?}", cloned);
@@ -2758,8 +3465,12 @@ mod tests {
     #[test]
     fn offset_violation_clone_preserves_kind() {
         let v = OffsetViolation::OffsetMismatch {
-            instr_idx: 0, instr_name: "test", expected_offset: 32,
-            actual_offset: 16, block_bytes: 18, elem_bytes: 4,
+            instr_idx: 0,
+            instr_name: "test",
+            expected_offset: 32,
+            actual_offset: 16,
+            block_bytes: 18,
+            elem_bytes: 4,
         };
         let cloned = v.clone();
         if let OffsetViolation::OffsetMismatch { instr_idx, .. } = cloned {
@@ -2773,10 +3484,16 @@ mod tests {
     #[test]
     fn lifecycle_violation_clone_preserves_fields() {
         let v = LifecycleViolation::InvariantWritten {
-            vreg: VRegId(5), loop_begin: 10, loop_end: 50, write_pos: 30,
+            vreg: VRegId(5),
+            loop_begin: 10,
+            loop_end: 50,
+            write_pos: 30,
         };
         let cloned = v.clone();
-        if let LifecycleViolation::InvariantWritten { vreg, write_pos, .. } = cloned {
+        if let LifecycleViolation::InvariantWritten {
+            vreg, write_pos, ..
+        } = cloned
+        {
             assert_eq!(vreg, VRegId(5));
             assert_eq!(write_pos, 30);
         } else {
@@ -2790,14 +3507,24 @@ mod tests {
         let report = VerifyReport {
             has_violations: true,
             spill_violations: vec![SpillViolation::SlotOverlap {
-                a_vreg: VRegId(0), a_offset: 0, a_end: 8,
-                b_vreg: VRegId(1), b_offset: 4, b_end: 12,
+                a_vreg: VRegId(0),
+                a_offset: 0,
+                a_end: 8,
+                b_vreg: VRegId(1),
+                b_offset: 4,
+                b_end: 12,
             }],
             offset_violations: vec![OffsetViolation::MisalignedBlock {
-                instr_idx: 3, offset: 5, block_bytes: 18, elem_bytes: 4,
+                instr_idx: 3,
+                offset: 5,
+                block_bytes: 18,
+                elem_bytes: 4,
             }],
             lifecycle_violations: vec![LifecycleViolation::BodyLocalEscape {
-                vreg: VRegId(9), loop_begin: 2, loop_end: 10, escape_pos: 15,
+                vreg: VRegId(9),
+                loop_begin: 2,
+                loop_end: 10,
+                escape_pos: 15,
             }],
         };
         assert!(report.has_violations);
@@ -2811,7 +3538,10 @@ mod tests {
     #[test]
     fn quant_offset_spec_clone_preserves_fields() {
         let spec = QuantOffsetSpec {
-            instr_idx: 7, expected_offset: 72, block_bytes: 36, elem_bytes: 2,
+            instr_idx: 7,
+            expected_offset: 72,
+            block_bytes: 36,
+            elem_bytes: 2,
         };
         let cloned = spec.clone();
         assert_eq!(cloned.instr_idx, 7);
@@ -2825,10 +3555,11 @@ mod tests {
     fn verify_offset_alignment_const_zero_always_aligned() {
         // offset=0 is aligned to any block_bytes
         for block_bytes in [1, 2, 4, 8, 16, 18, 32, 36] {
-            let result = verify_offset_alignment(
-                &OffsetExpr::Const(0), block_bytes, 0, "test",
+            let result = verify_offset_alignment(&OffsetExpr::Const(0), block_bytes, 0, "test");
+            assert!(
+                result.is_ok(),
+                "offset=0 should align to block_bytes={block_bytes}"
             );
-            assert!(result.is_ok(), "offset=0 should align to block_bytes={block_bytes}");
         }
     }
 
@@ -2841,7 +3572,9 @@ mod tests {
                 Box::new(OffsetExpr::Const(36)),
                 Box::new(OffsetExpr::Const(3)),
             ),
-            18, 0, "test",
+            18,
+            0,
+            "test",
         );
         assert!(result.is_err(), "misaligned Add should fail");
     }
@@ -2852,9 +3585,14 @@ mod tests {
         // Mul(Const(1), 7) with block_bytes=18 — factor 7 is not multiple of 18
         let result = verify_offset_alignment(
             &OffsetExpr::Mul(Box::new(OffsetExpr::Const(1)), 7),
-            18, 0, "test",
+            18,
+            0,
+            "test",
         );
-        assert!(result.is_err(), "Mul by non-block-multiple factor should fail");
+        assert!(
+            result.is_err(),
+            "Mul by non-block-multiple factor should fail"
+        );
     }
 
     // @trace TEST-12k70
@@ -2866,22 +3604,38 @@ mod tests {
         prog.emit_loop(BoundExpr::Const(2), 4, |prog, _, _| {
             let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
             prog.emit(VmInstr::VecLoad {
-                dst, base, offset: OffsetExpr::Const(0),
-                width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+                dst,
+                base,
+                offset: OffsetExpr::Const(0),
+                width: SimdWidth::W256,
+                dtype: QuantPrecision::F32,
+                predicate: None,
             });
         });
         let violations = verify_loop_lifecycle(&prog);
-        assert!(violations.is_empty(), "minimal loop should have no lifecycle violations: {:?}", violations);
+        assert!(
+            violations.is_empty(),
+            "minimal loop should have no lifecycle violations: {:?}",
+            violations
+        );
     }
 
     // @trace TEST-12k70
     #[test]
     fn spill_violation_read_before_write_clone() {
         let v = SpillViolation::ReadBeforeWrite {
-            vreg: VRegId(4), slot_idx: 1, first_read_pos: 8, first_write_pos: 12,
+            vreg: VRegId(4),
+            slot_idx: 1,
+            first_read_pos: 8,
+            first_write_pos: 12,
         };
         let cloned = v.clone();
-        if let SpillViolation::ReadBeforeWrite { vreg, first_read_pos, .. } = cloned {
+        if let SpillViolation::ReadBeforeWrite {
+            vreg,
+            first_read_pos,
+            ..
+        } = cloned
+        {
             assert_eq!(vreg, VRegId(4));
             assert_eq!(first_read_pos, 8);
         } else {
@@ -2898,7 +3652,9 @@ mod tests {
         let mut prog = VmProgram::new();
         prog.emit_loop(BoundExpr::Const(4), 32, |prog, _, _| {
             prog.emit_loop(BoundExpr::Const(2), 16, |prog, _, _| {
-                prog.emit(VmInstr::MemFence { order: MemFenceOrder::Release });
+                prog.emit(VmInstr::MemFence {
+                    order: MemFenceOrder::Release,
+                });
             });
         });
 
@@ -2906,7 +3662,11 @@ mod tests {
         let result = verify_loop_pairing(&prog);
 
         // Assert
-        assert!(result.is_ok(), "nested loops should pass pairing: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "nested loops should pass pairing: {:?}",
+            result
+        );
     }
 
     // @trace TEST-12k97
@@ -2918,9 +3678,17 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-        prog.emit(VmInstr::LoopBegin { counter, offsets: vec![LoopOffset { vreg: byte_off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(4)});
+        prog.emit(VmInstr::LoopBegin {
+            counter,
+            offsets: vec![LoopOffset {
+                vreg: byte_off,
+                stride: LoopStride::FixedBytes(32),
+            }],
+            bound: BoundExpr::Const(4),
+        });
         prog.emit(VmInstr::QuantBlockLoad {
-            dst, base,
+            dst,
+            base,
             offset: OffsetExpr::LoopOffset(byte_off),
             unpack: BlockUnpackMode::SignedNibbleLow,
             width: SimdWidth::W256,
@@ -2931,7 +3699,11 @@ mod tests {
         let result = verify_quant_offset_sanity(&prog);
 
         // Assert: dynamic offsets can't be checked for alignment
-        assert!(result.is_ok(), "dynamic offset should pass sanity: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "dynamic offset should pass sanity: {:?}",
+            result
+        );
     }
 
     // @trace TEST-12k97
@@ -2942,10 +3714,12 @@ mod tests {
         let src = VRegId(1);
         let off_vreg = VRegId(2);
         let instr = VmInstr::VecStore {
-            base, src,
+            base,
+            src,
             offset: OffsetExpr::ScalarVReg(off_vreg),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32, predicate: None,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         };
 
         // Act
@@ -2954,7 +3728,10 @@ mod tests {
         // Assert: must contain base, src, and the offset vreg
         assert!(srcs.contains(&base), "VecStore srcs should contain base");
         assert!(srcs.contains(&src), "VecStore srcs should contain src");
-        assert!(srcs.contains(&off_vreg), "VecStore srcs should contain offset vreg");
+        assert!(
+            srcs.contains(&off_vreg),
+            "VecStore srcs should contain offset vreg"
+        );
     }
 
     // @trace TEST-12k97
@@ -2966,7 +3743,10 @@ mod tests {
         let a = VRegId(12);
         let b = VRegId(13);
         let instr = VmInstr::Fma {
-            dst, acc, a, b,
+            dst,
+            acc,
+            a,
+            b,
             dtype: QuantPrecision::F32,
         };
 
@@ -3044,15 +3824,23 @@ mod tests {
         let dst = VRegId(5);
         let base = VRegId(0);
         let instr = VmInstr::VecLoad {
-            dst, base,
+            dst,
+            base,
             offset: OffsetExpr::Const(0),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32, predicate: None,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         };
 
         // Act & Assert
-        assert!(is_pure_write_to(&instr, dst), "VecLoad is pure write to dst");
-        assert!(!is_pure_write_to(&instr, base), "VecLoad is not pure write to base");
+        assert!(
+            is_pure_write_to(&instr, dst),
+            "VecLoad is pure write to dst"
+        );
+        assert!(
+            !is_pure_write_to(&instr, base),
+            "VecLoad is not pure write to base"
+        );
     }
 
     // @trace TEST-12k97
@@ -3062,7 +3850,11 @@ mod tests {
         let v = VRegId(3);
         let b = VRegId(4);
         let instr = VmInstr::VecBinOp {
-            dst: v, a: v, b, op: VecOp::Add, dtype: QuantPrecision::F32,
+            dst: v,
+            a: v,
+            b,
+            op: VecOp::Add,
+            dtype: QuantPrecision::F32,
         };
 
         // Act
@@ -3076,10 +3868,35 @@ mod tests {
     #[test]
     fn test_instr_name_known_variants() {
         // Arrange & Act & Assert
-        assert_eq!(instr_name(&VmInstr::VecLoad { dst: VRegId(0), base: VRegId(0), offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32 , predicate: None,}), "VecLoad");
-        assert_eq!(instr_name(&VmInstr::VecStore { base: VRegId(0), src: VRegId(0), offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32 , predicate: None,}), "VecStore");
+        assert_eq!(
+            instr_name(&VmInstr::VecLoad {
+                dst: VRegId(0),
+                base: VRegId(0),
+                offset: OffsetExpr::Const(0),
+                width: SimdWidth::W256,
+                dtype: QuantPrecision::F32,
+                predicate: None,
+            }),
+            "VecLoad"
+        );
+        assert_eq!(
+            instr_name(&VmInstr::VecStore {
+                base: VRegId(0),
+                src: VRegId(0),
+                offset: OffsetExpr::Const(0),
+                width: SimdWidth::W256,
+                dtype: QuantPrecision::F32,
+                predicate: None,
+            }),
+            "VecStore"
+        );
         assert_eq!(instr_name(&VmInstr::LoopEnd), "LoopEnd");
-        assert_eq!(instr_name(&VmInstr::MemFence { order: MemFenceOrder::Release }), "Other");
+        assert_eq!(
+            instr_name(&VmInstr::MemFence {
+                order: MemFenceOrder::Release
+            }),
+            "Other"
+        );
     }
 
     // ── Wave 12kea: 10 additional tests ────────────────────────────────────
@@ -3092,10 +3909,22 @@ mod tests {
         let a = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let undefined_b = VRegId(99); // never declared/defined
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        prog.emit(VmInstr::DeclareVReg { id: a, kind: VRegKind::Vec, width: SimdWidth::W256 });
-        prog.emit(VmInstr::DeclareVReg { id: dst, kind: VRegKind::Vec, width: SimdWidth::W256 });
+        prog.emit(VmInstr::DeclareVReg {
+            id: a,
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+        });
+        prog.emit(VmInstr::DeclareVReg {
+            id: dst,
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+        });
         prog.emit(VmInstr::VecBinOp {
-            dst, a, b: undefined_b, op: VecOp::Add, dtype: QuantPrecision::F32,
+            dst,
+            a,
+            b: undefined_b,
+            op: VecOp::Add,
+            dtype: QuantPrecision::F32,
         });
 
         // Act
@@ -3104,8 +3933,14 @@ mod tests {
         // Assert
         assert!(result.is_err(), "use of undefined VReg should fail");
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("undefined"), "error should mention undefined: {err}");
-        assert!(err.contains("VRegId(99)"), "error should mention the undefined vreg: {err}");
+        assert!(
+            err.contains("undefined"),
+            "error should mention undefined: {err}"
+        );
+        assert!(
+            err.contains("VRegId(99)"),
+            "error should mention the undefined vreg: {err}"
+        );
     }
 
     // @trace TEST-12kea
@@ -3124,7 +3959,11 @@ mod tests {
             mode: BiPlaneMode::Low5,
             width: SimdWidth::W256,
         });
-        let bp_idx = prog.instrs.iter().position(|i| matches!(i, VmInstr::QuantBiPlaneLoad { .. })).unwrap();
+        let bp_idx = prog
+            .instrs
+            .iter()
+            .position(|i| matches!(i, VmInstr::QuantBiPlaneLoad { .. }))
+            .unwrap();
         let specs = vec![QuantOffsetSpec {
             instr_idx: bp_idx,
             expected_offset: 18,
@@ -3137,7 +3976,11 @@ mod tests {
 
         // Assert: QuantBiPlaneLoad with spec entry always triggers OffsetMismatch
         let mismatch = violations.iter().find(|v| matches!(v, OffsetViolation::OffsetMismatch { instr_name, .. } if *instr_name == "QuantBiPlaneLoad"));
-        assert!(mismatch.is_some(), "expected QuantBiPlaneLoad OffsetMismatch, got {} violations", violations.len());
+        assert!(
+            mismatch.is_some(),
+            "expected QuantBiPlaneLoad OffsetMismatch, got {} violations",
+            violations.len()
+        );
     }
 
     // @trace TEST-12kea
@@ -3149,15 +3992,27 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-        prog.emit(VmInstr::LoopBegin { counter, offsets: vec![LoopOffset { vreg: byte_off, stride: LoopStride::FixedBytes(32) }], bound: BoundExpr::Const(4)});
+        prog.emit(VmInstr::LoopBegin {
+            counter,
+            offsets: vec![LoopOffset {
+                vreg: byte_off,
+                stride: LoopStride::FixedBytes(32),
+            }],
+            bound: BoundExpr::Const(4),
+        });
         prog.emit(VmInstr::QuantBlockLoad {
-            dst, base,
+            dst,
+            base,
             offset: OffsetExpr::LoopOffset(byte_off), // non-Const
             unpack: BlockUnpackMode::SignedNibbleLow, // block_bytes=18
             width: SimdWidth::W256,
         });
         prog.emit(VmInstr::LoopEnd);
-        let qbl_idx = prog.instrs.iter().position(|i| matches!(i, VmInstr::QuantBlockLoad { .. })).unwrap();
+        let qbl_idx = prog
+            .instrs
+            .iter()
+            .position(|i| matches!(i, VmInstr::QuantBlockLoad { .. }))
+            .unwrap();
         let specs = vec![QuantOffsetSpec {
             instr_idx: qbl_idx,
             expected_offset: 36,
@@ -3169,8 +4024,14 @@ mod tests {
         let violations = verify_quant_offsets(&prog, &specs);
 
         // Assert: block_bytes mismatch should trigger OffsetMismatch
-        let mismatch = violations.iter().find(|v| matches!(v, OffsetViolation::OffsetMismatch { .. }));
-        assert!(mismatch.is_some(), "expected OffsetMismatch for block_bytes mismatch, got {} violations", violations.len());
+        let mismatch = violations
+            .iter()
+            .find(|v| matches!(v, OffsetViolation::OffsetMismatch { .. }));
+        assert!(
+            mismatch.is_some(),
+            "expected OffsetMismatch for block_bytes mismatch, got {} violations",
+            violations.len()
+        );
     }
 
     // @trace TEST-12kea
@@ -3179,11 +4040,16 @@ mod tests {
         // Arrange: Mul(Const(7), 5) with block_bytes=18 — factor 5 not multiple of 18, inner 7 not aligned
         let result = verify_offset_alignment(
             &OffsetExpr::Mul(Box::new(OffsetExpr::Const(7)), 5),
-            18, 0, "test",
+            18,
+            0,
+            "test",
         );
 
         // Assert
-        assert!(result.is_err(), "Mul with misaligned inner and non-block-multiple factor should fail");
+        assert!(
+            result.is_err(),
+            "Mul with misaligned inner and non-block-multiple factor should fail"
+        );
     }
 
     // @trace TEST-12kea
@@ -3200,7 +4066,10 @@ mod tests {
         // Assert: first LoopEnd should fail (depth goes to 0 then underflows)
         assert!(result.is_err(), "two unmatched LoopEnds should fail");
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("LoopEnd"), "error should mention LoopEnd: {err}");
+        assert!(
+            err.contains("LoopEnd"),
+            "error should mention LoopEnd: {err}"
+        );
     }
 
     // @trace TEST-12kea
@@ -3208,11 +4077,18 @@ mod tests {
     fn test_reads_vreg_declare_vreg_path() {
         // Arrange: DeclareVReg should match its own id via the specialized path
         let id = VRegId(42);
-        let instr = VmInstr::DeclareVReg { id, kind: VRegKind::Vec, width: SimdWidth::W256 };
+        let instr = VmInstr::DeclareVReg {
+            id,
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+        };
 
         // Act & Assert
         assert!(reads_vreg(&instr, id), "DeclareVReg should read its own id");
-        assert!(!reads_vreg(&instr, VRegId(99)), "DeclareVReg should not read a different id");
+        assert!(
+            !reads_vreg(&instr, VRegId(99)),
+            "DeclareVReg should not read a different id"
+        );
     }
 
     // @trace TEST-12kea
@@ -3223,10 +4099,14 @@ mod tests {
         let src = VRegId(1);
         let off_vreg = VRegId(2);
         let scalar_load = VmInstr::ScalarLoad {
-            dst: VRegId(3), base, offset: OffsetExpr::ScalarVReg(off_vreg),
+            dst: VRegId(3),
+            base,
+            offset: OffsetExpr::ScalarVReg(off_vreg),
         };
         let scalar_store = VmInstr::ScalarStore {
-            base, src, offset: OffsetExpr::ScalarVReg(off_vreg),
+            base,
+            src,
+            offset: OffsetExpr::ScalarVReg(off_vreg),
         };
 
         // Act
@@ -3234,8 +4114,16 @@ mod tests {
         let store_offsets = collect_offset_exprs(&scalar_store);
 
         // Assert
-        assert_eq!(load_offsets.len(), 1, "ScalarLoad should yield 1 offset expr");
-        assert_eq!(store_offsets.len(), 1, "ScalarStore should yield 1 offset expr");
+        assert_eq!(
+            load_offsets.len(),
+            1,
+            "ScalarLoad should yield 1 offset expr"
+        );
+        assert_eq!(
+            store_offsets.len(),
+            1,
+            "ScalarStore should yield 1 offset expr"
+        );
     }
 
     // @trace TEST-12kea
@@ -3250,7 +4138,10 @@ mod tests {
         assert!(ptr_expr_vregs(&PtrExpr::StackArg(0)).is_empty());
         assert_eq!(ptr_expr_vregs(&PtrExpr::VRegPlusConst(va, 8)), vec![va]);
         assert_eq!(ptr_expr_vregs(&PtrExpr::VRegPlusVReg(va, vb)), vec![va, vb]);
-        assert_eq!(ptr_expr_vregs(&PtrExpr::VRegPlusOff(va, OffsetExpr::Const(16))), vec![va]);
+        assert_eq!(
+            ptr_expr_vregs(&PtrExpr::VRegPlusOff(va, OffsetExpr::Const(16))),
+            vec![va]
+        );
         assert!(ptr_expr_vregs(&PtrExpr::NamedArg("test".to_string())).is_empty());
         assert!(ptr_expr_vregs(&PtrExpr::SharedMem).is_empty());
         assert!(ptr_expr_vregs(&PtrExpr::AbsAddr(0x1000)).is_empty());
@@ -3276,10 +4167,12 @@ mod tests {
             bound: BoundExpr::Const(4),
         });
         prog.emit(VmInstr::VecLoad {
-            dst, base,
+            dst,
+            base,
             offset: OffsetExpr::LoopOffset(wrong_loop_vreg),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32, predicate: None,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         prog.emit(VmInstr::LoopEnd);
 
@@ -3287,9 +4180,15 @@ mod tests {
         let result = verify_loop_offset_scope(&prog);
 
         // Assert: wrong_loop_vreg not in active_loop_vregs
-        assert!(result.is_err(), "LoopOffset with wrong VReg inside loop should fail");
+        assert!(
+            result.is_err(),
+            "LoopOffset with wrong VReg inside loop should fail"
+        );
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("outside loop"), "error should mention outside loop: {err}");
+        assert!(
+            err.contains("outside loop"),
+            "error should mention outside loop: {err}"
+        );
     }
 
     // @trace TEST-12kea
@@ -3300,15 +4199,36 @@ mod tests {
         let acc = VRegId(2);
         let a = VRegId(3);
         let b = VRegId(4);
-        let instr = VmInstr::Fma { dst, acc, a, b, dtype: QuantPrecision::F32 };
+        let instr = VmInstr::Fma {
+            dst,
+            acc,
+            a,
+            b,
+            dtype: QuantPrecision::F32,
+        };
 
         // Act & Assert: dst is pure write
-        assert!(is_pure_write_to(&instr, dst), "Fma is pure write to dst when distinct");
+        assert!(
+            is_pure_write_to(&instr, dst),
+            "Fma is pure write to dst when distinct"
+        );
         // acc is not pure write (it is read as acc)
-        assert!(!is_pure_write_to(&instr, acc), "Fma is not pure write to acc");
+        assert!(
+            !is_pure_write_to(&instr, acc),
+            "Fma is not pure write to acc"
+        );
         // Fma with dst == acc is not pure write
-        let instr2 = VmInstr::Fma { dst: acc, acc, a, b, dtype: QuantPrecision::F32 };
-        assert!(!is_pure_write_to(&instr2, acc), "Fma with dst==acc is not pure write");
+        let instr2 = VmInstr::Fma {
+            dst: acc,
+            acc,
+            a,
+            b,
+            dtype: QuantPrecision::F32,
+        };
+        assert!(
+            !is_pure_write_to(&instr2, acc),
+            "Fma with dst==acc is not pure write"
+        );
     }
 
     // ── Wave 12kjd: 10 additional tests ────────────────────────────────────
@@ -3335,7 +4255,12 @@ mod tests {
     fn test_is_pure_write_to_vec_cast_dst_equals_src_not_pure() {
         // Arrange: VecCast where dst == src — reads old value while writing
         let v = VRegId(7);
-        let instr = VmInstr::VecCast { dst: v, src: v, from_bits: 32, to_bits: 16 };
+        let instr = VmInstr::VecCast {
+            dst: v,
+            src: v,
+            from_bits: 32,
+            to_bits: 16,
+        };
 
         // Act
         let result = is_pure_write_to(&instr, v);
@@ -3352,7 +4277,12 @@ mod tests {
         let true_val = VRegId(2);
         let false_val = VRegId(3);
         let dst = VRegId(4);
-        let instr = VmInstr::ConditionalSelect { dst, mask, true_val, false_val };
+        let instr = VmInstr::ConditionalSelect {
+            dst,
+            mask,
+            true_val,
+            false_val,
+        };
 
         // Act
         let srcs = collect_src_vregs(&instr);
@@ -3371,7 +4301,10 @@ mod tests {
         let v = VRegId(5);
         let b_vreg = VRegId(6);
         let instr = VmInstr::GprBinOp {
-            dst: v, a: v, b: GprOperand::VReg(b_vreg), op: GprOp::Add,
+            dst: v,
+            a: v,
+            b: GprOperand::VReg(b_vreg),
+            op: GprOp::Add,
         };
 
         // Act
@@ -3389,21 +4322,45 @@ mod tests {
         let dst_d = VRegId(21);
         let dst_b = VRegId(22);
         let quant_load = VmInstr::QuantLoadBytesVec {
-            dst: dst_q, base: VRegId(0), offset: 0, count: 4, signed: false, width: SimdWidth::W256,
+            dst: dst_q,
+            base: VRegId(0),
+            offset: 0,
+            count: 4,
+            signed: false,
+            width: SimdWidth::W256,
         };
         let dot_product = VmInstr::DotProduct {
-            acc: dst_d, a: VRegId(1), b: VRegId(2),
-            input_dtype: DotDtype::Int8, width: SimdWidth::W256,
+            acc: dst_d,
+            a: VRegId(1),
+            b: VRegId(2),
+            input_dtype: DotDtype::Int8,
+            width: SimdWidth::W256,
         };
         let biplane = VmInstr::QuantBiPlaneLoad {
-            dst: dst_b, qs_base: VRegId(3), extra_base: VRegId(4),
-            bias: 8.0, mode: BiPlaneMode::Low5, width: SimdWidth::W256,
+            dst: dst_b,
+            qs_base: VRegId(3),
+            extra_base: VRegId(4),
+            bias: 8.0,
+            mode: BiPlaneMode::Low5,
+            width: SimdWidth::W256,
         };
 
         // Act & Assert
-        assert_eq!(collect_dst_vreg(&quant_load), Some(dst_q), "QuantLoadBytesVec dst");
-        assert_eq!(collect_dst_vreg(&dot_product), Some(dst_d), "DotProduct dst");
-        assert_eq!(collect_dst_vreg(&biplane), Some(dst_b), "QuantBiPlaneLoad dst");
+        assert_eq!(
+            collect_dst_vreg(&quant_load),
+            Some(dst_q),
+            "QuantLoadBytesVec dst"
+        );
+        assert_eq!(
+            collect_dst_vreg(&dot_product),
+            Some(dst_d),
+            "DotProduct dst"
+        );
+        assert_eq!(
+            collect_dst_vreg(&biplane),
+            Some(dst_b),
+            "QuantBiPlaneLoad dst"
+        );
     }
 
     // @trace TEST-12kjd
@@ -3413,10 +4370,17 @@ mod tests {
         let base = VRegId(0);
         let off_vreg = VRegId(1);
         let prefetch = VmInstr::Prefetch {
-            base, offset: OffsetExpr::ScalarVReg(off_vreg), distance: 64, hint: crate::compiler::codegen::vm::isa_hook::PrefetchHint::T0,
+            base,
+            offset: OffsetExpr::ScalarVReg(off_vreg),
+            distance: 64,
+            hint: crate::compiler::codegen::vm::isa_hook::PrefetchHint::T0,
         };
         let tmem_load = VmInstr::TmemLoad {
-            dst: VRegId(2), name: "test_tmem".to_string(), offset: OffsetExpr::ScalarVReg(off_vreg), width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            dst: VRegId(2),
+            name: "test_tmem".to_string(),
+            offset: OffsetExpr::ScalarVReg(off_vreg),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
         };
 
         // Act
@@ -3424,7 +4388,11 @@ mod tests {
         let tmem_offsets = collect_offset_exprs(&tmem_load);
 
         // Assert
-        assert_eq!(prefetch_offsets.len(), 1, "Prefetch should yield 1 offset expr");
+        assert_eq!(
+            prefetch_offsets.len(),
+            1,
+            "Prefetch should yield 1 offset expr"
+        );
         assert_eq!(tmem_offsets.len(), 1, "TmemLoad should yield 1 offset expr");
     }
 
@@ -3436,7 +4404,9 @@ mod tests {
         prog.emit_loop(BoundExpr::Const(2), 8, |prog, _, _| {
             prog.emit_loop(BoundExpr::Const(3), 16, |prog, _, _| {
                 prog.emit_loop(BoundExpr::Const(4), 32, |prog, _, _| {
-                    prog.emit(VmInstr::MemFence { order: MemFenceOrder::Release });
+                    prog.emit(VmInstr::MemFence {
+                        order: MemFenceOrder::Release,
+                    });
                 });
             });
         });
@@ -3445,7 +4415,11 @@ mod tests {
         let result = verify_loop_pairing(&prog);
 
         // Assert
-        assert!(result.is_ok(), "triple nested loops should pass pairing: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "triple nested loops should pass pairing: {:?}",
+            result
+        );
     }
 
     // @trace TEST-12kjd
@@ -3453,7 +4427,19 @@ mod tests {
     fn test_collect_src_vregs_indirect_jump_reads_index() {
         // Arrange: IndirectJump reads the index register
         let index = VRegId(15);
-        let instr = VmInstr::IndirectJump { index, targets: vec![JumpTarget { expert_id: 0, instr_index: 0 }, JumpTarget { expert_id: 1, instr_index: 10 }] };
+        let instr = VmInstr::IndirectJump {
+            index,
+            targets: vec![
+                JumpTarget {
+                    expert_id: 0,
+                    instr_index: 0,
+                },
+                JumpTarget {
+                    expert_id: 1,
+                    instr_index: 10,
+                },
+            ],
+        };
 
         // Act
         let srcs = collect_src_vregs(&instr);
@@ -3473,7 +4459,11 @@ mod tests {
         let vregs = offset_vregs(&expr);
 
         // Assert
-        assert_eq!(vregs, vec![inner_vreg], "Mul should extract inner ScalarVReg");
+        assert_eq!(
+            vregs,
+            vec![inner_vreg],
+            "Mul should extract inner ScalarVReg"
+        );
     }
 
     // @trace TEST-12kjd
@@ -3484,25 +4474,42 @@ mod tests {
             has_violations: true,
             spill_violations: vec![
                 SpillViolation::SlotOverlap {
-                    a_vreg: VRegId(0), a_offset: 0, a_end: 8,
-                    b_vreg: VRegId(1), b_offset: 4, b_end: 12,
+                    a_vreg: VRegId(0),
+                    a_offset: 0,
+                    a_end: 8,
+                    b_vreg: VRegId(1),
+                    b_offset: 4,
+                    b_end: 12,
                 },
                 SpillViolation::MissingSpillStore {
-                    vreg: VRegId(2), slot_idx: 0, read_pos: 10,
+                    vreg: VRegId(2),
+                    slot_idx: 0,
+                    read_pos: 10,
                 },
             ],
             offset_violations: vec![OffsetViolation::BlockElemConfusion {
-                instr_idx: 5, offset: 4, block_bytes: 18, elem_bytes: 1,
+                instr_idx: 5,
+                offset: 4,
+                block_bytes: 18,
+                elem_bytes: 1,
             }],
             lifecycle_violations: vec![
                 LifecycleViolation::CarriedMissingPhi {
-                    vreg: VRegId(6), loop_begin: 2, loop_end: 20,
+                    vreg: VRegId(6),
+                    loop_begin: 2,
+                    loop_end: 20,
                 },
                 LifecycleViolation::InvariantWritten {
-                    vreg: VRegId(7), loop_begin: 2, loop_end: 20, write_pos: 10,
+                    vreg: VRegId(7),
+                    loop_begin: 2,
+                    loop_end: 20,
+                    write_pos: 10,
                 },
                 LifecycleViolation::BodyLocalEscape {
-                    vreg: VRegId(8), loop_begin: 2, loop_end: 20, escape_pos: 25,
+                    vreg: VRegId(8),
+                    loop_begin: 2,
+                    loop_end: 20,
+                    escape_pos: 25,
                 },
             ],
         };
@@ -3512,7 +4519,11 @@ mod tests {
         assert_eq!(report.spill_violations.len(), 2);
         assert_eq!(report.offset_violations.len(), 1);
         assert_eq!(report.lifecycle_violations.len(), 3);
-        assert_eq!(report.total_count(), 6, "total should be sum of all categories");
+        assert_eq!(
+            report.total_count(),
+            6,
+            "total should be sum of all categories"
+        );
     }
 
     // ── Wave 12x59: 10 additional tests ────────────────────────────────────
@@ -3535,7 +4546,10 @@ mod tests {
         // Assert: empty program should produce a clean report
         assert!(result.is_ok(), "empty program should pass: {:?}", result);
         let report = result.unwrap();
-        assert!(!report.has_violations, "empty program should have no violations");
+        assert!(
+            !report.has_violations,
+            "empty program should have no violations"
+        );
         assert_eq!(report.total_count(), 0);
     }
 
@@ -3546,17 +4560,29 @@ mod tests {
         let mut prog = VmProgram::new();
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::Const(0.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
+        prog.emit(VmInstr::Broadcast {
+            dst: acc,
+            src: ScalarExpr::Const(0.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+        });
         prog.emit_loop(BoundExpr::Const(4), 32, |prog, _, byte_off| {
             let loaded = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
             prog.emit(VmInstr::VecLoad {
-                dst: loaded, base,
+                dst: loaded,
+                base,
                 offset: OffsetExpr::LoopOffset(byte_off),
-                width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+                width: SimdWidth::W256,
+                dtype: QuantPrecision::F32,
+                predicate: None,
             });
             // acc is read (as 'a') and written (as dst) → LoopCarried with phi
             prog.emit(VmInstr::VecBinOp {
-                dst: acc, a: acc, b: loaded, op: VecOp::Add, dtype: QuantPrecision::F32,
+                dst: acc,
+                a: acc,
+                b: loaded,
+                op: VecOp::Add,
+                dtype: QuantPrecision::F32,
             });
         });
 
@@ -3564,7 +4590,11 @@ mod tests {
         let violations = verify_loop_lifecycle(&prog);
 
         // Assert: no violations for properly structured LoopCarried
-        assert!(violations.is_empty(), "LoopCarried with phi should be clean, got {:?}", violations);
+        assert!(
+            violations.is_empty(),
+            "LoopCarried with phi should be clean, got {:?}",
+            violations
+        );
     }
 
     // @trace TEST-12x59
@@ -3575,30 +4605,74 @@ mod tests {
         let a = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let b = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        prog.emit(VmInstr::Broadcast { dst: a, src: ScalarExpr::Const(1.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
-        prog.emit(VmInstr::Broadcast { dst: b, src: ScalarExpr::Const(2.0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
-        prog.emit(VmInstr::VecBinOp { dst, a, b, op: VecOp::Add, dtype: QuantPrecision::F32 });
+        prog.emit(VmInstr::Broadcast {
+            dst: a,
+            src: ScalarExpr::Const(1.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+        });
+        prog.emit(VmInstr::Broadcast {
+            dst: b,
+            src: ScalarExpr::Const(2.0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+        });
+        prog.emit(VmInstr::VecBinOp {
+            dst,
+            a,
+            b,
+            op: VecOp::Add,
+            dtype: QuantPrecision::F32,
+        });
 
         let alloc = RegAllocation {
             mapping: HashMap::new(),
             spills: vec![
-                super::super::reg_alloc::SpillSlot { vreg: a, offset: 0, size: 32 },
-                super::super::reg_alloc::SpillSlot { vreg: b, offset: 16, size: 32 }, // overlaps [0,32) and [16,48)
+                super::super::reg_alloc::SpillSlot {
+                    vreg: a,
+                    offset: 0,
+                    size: 32,
+                },
+                super::super::reg_alloc::SpillSlot {
+                    vreg: b,
+                    offset: 16,
+                    size: 32,
+                }, // overlaps [0,32) and [16,48)
             ],
             callee_saved_used: Vec::new(),
         };
         // Intervals overlap: both live from instr 0 to instr 5
         let intervals = vec![
-            LiveInterval { vreg: a, kind: VRegKind::Vec, width: SimdWidth::W256, def_point: 0, last_use: 5, lifecycle: LifecycleTag::BodyLocal },
-            LiveInterval { vreg: b, kind: VRegKind::Vec, width: SimdWidth::W256, def_point: 1, last_use: 5, lifecycle: LifecycleTag::BodyLocal },
+            LiveInterval {
+                vreg: a,
+                kind: VRegKind::Vec,
+                width: SimdWidth::W256,
+                def_point: 0,
+                last_use: 5,
+                lifecycle: LifecycleTag::BodyLocal,
+            },
+            LiveInterval {
+                vreg: b,
+                kind: VRegKind::Vec,
+                width: SimdWidth::W256,
+                def_point: 1,
+                last_use: 5,
+                lifecycle: LifecycleTag::BodyLocal,
+            },
         ];
 
         // Act
         let violations = verify_spill_consistency(&prog, &alloc, &intervals);
 
         // Assert: SlotOverlap should be detected
-        let overlap = violations.iter().find(|v| matches!(v, SpillViolation::SlotOverlap { .. }));
-        assert!(overlap.is_some(), "expected SlotOverlap for overlapping spill slots, got {} violations", violations.len());
+        let overlap = violations
+            .iter()
+            .find(|v| matches!(v, SpillViolation::SlotOverlap { .. }));
+        assert!(
+            overlap.is_some(),
+            "expected SlotOverlap for overlapping spill slots, got {} violations",
+            violations.len()
+        );
     }
 
     // @trace TEST-12x59
@@ -3612,7 +4686,8 @@ mod tests {
         // F16Broadcast: block_bytes=34, elem_bytes=2
         // offset=7: 7 % 34 != 0 AND 7 % 2 != 0 → MisalignedBlock
         prog.emit(VmInstr::QuantBlockLoad {
-            dst, base,
+            dst,
+            base,
             offset: OffsetExpr::Const(7),
             unpack: BlockUnpackMode::F16Broadcast,
             width: SimdWidth::W256,
@@ -3622,8 +4697,15 @@ mod tests {
         let violations = verify_quant_offsets(&prog, &[]);
 
         // Assert: MisalignedBlock detected
-        let misaligned = violations.iter().find(|v| matches!(v, OffsetViolation::MisalignedBlock { .. }));
-        assert!(misaligned.is_some(), "expected MisalignedBlock, got {} violations: {:?}", violations.len(), violations);
+        let misaligned = violations
+            .iter()
+            .find(|v| matches!(v, OffsetViolation::MisalignedBlock { .. }));
+        assert!(
+            misaligned.is_some(),
+            "expected MisalignedBlock, got {} violations: {:?}",
+            violations.len(),
+            violations
+        );
     }
 
     // @trace TEST-12x59
@@ -3632,7 +4714,9 @@ mod tests {
         // Arrange: large Const offset that IS aligned to block_bytes
         let result = verify_offset_alignment(
             &OffsetExpr::Const(180), // 180 % 18 == 0
-            18, 0, "test",
+            18,
+            0,
+            "test",
         );
 
         // Assert: aligned offset should pass regardless of magnitude
@@ -3644,20 +4728,37 @@ mod tests {
     fn test_lifecycle_violation_all_variants_display_non_empty() {
         // Arrange: construct each LifecycleViolation variant and check Display is non-empty
         let invariant = LifecycleViolation::InvariantWritten {
-            vreg: VRegId(1), loop_begin: 0, loop_end: 10, write_pos: 5,
+            vreg: VRegId(1),
+            loop_begin: 0,
+            loop_end: 10,
+            write_pos: 5,
         };
         let carried = LifecycleViolation::CarriedMissingPhi {
-            vreg: VRegId(2), loop_begin: 0, loop_end: 10,
+            vreg: VRegId(2),
+            loop_begin: 0,
+            loop_end: 10,
         };
         let escape = LifecycleViolation::BodyLocalEscape {
-            vreg: VRegId(3), loop_begin: 0, loop_end: 10, escape_pos: 15,
+            vreg: VRegId(3),
+            loop_begin: 0,
+            loop_end: 10,
+            escape_pos: 15,
         };
 
         // Act & Assert: each Display output should be non-empty and contain VRegId
-        for (label, v) in [("InvariantWritten", &invariant), ("CarriedMissingPhi", &carried), ("BodyLocalEscape", &escape)] {
+        for (label, v) in [
+            ("InvariantWritten", &invariant),
+            ("CarriedMissingPhi", &carried),
+            ("BodyLocalEscape", &escape),
+        ] {
             let s = format!("{}", v);
             assert!(!s.is_empty(), "{} Display should not be empty", label);
-            assert!(s.contains("VRegId"), "{} Display should contain VRegId: {}", label, s);
+            assert!(
+                s.contains("VRegId"),
+                "{} Display should contain VRegId: {}",
+                label,
+                s
+            );
         }
     }
 
@@ -3670,10 +4771,12 @@ mod tests {
         prog.emit_loop(BoundExpr::Const(8), 64, |prog, _, byte_off| {
             let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
             prog.emit(VmInstr::VecLoad {
-                dst, base,
+                dst,
+                base,
                 offset: OffsetExpr::LoopOffset(byte_off),
                 width: SimdWidth::W256,
-                dtype: QuantPrecision::F32, predicate: None,
+                dtype: QuantPrecision::F32,
+                predicate: None,
             });
         });
 
@@ -3681,7 +4784,11 @@ mod tests {
         let result = verify_vm_program(&prog);
 
         // Assert: clean loop with body-local VRegs should pass all rules
-        assert!(result.is_ok(), "loop with body-local VRegs should pass: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "loop with body-local VRegs should pass: {:?}",
+            result
+        );
     }
 
     // @trace TEST-12x59
@@ -3689,17 +4796,28 @@ mod tests {
     fn test_spill_violation_all_variants_display_non_empty() {
         // Arrange: construct each SpillViolation variant and verify Display is non-empty
         let overlap = SpillViolation::SlotOverlap {
-            a_vreg: VRegId(0), a_offset: 0, a_end: 8,
-            b_vreg: VRegId(1), b_offset: 4, b_end: 12,
+            a_vreg: VRegId(0),
+            a_offset: 0,
+            a_end: 8,
+            b_vreg: VRegId(1),
+            b_offset: 4,
+            b_end: 12,
         };
         let rbw = SpillViolation::ReadBeforeWrite {
-            vreg: VRegId(2), slot_idx: 0, first_read_pos: 3, first_write_pos: 7,
+            vreg: VRegId(2),
+            slot_idx: 0,
+            first_read_pos: 3,
+            first_write_pos: 7,
         };
         let missing_store = SpillViolation::MissingSpillStore {
-            vreg: VRegId(3), slot_idx: 1, read_pos: 5,
+            vreg: VRegId(3),
+            slot_idx: 1,
+            read_pos: 5,
         };
         let missing_load = SpillViolation::MissingReloadLoad {
-            vreg: VRegId(4), slot_idx: 2, write_pos: 9,
+            vreg: VRegId(4),
+            slot_idx: 2,
+            write_pos: 9,
         };
 
         // Act & Assert: each Display output should be non-empty and mention vreg
@@ -3711,7 +4829,12 @@ mod tests {
         ] {
             let s = format!("{}", v);
             assert!(!s.is_empty(), "{} Display should not be empty", label);
-            assert!(s.contains("v"), "{} Display should contain vreg: {}", label, s);
+            assert!(
+                s.contains("v"),
+                "{} Display should contain vreg: {}",
+                label,
+                s
+            );
         }
     }
 
@@ -3724,7 +4847,9 @@ mod tests {
                 Box::new(OffsetExpr::Const(0)),
                 Box::new(OffsetExpr::Const(0)),
             ),
-            18, 0, "test",
+            18,
+            0,
+            "test",
         );
 
         // Assert: zero offsets are always aligned
@@ -3738,16 +4863,25 @@ mod tests {
         let report = VerifyReport {
             has_violations: false, // incorrectly set
             spill_violations: vec![SpillViolation::MissingSpillStore {
-                vreg: VRegId(1), slot_idx: 0, read_pos: 5,
+                vreg: VRegId(1),
+                slot_idx: 0,
+                read_pos: 5,
             }],
             offset_violations: vec![],
             lifecycle_violations: vec![],
         };
 
         // Act & Assert: total_count should reflect actual violations regardless of flag
-        assert_eq!(report.total_count(), 1, "total_count should count actual violations");
+        assert_eq!(
+            report.total_count(),
+            1,
+            "total_count should count actual violations"
+        );
         // has_violations is independently set — this test documents the behavior
-        assert!(!report.has_violations, "has_violations is independently set, not derived");
+        assert!(
+            !report.has_violations,
+            "has_violations is independently set, not derived"
+        );
     }
 
     // @trace TEST-12x59
@@ -3760,14 +4894,16 @@ mod tests {
         let dst2 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         // First: aligned (offset 0)
         prog.emit(VmInstr::QuantBlockLoad {
-            dst: dst1, base,
+            dst: dst1,
+            base,
             offset: OffsetExpr::Const(0),
             unpack: BlockUnpackMode::SignedNibbleLow, // block_bytes=18, elem_bytes=1
             width: SimdWidth::W256,
         });
         // Second: misaligned to elem_bytes (offset 5, F16Broadcast: elem_bytes=2, 5 % 2 != 0 → MisalignedBlock)
         prog.emit(VmInstr::QuantBlockLoad {
-            dst: dst2, base,
+            dst: dst2,
+            base,
             offset: OffsetExpr::Const(5),
             unpack: BlockUnpackMode::F16Broadcast, // block_bytes=34, elem_bytes=2
             width: SimdWidth::W256,
@@ -3777,9 +4913,16 @@ mod tests {
         let violations = verify_quant_offsets(&prog, &[]);
 
         // Assert: exactly one violation for the second instruction
-        assert_eq!(violations.len(), 1, "expected exactly 1 violation for misaligned second block: {:?}", violations);
-        assert!(matches!(violations[0], OffsetViolation::MisalignedBlock { .. }),
-            "violation should be MisalignedBlock");
+        assert_eq!(
+            violations.len(),
+            1,
+            "expected exactly 1 violation for misaligned second block: {:?}",
+            violations
+        );
+        assert!(
+            matches!(violations[0], OffsetViolation::MisalignedBlock { .. }),
+            "violation should be MisalignedBlock"
+        );
     }
 
     // ── Wave 12x60: 10 additional tests ────────────────────────────────────
@@ -3815,15 +4958,24 @@ mod tests {
     fn test_offset_violation_all_variants_display_non_empty() {
         // Arrange: construct each OffsetViolation variant
         let mismatch = OffsetViolation::OffsetMismatch {
-            instr_idx: 0, instr_name: "QuantBlockLoad",
-            expected_offset: 36, actual_offset: 18,
-            block_bytes: 18, elem_bytes: 1,
+            instr_idx: 0,
+            instr_name: "QuantBlockLoad",
+            expected_offset: 36,
+            actual_offset: 18,
+            block_bytes: 18,
+            elem_bytes: 1,
         };
         let misaligned = OffsetViolation::MisalignedBlock {
-            instr_idx: 3, offset: 5, block_bytes: 18, elem_bytes: 4,
+            instr_idx: 3,
+            offset: 5,
+            block_bytes: 18,
+            elem_bytes: 4,
         };
         let confusion = OffsetViolation::BlockElemConfusion {
-            instr_idx: 7, offset: 4, block_bytes: 18, elem_bytes: 1,
+            instr_idx: 7,
+            offset: 4,
+            block_bytes: 18,
+            elem_bytes: 1,
         };
 
         // Act & Assert: each Display output should be non-empty and contain instr index
@@ -3834,7 +4986,12 @@ mod tests {
         ] {
             let s = format!("{}", v);
             assert!(!s.is_empty(), "{} Display should not be empty", label);
-            assert!(s.contains("instr["), "{} Display should contain instr index: {}", label, s);
+            assert!(
+                s.contains("instr["),
+                "{} Display should contain instr index: {}",
+                label,
+                s
+            );
         }
     }
 
@@ -3848,10 +5005,22 @@ mod tests {
         // Act & Assert: both should produce equivalent clean reports
         assert_eq!(via_empty.has_violations, via_default.has_violations);
         assert_eq!(via_empty.total_count(), via_default.total_count());
-        assert_eq!(via_empty.spill_violations.len(), via_default.spill_violations.len());
-        assert_eq!(via_empty.offset_violations.len(), via_default.offset_violations.len());
-        assert_eq!(via_empty.lifecycle_violations.len(), via_default.lifecycle_violations.len());
-        assert!(!via_empty.has_violations, "empty() should have no violations");
+        assert_eq!(
+            via_empty.spill_violations.len(),
+            via_default.spill_violations.len()
+        );
+        assert_eq!(
+            via_empty.offset_violations.len(),
+            via_default.offset_violations.len()
+        );
+        assert_eq!(
+            via_empty.lifecycle_violations.len(),
+            via_default.lifecycle_violations.len()
+        );
+        assert!(
+            !via_empty.has_violations,
+            "empty() should have no violations"
+        );
         assert_eq!(via_empty.total_count(), 0, "empty() total should be 0");
     }
 
@@ -3863,11 +5032,18 @@ mod tests {
             has_violations: true,
             spill_violations: vec![
                 SpillViolation::SlotOverlap {
-                    a_vreg: VRegId(0), a_offset: 0, a_end: 16,
-                    b_vreg: VRegId(1), b_offset: 8, b_end: 24,
+                    a_vreg: VRegId(0),
+                    a_offset: 0,
+                    a_end: 16,
+                    b_vreg: VRegId(1),
+                    b_offset: 8,
+                    b_end: 24,
                 },
                 SpillViolation::ReadBeforeWrite {
-                    vreg: VRegId(2), slot_idx: 1, first_read_pos: 3, first_write_pos: 7,
+                    vreg: VRegId(2),
+                    slot_idx: 1,
+                    first_read_pos: 3,
+                    first_write_pos: 7,
                 },
             ],
             offset_violations: vec![],
@@ -3875,7 +5051,11 @@ mod tests {
         };
 
         // Act & Assert
-        assert_eq!(report.total_count(), 2, "total should count only spill violations");
+        assert_eq!(
+            report.total_count(),
+            2,
+            "total should count only spill violations"
+        );
         assert!(report.has_violations);
         assert_eq!(report.spill_violations.len(), 2);
         assert!(report.offset_violations.is_empty());
@@ -3891,22 +5071,35 @@ mod tests {
             spill_violations: vec![],
             offset_violations: vec![
                 OffsetViolation::OffsetMismatch {
-                    instr_idx: 0, instr_name: "QuantBlockLoad",
-                    expected_offset: 36, actual_offset: 18,
-                    block_bytes: 18, elem_bytes: 1,
+                    instr_idx: 0,
+                    instr_name: "QuantBlockLoad",
+                    expected_offset: 36,
+                    actual_offset: 18,
+                    block_bytes: 18,
+                    elem_bytes: 1,
                 },
                 OffsetViolation::MisalignedBlock {
-                    instr_idx: 5, offset: 7, block_bytes: 18, elem_bytes: 4,
+                    instr_idx: 5,
+                    offset: 7,
+                    block_bytes: 18,
+                    elem_bytes: 4,
                 },
                 OffsetViolation::BlockElemConfusion {
-                    instr_idx: 10, offset: 4, block_bytes: 18, elem_bytes: 1,
+                    instr_idx: 10,
+                    offset: 4,
+                    block_bytes: 18,
+                    elem_bytes: 1,
                 },
             ],
             lifecycle_violations: vec![],
         };
 
         // Act & Assert
-        assert_eq!(report.total_count(), 3, "total should count only offset violations");
+        assert_eq!(
+            report.total_count(),
+            3,
+            "total should count only offset violations"
+        );
         assert!(report.has_violations);
         assert!(report.spill_violations.is_empty());
         assert_eq!(report.offset_violations.len(), 3);
@@ -3923,16 +5116,25 @@ mod tests {
             offset_violations: vec![],
             lifecycle_violations: vec![
                 LifecycleViolation::InvariantWritten {
-                    vreg: VRegId(3), loop_begin: 0, loop_end: 10, write_pos: 5,
+                    vreg: VRegId(3),
+                    loop_begin: 0,
+                    loop_end: 10,
+                    write_pos: 5,
                 },
                 LifecycleViolation::CarriedMissingPhi {
-                    vreg: VRegId(4), loop_begin: 0, loop_end: 10,
+                    vreg: VRegId(4),
+                    loop_begin: 0,
+                    loop_end: 10,
                 },
             ],
         };
 
         // Act & Assert
-        assert_eq!(report.total_count(), 2, "total should count only lifecycle violations");
+        assert_eq!(
+            report.total_count(),
+            2,
+            "total should count only lifecycle violations"
+        );
         assert!(report.has_violations);
         assert!(report.spill_violations.is_empty());
         assert!(report.offset_violations.is_empty());
@@ -3944,13 +5146,21 @@ mod tests {
     fn test_lifecycle_violation_clone_roundtrip_all_variants() {
         // Arrange: construct each LifecycleViolation variant, clone, and verify fields
         let invariant = LifecycleViolation::InvariantWritten {
-            vreg: VRegId(15), loop_begin: 100, loop_end: 200, write_pos: 150,
+            vreg: VRegId(15),
+            loop_begin: 100,
+            loop_end: 200,
+            write_pos: 150,
         };
         let carried = LifecycleViolation::CarriedMissingPhi {
-            vreg: VRegId(25), loop_begin: 300, loop_end: 400,
+            vreg: VRegId(25),
+            loop_begin: 300,
+            loop_end: 400,
         };
         let escape = LifecycleViolation::BodyLocalEscape {
-            vreg: VRegId(35), loop_begin: 500, loop_end: 600, escape_pos: 700,
+            vreg: VRegId(35),
+            loop_begin: 500,
+            loop_end: 600,
+            escape_pos: 700,
         };
 
         // Act: clone each
@@ -3959,7 +5169,13 @@ mod tests {
         let esc_clone = escape.clone();
 
         // Assert: cloned fields match originals
-        if let LifecycleViolation::InvariantWritten { vreg, loop_begin, loop_end, write_pos } = inv_clone {
+        if let LifecycleViolation::InvariantWritten {
+            vreg,
+            loop_begin,
+            loop_end,
+            write_pos,
+        } = inv_clone
+        {
             assert_eq!(vreg, VRegId(15));
             assert_eq!(loop_begin, 100);
             assert_eq!(loop_end, 200);
@@ -3967,14 +5183,25 @@ mod tests {
         } else {
             panic!("expected InvariantWritten after clone");
         }
-        if let LifecycleViolation::CarriedMissingPhi { vreg, loop_begin, loop_end } = car_clone {
+        if let LifecycleViolation::CarriedMissingPhi {
+            vreg,
+            loop_begin,
+            loop_end,
+        } = car_clone
+        {
             assert_eq!(vreg, VRegId(25));
             assert_eq!(loop_begin, 300);
             assert_eq!(loop_end, 400);
         } else {
             panic!("expected CarriedMissingPhi after clone");
         }
-        if let LifecycleViolation::BodyLocalEscape { vreg, loop_begin, loop_end, escape_pos } = esc_clone {
+        if let LifecycleViolation::BodyLocalEscape {
+            vreg,
+            loop_begin,
+            loop_end,
+            escape_pos,
+        } = esc_clone
+        {
             assert_eq!(vreg, VRegId(35));
             assert_eq!(loop_begin, 500);
             assert_eq!(loop_end, 600);
@@ -3995,7 +5222,11 @@ mod tests {
         let result = verify_vm_program(&prog);
 
         // Assert: single DeclareVReg should pass all verification rules
-        assert!(result.is_ok(), "single DeclareVReg should pass: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "single DeclareVReg should pass: {:?}",
+            result
+        );
         assert_eq!(prog.instrs.len(), 1);
         assert!(matches!(prog.instrs[0], VmInstr::DeclareVReg { id, .. } if id == v));
     }
@@ -4005,17 +5236,28 @@ mod tests {
     fn test_spill_violation_debug_format_all_variants() {
         // Arrange: construct each SpillViolation variant and check Debug output
         let overlap = SpillViolation::SlotOverlap {
-            a_vreg: VRegId(0), a_offset: 0, a_end: 8,
-            b_vreg: VRegId(1), b_offset: 4, b_end: 12,
+            a_vreg: VRegId(0),
+            a_offset: 0,
+            a_end: 8,
+            b_vreg: VRegId(1),
+            b_offset: 4,
+            b_end: 12,
         };
         let rbw = SpillViolation::ReadBeforeWrite {
-            vreg: VRegId(2), slot_idx: 0, first_read_pos: 3, first_write_pos: 7,
+            vreg: VRegId(2),
+            slot_idx: 0,
+            first_read_pos: 3,
+            first_write_pos: 7,
         };
         let missing_store = SpillViolation::MissingSpillStore {
-            vreg: VRegId(3), slot_idx: 1, read_pos: 5,
+            vreg: VRegId(3),
+            slot_idx: 1,
+            read_pos: 5,
         };
         let missing_load = SpillViolation::MissingReloadLoad {
-            vreg: VRegId(4), slot_idx: 2, write_pos: 9,
+            vreg: VRegId(4),
+            slot_idx: 2,
+            write_pos: 9,
         };
 
         // Act & Assert: Debug format should contain the variant name
@@ -4026,7 +5268,12 @@ mod tests {
             ("MissingReloadLoad", &missing_load),
         ] {
             let s = format!("{:?}", v);
-            assert!(s.contains(label), "{} Debug should contain variant name: {}", label, s);
+            assert!(
+                s.contains(label),
+                "{} Debug should contain variant name: {}",
+                label,
+                s
+            );
         }
     }
 
@@ -4037,13 +5284,21 @@ mod tests {
         let report = VerifyReport {
             has_violations: true,
             spill_violations: vec![SpillViolation::MissingSpillStore {
-                vreg: VRegId(1), slot_idx: 0, read_pos: 5,
+                vreg: VRegId(1),
+                slot_idx: 0,
+                read_pos: 5,
             }],
             offset_violations: vec![OffsetViolation::MisalignedBlock {
-                instr_idx: 3, offset: 5, block_bytes: 18, elem_bytes: 4,
+                instr_idx: 3,
+                offset: 5,
+                block_bytes: 18,
+                elem_bytes: 4,
             }],
             lifecycle_violations: vec![LifecycleViolation::InvariantWritten {
-                vreg: VRegId(7), loop_begin: 2, loop_end: 20, write_pos: 10,
+                vreg: VRegId(7),
+                loop_begin: 2,
+                loop_end: 20,
+                write_pos: 10,
             }],
         };
 
@@ -4051,11 +5306,26 @@ mod tests {
         let s = format!("{:?}", report);
 
         // Assert: Debug should contain the field names
-        assert!(s.contains("VerifyReport"), "Debug should contain struct name: {s}");
-        assert!(s.contains("has_violations"), "Debug should contain has_violations field: {s}");
-        assert!(s.contains("spill_violations"), "Debug should contain spill_violations field: {s}");
-        assert!(s.contains("offset_violations"), "Debug should contain offset_violations field: {s}");
-        assert!(s.contains("lifecycle_violations"), "Debug should contain lifecycle_violations field: {s}");
+        assert!(
+            s.contains("VerifyReport"),
+            "Debug should contain struct name: {s}"
+        );
+        assert!(
+            s.contains("has_violations"),
+            "Debug should contain has_violations field: {s}"
+        );
+        assert!(
+            s.contains("spill_violations"),
+            "Debug should contain spill_violations field: {s}"
+        );
+        assert!(
+            s.contains("offset_violations"),
+            "Debug should contain offset_violations field: {s}"
+        );
+        assert!(
+            s.contains("lifecycle_violations"),
+            "Debug should contain lifecycle_violations field: {s}"
+        );
     }
 
     // ── Wave 12x61: 10 additional tests ────────────────────────────────────
@@ -4080,9 +5350,15 @@ mod tests {
         let result = verify_vm_program(&prog);
 
         // Assert: unmatched LoopBegin should cause failure
-        assert!(result.is_err(), "unmatched LoopBegin should fail verify_vm_program");
+        assert!(
+            result.is_err(),
+            "unmatched LoopBegin should fail verify_vm_program"
+        );
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("unmatched"), "error should mention unmatched: {err}");
+        assert!(
+            err.contains("unmatched"),
+            "error should mention unmatched: {err}"
+        );
     }
 
     // @trace TEST-12x61
@@ -4094,27 +5370,39 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let undefined_src = VRegId(99); // never declared
         prog.emit(VmInstr::VecLoad {
-            dst, base,
+            dst,
+            base,
             offset: OffsetExpr::Const(0),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32, predicate: None,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         prog.emit(VmInstr::VecStore {
             base,
             src: undefined_src,
             offset: OffsetExpr::Const(0),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32, predicate: None,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
 
         // Act
         let result = verify_vm_program(&prog);
 
         // Assert: undefined vreg in src should fail
-        assert!(result.is_err(), "use of undefined vreg in VecStore should fail");
+        assert!(
+            result.is_err(),
+            "use of undefined vreg in VecStore should fail"
+        );
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("undefined"), "error should mention undefined: {err}");
-        assert!(err.contains("VRegId(99)"), "error should reference the undefined vreg: {err}");
+        assert!(
+            err.contains("undefined"),
+            "error should mention undefined: {err}"
+        );
+        assert!(
+            err.contains("VRegId(99)"),
+            "error should reference the undefined vreg: {err}"
+        );
     }
 
     // @trace TEST-12x61
@@ -4125,7 +5413,8 @@ mod tests {
         let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::QuantBlockLoad {
-            dst, base,
+            dst,
+            base,
             offset: OffsetExpr::Const(7), // 7 % 2 != 0, misaligned to elem_bytes
             unpack: BlockUnpackMode::F16Broadcast, // elem_bytes=2
             width: SimdWidth::W256,
@@ -4135,9 +5424,15 @@ mod tests {
         let result = verify_vm_program(&prog);
 
         // Assert: misaligned quant offset should cause failure
-        assert!(result.is_err(), "misaligned quant block offset should fail verify_vm_program");
+        assert!(
+            result.is_err(),
+            "misaligned quant block offset should fail verify_vm_program"
+        );
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("not aligned"), "error should mention alignment: {err}");
+        assert!(
+            err.contains("not aligned"),
+            "error should mention alignment: {err}"
+        );
     }
 
     // @trace TEST-12x61
@@ -4159,27 +5454,42 @@ mod tests {
             }],
             bound: BoundExpr::Const(4),
         });
-        prog.emit(VmInstr::DeclareVReg { id: inner_val, kind: VRegKind::Vec, width: SimdWidth::W256 });
+        prog.emit(VmInstr::DeclareVReg {
+            id: inner_val,
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+        });
         prog.emit(VmInstr::VecLoad {
-            dst: inner_val, base,
+            dst: inner_val,
+            base,
             offset: OffsetExpr::Const(0),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32, predicate: None,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         prog.emit(VmInstr::LoopEnd);
         // Use inner_val after loop — BodyLocalEscape
         prog.emit(VmInstr::VecBinOp {
-            dst: post_dst, a: inner_val, b: inner_val,
-            op: VecOp::Add, dtype: QuantPrecision::F32,
+            dst: post_dst,
+            a: inner_val,
+            b: inner_val,
+            op: VecOp::Add,
+            dtype: QuantPrecision::F32,
         });
 
         // Act
         let result = verify_vm_program(&prog);
 
         // Assert: BodyLocalEscape should cause failure at VM level
-        assert!(result.is_err(), "BodyLocalEscape should fail verify_vm_program");
+        assert!(
+            result.is_err(),
+            "BodyLocalEscape should fail verify_vm_program"
+        );
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("lifecycle"), "error should mention lifecycle: {err}");
+        assert!(
+            err.contains("lifecycle"),
+            "error should mention lifecycle: {err}"
+        );
     }
 
     // @trace TEST-12x61
@@ -4193,7 +5503,11 @@ mod tests {
         let result = verify_vm_program(&prog);
 
         // Assert: comment-only program should pass all rules
-        assert!(result.is_ok(), "comment-only program should pass: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "comment-only program should pass: {:?}",
+            result
+        );
     }
 
     // @trace TEST-12x61
@@ -4204,8 +5518,14 @@ mod tests {
         let imm_dst = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         let other = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         let result_dst = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        prog.emit(VmInstr::GprLoadImm { dst: imm_dst, value: 42 });
-        prog.emit(VmInstr::GprLoadImm { dst: other, value: 10 });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: imm_dst,
+            value: 42,
+        });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: other,
+            value: 10,
+        });
         prog.emit(VmInstr::GprBinOp {
             dst: result_dst,
             a: imm_dst,
@@ -4217,7 +5537,11 @@ mod tests {
         let result = verify_vm_program(&prog);
 
         // Assert: properly defined GPRs should pass
-        assert!(result.is_ok(), "GprLoadImm + GprBinOp chain should pass: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "GprLoadImm + GprBinOp chain should pass: {:?}",
+            result
+        );
     }
 
     // @trace TEST-12x61
@@ -4229,18 +5553,22 @@ mod tests {
         let result: Result<(), std::convert::Infallible> = prog.emit_scope(|p| {
             let a = p.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
             p.emit(VmInstr::VecLoad {
-                dst: a, base,
+                dst: a,
+                base,
                 offset: OffsetExpr::Const(0),
                 width: SimdWidth::W256,
-                dtype: QuantPrecision::F32, predicate: None,
+                dtype: QuantPrecision::F32,
+                predicate: None,
             });
             let _: Result<(), std::convert::Infallible> = p.emit_scope(|p2| {
                 let b = p2.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
                 p2.emit(VmInstr::VecLoad {
-                    dst: b, base,
+                    dst: b,
+                    base,
                     offset: OffsetExpr::Const(32),
                     width: SimdWidth::W256,
-                    dtype: QuantPrecision::F32, predicate: None,
+                    dtype: QuantPrecision::F32,
+                    predicate: None,
                 });
                 Ok(())
             });
@@ -4252,7 +5580,11 @@ mod tests {
 
         // Assert: nested scopes with valid instructions should pass
         assert!(result.is_ok(), "emit_scope should succeed");
-        assert!(verify_result.is_ok(), "nested scopes with valid loads should pass: {:?}", verify_result);
+        assert!(
+            verify_result.is_ok(),
+            "nested scopes with valid loads should pass: {:?}",
+            verify_result
+        );
     }
 
     // @trace TEST-12x61
@@ -4271,13 +5603,17 @@ mod tests {
         prog.emit_loop(BoundExpr::Const(4), 32, |prog, _, byte_off| {
             let loaded = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
             prog.emit(VmInstr::VecLoad {
-                dst: loaded, base,
+                dst: loaded,
+                base,
                 offset: OffsetExpr::LoopOffset(byte_off),
                 width: SimdWidth::W256,
-                dtype: QuantPrecision::F32, predicate: None,
+                dtype: QuantPrecision::F32,
+                predicate: None,
             });
             prog.emit(VmInstr::VecBinOp {
-                dst: acc, a: acc, b: loaded,
+                dst: acc,
+                a: acc,
+                b: loaded,
                 op: VecOp::Add,
                 dtype: QuantPrecision::F32,
             });
@@ -4287,7 +5623,11 @@ mod tests {
         let result = verify_vm_program(&prog);
 
         // Assert: LoopCarried accumulator with proper phi should pass
-        assert!(result.is_ok(), "loop with carried accumulator should pass: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "loop with carried accumulator should pass: {:?}",
+            result
+        );
     }
 
     // @trace TEST-12x61
@@ -4297,7 +5637,11 @@ mod tests {
         let mut prog = VmProgram::new();
         let undefined_base = VRegId(77); // never declared
         let dst = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        prog.emit(VmInstr::DeclareVReg { id: dst, kind: VRegKind::Scalar, width: SimdWidth::Scalar });
+        prog.emit(VmInstr::DeclareVReg {
+            id: dst,
+            kind: VRegKind::Scalar,
+            width: SimdWidth::Scalar,
+        });
         prog.emit(VmInstr::ScalarLoad {
             dst,
             base: undefined_base,
@@ -4308,10 +5652,19 @@ mod tests {
         let result = verify_vm_program(&prog);
 
         // Assert: undefined base vreg should fail def-before-use
-        assert!(result.is_err(), "ScalarLoad with undefined base should fail");
+        assert!(
+            result.is_err(),
+            "ScalarLoad with undefined base should fail"
+        );
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("undefined"), "error should mention undefined: {err}");
-        assert!(err.contains("VRegId(77)"), "error should reference the undefined vreg: {err}");
+        assert!(
+            err.contains("undefined"),
+            "error should mention undefined: {err}"
+        );
+        assert!(
+            err.contains("VRegId(77)"),
+            "error should reference the undefined vreg: {err}"
+        );
     }
 
     // @trace TEST-12x61
@@ -4336,12 +5689,16 @@ mod tests {
             dtype: QuantPrecision::F32,
         });
         prog.emit(VmInstr::VecBinOp {
-            dst: sum, a, b,
+            dst: sum,
+            a,
+            b,
             op: VecOp::Add,
             dtype: QuantPrecision::F32,
         });
         prog.emit(VmInstr::VecBinOp {
-            dst: product, a: sum, b: a,
+            dst: product,
+            a: sum,
+            b: a,
             op: VecOp::Mul,
             dtype: QuantPrecision::F32,
         });
@@ -4350,6 +5707,10 @@ mod tests {
         let result = verify_vm_program(&prog);
 
         // Assert: properly chained operations should pass
-        assert!(result.is_ok(), "broadcast chain with VecBinOp should pass: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "broadcast chain with VecBinOp should pass: {:?}",
+            result
+        );
     }
 }

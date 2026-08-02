@@ -237,7 +237,10 @@ mod tests {
         );
 
         for &v in &out {
-            assert!(v.abs() < 1e-6, "zero-input should give zero output, got {v}");
+            assert!(
+                v.abs() < 1e-6,
+                "zero-input should give zero output, got {v}"
+            );
         }
     }
 }

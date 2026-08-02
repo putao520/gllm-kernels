@@ -66,7 +66,9 @@ pub struct PingPongLayout {
 impl BufferLayout {
     /// 根据 tensor_id 查询 scratchpad 偏移
     pub fn offset_for(&self, tid: crate::compiler::graph::TensorId) -> Option<usize> {
-        self.base.slots.iter()
+        self.base
+            .slots
+            .iter()
             .find(|s| s.tensor_id == tid)
             .map(|s| s.offset)
     }
@@ -348,12 +350,14 @@ pub fn plan_stack_blueprint(
     has_debug_probe: bool,
 ) -> StackBlueprint {
     // 计算最大 spill 需求
-    let max_spill_vec = pressure.iter()
+    let max_spill_vec = pressure
+        .iter()
         .map(|g| g.peak_vec_regs.saturating_sub(g.available_vec_regs))
         .max()
         .unwrap_or(0);
 
-    let max_spill_gpr = pressure.iter()
+    let max_spill_gpr = pressure
+        .iter()
         .map(|g| g.peak_gpr_regs.saturating_sub(g.available_gpr_regs))
         .max()
         .unwrap_or(0);
@@ -404,8 +408,12 @@ pub fn plan_stack_blueprint(
     let total_frame_bytes = (num_abi_args.min(6) * 8
         + num_callee_saves * 8
         + spill_total
-        + debug_probe_region.as_ref().map(|r| r.size_bytes).unwrap_or(0)
-        + 15) & !15; // 16-byte align
+        + debug_probe_region
+            .as_ref()
+            .map(|r| r.size_bytes)
+            .unwrap_or(0)
+        + 15)
+        & !15; // 16-byte align
 
     StackBlueprint {
         total_frame_bytes,
@@ -444,49 +452,65 @@ pub fn estimate_register_pressure(
     total_vec_regs: usize,
     total_gpr_regs: usize,
 ) -> Vec<GroupPressure> {
-    (0..num_groups).map(|gid| {
-        let op_count = ops_per_group.get(gid).copied().unwrap_or(0);
-        let is_gemm = gemm_groups.get(gid).copied().unwrap_or(false);
+    (0..num_groups)
+        .map(|gid| {
+            let op_count = ops_per_group.get(gid).copied().unwrap_or(0);
+            let is_gemm = gemm_groups.get(gid).copied().unwrap_or(false);
 
-        // 粗粒度估计: 每个 op ~2 vec regs + ~3 GPR (输入/输出/临时)
-        let inner = InnerDemand {
-            vec_regs: op_count.saturating_mul(2).max(4),
-            gpr_regs: op_count.saturating_mul(3).max(6),
-            has_gemm: is_gemm,
-        };
+            // 粗粒度估计: 每个 op ~2 vec regs + ~3 GPR (输入/输出/临时)
+            let inner = InnerDemand {
+                vec_regs: op_count.saturating_mul(2).max(4),
+                gpr_regs: op_count.saturating_mul(3).max(6),
+                has_gemm: is_gemm,
+            };
 
-        // GEMM 额外需求: 累加器 + packed panel 寄存器
-        let vec_regs = if is_gemm { inner.vec_regs + 8 } else { inner.vec_regs };
-        let gpr_regs = if is_gemm { inner.gpr_regs + 4 } else { inner.gpr_regs };
+            // GEMM 额外需求: 累加器 + packed panel 寄存器
+            let vec_regs = if is_gemm {
+                inner.vec_regs + 8
+            } else {
+                inner.vec_regs
+            };
+            let gpr_regs = if is_gemm {
+                inner.gpr_regs + 4
+            } else {
+                inner.gpr_regs
+            };
 
-        let available_vec = total_vec_regs.saturating_sub(4); // 预留 callee-save
-        let available_gpr = total_gpr_regs.saturating_sub(4);
+            let available_vec = total_vec_regs.saturating_sub(4); // 预留 callee-save
+            let available_gpr = total_gpr_regs.saturating_sub(4);
 
-        let spill_policy = if vec_regs > available_vec || gpr_regs > available_gpr {
-            SpillPolicy::FenceRequired
-        } else {
-            SpillPolicy::NoSpill
-        };
+            let spill_policy = if vec_regs > available_vec || gpr_regs > available_gpr {
+                SpillPolicy::FenceRequired
+            } else {
+                SpillPolicy::NoSpill
+            };
 
-        let suggested_blocking = if is_gemm {
-            // 简化: 从可用 vec regs 推导 blocking
-            let mr = (available_vec / 4).min(8).max(1);
-            let nr = (available_vec / 4).min(4).max(1);
-            Some(GemmBlocking { mc: mr * 4, nc: nr * 4, kc: 64, mr, nr })
-        } else {
-            None
-        };
+            let suggested_blocking = if is_gemm {
+                // 简化: 从可用 vec regs 推导 blocking
+                let mr = (available_vec / 4).min(8).max(1);
+                let nr = (available_vec / 4).min(4).max(1);
+                Some(GemmBlocking {
+                    mc: mr * 4,
+                    nc: nr * 4,
+                    kc: 64,
+                    mr,
+                    nr,
+                })
+            } else {
+                None
+            };
 
-        GroupPressure {
-            group_id: gid,
-            peak_vec_regs: vec_regs,
-            peak_gpr_regs: gpr_regs,
-            available_vec_regs: available_vec,
-            available_gpr_regs: available_gpr,
-            suggested_blocking,
-            spill_policy,
-        }
-    }).collect()
+            GroupPressure {
+                group_id: gid,
+                peak_vec_regs: vec_regs,
+                peak_gpr_regs: gpr_regs,
+                available_vec_regs: available_vec,
+                available_gpr_regs: available_gpr,
+                suggested_blocking,
+                spill_policy,
+            }
+        })
+        .collect()
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -508,7 +532,8 @@ pub fn partition_concurrency(
         return ConcurrencyPartition::single_sequence(buffer_layout, stack);
     }
 
-    let per_seq_scratchpad = buffer_layout.ping_pong
+    let per_seq_scratchpad = buffer_layout
+        .ping_pong
         .map(|pp| pp.buffer_bytes * 2)
         .unwrap_or(buffer_layout.total_bytes);
 
@@ -588,8 +613,8 @@ pub fn build_resource_plan(input: ResourcePlanInput) -> GraphResourcePlan {
     } else {
         None
     };
-    let total_bytes = input.buffer_alloc.total_bytes
-        + ping_pong.map(|pp| pp.buffer_bytes).unwrap_or(0);
+    let total_bytes =
+        input.buffer_alloc.total_bytes + ping_pong.map(|pp| pp.buffer_bytes).unwrap_or(0);
     let buffers = BufferLayout {
         base: input.buffer_alloc,
         memory_map: vec![],
@@ -624,7 +649,11 @@ pub fn build_resource_plan(input: ResourcePlanInput) -> GraphResourcePlan {
     );
 
     // Step 5: Summary
-    let bytes_saved_by_reuse = buffers.memory_map.iter().map(|r| r.size_bytes).sum::<usize>();
+    let bytes_saved_by_reuse = buffers
+        .memory_map
+        .iter()
+        .map(|r| r.size_bytes)
+        .sum::<usize>();
     let summary = ResourceSummary {
         total_scratchpad_bytes: buffers.total_bytes,
         total_stack_bytes: stack.total_frame_bytes,
@@ -665,15 +694,18 @@ pub fn plan_mega_kernel_resources(
     activation_bytes: usize,
     kv_bytes: usize,
 ) -> GraphResourcePlan {
-    let ops_per_group: Vec<usize> = plan.groups.iter()
-        .map(|g| g.ops.len())
-        .collect();
+    let ops_per_group: Vec<usize> = plan.groups.iter().map(|g| g.ops.len()).collect();
 
-    let gemm_groups: Vec<bool> = plan.groups.iter()
+    let gemm_groups: Vec<bool> = plan
+        .groups
+        .iter()
         .map(|g| {
             g.ops.iter().any(|&op_id| {
                 graph.op(op_id).is_some_and(|op| {
-                    matches!(op.op_resolved(graph), Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_)))
+                    matches!(
+                        op.op_resolved(graph),
+                        Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_))
+                    )
                 })
             })
         })
@@ -706,7 +738,10 @@ pub fn plan_mega_kernel_resources(
 /// 分析图中哪些值在层循环中不变：
 /// - RoPE cos/sin 表 (所有层共享)
 /// - 模型配置常量 (hidden_dim, num_heads)
-fn derive_loop_invariants_from_graph(graph: &CompilerGraph, hidden_dim: usize) -> Vec<LoopInvariant> {
+fn derive_loop_invariants_from_graph(
+    graph: &CompilerGraph,
+    hidden_dim: usize,
+) -> Vec<LoopInvariant> {
     let mut invariants = Vec::new();
 
     // Single-pass: collect invariants directly from op kinds
@@ -750,13 +785,15 @@ fn derive_loop_invariants_from_graph(graph: &CompilerGraph, hidden_dim: usize) -
 impl GraphResourcePlan {
     /// 查询指定融合组的建议 GEMM blocking 策略。
     pub fn gemm_blocking_for_group(&self, group_id: usize) -> Option<&GemmBlocking> {
-        self.pressure.get(group_id)
+        self.pressure
+            .get(group_id)
             .and_then(|g| g.suggested_blocking.as_ref())
     }
 
     /// 查询指定融合组是否需要 spill fence。
     pub fn group_needs_spill(&self, group_id: usize) -> bool {
-        self.pressure.get(group_id)
+        self.pressure
+            .get(group_id)
             .map(|g| g.spill_policy == SpillPolicy::FenceRequired)
             .unwrap_or(false)
     }
@@ -769,7 +806,11 @@ impl GraphResourcePlan {
     /// 总 scratchpad 内存（含 ping-pong 双 buffer）。
     pub fn total_scratchpad_with_pingpong(&self) -> usize {
         self.buffers.total_bytes
-            + self.buffers.ping_pong.map(|pp| pp.buffer_bytes).unwrap_or(0)
+            + self
+                .buffers
+                .ping_pong
+                .map(|pp| pp.buffer_bytes)
+                .unwrap_or(0)
     }
 }
 
@@ -830,14 +871,19 @@ mod tests {
 
         assert!(plan.loop_invariant_by_index(0).is_some());
         assert!(plan.loop_invariant_by_index(1).is_none());
-        assert_eq!(plan.loop_invariant_by_index(0).unwrap().computation, InvariantComputation::LoadAbiArg(0));
+        assert_eq!(
+            plan.loop_invariant_by_index(0).unwrap().computation,
+            InvariantComputation::LoadAbiArg(0)
+        );
     }
 
     #[test]
     fn test_plan_mega_kernel_resources_from_graph() {
-        use crate::compiler::graph::{CompilerGraph, Op, GemmSpec, QuantGemmSpec, RopeSpec, SymDim};
-        use crate::compiler::fusion::FusionPlan;
         use crate::compiler::codegen::vm::isa_profile::IsaProfile;
+        use crate::compiler::fusion::FusionPlan;
+        use crate::compiler::graph::{
+            CompilerGraph, GemmSpec, Op, QuantGemmSpec, RopeSpec, SymDim,
+        };
         use crate::dispatch::device_profile::DeviceProfile;
         use crate::types::DType;
 
@@ -853,33 +899,69 @@ mod tests {
         let q_out = graph.add_tensor_concrete("q_out", &[1, hidden], DType::F32);
         let rope_out = graph.add_tensor_concrete("rope_out", &[1, hidden], DType::F32);
 
-        let embed = graph.add_op(Op::Gather { table_rows: 32000, embed_dim: hidden, index_dim: SymDim::Concrete(1).clone(), indices_kind: crate::compiler::graph::GatherIndicesKind::default().clone(), scale: None },
-            vec![ids_tok, embed_w], vec![embed_out], "embed",
+        let embed = graph.add_op(
+            Op::Gather {
+                table_rows: 32000,
+                embed_dim: hidden,
+                index_dim: SymDim::Concrete(1).clone(),
+                indices_kind: crate::compiler::graph::GatherIndicesKind::default().clone(),
+                scale: None,
+            },
+            vec![ids_tok, embed_w],
+            vec![embed_out],
+            "embed",
         );
-        let q_proj = graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: hidden, k: hidden, dtype: crate::types::DType::F32, trans_b: true, has_bias: false }),
-            vec![embed_out, q_w], vec![q_out], "q_proj",
+        let q_proj = graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: hidden,
+                k: hidden,
+                dtype: crate::types::DType::F32,
+                trans_b: true,
+                has_bias: false,
+            }),
+            vec![embed_out, q_w],
+            vec![q_out],
+            "q_proj",
         );
-        let rope = graph.add_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }),
-            vec![q_out], vec![rope_out], "rope",
+        let rope = graph.add_op(
+            Op::RoPE(RopeSpec {
+                num_heads: 8,
+                head_dim: 64,
+                theta: 10000.0,
+                partial: 1.0,
+                rope_scaling: None,
+            }),
+            vec![q_out],
+            vec![rope_out],
+            "rope",
         );
 
         let plan = FusionPlan {
             groups: vec![
                 crate::compiler::fusion::FusionGroup {
-                    id: 0, anchor: embed, epilogue: vec![],
+                    id: 0,
+                    anchor: embed,
+                    epilogue: vec![],
                     mode: crate::compiler::fusion::FusionMode::Standalone,
-                    ops: vec![embed], multi_output: Default::default(), dominant_dtype: None,
+                    ops: vec![embed],
+                    multi_output: Default::default(),
+                    dominant_dtype: None,
                     marker: GroupMarker::None,
                     is_layer_group: false,
-            hetero_layer_type: None,
+                    hetero_layer_type: None,
                 },
                 crate::compiler::fusion::FusionGroup {
-                    id: 1, anchor: q_proj, epilogue: vec![rope],
+                    id: 1,
+                    anchor: q_proj,
+                    epilogue: vec![rope],
                     mode: crate::compiler::fusion::FusionMode::EpilogueInjection,
-                    ops: vec![q_proj, rope], multi_output: Default::default(), dominant_dtype: None,
+                    ops: vec![q_proj, rope],
+                    multi_output: Default::default(),
+                    dominant_dtype: None,
                     marker: GroupMarker::None,
                     is_layer_group: false,
-            hetero_layer_type: None,
+                    hetero_layer_type: None,
                 },
             ],
             op_to_group: [(embed, 0), (q_proj, 1), (rope, 1)].into_iter().collect(),
@@ -890,8 +972,13 @@ mod tests {
         let kv_bytes = 512 * 2;
 
         let resource_plan = plan_mega_kernel_resources(
-            &graph, &plan, &profile, &alloc,
-            hidden, activation_bytes, kv_bytes,
+            &graph,
+            &plan,
+            &profile,
+            &alloc,
+            hidden,
+            activation_bytes,
+            kv_bytes,
         );
 
         assert_eq!(resource_plan.summary.num_layers, 2);
@@ -905,13 +992,20 @@ mod tests {
         assert!(!resource_plan.gemm_blocking_for_group(0).is_some());
         assert!(resource_plan.gemm_blocking_for_group(1).is_some());
 
-        let has_rope = resource_plan.loop_invariants.iter()
+        let has_rope = resource_plan
+            .loop_invariants
+            .iter()
             .any(|inv| matches!(inv.kind, InvariantKind::RopeTablePtr));
         assert!(has_rope, "RoPE op should produce RopeTablePtr invariant");
 
-        let has_hidden = resource_plan.loop_invariants.iter()
+        let has_hidden = resource_plan
+            .loop_invariants
+            .iter()
             .any(|inv| matches!(inv.kind, InvariantKind::ModelConfig { .. }));
-        assert!(has_hidden, "hidden_dim should produce ModelConfig invariant");
+        assert!(
+            has_hidden,
+            "hidden_dim should produce ModelConfig invariant"
+        );
     }
 
     #[test]
@@ -1059,8 +1153,17 @@ mod data_structure_tests {
         let pack = InvariantKind::PackMapBase;
 
         assert!(matches!(rope, InvariantKind::RopeTablePtr));
-        assert!(matches!(norm, InvariantKind::NormGammaPtr { layer_stride: 512 }));
-        assert!(matches!(config, InvariantKind::ModelConfig { name: _, value: 768 }));
+        assert!(matches!(
+            norm,
+            InvariantKind::NormGammaPtr { layer_stride: 512 }
+        ));
+        assert!(matches!(
+            config,
+            InvariantKind::ModelConfig {
+                name: _,
+                value: 768
+            }
+        ));
         assert!(matches!(pack, InvariantKind::PackMapBase));
     }
 
@@ -1082,12 +1185,24 @@ mod data_structure_tests {
         let inv = LoopInvariant {
             kind: InvariantKind::NormGammaPtr { layer_stride: 1024 },
             location: InvariantLocation::Gpr(12),
-            computation: InvariantComputation::PtrArithmetic { base: 2, stride: 1024 },
+            computation: InvariantComputation::PtrArithmetic {
+                base: 2,
+                stride: 1024,
+            },
         };
 
-        assert!(matches!(inv.kind, InvariantKind::NormGammaPtr { layer_stride: 1024 }));
+        assert!(matches!(
+            inv.kind,
+            InvariantKind::NormGammaPtr { layer_stride: 1024 }
+        ));
         assert!(matches!(inv.location, InvariantLocation::Gpr(12)));
-        assert_eq!(inv.computation, InvariantComputation::PtrArithmetic { base: 2, stride: 1024 });
+        assert_eq!(
+            inv.computation,
+            InvariantComputation::PtrArithmetic {
+                base: 2,
+                stride: 1024
+            }
+        );
     }
 
     // ── 6. InvariantLocation ──────────────────────────────────────────
@@ -1107,20 +1222,41 @@ mod data_structure_tests {
     fn invariant_computation_all_variants_and_equality() {
         let load_abi = InvariantComputation::LoadAbiArg(3);
         let load_imm = InvariantComputation::LoadImm(42);
-        let ptr_arith = InvariantComputation::PtrArithmetic { base: 1, stride: 256 };
+        let ptr_arith = InvariantComputation::PtrArithmetic {
+            base: 1,
+            stride: 256,
+        };
 
         assert_eq!(load_abi, InvariantComputation::LoadAbiArg(3));
         assert_ne!(load_abi, InvariantComputation::LoadAbiArg(2));
         assert_eq!(load_imm, InvariantComputation::LoadImm(42));
-        assert_eq!(ptr_arith, InvariantComputation::PtrArithmetic { base: 1, stride: 256 });
-        assert_ne!(ptr_arith, InvariantComputation::PtrArithmetic { base: 1, stride: 128 });
+        assert_eq!(
+            ptr_arith,
+            InvariantComputation::PtrArithmetic {
+                base: 1,
+                stride: 256
+            }
+        );
+        assert_ne!(
+            ptr_arith,
+            InvariantComputation::PtrArithmetic {
+                base: 1,
+                stride: 128
+            }
+        );
     }
 
     // ── 8. GroupPressure ──────────────────────────────────────────────
 
     #[test]
     fn group_pressure_construction_all_fields() {
-        let blocking = GemmBlocking { mr: 4, nr: 4, mc: 16, nc: 16, kc: 64 };
+        let blocking = GemmBlocking {
+            mr: 4,
+            nr: 4,
+            mc: 16,
+            nc: 16,
+            kc: 64,
+        };
         let gp = GroupPressure {
             group_id: 2,
             peak_vec_regs: 20,
@@ -1150,9 +1286,10 @@ mod data_structure_tests {
             abi_arg_slots: [Some(-8), Some(-16), None, None, None, None],
             callee_save_slots: vec![(3u8, -56), (12u8, -64)],
             spill_base_rbp_off: -72,
-            spill_slots: vec![
-                SpillSlot { rbp_offset: -136, size_bytes: 64 },
-            ],
+            spill_slots: vec![SpillSlot {
+                rbp_offset: -136,
+                size_bytes: 64,
+            }],
             mxcsr_rsp_off: 0,
             debug_probe_region: None,
         };
@@ -1211,8 +1348,14 @@ mod data_structure_tests {
             callee_save_slots: vec![],
             spill_base_rbp_off: -48,
             spill_slots: vec![
-                SpillSlot { rbp_offset: -112, size_bytes: 64 },
-                SpillSlot { rbp_offset: -176, size_bytes: 64 },
+                SpillSlot {
+                    rbp_offset: -112,
+                    size_bytes: 64,
+                },
+                SpillSlot {
+                    rbp_offset: -176,
+                    size_bytes: 64,
+                },
             ],
             mxcsr_rsp_off: 0,
             debug_probe_region: None,
@@ -1225,7 +1368,10 @@ mod data_structure_tests {
         assert_eq!(partition.per_sequence.kv_cache_region.offset, 0);
         assert_eq!(partition.per_sequence.kv_cache_region.size_bytes, 0);
         assert_eq!(partition.per_sequence.seq_offset_map.activation_offset, 0);
-        assert!(matches!(partition.shared.weight_ptr, InvariantLocation::Gpr(0)));
+        assert!(matches!(
+            partition.shared.weight_ptr,
+            InvariantLocation::Gpr(0)
+        ));
         assert!(partition.shared.constants.is_empty());
         assert!(partition.shared.global_counters.is_empty());
     }
@@ -1331,15 +1477,15 @@ mod data_structure_tests {
 
     #[test]
     fn estimate_pressure_gemm_group_has_suggested_blocking() {
-        let result = estimate_register_pressure(
-            2,
-            &[3, 4],
-            &[false, true],
-            32,
-            16,
+        let result = estimate_register_pressure(2, &[3, 4], &[false, true], 32, 16);
+        assert!(
+            result[0].suggested_blocking.is_none(),
+            "non-GEMM group should have no blocking"
         );
-        assert!(result[0].suggested_blocking.is_none(), "non-GEMM group should have no blocking");
-        assert!(result[1].suggested_blocking.is_some(), "GEMM group should have blocking");
+        assert!(
+            result[1].suggested_blocking.is_some(),
+            "GEMM group should have blocking"
+        );
         let blocking = result[1].suggested_blocking.as_ref().unwrap();
         assert!(blocking.mr > 0);
         assert!(blocking.nr > 0);
@@ -1351,14 +1497,12 @@ mod data_structure_tests {
     #[test]
     fn estimate_pressure_detects_spill_fence_when_oversubscribed() {
         // 10 ops => 20 vec regs min + 8 GEMM = 28; total_vec=16 => available=12
-        let result = estimate_register_pressure(
-            1,
-            &[10],
-            &[true],
-            16,
-            8,
+        let result = estimate_register_pressure(1, &[10], &[true], 16, 8);
+        assert_eq!(
+            result[0].spill_policy,
+            SpillPolicy::FenceRequired,
+            "oversubscribed group should need spill fence"
         );
-        assert_eq!(result[0].spill_policy, SpillPolicy::FenceRequired, "oversubscribed group should need spill fence");
     }
 
     // ── 20. plan_stack_blueprint — no args, no debug probe ────────────
@@ -1370,7 +1514,11 @@ mod data_structure_tests {
         assert!(bp.callee_save_slots.is_empty());
         assert!(bp.spill_slots.is_empty());
         assert!(bp.debug_probe_region.is_none());
-        assert_eq!(bp.total_frame_bytes % 16, 0, "frame should be 16-byte aligned");
+        assert_eq!(
+            bp.total_frame_bytes % 16,
+            0,
+            "frame should be 16-byte aligned"
+        );
     }
 
     // ── 21. plan_stack_blueprint — with debug probe ───────────────────
@@ -1435,7 +1583,10 @@ mod data_structure_tests {
 
         assert_eq!(partition.per_sequence.seq_offset_map.activation_offset, 0);
         assert_eq!(partition.per_sequence.seq_offset_map.kv_cache_offset, 4096);
-        assert_eq!(partition.per_sequence.seq_offset_map.temp_buffer_offset, 4096 + 8192);
+        assert_eq!(
+            partition.per_sequence.seq_offset_map.temp_buffer_offset,
+            4096 + 8192
+        );
         assert_eq!(partition.per_sequence.kv_cache_region.offset, 4096);
         assert_eq!(partition.per_sequence.kv_cache_region.size_bytes, 8192);
     }
@@ -1510,7 +1661,10 @@ mod data_structure_tests {
             kv_bytes: 4096,
         });
 
-        assert!(plan.buffers.ping_pong.is_none(), "batch>1 should not have ping-pong");
+        assert!(
+            plan.buffers.ping_pong.is_none(),
+            "batch>1 should not have ping-pong"
+        );
         assert_eq!(plan.summary.batch_size, 4);
     }
 
@@ -1557,10 +1711,22 @@ mod data_structure_tests {
 
     #[test]
     fn invariant_computation_ptr_arithmetic_equality() {
-        let a = InvariantComputation::PtrArithmetic { base: 3, stride: 512 };
-        let b = InvariantComputation::PtrArithmetic { base: 3, stride: 512 };
-        let c = InvariantComputation::PtrArithmetic { base: 3, stride: 256 };
-        let d = InvariantComputation::PtrArithmetic { base: 1, stride: 512 };
+        let a = InvariantComputation::PtrArithmetic {
+            base: 3,
+            stride: 512,
+        };
+        let b = InvariantComputation::PtrArithmetic {
+            base: 3,
+            stride: 512,
+        };
+        let c = InvariantComputation::PtrArithmetic {
+            base: 3,
+            stride: 256,
+        };
+        let d = InvariantComputation::PtrArithmetic {
+            base: 1,
+            stride: 512,
+        };
 
         assert_eq!(a, b);
         assert_ne!(a, c);
@@ -1602,7 +1768,11 @@ mod data_structure_tests {
         assert_eq!(vec_spill_count, 20, "should have 20 ZMM spill slots");
         assert_eq!(gpr_spill_count, 4, "should have 4 GPR spill slots");
         assert!(bp.total_frame_bytes > 0);
-        assert_eq!(bp.total_frame_bytes % 16, 0, "frame must be 16-byte aligned");
+        assert_eq!(
+            bp.total_frame_bytes % 16,
+            0,
+            "frame must be 16-byte aligned"
+        );
     }
 
     // ── 31. estimate_register_pressure — asymmetric groups ────────────
@@ -1610,13 +1780,7 @@ mod data_structure_tests {
     #[test]
     fn estimate_pressure_asymmetric_groups_correct_peak() {
         // Arrange: 3 groups with different sizes and GEMM flags
-        let result = estimate_register_pressure(
-            3,
-            &[1, 8, 3],
-            &[false, true, false],
-            32,
-            16,
-        );
+        let result = estimate_register_pressure(3, &[1, 8, 3], &[false, true, false], 32, 16);
 
         // Assert: group 0 has 1 op → max(2,4)=4 vec; group 1 has 8 ops + GEMM → max(16,4)+8=24 vec
         assert_eq!(result.len(), 3);
@@ -1656,7 +1820,10 @@ mod data_structure_tests {
 
         // Assert: without ping_pong, per_seq_scratchpad = total_bytes (not buffer_bytes*2)
         assert_eq!(partition.per_sequence.scratchpad_bytes_per_seq, 4096);
-        assert_eq!(partition.per_sequence.seq_offset_map.temp_buffer_offset, 2048 + 4096);
+        assert_eq!(
+            partition.per_sequence.seq_offset_map.temp_buffer_offset,
+            2048 + 4096
+        );
     }
 
     // ── 33. build_resource_plan — summary aggregates multiple invariants ─
@@ -1671,7 +1838,10 @@ mod data_structure_tests {
                 computation: InvariantComputation::LoadAbiArg(0),
             },
             LoopInvariant {
-                kind: InvariantKind::ModelConfig { name: "hidden_dim".into(), value: 768 },
+                kind: InvariantKind::ModelConfig {
+                    name: "hidden_dim".into(),
+                    value: 768,
+                },
                 location: InvariantLocation::Stack(-264),
                 computation: InvariantComputation::LoadImm(768),
             },
@@ -1714,12 +1884,14 @@ mod data_structure_tests {
 
     #[test]
     fn plan_mega_kernel_quant_gemm_produces_pack_map_invariant() {
-        use crate::compiler::graph::{CompilerGraph, Op, GemmSpec, QuantGemmSpec, RopeSpec, SymDim};
-        use crate::compiler::fusion::{FusionGroup, FusionMode, GroupMarker};
         use crate::compiler::codegen::vm::isa_profile::IsaProfile;
+        use crate::compiler::fusion::{FusionGroup, FusionMode, GroupMarker};
+        use crate::compiler::graph::{
+            CompilerGraph, GemmSpec, Op, QuantGemmSpec, RopeSpec, SymDim,
+        };
         use crate::dispatch::device_profile::DeviceProfile;
-        use crate::types::DType;
         use crate::quant::QuantType;
+        use crate::types::DType;
 
         let profile = IsaProfile::from_device_profile(&DeviceProfile::detect());
 
@@ -1730,7 +1902,13 @@ mod data_structure_tests {
         let q_weight = graph.add_tensor_concrete("q_weight", &[hidden, hidden], DType::F32);
         let q_out = graph.add_tensor_concrete("q_out", &[1, hidden], DType::F32);
 
-        let qgemm = graph.add_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: hidden, k: hidden, quant_type: QuantType::Q4K }),
+        let qgemm = graph.add_op(
+            Op::QuantGemm(QuantGemmSpec {
+                m: SymDim::Concrete(1),
+                n: hidden,
+                k: hidden,
+                quant_type: QuantType::Q4K,
+            }),
             vec![input_t, q_weight],
             vec![q_out],
             "qgemm",
@@ -1747,7 +1925,7 @@ mod data_structure_tests {
                 dominant_dtype: None,
                 marker: GroupMarker::None,
                 is_layer_group: false,
-            hetero_layer_type: None,
+                hetero_layer_type: None,
             }],
             op_to_group: [(qgemm, 0)].into_iter().collect(),
         };
@@ -1755,24 +1933,33 @@ mod data_structure_tests {
         let alloc = BufferAllocation::default();
 
         // Act
-        let rp = plan_mega_kernel_resources(
-            &graph, &plan, &profile, &alloc,
-            hidden, 2048, 4096,
-        );
+        let rp = plan_mega_kernel_resources(&graph, &plan, &profile, &alloc, hidden, 2048, 4096);
 
         // Assert: QuantGemm should produce PackMapBase invariant (and always hidden_dim ModelConfig)
-        let has_pack_map = rp.loop_invariants.iter()
+        let has_pack_map = rp
+            .loop_invariants
+            .iter()
             .any(|inv| matches!(inv.kind, InvariantKind::PackMapBase));
-        assert!(has_pack_map, "QuantGemm graph should produce PackMapBase invariant");
+        assert!(
+            has_pack_map,
+            "QuantGemm graph should produce PackMapBase invariant"
+        );
 
-        let has_hidden = rp.loop_invariants.iter()
+        let has_hidden = rp
+            .loop_invariants
+            .iter()
             .any(|inv| matches!(inv.kind, InvariantKind::ModelConfig { .. }));
         assert!(has_hidden);
 
         // No RoPE in graph, so no RopeTablePtr
-        let has_rope = rp.loop_invariants.iter()
+        let has_rope = rp
+            .loop_invariants
+            .iter()
             .any(|inv| matches!(inv.kind, InvariantKind::RopeTablePtr));
-        assert!(!has_rope, "graph without RoPE should not produce RopeTablePtr");
+        assert!(
+            !has_rope,
+            "graph without RoPE should not produce RopeTablePtr"
+        );
     }
 
     // ── 35. group_needs_spill returns true for oversubscribed group ──
@@ -1797,7 +1984,10 @@ mod data_structure_tests {
         });
 
         // Act & Assert
-        assert!(plan.group_needs_spill(0), "oversubscribed group should need spill");
+        assert!(
+            plan.group_needs_spill(0),
+            "oversubscribed group should need spill"
+        );
     }
 
     // ── 36. plan_stack_blueprint — callee save slots positioned correctly ─
@@ -1854,13 +2044,7 @@ mod data_structure_tests {
     #[test]
     fn estimate_pressure_groups_exceed_ops_slice_get_defaults() {
         // Arrange: 3 groups declared but only 1 entry in ops_per_group and gemm_groups
-        let result = estimate_register_pressure(
-            3,
-            &[5],
-            &[true],
-            32,
-            16,
-        );
+        let result = estimate_register_pressure(3, &[5], &[true], 32, 16);
 
         // Assert: group 0 gets ops=5 + GEMM; groups 1,2 get ops=0 (default), no GEMM
         assert_eq!(result.len(), 3);
@@ -1881,9 +2065,11 @@ mod data_structure_tests {
 
     #[test]
     fn derive_invariants_gather_produces_pack_map_base() {
-        use crate::compiler::graph::{CompilerGraph, Op, GemmSpec, QuantGemmSpec, RopeSpec, SymDim};
         use crate::compiler::codegen::vm::isa_profile::IsaProfile;
         use crate::compiler::fusion::{FusionGroup, FusionMode, GroupMarker};
+        use crate::compiler::graph::{
+            CompilerGraph, GemmSpec, Op, QuantGemmSpec, RopeSpec, SymDim,
+        };
         use crate::dispatch::device_profile::DeviceProfile;
         use crate::types::DType;
 
@@ -1896,7 +2082,14 @@ mod data_structure_tests {
         let embed_w = graph.add_tensor_concrete("embed_w", &[32000, hidden], DType::F32);
         let embed_out = graph.add_tensor_concrete("embed_out", &[1, hidden], DType::F32);
 
-        let gather = graph.add_op(Op::Gather { table_rows: 32000, embed_dim: hidden, index_dim: SymDim::Concrete(1).clone(), indices_kind: crate::compiler::graph::GatherIndicesKind::default().clone(), scale: None },
+        let gather = graph.add_op(
+            Op::Gather {
+                table_rows: 32000,
+                embed_dim: hidden,
+                index_dim: SymDim::Concrete(1).clone(),
+                indices_kind: crate::compiler::graph::GatherIndicesKind::default().clone(),
+                scale: None,
+            },
             vec![ids, embed_w],
             vec![embed_out],
             "embed",
@@ -1913,28 +2106,44 @@ mod data_structure_tests {
                 dominant_dtype: None,
                 marker: GroupMarker::None,
                 is_layer_group: false,
-            hetero_layer_type: None,
+                hetero_layer_type: None,
             }],
             op_to_group: [(gather, 0)].into_iter().collect(),
         };
 
         // Act
         let rp = plan_mega_kernel_resources(
-            &graph, &fusion_plan, &profile,
+            &graph,
+            &fusion_plan,
+            &profile,
             &BufferAllocation::default(),
-            hidden, 1024, 2048,
+            hidden,
+            1024,
+            2048,
         );
 
         // Assert: Gather produces PackMapBase; no RoPE → no RopeTablePtr
-        let has_pack = rp.loop_invariants.iter()
+        let has_pack = rp
+            .loop_invariants
+            .iter()
             .any(|inv| matches!(inv.kind, InvariantKind::PackMapBase));
-        assert!(has_pack, "Gather graph should produce PackMapBase invariant");
+        assert!(
+            has_pack,
+            "Gather graph should produce PackMapBase invariant"
+        );
 
-        let has_rope = rp.loop_invariants.iter()
+        let has_rope = rp
+            .loop_invariants
+            .iter()
             .any(|inv| matches!(inv.kind, InvariantKind::RopeTablePtr));
-        assert!(!has_rope, "Gather-only graph should not produce RopeTablePtr");
+        assert!(
+            !has_rope,
+            "Gather-only graph should not produce RopeTablePtr"
+        );
 
-        let has_hidden = rp.loop_invariants.iter()
+        let has_hidden = rp
+            .loop_invariants
+            .iter()
             .any(|inv| matches!(inv.kind, InvariantKind::ModelConfig { .. }));
         assert!(has_hidden);
     }
@@ -1961,19 +2170,21 @@ mod data_structure_tests {
     #[test]
     fn estimate_pressure_all_gemm_groups_get_blocking() {
         // Arrange: 4 groups, all GEMM
-        let result = estimate_register_pressure(
-            4,
-            &[2, 3, 4, 5],
-            &[true, true, true, true],
-            32,
-            16,
-        );
+        let result =
+            estimate_register_pressure(4, &[2, 3, 4, 5], &[true, true, true, true], 32, 16);
 
         // Assert: every group has suggested_blocking
         assert_eq!(result.len(), 4);
         for gp in &result {
-            assert!(gp.suggested_blocking.is_some(), "GEMM group {} should have blocking", gp.group_id);
-            assert!(gp.peak_vec_regs >= 12, "GEMM group adds +8 vec regs on top of base");
+            assert!(
+                gp.suggested_blocking.is_some(),
+                "GEMM group {} should have blocking",
+                gp.group_id
+            );
+            assert!(
+                gp.peak_vec_regs >= 12,
+                "GEMM group adds +8 vec regs on top of base"
+            );
         }
     }
 
@@ -2002,16 +2213,21 @@ mod data_structure_tests {
         assert!(plan.stack.debug_probe_region.is_some());
         let probe = plan.stack.debug_probe_region.unwrap();
         assert_eq!(probe.size_bytes, 4096);
-        assert!(plan.stack.total_frame_bytes >= 4096, "frame must include debug probe bytes");
+        assert!(
+            plan.stack.total_frame_bytes >= 4096,
+            "frame must include debug probe bytes"
+        );
     }
 
     // ── 43. plan_mega_kernel_resources — graph with RoPE + Gather produces all three invariant types ─
 
     #[test]
     fn plan_mega_kernel_rope_and_gather_produces_all_invariant_types() {
-        use crate::compiler::graph::{CompilerGraph, Op, GemmSpec, QuantGemmSpec, RopeSpec, SymDim};
-        use crate::compiler::fusion::{FusionGroup, FusionMode, GroupMarker};
         use crate::compiler::codegen::vm::isa_profile::IsaProfile;
+        use crate::compiler::fusion::{FusionGroup, FusionMode, GroupMarker};
+        use crate::compiler::graph::{
+            CompilerGraph, GemmSpec, Op, QuantGemmSpec, RopeSpec, SymDim,
+        };
         use crate::dispatch::device_profile::DeviceProfile;
         use crate::types::DType;
 
@@ -2026,12 +2242,26 @@ mod data_structure_tests {
         let q_out = graph.add_tensor_concrete("q_out", &[1, hidden], DType::F32);
         let rope_out = graph.add_tensor_concrete("rope_out", &[1, hidden], DType::F32);
 
-        let gather = graph.add_op(Op::Gather { table_rows: 32000, embed_dim: hidden, index_dim: SymDim::Concrete(1).clone(), indices_kind: crate::compiler::graph::GatherIndicesKind::default().clone(), scale: None },
+        let gather = graph.add_op(
+            Op::Gather {
+                table_rows: 32000,
+                embed_dim: hidden,
+                index_dim: SymDim::Concrete(1).clone(),
+                indices_kind: crate::compiler::graph::GatherIndicesKind::default().clone(),
+                scale: None,
+            },
             vec![ids, embed_w],
             vec![embed_out],
             "embed",
         );
-        let rope = graph.add_op(Op::RoPE(RopeSpec { num_heads: 4, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }),
+        let rope = graph.add_op(
+            Op::RoPE(RopeSpec {
+                num_heads: 4,
+                head_dim: 64,
+                theta: 10000.0,
+                partial: 1.0,
+                rope_scaling: None,
+            }),
             vec![q_out],
             vec![rope_out],
             "rope",
@@ -2048,30 +2278,46 @@ mod data_structure_tests {
                 dominant_dtype: None,
                 marker: GroupMarker::None,
                 is_layer_group: false,
-            hetero_layer_type: None,
+                hetero_layer_type: None,
             }],
             op_to_group: [(gather, 0), (rope, 0)].into_iter().collect(),
         };
 
         // Act
         let rp = plan_mega_kernel_resources(
-            &graph, &fusion_plan, &profile,
+            &graph,
+            &fusion_plan,
+            &profile,
             &BufferAllocation::default(),
-            hidden, 1024, 2048,
+            hidden,
+            1024,
+            2048,
         );
 
         // Assert: all three invariant types present
-        let has_rope = rp.loop_invariants.iter()
+        let has_rope = rp
+            .loop_invariants
+            .iter()
             .any(|inv| matches!(inv.kind, InvariantKind::RopeTablePtr));
-        let has_pack = rp.loop_invariants.iter()
+        let has_pack = rp
+            .loop_invariants
+            .iter()
             .any(|inv| matches!(inv.kind, InvariantKind::PackMapBase));
-        let has_hidden = rp.loop_invariants.iter()
+        let has_hidden = rp
+            .loop_invariants
+            .iter()
             .any(|inv| matches!(inv.kind, InvariantKind::ModelConfig { .. }));
 
         assert!(has_rope, "graph with RoPE should produce RopeTablePtr");
         assert!(has_pack, "graph with Gather should produce PackMapBase");
-        assert!(has_hidden, "graph always produces ModelConfig for hidden_dim");
-        assert!(rp.loop_invariants.len() >= 3, "should have at least 3 invariants");
+        assert!(
+            has_hidden,
+            "graph always produces ModelConfig for hidden_dim"
+        );
+        assert!(
+            rp.loop_invariants.len() >= 3,
+            "should have at least 3 invariants"
+        );
     }
 
     // ── 44. partition_concurrency — batch=0 delegates to single_sequence ──
@@ -2101,7 +2347,10 @@ mod data_structure_tests {
         // Assert: same as single_sequence (kv_cache_region is empty)
         assert_eq!(partition.per_sequence.scratchpad_bytes_per_seq, 2048);
         assert_eq!(partition.per_sequence.kv_cache_region.size_bytes, 0);
-        assert!(matches!(partition.shared.weight_ptr, InvariantLocation::Gpr(0)));
+        assert!(matches!(
+            partition.shared.weight_ptr,
+            InvariantLocation::Gpr(0)
+        ));
     }
 
     // ── 45. plan_stack_blueprint — spill slots are laid out sequentially downward ──
@@ -2123,10 +2372,14 @@ mod data_structure_tests {
         let bp = plan_stack_blueprint(&pressure, 2, 2, false);
 
         // Assert: 14 vec spills + 6 gpr spills
-        let vec_slots: Vec<_> = bp.spill_slots.iter()
+        let vec_slots: Vec<_> = bp
+            .spill_slots
+            .iter()
             .filter(|s| s.size_bytes == 64)
             .collect();
-        let gpr_slots: Vec<_> = bp.spill_slots.iter()
+        let gpr_slots: Vec<_> = bp
+            .spill_slots
+            .iter()
             .filter(|s| s.size_bytes == 8)
             .collect();
         assert_eq!(vec_slots.len(), 14);
@@ -2134,21 +2387,28 @@ mod data_structure_tests {
 
         // All spill slots must be below (more negative than) spill_base_rbp_off
         for slot in &bp.spill_slots {
-            assert!(slot.rbp_offset < bp.spill_base_rbp_off,
+            assert!(
+                slot.rbp_offset < bp.spill_base_rbp_off,
                 "spill slot at {} must be below spill base {}",
-                slot.rbp_offset, bp.spill_base_rbp_off);
+                slot.rbp_offset,
+                bp.spill_base_rbp_off
+            );
         }
 
         // Vec spill slots are strictly decreasing in rbp_offset
         for i in 1..vec_slots.len() {
-            assert!(vec_slots[i].rbp_offset < vec_slots[i - 1].rbp_offset,
-                "vec spill slots should be decreasing");
+            assert!(
+                vec_slots[i].rbp_offset < vec_slots[i - 1].rbp_offset,
+                "vec spill slots should be decreasing"
+            );
         }
 
         // GPR spill slots are strictly decreasing in rbp_offset
         for i in 1..gpr_slots.len() {
-            assert!(gpr_slots[i].rbp_offset < gpr_slots[i - 1].rbp_offset,
-                "gpr spill slots should be decreasing");
+            assert!(
+                gpr_slots[i].rbp_offset < gpr_slots[i - 1].rbp_offset,
+                "gpr spill slots should be decreasing"
+            );
         }
     }
 
@@ -2175,7 +2435,10 @@ mod data_structure_tests {
 
         // Assert: no ping_pong, so total_scratchpad_with_pingpong == buffers.total_bytes
         assert!(plan.buffers.ping_pong.is_none());
-        assert_eq!(plan.total_scratchpad_with_pingpong(), plan.buffers.total_bytes);
+        assert_eq!(
+            plan.total_scratchpad_with_pingpong(),
+            plan.buffers.total_bytes
+        );
     }
 
     // ── 47. estimate_register_pressure — single group, zero ops, no GEMM ──
@@ -2190,7 +2453,11 @@ mod data_structure_tests {
         assert_eq!(result[0].peak_vec_regs, 4);
         assert_eq!(result[0].peak_gpr_regs, 6);
         assert!(result[0].suggested_blocking.is_none());
-        assert_eq!(result[0].spill_policy, SpillPolicy::NoSpill, "minimum defaults should not trigger spill");
+        assert_eq!(
+            result[0].spill_policy,
+            SpillPolicy::NoSpill,
+            "minimum defaults should not trigger spill"
+        );
     }
 
     // ── 48. build_resource_plan — loop_invariant_by_index returns correct kinds ──
@@ -2205,14 +2472,20 @@ mod data_structure_tests {
                 computation: InvariantComputation::LoadAbiArg(0),
             },
             LoopInvariant {
-                kind: InvariantKind::ModelConfig { name: "num_heads".into(), value: 32 },
+                kind: InvariantKind::ModelConfig {
+                    name: "num_heads".into(),
+                    value: 32,
+                },
                 location: InvariantLocation::Stack(-264),
                 computation: InvariantComputation::LoadImm(32),
             },
             LoopInvariant {
                 kind: InvariantKind::NormGammaPtr { layer_stride: 4096 },
                 location: InvariantLocation::Gpr(10),
-                computation: InvariantComputation::PtrArithmetic { base: 3, stride: 4096 },
+                computation: InvariantComputation::PtrArithmetic {
+                    base: 3,
+                    stride: 4096,
+                },
             },
             LoopInvariant {
                 kind: InvariantKind::PackMapBase,
@@ -2239,7 +2512,10 @@ mod data_structure_tests {
         });
 
         // Assert: order preserved
-        assert!(matches!(plan.loop_invariant_by_index(0).unwrap().kind, InvariantKind::RopeTablePtr));
+        assert!(matches!(
+            plan.loop_invariant_by_index(0).unwrap().kind,
+            InvariantKind::RopeTablePtr
+        ));
         let inv1_kind = &plan.loop_invariant_by_index(1).unwrap().kind;
         if let InvariantKind::ModelConfig { name, value } = inv1_kind {
             assert_eq!(name, "num_heads");
@@ -2251,7 +2527,10 @@ mod data_structure_tests {
             plan.loop_invariant_by_index(2).unwrap().kind,
             InvariantKind::NormGammaPtr { layer_stride: 4096 }
         ));
-        assert!(matches!(plan.loop_invariant_by_index(3).unwrap().kind, InvariantKind::PackMapBase));
+        assert!(matches!(
+            plan.loop_invariant_by_index(3).unwrap().kind,
+            InvariantKind::PackMapBase
+        ));
         assert!(plan.loop_invariant_by_index(4).is_none());
     }
 
@@ -2277,8 +2556,16 @@ mod data_structure_tests {
         let bp2 = plan_stack_blueprint(&[], 1, 1, false);
 
         // Assert: both configs produce 16-byte aligned frames
-        assert_eq!(bp1.total_frame_bytes % 16, 0, "config 1 frame must be 16-byte aligned");
-        assert_eq!(bp2.total_frame_bytes % 16, 0, "config 2 frame must be 16-byte aligned");
+        assert_eq!(
+            bp1.total_frame_bytes % 16,
+            0,
+            "config 1 frame must be 16-byte aligned"
+        );
+        assert_eq!(
+            bp2.total_frame_bytes % 16,
+            0,
+            "config 2 frame must be 16-byte aligned"
+        );
     }
 
     // ── 50. estimate_register_pressure — GEMM group peak includes extra GPR ──
@@ -2286,18 +2573,16 @@ mod data_structure_tests {
     #[test]
     fn estimate_pressure_gemm_group_adds_extra_gpr() {
         // Arrange: compare GEMM vs non-GEMM with same ops
-        let result = estimate_register_pressure(
-            2,
-            &[4, 4],
-            &[false, true],
-            32,
-            16,
-        );
+        let result = estimate_register_pressure(2, &[4, 4], &[false, true], 32, 16);
 
         // Assert: GEMM group needs +4 extra GPR beyond the non-GEMM baseline
         let non_gemm_gpr = result[0].peak_gpr_regs;
         let gemm_gpr = result[1].peak_gpr_regs;
-        assert_eq!(gemm_gpr, non_gemm_gpr + 4, "GEMM group should need 4 extra GPR");
+        assert_eq!(
+            gemm_gpr,
+            non_gemm_gpr + 4,
+            "GEMM group should need 4 extra GPR"
+        );
     }
 
     // ── 51. estimate_register_pressure — available regs subtract callee reserve ──
@@ -2308,8 +2593,14 @@ mod data_structure_tests {
         let result = estimate_register_pressure(1, &[2], &[false], 32, 16);
 
         // Assert
-        assert_eq!(result[0].available_vec_regs, 28, "available vec = 32 - 4 callee reserve");
-        assert_eq!(result[0].available_gpr_regs, 12, "available gpr = 16 - 4 callee reserve");
+        assert_eq!(
+            result[0].available_vec_regs, 28,
+            "available vec = 32 - 4 callee reserve"
+        );
+        assert_eq!(
+            result[0].available_gpr_regs, 12,
+            "available gpr = 16 - 4 callee reserve"
+        );
     }
 
     // ── 52. plan_stack_blueprint — no pressure means zero spill slots ──
@@ -2331,7 +2622,10 @@ mod data_structure_tests {
         let bp = plan_stack_blueprint(&pressure, 2, 2, false);
 
         // Assert: peak - available = negative → saturating_sub → 0 spill
-        assert!(bp.spill_slots.is_empty(), "no oversubscription should produce zero spill slots");
+        assert!(
+            bp.spill_slots.is_empty(),
+            "no oversubscription should produce zero spill slots"
+        );
     }
 
     // ── 53. build_resource_plan — summary peak regs from multiple groups ──
@@ -2356,8 +2650,18 @@ mod data_structure_tests {
         });
 
         // Assert: summary peak is the max across all groups
-        let max_vec = result.pressure.iter().map(|g| g.peak_vec_regs).max().unwrap();
-        let max_gpr = result.pressure.iter().map(|g| g.peak_gpr_regs).max().unwrap();
+        let max_vec = result
+            .pressure
+            .iter()
+            .map(|g| g.peak_vec_regs)
+            .max()
+            .unwrap();
+        let max_gpr = result
+            .pressure
+            .iter()
+            .map(|g| g.peak_gpr_regs)
+            .max()
+            .unwrap();
         assert_eq!(result.summary.peak_vec_regs, max_vec);
         assert_eq!(result.summary.peak_gpr_regs, max_gpr);
     }
@@ -2452,9 +2756,12 @@ mod data_structure_tests {
         // Assert: debug probe must exist and be below every spill slot
         let probe = bp.debug_probe_region.expect("should have debug probe");
         for slot in &bp.spill_slots {
-            assert!(probe.rbp_offset < slot.rbp_offset,
+            assert!(
+                probe.rbp_offset < slot.rbp_offset,
                 "probe at {} must be below spill slot at {}",
-                probe.rbp_offset, slot.rbp_offset);
+                probe.rbp_offset,
+                slot.rbp_offset
+            );
         }
     }
 
@@ -2482,7 +2789,10 @@ mod data_structure_tests {
 
         // Assert: total_bytes = buffer_alloc (0) + ping_pong (activation_bytes)
         assert!(plan.buffers.ping_pong.is_some());
-        assert_eq!(plan.buffers.ping_pong.unwrap().buffer_bytes, activation_bytes);
+        assert_eq!(
+            plan.buffers.ping_pong.unwrap().buffer_bytes,
+            activation_bytes
+        );
         assert!(plan.buffers.total_bytes >= activation_bytes);
     }
 
@@ -2496,7 +2806,11 @@ mod data_structure_tests {
         // Assert: 50 ops → 50*2=100 vec regs, 50*3=150 gpr regs (no minimum clamp needed)
         assert_eq!(result[0].peak_vec_regs, 100, "50 ops * 2 vec per op = 100");
         assert_eq!(result[0].peak_gpr_regs, 150, "50 ops * 3 gpr per op = 150");
-        assert_eq!(result[0].spill_policy, SpillPolicy::FenceRequired, "100 vec >> 28 available, needs spill");
+        assert_eq!(
+            result[0].spill_policy,
+            SpillPolicy::FenceRequired,
+            "100 vec >> 28 available, needs spill"
+        );
     }
 
     // ── 60. build_resource_plan — empty graph (zero groups, zero ops) ──
@@ -2544,7 +2858,11 @@ mod data_structure_tests {
         assert_eq!(result[0].available_gpr_regs, 4);
         assert!(result[0].suggested_blocking.is_none());
         // 4 vec <= 12 available and 6 gpr > 4 available => needs spill
-        assert_eq!(result[0].spill_policy, SpillPolicy::FenceRequired, "6 gpr > 4 available gpr => spill fence");
+        assert_eq!(
+            result[0].spill_policy,
+            SpillPolicy::FenceRequired,
+            "6 gpr > 4 available gpr => spill fence"
+        );
     }
 
     // ── 62. BufferLayout coloring — memory_map with multiple tenants ──
@@ -2567,7 +2885,11 @@ mod data_structure_tests {
         // Assert: region has 3 tenants, offset_for still checks base slots
         assert_eq!(layout.memory_map.len(), 1);
         assert_eq!(layout.memory_map[0].tenants.len(), 3);
-        assert_eq!(layout.activation_bytes(), 0, "no ping_pong => 0 activation bytes");
+        assert_eq!(
+            layout.activation_bytes(),
+            0,
+            "no ping_pong => 0 activation bytes"
+        );
     }
 
     // ── 63. concurrency partition boundary — batch=1 vs batch=2 offset divergence ──
@@ -2599,7 +2921,10 @@ mod data_structure_tests {
         assert_eq!(p1.per_sequence.kv_cache_region.size_bytes, 0);
         assert_eq!(p2.per_sequence.kv_cache_region.size_bytes, 8192);
         assert_eq!(p2.per_sequence.seq_offset_map.kv_cache_offset, 4096);
-        assert_eq!(p2.per_sequence.seq_offset_map.temp_buffer_offset, 4096 + 8192);
+        assert_eq!(
+            p2.per_sequence.seq_offset_map.temp_buffer_offset,
+            4096 + 8192
+        );
     }
 
     // ── 64. estimate_register_pressure — total regs saturating at zero ──
@@ -2612,7 +2937,11 @@ mod data_structure_tests {
         // Assert: available = 0-4 = saturating_sub => 0; peak > available => spill
         assert_eq!(result[0].available_vec_regs, 0);
         assert_eq!(result[0].available_gpr_regs, 0);
-        assert_eq!(result[0].spill_policy, SpillPolicy::FenceRequired, "any demand > 0 available => spill");
+        assert_eq!(
+            result[0].spill_policy,
+            SpillPolicy::FenceRequired,
+            "any demand > 0 available => spill"
+        );
         assert_eq!(result[0].peak_vec_regs, 4);
         assert_eq!(result[0].peak_gpr_regs, 6);
     }
@@ -2639,7 +2968,10 @@ mod data_structure_tests {
         let vec_spills = bp.spill_slots.iter().filter(|s| s.size_bytes == 64).count();
         let gpr_spills = bp.spill_slots.iter().filter(|s| s.size_bytes == 8).count();
         assert_eq!(vec_spills, 0, "vec not oversubscribed => zero vec spills");
-        assert_eq!(gpr_spills, 8, "20-12=8 gpr oversubscription => 8 gpr spills");
+        assert_eq!(
+            gpr_spills, 8,
+            "20-12=8 gpr oversubscription => 8 gpr spills"
+        );
     }
 
     // ── 66. build_resource_plan — zero activation and kv bytes ──
@@ -2699,7 +3031,10 @@ mod data_structure_tests {
         assert_eq!(partition.per_sequence.kv_cache_region.offset, 8192);
         assert_eq!(partition.per_sequence.kv_cache_region.size_bytes, 16384);
         assert_eq!(partition.per_sequence.seq_offset_map.kv_cache_offset, 8192);
-        assert_eq!(partition.per_sequence.seq_offset_map.temp_buffer_offset, 8192 + 16384);
+        assert_eq!(
+            partition.per_sequence.seq_offset_map.temp_buffer_offset,
+            8192 + 16384
+        );
     }
 
     // ── 68. plan_stack_blueprint — only vec spills, no gpr spills ──
@@ -2723,7 +3058,10 @@ mod data_structure_tests {
         // Assert: 20 vec spills (36-16=20), 0 gpr spills (6-12=0 via saturating_sub)
         let vec_spills = bp.spill_slots.iter().filter(|s| s.size_bytes == 64).count();
         let gpr_spills = bp.spill_slots.iter().filter(|s| s.size_bytes == 8).count();
-        assert_eq!(vec_spills, 20, "36-16=20 vec oversubscription => 20 ZMM spills");
+        assert_eq!(
+            vec_spills, 20,
+            "36-16=20 vec oversubscription => 20 ZMM spills"
+        );
         assert_eq!(gpr_spills, 0, "6 <= 12 => zero gpr spills");
     }
 
@@ -2735,12 +3073,18 @@ mod data_structure_tests {
         let inv1 = LoopInvariant {
             kind: InvariantKind::NormGammaPtr { layer_stride: 256 },
             location: InvariantLocation::Gpr(10),
-            computation: InvariantComputation::PtrArithmetic { base: 2, stride: 256 },
+            computation: InvariantComputation::PtrArithmetic {
+                base: 2,
+                stride: 256,
+            },
         };
         let inv2 = LoopInvariant {
             kind: InvariantKind::NormGammaPtr { layer_stride: 4096 },
             location: InvariantLocation::Gpr(11),
-            computation: InvariantComputation::PtrArithmetic { base: 2, stride: 4096 },
+            computation: InvariantComputation::PtrArithmetic {
+                base: 2,
+                stride: 4096,
+            },
         };
 
         let plan = build_resource_plan(ResourcePlanInput {
@@ -2763,11 +3107,16 @@ mod data_structure_tests {
         assert_eq!(plan.summary.num_loop_invariants, 2);
         let inv0 = plan.loop_invariant_by_index(0).unwrap();
         let inv1_ret = plan.loop_invariant_by_index(1).unwrap();
-        assert!(matches!(inv0.kind, InvariantKind::NormGammaPtr { layer_stride: 256 }));
-        assert!(matches!(inv1_ret.kind, InvariantKind::NormGammaPtr { layer_stride: 4096 }));
+        assert!(matches!(
+            inv0.kind,
+            InvariantKind::NormGammaPtr { layer_stride: 256 }
+        ));
+        assert!(matches!(
+            inv1_ret.kind,
+            InvariantKind::NormGammaPtr { layer_stride: 4096 }
+        ));
         assert_ne!(
-            inv0.computation,
-            inv1_ret.computation,
+            inv0.computation, inv1_ret.computation,
             "different strides must produce different computations"
         );
     }
@@ -2783,9 +3132,21 @@ mod data_structure_tests {
         let layout = BufferLayout {
             base: BufferAllocation {
                 slots: vec![
-                    BufferSlot { tensor_id: t0, offset: 0, size_bytes: 1024 },
-                    BufferSlot { tensor_id: t1, offset: 1024, size_bytes: 2048 },
-                    BufferSlot { tensor_id: t2, offset: 3072, size_bytes: 512 },
+                    BufferSlot {
+                        tensor_id: t0,
+                        offset: 0,
+                        size_bytes: 1024,
+                    },
+                    BufferSlot {
+                        tensor_id: t1,
+                        offset: 1024,
+                        size_bytes: 2048,
+                    },
+                    BufferSlot {
+                        tensor_id: t2,
+                        offset: 3072,
+                        size_bytes: 512,
+                    },
                 ],
                 ..BufferAllocation::default()
             },
@@ -2798,7 +3159,10 @@ mod data_structure_tests {
         assert_eq!(layout.offset_for(t0), Some(0));
         assert_eq!(layout.offset_for(t1), Some(1024));
         assert_eq!(layout.offset_for(t2), Some(3072));
-        assert!(layout.offset_for(TensorId(99)).is_none(), "unknown tensor returns None");
+        assert!(
+            layout.offset_for(TensorId(99)).is_none(),
+            "unknown tensor returns None"
+        );
     }
 
     // ── 71. PingPongLayout contiguous memory region calculation ──
@@ -2816,7 +3180,11 @@ mod data_structure_tests {
         let total_region = pp.pong_offset + pp.buffer_bytes;
         assert_eq!(total_region, 32768);
         assert_eq!(total_region, pp.buffer_bytes * 2, "two equal buffers");
-        assert_eq!(pp.pong_offset - pp.ping_offset, pp.buffer_bytes, "buffers are contiguous");
+        assert_eq!(
+            pp.pong_offset - pp.ping_offset,
+            pp.buffer_bytes,
+            "buffers are contiguous"
+        );
     }
 
     // ── 72. MemoryRegion non-overlapping offset ranges ──
@@ -2844,8 +3212,16 @@ mod data_structure_tests {
         assert_eq!(r0.offset + r0.size_bytes, 4096);
         assert_eq!(r1.offset + r1.size_bytes, 12288);
         assert_eq!(r2.offset + r2.size_bytes, 14336);
-        assert_eq!(r1.offset, r0.offset + r0.size_bytes, "r1 starts where r0 ends");
-        assert_eq!(r2.offset, r1.offset + r1.size_bytes, "r2 starts where r1 ends");
+        assert_eq!(
+            r1.offset,
+            r0.offset + r0.size_bytes,
+            "r1 starts where r0 ends"
+        );
+        assert_eq!(
+            r2.offset,
+            r1.offset + r1.size_bytes,
+            "r2 starts where r1 ends"
+        );
     }
 
     // ── 73. GroupPressure spill fence true when vec_oversubscribed but gpr_ok ──
@@ -2865,8 +3241,14 @@ mod data_structure_tests {
 
         // Assert: spill fence triggered by vec alone
         assert_eq!(gp.spill_policy, SpillPolicy::FenceRequired);
-        assert!(gp.peak_vec_regs > gp.available_vec_regs, "vec oversubscribed");
-        assert!(gp.peak_gpr_regs <= gp.available_gpr_regs, "gpr not oversubscribed");
+        assert!(
+            gp.peak_vec_regs > gp.available_vec_regs,
+            "vec oversubscribed"
+        );
+        assert!(
+            gp.peak_gpr_regs <= gp.available_gpr_regs,
+            "gpr not oversubscribed"
+        );
     }
 
     // ── 74. StackBlueprint total_frame_bytes accounts for all components ──
@@ -2890,14 +3272,19 @@ mod data_structure_tests {
         // Assert: frame must include ABI args + callee saves + spill + debug probe
         let abi_bytes = 6 * 8;
         let callee_bytes = 5 * 8;
-        let vec_spill_count = pressure[0].peak_vec_regs.saturating_sub(pressure[0].available_vec_regs);
+        let vec_spill_count = pressure[0]
+            .peak_vec_regs
+            .saturating_sub(pressure[0].available_vec_regs);
         let vec_spill_bytes = vec_spill_count * 64;
         let probe_bytes = 4096;
         let min_expected = abi_bytes + callee_bytes + vec_spill_bytes + probe_bytes;
 
-        assert!(bp.total_frame_bytes >= min_expected,
+        assert!(
+            bp.total_frame_bytes >= min_expected,
             "frame {} must cover at least {} (abi + callee + spill + probe)",
-            bp.total_frame_bytes, min_expected);
+            bp.total_frame_bytes,
+            min_expected
+        );
         assert_eq!(bp.total_frame_bytes % 16, 0, "must be 16-byte aligned");
     }
 
@@ -2918,11 +3305,26 @@ mod data_structure_tests {
             callee_save_slots: vec![],
             spill_base_rbp_off: -48,
             spill_slots: vec![
-                SpillSlot { rbp_offset: -112, size_bytes: 64 },
-                SpillSlot { rbp_offset: -176, size_bytes: 64 },
-                SpillSlot { rbp_offset: -240, size_bytes: 64 },
-                SpillSlot { rbp_offset: -248, size_bytes: 8 },
-                SpillSlot { rbp_offset: -256, size_bytes: 8 },
+                SpillSlot {
+                    rbp_offset: -112,
+                    size_bytes: 64,
+                },
+                SpillSlot {
+                    rbp_offset: -176,
+                    size_bytes: 64,
+                },
+                SpillSlot {
+                    rbp_offset: -240,
+                    size_bytes: 64,
+                },
+                SpillSlot {
+                    rbp_offset: -248,
+                    size_bytes: 8,
+                },
+                SpillSlot {
+                    rbp_offset: -256,
+                    size_bytes: 8,
+                },
             ],
             mxcsr_rsp_off: 0,
             debug_probe_region: None,
@@ -2933,7 +3335,10 @@ mod data_structure_tests {
 
         // Assert: spill_slots_per_seq matches stack.spill_slots.len()
         assert_eq!(partition.per_sequence.spill_slots_per_seq, 5);
-        assert_eq!(partition.per_sequence.spill_slots_per_seq, stack.spill_slots.len());
+        assert_eq!(
+            partition.per_sequence.spill_slots_per_seq,
+            stack.spill_slots.len()
+        );
     }
 
     // ── 76. GraphResourcePlan gemm_blocking_for_group returns correct blocking ──
@@ -2958,14 +3363,20 @@ mod data_structure_tests {
         });
 
         // Act & Assert
-        assert!(plan.gemm_blocking_for_group(0).is_none(), "group 0 is not GEMM");
+        assert!(
+            plan.gemm_blocking_for_group(0).is_none(),
+            "group 0 is not GEMM"
+        );
         let blocking = plan.gemm_blocking_for_group(1).expect("group 1 is GEMM");
         assert!(blocking.mr > 0);
         assert!(blocking.nr > 0);
         assert!(blocking.mc > 0);
         assert!(blocking.nc > 0);
         assert_eq!(blocking.kc, 64, "kc is always 64 in current implementation");
-        assert!(plan.gemm_blocking_for_group(2).is_none(), "group 2 is not GEMM");
+        assert!(
+            plan.gemm_blocking_for_group(2).is_none(),
+            "group 2 is not GEMM"
+        );
     }
 
     // ── 77. estimate_register_pressure — GEMM blocking derived from available regs ──
@@ -2976,9 +3387,18 @@ mod data_structure_tests {
         let result = estimate_register_pressure(1, &[3], &[true], 12, 8);
 
         // Assert: available_vec = 12 - 4 = 8; mr = min(8/4, 8).max(1) = 2; nr = min(8/4, 4).max(1) = 2
-        let blocking = result[0].suggested_blocking.as_ref().expect("GEMM group needs blocking");
-        assert_eq!(blocking.mr, 2, "mr = min(available/4, 8).max(1) = min(2, 8) = 2");
-        assert_eq!(blocking.nr, 2, "nr = min(available/4, 4).max(1) = min(2, 4) = 2");
+        let blocking = result[0]
+            .suggested_blocking
+            .as_ref()
+            .expect("GEMM group needs blocking");
+        assert_eq!(
+            blocking.mr, 2,
+            "mr = min(available/4, 8).max(1) = min(2, 8) = 2"
+        );
+        assert_eq!(
+            blocking.nr, 2,
+            "nr = min(available/4, 4).max(1) = min(2, 4) = 2"
+        );
         assert_eq!(blocking.mc, 8, "mc = mr * 4 = 8");
         assert_eq!(blocking.nc, 8, "nc = nr * 4 = 8");
     }
@@ -2994,7 +3414,10 @@ mod data_structure_tests {
         // Assert: register numbers are 0, 1, 2, 3
         assert_eq!(bp.callee_save_slots.len(), 4);
         for (i, &(reg, _off)) in bp.callee_save_slots.iter().enumerate() {
-            assert_eq!(reg, i as u8, "callee save register number should be sequential");
+            assert_eq!(
+                reg, i as u8,
+                "callee save register number should be sequential"
+            );
         }
 
         // Offsets are 8 bytes apart
@@ -3026,7 +3449,10 @@ mod data_structure_tests {
         });
 
         // Assert: summary.total_scratchpad_bytes == buffers.total_bytes
-        assert_eq!(plan.summary.total_scratchpad_bytes, plan.buffers.total_bytes);
+        assert_eq!(
+            plan.summary.total_scratchpad_bytes,
+            plan.buffers.total_bytes
+        );
         // And summary.total_stack_bytes == stack.total_frame_bytes
         assert_eq!(plan.summary.total_stack_bytes, plan.stack.total_frame_bytes);
     }
@@ -3039,10 +3465,23 @@ mod data_structure_tests {
         let result = estimate_register_pressure(1, &[1000], &[true], 32, 16);
 
         // Assert: 1000 ops -> 2000 vec regs + 8 GEMM = 2008; 3000 gpr + 4 GEMM = 3004
-        assert_eq!(result[0].peak_vec_regs, 2008, "1000 ops * 2 + 8 GEMM = 2008");
-        assert_eq!(result[0].peak_gpr_regs, 3004, "1000 ops * 3 + 4 GEMM = 3004");
-        assert_eq!(result[0].spill_policy, SpillPolicy::FenceRequired, "massive oversubscription requires spill");
-        assert!(result[0].suggested_blocking.is_some(), "GEMM group has blocking");
+        assert_eq!(
+            result[0].peak_vec_regs, 2008,
+            "1000 ops * 2 + 8 GEMM = 2008"
+        );
+        assert_eq!(
+            result[0].peak_gpr_regs, 3004,
+            "1000 ops * 3 + 4 GEMM = 3004"
+        );
+        assert_eq!(
+            result[0].spill_policy,
+            SpillPolicy::FenceRequired,
+            "massive oversubscription requires spill"
+        );
+        assert!(
+            result[0].suggested_blocking.is_some(),
+            "GEMM group has blocking"
+        );
     }
 
     // ── 81. plan_stack_blueprint — zero pressure produces minimal frame ──
@@ -3055,8 +3494,15 @@ mod data_structure_tests {
         // Assert: minimal frame = (2 + 2) * 8 = 32 bytes, aligned to 16
         let min_bytes = 2 * 8 + 2 * 8; // 32
         assert!(bp.total_frame_bytes >= min_bytes);
-        assert_eq!(bp.total_frame_bytes % 16, 0, "frame must be 16-byte aligned");
-        assert!(bp.spill_slots.is_empty(), "no pressure means no spill slots");
+        assert_eq!(
+            bp.total_frame_bytes % 16,
+            0,
+            "frame must be 16-byte aligned"
+        );
+        assert!(
+            bp.spill_slots.is_empty(),
+            "no pressure means no spill slots"
+        );
         assert!(bp.debug_probe_region.is_none());
     }
 
@@ -3123,10 +3569,14 @@ mod data_structure_tests {
         let bp = plan_stack_blueprint(&pressure, 2, 2, false);
 
         // Assert: vec spill slots (64-byte) have less negative offsets than gpr slots (8-byte)
-        let vec_slots: Vec<_> = bp.spill_slots.iter()
+        let vec_slots: Vec<_> = bp
+            .spill_slots
+            .iter()
             .filter(|s| s.size_bytes == 64)
             .collect();
-        let gpr_slots: Vec<_> = bp.spill_slots.iter()
+        let gpr_slots: Vec<_> = bp
+            .spill_slots
+            .iter()
             .filter(|s| s.size_bytes == 8)
             .collect();
 
@@ -3136,9 +3586,12 @@ mod data_structure_tests {
         // All vec slots should be closer to rbp (less negative) than all gpr slots
         let max_vec_offset = vec_slots.iter().map(|s| s.rbp_offset).max().unwrap();
         let min_gpr_offset = gpr_slots.iter().map(|s| s.rbp_offset).min().unwrap();
-        assert!(max_vec_offset > min_gpr_offset,
+        assert!(
+            max_vec_offset > min_gpr_offset,
             "vec spills (max offset {}) should be above gpr spills (min offset {})",
-            max_vec_offset, min_gpr_offset);
+            max_vec_offset,
+            min_gpr_offset
+        );
     }
 
     // ── 85. build_resource_plan — empty ops_per_group with non-zero num_groups ──
@@ -3240,11 +3693,17 @@ mod data_structure_tests {
             spill_policy: SpillPolicy::FenceRequired,
         }];
         let bp3 = plan_stack_blueprint(&pressure, 4, 3, false);
-        assert!(bp3.total_frame_bytes >= bp2.total_frame_bytes + 8 * 64, "8 vec spills * 64 bytes");
+        assert!(
+            bp3.total_frame_bytes >= bp2.total_frame_bytes + 8 * 64,
+            "8 vec spills * 64 bytes"
+        );
 
         // Add debug probe
         let bp4 = plan_stack_blueprint(&pressure, 4, 3, true);
-        assert!(bp4.total_frame_bytes >= bp3.total_frame_bytes + 4096, "4KB debug probe");
+        assert!(
+            bp4.total_frame_bytes >= bp3.total_frame_bytes + 4096,
+            "4KB debug probe"
+        );
     }
 
     // ── 88. ResourceSummary all fields populated from plan components ──
@@ -3259,7 +3718,10 @@ mod data_structure_tests {
                 computation: InvariantComputation::LoadAbiArg(0),
             },
             LoopInvariant {
-                kind: InvariantKind::ModelConfig { name: "hidden_dim".into(), value: 1024 },
+                kind: InvariantKind::ModelConfig {
+                    name: "hidden_dim".into(),
+                    value: 1024,
+                },
                 location: InvariantLocation::Stack(-264),
                 computation: InvariantComputation::LoadImm(1024),
             },
@@ -3309,18 +3771,15 @@ mod data_structure_tests {
         let ops_counts = [1, 5, 10, 20, 50];
         let gemm_flags = [false; 5];
 
-        let result = estimate_register_pressure(
-            5,
-            &ops_counts,
-            &gemm_flags,
-            32,
-            16,
-        );
+        let result = estimate_register_pressure(5, &ops_counts, &gemm_flags, 32, 16);
 
         // Assert: no non-GEMM group has suggested_blocking
         for (i, gp) in result.iter().enumerate() {
-            assert!(gp.suggested_blocking.is_none(),
-                "non-GEMM group {} should not have blocking", i);
+            assert!(
+                gp.suggested_blocking.is_none(),
+                "non-GEMM group {} should not have blocking",
+                i
+            );
         }
     }
 }

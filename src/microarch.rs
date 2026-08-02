@@ -19,13 +19,13 @@ pub enum MicroArch {
     Haswell,
     Broadwell,
     SkylakeClient,
-    CometLake,      // 10th gen, 14nm, AVX2 only, DDR4
-    SkylakeX,       // AVX-512 with heavy downclocking
-    CascadeLake,    // SKX derivative, same downclocking
+    CometLake,   // 10th gen, 14nm, AVX2 only, DDR4
+    SkylakeX,    // AVX-512 with heavy downclocking
+    CascadeLake, // SKX derivative, same downclocking
     IceLakeClient,
-    IceLakeServer,  // AVX-512 with mild downclocking
+    IceLakeServer, // AVX-512 with mild downclocking
     TigerLake,
-    AlderLake,      // Hybrid, P-cores only for AVX
+    AlderLake, // Hybrid, P-cores only for AVX
     RaptorLake,
     SapphireRapids, // AVX-512 no downclocking, AMX
     GraniteRapids,
@@ -33,8 +33,8 @@ pub enum MicroArch {
     // AMD Zen
     Zen2,
     Zen3,
-    Zen4,           // AVX-512 via double-pump (256-bit units)
-    Zen5,           // Native AVX-512 (512-bit units)
+    Zen4, // AVX-512 via double-pump (256-bit units)
+    Zen5, // Native AVX-512 (512-bit units)
 
     // Fallback tiers (when exact model unknown)
     GenericAvx512,
@@ -47,10 +47,13 @@ impl MicroArch {
     pub fn microkernel_geometry(self) -> (usize, usize, usize) {
         match self {
             // AVX-512 native (no downclocking penalty)
-            Self::IceLakeClient | Self::IceLakeServer |
-            Self::TigerLake | Self::SapphireRapids |
-            Self::GraniteRapids | Self::Zen5 |
-            Self::GenericAvx512 => (14, 32, 16),
+            Self::IceLakeClient
+            | Self::IceLakeServer
+            | Self::TigerLake
+            | Self::SapphireRapids
+            | Self::GraniteRapids
+            | Self::Zen5
+            | Self::GenericAvx512 => (14, 32, 16),
 
             // AVX-512 with heavy downclocking — use AVX2 geometry
             Self::SkylakeX | Self::CascadeLake => (6, 16, 8),
@@ -59,10 +62,15 @@ impl MicroArch {
             Self::Zen4 => (6, 16, 8),
 
             // AVX2
-            Self::Haswell | Self::Broadwell |
-            Self::SkylakeClient | Self::CometLake | Self::AlderLake | Self::RaptorLake |
-            Self::Zen2 | Self::Zen3 |
-            Self::GenericAvx2 => (6, 16, 8),
+            Self::Haswell
+            | Self::Broadwell
+            | Self::SkylakeClient
+            | Self::CometLake
+            | Self::AlderLake
+            | Self::RaptorLake
+            | Self::Zen2
+            | Self::Zen3
+            | Self::GenericAvx2 => (6, 16, 8),
 
             Self::Scalar => (4, 4, 1),
         }
@@ -70,11 +78,15 @@ impl MicroArch {
 
     /// Whether this arch has usable AVX-512 (no severe downclocking).
     pub fn use_avx512(self) -> bool {
-        matches!(self,
-            Self::IceLakeClient | Self::IceLakeServer |
-            Self::TigerLake | Self::SapphireRapids |
-            Self::GraniteRapids | Self::Zen5 |
-            Self::GenericAvx512
+        matches!(
+            self,
+            Self::IceLakeClient
+                | Self::IceLakeServer
+                | Self::TigerLake
+                | Self::SapphireRapids
+                | Self::GraniteRapids
+                | Self::Zen5
+                | Self::GenericAvx512
         )
     }
 
@@ -87,15 +99,25 @@ impl MicroArch {
     pub fn estimated_mem_latency_ns(self) -> u32 {
         match self {
             // DDR4 systems (~60-70ns)
-            Self::Haswell | Self::Broadwell | Self::SkylakeClient |
-            Self::CometLake | Self::SkylakeX | Self::CascadeLake |
-            Self::Zen2 | Self::Zen3 => 65,
+            Self::Haswell
+            | Self::Broadwell
+            | Self::SkylakeClient
+            | Self::CometLake
+            | Self::SkylakeX
+            | Self::CascadeLake
+            | Self::Zen2
+            | Self::Zen3 => 65,
 
             // DDR5 systems (~80-90ns)
-            Self::IceLakeClient | Self::IceLakeServer |
-            Self::TigerLake | Self::AlderLake | Self::RaptorLake |
-            Self::SapphireRapids | Self::GraniteRapids |
-            Self::Zen4 | Self::Zen5 => 85,
+            Self::IceLakeClient
+            | Self::IceLakeServer
+            | Self::TigerLake
+            | Self::AlderLake
+            | Self::RaptorLake
+            | Self::SapphireRapids
+            | Self::GraniteRapids
+            | Self::Zen4
+            | Self::Zen5 => 85,
 
             Self::GenericAvx512 => 80,
             Self::GenericAvx2 => 70,
@@ -128,10 +150,15 @@ impl MicroArch {
 
     /// Has AVX-512 VNNI (Vector Neural Network Instructions).
     pub fn has_vnni(self) -> bool {
-        matches!(self,
-            Self::IceLakeClient | Self::IceLakeServer |
-            Self::TigerLake | Self::SapphireRapids |
-            Self::GraniteRapids | Self::Zen4 | Self::Zen5
+        matches!(
+            self,
+            Self::IceLakeClient
+                | Self::IceLakeServer
+                | Self::TigerLake
+                | Self::SapphireRapids
+                | Self::GraniteRapids
+                | Self::Zen4
+                | Self::Zen5
         )
     }
 
@@ -142,9 +169,9 @@ impl MicroArch {
 
     /// Has AVX-512 BF16 instructions.
     pub fn has_bf16(self) -> bool {
-        matches!(self,
-            Self::SapphireRapids | Self::GraniteRapids |
-            Self::Zen4 | Self::Zen5
+        matches!(
+            self,
+            Self::SapphireRapids | Self::GraniteRapids | Self::Zen4 | Self::Zen5
         )
     }
 
@@ -487,9 +514,15 @@ impl KernelConfig {
         #[allow(unused_mut)]
         let mut cfg = KernelConfig {
             arch,
-            mr, nr, simd_width: simd_w,
-            kc, mc, nc,
-            l1d, l2, l3,
+            mr,
+            nr,
+            simd_width: simd_w,
+            kc,
+            mc,
+            nc,
+            l1d,
+            l2,
+            l3,
             pf_distance_b: pf_b,
             pf_distance_a: pf_a,
             pf_hint_gemv: 3, // NTA for streaming GEMV
@@ -595,15 +628,26 @@ impl std::fmt::Display for MicroArch {
 
 impl std::fmt::Display for KernelConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} | MR={} NR={} SIMD={} | KC={} MC={} NC={} | \
+        write!(
+            f,
+            "{} | MR={} NR={} SIMD={} | KC={} MC={} NC={} | \
                 L1D={}K L2={}K L3={}M | AVX512={} ZMM_DC={} | \
                 PF_B={} PF_A={} PF_GEMV_rows={}",
             self.arch,
-            self.mr, self.nr, self.simd_width,
-            self.kc, self.mc, self.nc,
-            self.l1d / 1024, self.l2 / 1024, self.l3 / (1024 * 1024),
-            self.use_avx512, self.zmm_downclocking,
-            self.pf_distance_b, self.pf_distance_a, self.pf_rows_gemv,
+            self.mr,
+            self.nr,
+            self.simd_width,
+            self.kc,
+            self.mc,
+            self.nc,
+            self.l1d / 1024,
+            self.l2 / 1024,
+            self.l3 / (1024 * 1024),
+            self.use_avx512,
+            self.zmm_downclocking,
+            self.pf_distance_b,
+            self.pf_distance_a,
+            self.pf_rows_gemv,
         )
     }
 }
@@ -642,13 +686,21 @@ mod tests {
 
         // BLIS constraint: B strip fits in L1D (≤ 7/8 of L1D)
         let b_strip = cfg.nr * cfg.kc * 4;
-        assert!(b_strip <= cfg.l1d,
-            "B strip {}B exceeds L1D {}B", b_strip, cfg.l1d);
+        assert!(
+            b_strip <= cfg.l1d,
+            "B strip {}B exceeds L1D {}B",
+            b_strip,
+            cfg.l1d
+        );
 
         // BLIS constraint: A panel fits in L2
         let a_panel = cfg.mc * cfg.kc * 4;
-        assert!(a_panel <= cfg.l2,
-            "A panel {}B exceeds L2 {}B", a_panel, cfg.l2);
+        assert!(
+            a_panel <= cfg.l2,
+            "A panel {}B exceeds L2 {}B",
+            a_panel,
+            cfg.l2
+        );
 
         // Prefetch sanity
         assert!(cfg.pf_distance_b >= 128);
@@ -688,7 +740,10 @@ mod tests {
     fn test_config_with_explicit_cache() {
         // Simulate a system with 48KB L1D, 1MB L2, 32MB L3
         let cfg = KernelConfig::from_arch_with_cache(
-            MicroArch::SapphireRapids, 48 * 1024, 1024 * 1024, 32 * 1024 * 1024,
+            MicroArch::SapphireRapids,
+            48 * 1024,
+            1024 * 1024,
+            32 * 1024 * 1024,
         );
         eprintln!("SPR config: {cfg}");
         assert_eq!(cfg.mr, 14);
@@ -699,7 +754,12 @@ mod tests {
 
         // Verify BLIS constraints
         let b_strip = cfg.nr * cfg.kc * 4;
-        assert!(b_strip <= cfg.l1d, "B strip {}B > L1D {}B", b_strip, cfg.l1d);
+        assert!(
+            b_strip <= cfg.l1d,
+            "B strip {}B > L1D {}B",
+            b_strip,
+            cfg.l1d
+        );
     }
 
     #[test]
@@ -727,8 +787,10 @@ mod tests {
         let spr = KernelConfig::from_arch(MicroArch::SapphireRapids);
         // Different microarchitectures should produce different prefetch distances
         // due to different memory latency and frequency estimates.
-        assert_ne!(hsw.pf_distance_b, spr.pf_distance_b,
-            "Haswell and SPR should have different prefetch distances");
+        assert_ne!(
+            hsw.pf_distance_b, spr.pf_distance_b,
+            "Haswell and SPR should have different prefetch distances"
+        );
     }
 
     #[test]
@@ -765,8 +827,10 @@ mod tests {
         assert!(MicroArch::GraniteRapids.has_amx());
         // Everything else: no AMX.
         for arch in [
-            MicroArch::Haswell, MicroArch::IceLakeServer,
-            MicroArch::Zen5, MicroArch::GenericAvx512,
+            MicroArch::Haswell,
+            MicroArch::IceLakeServer,
+            MicroArch::Zen5,
+            MicroArch::GenericAvx512,
         ] {
             assert!(!arch.has_amx(), "{arch:?} should not have AMX");
         }
@@ -776,17 +840,24 @@ mod tests {
     fn has_vnni_coverage() {
         // VNNI present on Ice Lake+, Tiger Lake, SPR, Granite Rapids, Zen4, Zen5.
         let with_vnni = [
-            MicroArch::IceLakeClient, MicroArch::IceLakeServer,
-            MicroArch::TigerLake, MicroArch::SapphireRapids,
-            MicroArch::GraniteRapids, MicroArch::Zen4, MicroArch::Zen5,
+            MicroArch::IceLakeClient,
+            MicroArch::IceLakeServer,
+            MicroArch::TigerLake,
+            MicroArch::SapphireRapids,
+            MicroArch::GraniteRapids,
+            MicroArch::Zen4,
+            MicroArch::Zen5,
         ];
         for arch in with_vnni {
             assert!(arch.has_vnni(), "{arch:?} should have VNNI");
         }
         // Pre-Ice-Lake Intel and early AMD lack VNNI.
         let without_vnni = [
-            MicroArch::Haswell, MicroArch::SkylakeClient,
-            MicroArch::SkylakeX, MicroArch::Zen2, MicroArch::Zen3,
+            MicroArch::Haswell,
+            MicroArch::SkylakeClient,
+            MicroArch::SkylakeX,
+            MicroArch::Zen2,
+            MicroArch::Zen3,
         ];
         for arch in without_vnni {
             assert!(!arch.has_vnni(), "{arch:?} should not have VNNI");
@@ -817,21 +888,27 @@ mod tests {
     #[test]
     fn mem_latency_ddr4_vs_ddr5() {
         // DDR4-era architectures: 65 ns.
-        let ddr4 = [
-            MicroArch::Haswell, MicroArch::SkylakeX, MicroArch::Zen2,
-        ];
+        let ddr4 = [MicroArch::Haswell, MicroArch::SkylakeX, MicroArch::Zen2];
         for arch in ddr4 {
-            assert_eq!(arch.estimated_mem_latency_ns(), 65,
-                "{arch:?} should be 65 ns DDR4");
+            assert_eq!(
+                arch.estimated_mem_latency_ns(),
+                65,
+                "{arch:?} should be 65 ns DDR4"
+            );
         }
         // DDR5-era architectures: 85 ns.
         let ddr5 = [
-            MicroArch::AlderLake, MicroArch::SapphireRapids,
-            MicroArch::Zen4, MicroArch::Zen5,
+            MicroArch::AlderLake,
+            MicroArch::SapphireRapids,
+            MicroArch::Zen4,
+            MicroArch::Zen5,
         ];
         for arch in ddr5 {
-            assert_eq!(arch.estimated_mem_latency_ns(), 85,
-                "{arch:?} should be 85 ns DDR5");
+            assert_eq!(
+                arch.estimated_mem_latency_ns(),
+                85,
+                "{arch:?} should be 85 ns DDR5"
+            );
         }
     }
 
@@ -839,11 +916,19 @@ mod tests {
     fn amx_future_extensions_always_false() {
         // AMX-COMPLEX, AMX-TRANSPOSE, AMX-FP8 are reserved for Diamond Rapids (TBD).
         for arch in [
-            MicroArch::SapphireRapids, MicroArch::GraniteRapids,
-            MicroArch::Zen5, MicroArch::Scalar,
+            MicroArch::SapphireRapids,
+            MicroArch::GraniteRapids,
+            MicroArch::Zen5,
+            MicroArch::Scalar,
         ] {
-            assert!(!arch.has_amx_complex(), "{arch:?} AMX-COMPLEX should be false");
-            assert!(!arch.has_amx_transpose(), "{arch:?} AMX-TRANSPOSE should be false");
+            assert!(
+                !arch.has_amx_complex(),
+                "{arch:?} AMX-COMPLEX should be false"
+            );
+            assert!(
+                !arch.has_amx_transpose(),
+                "{arch:?} AMX-TRANSPOSE should be false"
+            );
             assert!(!arch.has_amx_fp8(), "{arch:?} AMX-FP8 should be false");
         }
     }
@@ -852,12 +937,17 @@ mod tests {
     fn avx10_apx_sparse_mask_intersect_always_false() {
         // These features are not yet tied to any MicroArch variant.
         for arch in [
-            MicroArch::GraniteRapids, MicroArch::SapphireRapids,
-            MicroArch::Zen5, MicroArch::GenericAvx512,
+            MicroArch::GraniteRapids,
+            MicroArch::SapphireRapids,
+            MicroArch::Zen5,
+            MicroArch::GenericAvx512,
         ] {
             assert!(!arch.has_avx10_2(), "{arch:?} AVX10.2 should be false");
             assert!(!arch.has_apx(), "{arch:?} APX should be false");
-            assert!(!arch.has_sparse_mask_intersect(), "{arch:?} VP2INTERSECT should be false");
+            assert!(
+                !arch.has_sparse_mask_intersect(),
+                "{arch:?} VP2INTERSECT should be false"
+            );
         }
     }
 
@@ -874,7 +964,10 @@ mod tests {
     #[test]
     fn display_kernel_config_includes_key_fields() {
         let cfg = KernelConfig::from_arch_with_cache(
-            MicroArch::Haswell, 32 * 1024, 256 * 1024, 8 * 1024 * 1024,
+            MicroArch::Haswell,
+            32 * 1024,
+            256 * 1024,
+            8 * 1024 * 1024,
         );
         let s = cfg.to_string();
         // Must contain MR, NR, KC, MC, NC, L1D, L2, L3 values.
@@ -888,7 +981,10 @@ mod tests {
     #[test]
     fn blocking_params_roundtrip() {
         let cfg = KernelConfig::from_arch_with_cache(
-            MicroArch::SapphireRapids, 48 * 1024, 1024 * 1024, 32 * 1024 * 1024,
+            MicroArch::SapphireRapids,
+            48 * 1024,
+            1024 * 1024,
+            32 * 1024 * 1024,
         );
         let bp = cfg.blocking_params();
         assert_eq!(bp.kc, cfg.kc);
@@ -899,7 +995,10 @@ mod tests {
     #[test]
     fn nc_for_node_l3_scales_and_aligns() {
         let cfg = KernelConfig::from_arch_with_cache(
-            MicroArch::GenericAvx2, 32 * 1024, 256 * 1024, 16 * 1024 * 1024,
+            MicroArch::GenericAvx2,
+            32 * 1024,
+            256 * 1024,
+            16 * 1024 * 1024,
         );
         let nc_small = cfg.nc_for_node_l3(4 * 1024 * 1024);
         let nc_large = cfg.nc_for_node_l3(64 * 1024 * 1024);
@@ -925,18 +1024,33 @@ mod tests {
     fn estimated_freq_ghz_all_positive() {
         // Every MicroArch variant must report a positive frequency.
         let arches = [
-            MicroArch::Haswell, MicroArch::Broadwell,
-            MicroArch::SkylakeClient, MicroArch::CometLake,
-            MicroArch::SkylakeX, MicroArch::CascadeLake,
-            MicroArch::IceLakeClient, MicroArch::IceLakeServer,
-            MicroArch::TigerLake, MicroArch::AlderLake, MicroArch::RaptorLake,
-            MicroArch::SapphireRapids, MicroArch::GraniteRapids,
-            MicroArch::Zen2, MicroArch::Zen3, MicroArch::Zen4, MicroArch::Zen5,
-            MicroArch::GenericAvx512, MicroArch::GenericAvx2, MicroArch::Scalar,
+            MicroArch::Haswell,
+            MicroArch::Broadwell,
+            MicroArch::SkylakeClient,
+            MicroArch::CometLake,
+            MicroArch::SkylakeX,
+            MicroArch::CascadeLake,
+            MicroArch::IceLakeClient,
+            MicroArch::IceLakeServer,
+            MicroArch::TigerLake,
+            MicroArch::AlderLake,
+            MicroArch::RaptorLake,
+            MicroArch::SapphireRapids,
+            MicroArch::GraniteRapids,
+            MicroArch::Zen2,
+            MicroArch::Zen3,
+            MicroArch::Zen4,
+            MicroArch::Zen5,
+            MicroArch::GenericAvx512,
+            MicroArch::GenericAvx2,
+            MicroArch::Scalar,
         ];
         for arch in arches {
             let freq = arch.estimated_freq_ghz();
-            assert!(freq > 0.0, "{arch:?} frequency must be positive, got {freq}");
+            assert!(
+                freq > 0.0,
+                "{arch:?} frequency must be positive, got {freq}"
+            );
         }
     }
 
@@ -968,14 +1082,21 @@ mod tests {
     fn use_avx512_false_for_avx2_only_arches() {
         // AVX2-only architectures must not claim AVX-512 usability.
         let avx2_only = [
-            MicroArch::Haswell, MicroArch::Broadwell,
-            MicroArch::SkylakeClient, MicroArch::CometLake,
-            MicroArch::AlderLake, MicroArch::RaptorLake,
-            MicroArch::Zen2, MicroArch::Zen3,
+            MicroArch::Haswell,
+            MicroArch::Broadwell,
+            MicroArch::SkylakeClient,
+            MicroArch::CometLake,
+            MicroArch::AlderLake,
+            MicroArch::RaptorLake,
+            MicroArch::Zen2,
+            MicroArch::Zen3,
             MicroArch::GenericAvx2,
         ];
         for arch in avx2_only {
-            assert!(!arch.use_avx512(), "{arch:?} should not claim usable AVX-512");
+            assert!(
+                !arch.use_avx512(),
+                "{arch:?} should not claim usable AVX-512"
+            );
         }
     }
 
@@ -983,9 +1104,12 @@ mod tests {
     fn use_avx512_true_for_native_avx512_arches() {
         // Architectures with native AVX-512 (no downclocking) must claim it.
         let avx512_native = [
-            MicroArch::IceLakeClient, MicroArch::IceLakeServer,
-            MicroArch::TigerLake, MicroArch::SapphireRapids,
-            MicroArch::GraniteRapids, MicroArch::Zen5,
+            MicroArch::IceLakeClient,
+            MicroArch::IceLakeServer,
+            MicroArch::TigerLake,
+            MicroArch::SapphireRapids,
+            MicroArch::GraniteRapids,
+            MicroArch::Zen5,
             MicroArch::GenericAvx512,
         ];
         for arch in avx512_native {
@@ -1000,12 +1124,19 @@ mod tests {
         assert!(MicroArch::CascadeLake.zmm_downclocking());
         // All other arches: no downclocking.
         let no_dc = [
-            MicroArch::IceLakeServer, MicroArch::SapphireRapids,
-            MicroArch::Zen5, MicroArch::Haswell, MicroArch::Zen4,
-            MicroArch::GenericAvx512, MicroArch::Scalar,
+            MicroArch::IceLakeServer,
+            MicroArch::SapphireRapids,
+            MicroArch::Zen5,
+            MicroArch::Haswell,
+            MicroArch::Zen4,
+            MicroArch::GenericAvx512,
+            MicroArch::Scalar,
         ];
         for arch in no_dc {
-            assert!(!arch.zmm_downclocking(), "{arch:?} should not have ZMM downclocking");
+            assert!(
+                !arch.zmm_downclocking(),
+                "{arch:?} should not have ZMM downclocking"
+            );
         }
     }
 
@@ -1022,7 +1153,10 @@ mod tests {
     fn kernel_config_from_arch_scalar_minimum_values() {
         // Scalar arch: geometry (4,4,1), all fields should reflect minimal hardware.
         let cfg = KernelConfig::from_arch_with_cache(
-            MicroArch::Scalar, 16 * 1024, 128 * 1024, 4 * 1024 * 1024,
+            MicroArch::Scalar,
+            16 * 1024,
+            128 * 1024,
+            4 * 1024 * 1024,
         );
         assert_eq!(cfg.mr, 4);
         assert_eq!(cfg.nr, 4);
@@ -1038,7 +1172,10 @@ mod tests {
     fn kernel_config_from_arch_zen4_reflects_no_avx512_flag() {
         // Zen4 double-pump: KernelConfig.use_avx512 must be false.
         let cfg = KernelConfig::from_arch_with_cache(
-            MicroArch::Zen4, 32 * 1024, 512 * 1024, 16 * 1024 * 1024,
+            MicroArch::Zen4,
+            32 * 1024,
+            512 * 1024,
+            16 * 1024 * 1024,
         );
         assert_eq!(cfg.mr, 6);
         assert_eq!(cfg.nr, 16);
@@ -1053,14 +1190,26 @@ mod tests {
     fn display_all_microarch_variants_no_panic() {
         // Ensure Display is implemented for all variants without panic.
         let arches = [
-            MicroArch::Haswell, MicroArch::Broadwell,
-            MicroArch::SkylakeClient, MicroArch::CometLake,
-            MicroArch::SkylakeX, MicroArch::CascadeLake,
-            MicroArch::IceLakeClient, MicroArch::IceLakeServer,
-            MicroArch::TigerLake, MicroArch::AlderLake, MicroArch::RaptorLake,
-            MicroArch::SapphireRapids, MicroArch::GraniteRapids,
-            MicroArch::Zen2, MicroArch::Zen3, MicroArch::Zen4, MicroArch::Zen5,
-            MicroArch::GenericAvx512, MicroArch::GenericAvx2, MicroArch::Scalar,
+            MicroArch::Haswell,
+            MicroArch::Broadwell,
+            MicroArch::SkylakeClient,
+            MicroArch::CometLake,
+            MicroArch::SkylakeX,
+            MicroArch::CascadeLake,
+            MicroArch::IceLakeClient,
+            MicroArch::IceLakeServer,
+            MicroArch::TigerLake,
+            MicroArch::AlderLake,
+            MicroArch::RaptorLake,
+            MicroArch::SapphireRapids,
+            MicroArch::GraniteRapids,
+            MicroArch::Zen2,
+            MicroArch::Zen3,
+            MicroArch::Zen4,
+            MicroArch::Zen5,
+            MicroArch::GenericAvx512,
+            MicroArch::GenericAvx2,
+            MicroArch::Scalar,
         ];
         for arch in arches {
             let s = arch.to_string();
@@ -1081,13 +1230,19 @@ mod tests {
     fn estimated_mem_latency_consistent_within_memory_gen() {
         // All DDR4-era arches must have the same latency; all DDR5-era must match.
         // DDR4 Intel
-        assert_eq!(MicroArch::Broadwell.estimated_mem_latency_ns(),
-                   MicroArch::Haswell.estimated_mem_latency_ns());
+        assert_eq!(
+            MicroArch::Broadwell.estimated_mem_latency_ns(),
+            MicroArch::Haswell.estimated_mem_latency_ns()
+        );
         // DDR5 Intel
-        assert_eq!(MicroArch::SapphireRapids.estimated_mem_latency_ns(),
-                   MicroArch::AlderLake.estimated_mem_latency_ns());
+        assert_eq!(
+            MicroArch::SapphireRapids.estimated_mem_latency_ns(),
+            MicroArch::AlderLake.estimated_mem_latency_ns()
+        );
         // DDR5 AMD
-        assert_eq!(MicroArch::Zen5.estimated_mem_latency_ns(),
-                   MicroArch::Zen4.estimated_mem_latency_ns());
+        assert_eq!(
+            MicroArch::Zen5.estimated_mem_latency_ns(),
+            MicroArch::Zen4.estimated_mem_latency_ns()
+        );
     }
 }

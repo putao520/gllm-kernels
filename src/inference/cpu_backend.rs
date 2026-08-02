@@ -21,14 +21,14 @@
 
 use crate::compiler::{CompiledLayer, InferenceCompiler};
 use crate::cpu_kernels::CpuKernels;
-use crate::dispatch::{DeviceProfile, device_profile};
-use crate::types::{DType, InferenceError, ModelConfig};
-use crate::inference::tensor::{DeviceKind, DeviceTensor};
-use crate::inference::weights::ModelWeights;
+use crate::dispatch::{device_profile, DeviceProfile};
 #[allow(unused_imports)]
 use crate::inference::kv_cache::{KvCache, PAGE_SIZE};
+use crate::inference::tensor::{DeviceKind, DeviceTensor};
+use crate::inference::weights::ModelWeights;
 use crate::inference::InferenceBackend;
 use crate::traits::Kernels;
+use crate::types::{DType, InferenceError, ModelConfig};
 
 /// CPU inference backend.
 ///
@@ -145,7 +145,7 @@ impl InferenceBackend for CpuInferenceBackend {
         _seq_lens: &[usize],
         output: &mut DeviceTensor,
     ) -> Result<(), InferenceError> {
-// ARCH-RUST-IS-CODEGEN + NO-FALLBACK: production path delegates to JIT compiled
+        // ARCH-RUST-IS-CODEGEN + NO-FALLBACK: production path delegates to JIT compiled
         // MegaKernelFn (22-param ABI, batch_size=1 single-token). No Rust operator
         // fallback. When no `CompiledLayer` is attached, return `Err` (NO-FALLBACK).
         //
@@ -160,9 +160,7 @@ impl InferenceBackend for CpuInferenceBackend {
         // `DeviceTensor`s — it is NOT the MegaKernel weight blob. Therefore the
         // delegation requires the upstream caller to attach a precompiled layer
         // + contiguous weight blob (`with_weight_blob`).
-        if let (Some(layer), weights_addr) =
-            (self.compiled_layer.as_ref(), self.weight_blob_addr)
-        {
+        if let (Some(layer), weights_addr) = (self.compiled_layer.as_ref(), self.weight_blob_addr) {
             if weights_addr != 0 {
                 // Single-token, single-batch decode (batch_size=1, seq_len=1).
                 let batch_size = 1usize;
@@ -217,9 +215,7 @@ impl InferenceBackend for CpuInferenceBackend {
         //
         // Encoder prefill: batch_size=1, seq_len = input.num_elements() / hidden_size (>1)。
         // MegaKernelFn ABI: arg0 input, arg1 weight_blob, arg5 batch_size, arg6 seq_len。
-        if let (Some(layer), weights_addr) =
-            (self.compiled_layer.as_ref(), self.weight_blob_addr)
-        {
+        if let (Some(layer), weights_addr) = (self.compiled_layer.as_ref(), self.weight_blob_addr) {
             if weights_addr != 0 {
                 let h = self.config.hidden_size;
                 let seq_len = input.num_elements() / h; // encoder prefill seq_len > 1
@@ -463,8 +459,7 @@ impl CpuInferenceBackend {
                     for sj in 0..seq_len {
                         let mut dot = 0.0f32;
                         for d in 0..head_dim {
-                            dot += q[si * q_dim + q_off + d]
-                                 * k[sj * kv_dim + kv_off + d];
+                            dot += q[si * q_dim + q_off + d] * k[sj * kv_dim + kv_off + d];
                         }
                         scores[si * seq_len + sj] = dot * scale;
                     }
@@ -489,8 +484,7 @@ impl CpuInferenceBackend {
                     for d in 0..head_dim {
                         let mut sum = 0.0f32;
                         for sj in 0..seq_len {
-                            sum += attn_w[si * seq_len + sj]
-                                 * v[sj * kv_dim + kv_off + d];
+                            sum += attn_w[si * seq_len + sj] * v[sj * kv_dim + kv_off + d];
                         }
                         attn_out[si * q_dim + q_off + d] = sum;
                     }
@@ -499,7 +493,8 @@ impl CpuInferenceBackend {
 
             // --- 4. Output projection + residual ---
             let wo: &[f32] = unsafe { lw.wo.as_slice() };
-            self.kernels.gemm(&attn_out, wo, &mut proj, seq_len, h, q_dim);
+            self.kernels
+                .gemm(&attn_out, wo, &mut proj, seq_len, h, q_dim);
             self.kernels.vec_add(&hidden, &proj, &mut residual);
             hidden.copy_from_slice(&residual);
 
@@ -515,9 +510,11 @@ impl CpuInferenceBackend {
             // --- 6. FFN: up → GELU → down + residual ---
             let wu: &[f32] = unsafe { lw.w_up.as_slice() };
             let wd: &[f32] = unsafe { lw.w_down.as_slice() };
-            self.kernels.gemm(&normed, wu, &mut up_buf, seq_len, inter, h);
+            self.kernels
+                .gemm(&normed, wu, &mut up_buf, seq_len, inter, h);
             self.kernels.gelu(&up_buf, &mut gelu_buf);
-            self.kernels.gemm(&gelu_buf, wd, &mut down_buf, seq_len, h, inter);
+            self.kernels
+                .gemm(&gelu_buf, wd, &mut down_buf, seq_len, h, inter);
             self.kernels.vec_add(&hidden, &down_buf, &mut residual);
             hidden.copy_from_slice(&residual);
         }
@@ -591,7 +588,8 @@ impl CpuInferenceBackend {
 
             // 1. RMSNorm
             let norm_w: &[f32] = unsafe { lw.attn_norm.as_slice() };
-            self.kernels.rms_norm(&hidden, norm_w, &mut normed, self.config.norm_eps);
+            self.kernels
+                .rms_norm(&hidden, norm_w, &mut normed, self.config.norm_eps);
 
             // 2. QKV projections
             let wq: &[f32] = unsafe { lw.wq.as_slice() };
@@ -604,9 +602,15 @@ impl CpuInferenceBackend {
             // 2b. Apply QKV bias if present (Qwen has bias, Llama does not)
             if let Some(ref bias) = lw.qkv_bias {
                 let bias_slice: &[f32] = unsafe { bias.as_slice() };
-                for i in 0..q_dim { q[i] += bias_slice[i]; }
-                for i in 0..kv_dim { k[i] += bias_slice[q_dim + i]; }
-                for i in 0..kv_dim { v[i] += bias_slice[q_dim + kv_dim + i]; }
+                for i in 0..q_dim {
+                    q[i] += bias_slice[i];
+                }
+                for i in 0..kv_dim {
+                    k[i] += bias_slice[q_dim + i];
+                }
+                for i in 0..kv_dim {
+                    v[i] += bias_slice[q_dim + kv_dim + i];
+                }
             }
 
             // 3. RoPE (with partial rotary support for Phi)
@@ -624,8 +628,22 @@ impl CpuInferenceBackend {
                 cos_table[i] = angle.cos() as f32;
                 sin_table[i] = angle.sin() as f32;
             }
-            apply_rope_inplace(&mut q, &cos_table, &sin_table, self.config.num_heads, head_dim, self.config.partial_rotary_factor);
-            apply_rope_inplace(&mut k, &cos_table, &sin_table, self.config.num_kv_heads, head_dim, self.config.partial_rotary_factor);
+            apply_rope_inplace(
+                &mut q,
+                &cos_table,
+                &sin_table,
+                self.config.num_heads,
+                head_dim,
+                self.config.partial_rotary_factor,
+            );
+            apply_rope_inplace(
+                &mut k,
+                &cos_table,
+                &sin_table,
+                self.config.num_kv_heads,
+                head_dim,
+                self.config.partial_rotary_factor,
+            );
 
             // 4. Attention computation with KV cache + causal mask
             let num_heads = self.config.num_heads;
@@ -701,12 +719,8 @@ impl CpuInferenceBackend {
                         let k_val = unsafe {
                             match kv_dtype {
                                 DType::F32 => *(kp.add(byte_off) as *const f32),
-                                DType::BF16 => {
-                                    (*(kp.add(byte_off) as *const half::bf16)).to_f32()
-                                }
-                                DType::F16 => {
-                                    (*(kp.add(byte_off) as *const half::f16)).to_f32()
-                                }
+                                DType::BF16 => (*(kp.add(byte_off) as *const half::bf16)).to_f32(),
+                                DType::F16 => (*(kp.add(byte_off) as *const half::f16)).to_f32(),
                                 other => {
                                     return Err(InferenceError::Unsupported(format!(
                                         "dtype {other:?} for KV cache K read"
@@ -757,12 +771,8 @@ impl CpuInferenceBackend {
                         let v_val = unsafe {
                             match kv_dtype {
                                 DType::F32 => *(vp.add(byte_off) as *const f32),
-                                DType::BF16 => {
-                                    (*(vp.add(byte_off) as *const half::bf16)).to_f32()
-                                }
-                                DType::F16 => {
-                                    (*(vp.add(byte_off) as *const half::f16)).to_f32()
-                                }
+                                DType::BF16 => (*(vp.add(byte_off) as *const half::bf16)).to_f32(),
+                                DType::F16 => (*(vp.add(byte_off) as *const half::f16)).to_f32(),
                                 other => {
                                     return Err(InferenceError::Unsupported(format!(
                                         "dtype {other:?} for KV cache V read"
@@ -787,7 +797,8 @@ impl CpuInferenceBackend {
 
             // 7. FFN RMSNorm
             let ffn_norm_w: &[f32] = unsafe { lw.ffn_norm.as_slice() };
-            self.kernels.rms_norm(&hidden, ffn_norm_w, &mut normed, self.config.norm_eps);
+            self.kernels
+                .rms_norm(&hidden, ffn_norm_w, &mut normed, self.config.norm_eps);
 
             // 8. FFN: gate + up + activation + down
             let wg: &[f32] = unsafe { lw.w_gate.as_slice() };
@@ -808,13 +819,15 @@ impl CpuInferenceBackend {
 
         // Final RMSNorm
         let final_norm_w: &[f32] = unsafe { weights.final_norm.as_slice() };
-        self.kernels.rms_norm(&hidden, final_norm_w, &mut normed, self.config.norm_eps);
+        self.kernels
+            .rms_norm(&hidden, final_norm_w, &mut normed, self.config.norm_eps);
 
         // LM head: [1, h] @ [h, vocab_size] → [1, vocab_size]
         let lm_head_w: &[f32] = unsafe { weights.lm_head.as_slice() };
         let vocab_size = self.config.vocab_size;
         let mut logits = vec![0.0f32; vocab_size];
-        self.kernels.gemm(&normed, lm_head_w, &mut logits, 1, vocab_size, h);
+        self.kernels
+            .gemm(&normed, lm_head_w, &mut logits, 1, vocab_size, h);
 
         // Copy logits to output
         unsafe {
@@ -827,7 +840,6 @@ impl CpuInferenceBackend {
 
         Ok(())
     }
-
 
     #[cfg(test)]
     pub(crate) fn generate_reference(
@@ -858,9 +870,10 @@ impl CpuInferenceBackend {
         for (pos, &token_id) in prompt_tokens.iter().enumerate() {
             let tid = token_id as usize;
             if tid >= self.config.vocab_size {
-                return Err(InferenceError::RuntimeError(
-                    format!("token_id {tid} >= vocab_size {}", self.config.vocab_size),
-                ));
+                return Err(InferenceError::RuntimeError(format!(
+                    "token_id {tid} >= vocab_size {}",
+                    self.config.vocab_size
+                )));
             }
             let token_embed = &embedding[tid * h..(tid + 1) * h];
             let input = unsafe { DeviceTensor::from_slice(token_embed) };
@@ -868,7 +881,12 @@ impl CpuInferenceBackend {
             let positions = unsafe { DeviceTensor::from_slice(&pos_data) };
 
             self.decoder_forward_reference_impl(
-                &input, &positions, &mut kv_cache, weights, &[1], &mut logits_tensor,
+                &input,
+                &positions,
+                &mut kv_cache,
+                weights,
+                &[1],
+                &mut logits_tensor,
             )?;
         }
 
@@ -891,7 +909,12 @@ impl CpuInferenceBackend {
             let positions = unsafe { DeviceTensor::from_slice(&pos_data) };
 
             self.decoder_forward_reference_impl(
-                &input, &positions, &mut kv_cache, weights, &[1], &mut logits_tensor,
+                &input,
+                &positions,
+                &mut kv_cache,
+                weights,
+                &[1],
+                &mut logits_tensor,
             )?;
             self.sample(&logits_tensor, temperature, 0, 0.0, &mut next_token)?;
             generated.push(next_token[0]);
@@ -1072,7 +1095,12 @@ mod tests {
         let mut output = backend.alloc(cfg.vocab_size, DType::F32).unwrap();
 
         let result = backend.decoder_forward_reference_impl(
-            &input, &positions, &mut kv_cache, &weights, &[1], &mut output,
+            &input,
+            &positions,
+            &mut kv_cache,
+            &weights,
+            &[1],
+            &mut output,
         );
         assert!(result.is_ok(), "decoder_forward failed: {:?}", result.err());
         assert_eq!(output.num_elements(), cfg.vocab_size);
@@ -1091,7 +1119,14 @@ mod tests {
         let mut qk: Vec<f32> = (1..=16).map(|x| x as f32).collect();
         let original = qk.clone();
 
-        apply_rope_inplace(&mut qk, &cos, &sin, num_heads, head_dim, partial_rotary_factor);
+        apply_rope_inplace(
+            &mut qk,
+            &cos,
+            &sin,
+            num_heads,
+            head_dim,
+            partial_rotary_factor,
+        );
 
         // Head 0: rotated part (dims 0..4)
         assert!((qk[0] - (1.0 * 0.5 - 3.0 * 0.6)).abs() < 1e-5);
@@ -1235,8 +1270,7 @@ mod tests {
         // Future positions 1 and 2 must be masked out
         let k2 = vec![1.0f32; head_dim];
         let v2 = vec![3.0f32; head_dim];
-        let (w_masked, out_masked) =
-            attend(&q, &[&k0, &k1, &k2], &[&v0, &v1, &v2], 0);
+        let (w_masked, out_masked) = attend(&q, &[&k0, &k1, &k2], &[&v0, &v1, &v2], 0);
         assert!(
             (w_masked[0] - 1.0).abs() < 1e-6,
             "masked: pos 0 should get all weight, got {}",
@@ -1311,8 +1345,16 @@ mod tests {
         // --- Query at position 1 (within window, no clipping) ---
         // Window=3, pos=1: attend to [0, 1] (pos < W, so no left clipping)
         let (w1, _) = attend_sw(1, 2);
-        assert!((w1[0] - 0.5).abs() < 1e-6, "pos 1: should attend 50% to pos 0, got {}", w1[0]);
-        assert!((w1[1] - 0.5).abs() < 1e-6, "pos 1: should attend 50% to pos 1, got {}", w1[1]);
+        assert!(
+            (w1[0] - 0.5).abs() < 1e-6,
+            "pos 1: should attend 50% to pos 0, got {}",
+            w1[0]
+        );
+        assert!(
+            (w1[1] - 0.5).abs() < 1e-6,
+            "pos 1: should attend 50% to pos 1, got {}",
+            w1[1]
+        );
 
         // --- Query at position 5, cache has 6 entries (0..=5) ---
         // Window=3: attend to [3, 4, 5], positions 0, 1, 2 must be masked
@@ -1323,7 +1365,8 @@ mod tests {
             assert!(
                 w5[t] < 1e-6,
                 "pos 5 window=3: position {} should be masked, got weight {}",
-                t, w5[t]
+                t,
+                w5[t]
             );
         }
 
@@ -1332,7 +1375,8 @@ mod tests {
             assert!(
                 (w5[t] - 1.0 / 3.0).abs() < 1e-5,
                 "pos 5 window=3: position {} should get 1/3 weight, got {}",
-                t, w5[t]
+                t,
+                w5[t]
             );
         }
 
@@ -1357,7 +1401,8 @@ mod tests {
             assert!(
                 (w3[t] - 1.0 / 3.0).abs() < 1e-5,
                 "pos 3 window=3: position {} should get 1/3 weight, got {}",
-                t, w3[t]
+                t,
+                w3[t]
             );
         }
         // Output = (1/3)*1.0 + (1/3)*2.0 + (1/3)*3.0 = 2.0
@@ -1421,13 +1466,21 @@ mod tests {
         for lw in weights.layers.iter_mut() {
             unsafe {
                 let gamma: &mut [f32] = lw.attn_norm.as_mut_slice();
-                for v in gamma.iter_mut() { *v = 1.0; }
+                for v in gamma.iter_mut() {
+                    *v = 1.0;
+                }
                 let beta: &mut [f32] = lw.attn_norm_bias.as_mut_slice();
-                for v in beta.iter_mut() { *v = 0.0; }
+                for v in beta.iter_mut() {
+                    *v = 0.0;
+                }
                 let ffn_gamma: &mut [f32] = lw.ffn_norm.as_mut_slice();
-                for v in ffn_gamma.iter_mut() { *v = 1.0; }
+                for v in ffn_gamma.iter_mut() {
+                    *v = 1.0;
+                }
                 let ffn_beta: &mut [f32] = lw.ffn_norm_bias.as_mut_slice();
-                for v in ffn_beta.iter_mut() { *v = 0.0; }
+                for v in ffn_beta.iter_mut() {
+                    *v = 0.0;
+                }
                 fill_tensor_pattern(&mut lw.wq, 0.01);
                 fill_tensor_pattern(&mut lw.wk, 0.01);
                 fill_tensor_pattern(&mut lw.wv, 0.01);
@@ -1473,13 +1526,21 @@ mod tests {
         for lw in weights.layers.iter_mut() {
             unsafe {
                 let gamma: &mut [f32] = lw.attn_norm.as_mut_slice();
-                for v in gamma.iter_mut() { *v = 1.0; }
+                for v in gamma.iter_mut() {
+                    *v = 1.0;
+                }
                 let beta: &mut [f32] = lw.attn_norm_bias.as_mut_slice();
-                for v in beta.iter_mut() { *v = 0.0; }
+                for v in beta.iter_mut() {
+                    *v = 0.0;
+                }
                 let fg: &mut [f32] = lw.ffn_norm.as_mut_slice();
-                for v in fg.iter_mut() { *v = 1.0; }
+                for v in fg.iter_mut() {
+                    *v = 1.0;
+                }
                 let fb: &mut [f32] = lw.ffn_norm_bias.as_mut_slice();
-                for v in fb.iter_mut() { *v = 0.0; }
+                for v in fb.iter_mut() {
+                    *v = 0.0;
+                }
                 fill_tensor_pattern(&mut lw.wq, 0.02);
                 fill_tensor_pattern(&mut lw.wk, 0.02);
                 fill_tensor_pattern(&mut lw.wv, 0.02);
@@ -1511,12 +1572,20 @@ mod tests {
         let mask_partial = unsafe { DeviceTensor::from_slice(&partial_mask) };
         let mut out_partial = DeviceTensor::alloc_cpu(seq_len * h, DType::F32).unwrap();
         backend
-            .encoder_forward_reference_impl(&input, &positions, &mask_partial, &weights, &mut out_partial)
+            .encoder_forward_reference_impl(
+                &input,
+                &positions,
+                &mask_partial,
+                &weights,
+                &mut out_partial,
+            )
             .unwrap();
 
         let s_full: &[f32] = unsafe { out_full.as_slice() };
         let s_partial: &[f32] = unsafe { out_partial.as_slice() };
-        let diff: f32 = s_full.iter().zip(s_partial.iter())
+        let diff: f32 = s_full
+            .iter()
+            .zip(s_partial.iter())
             .map(|(a, b)| (a - b).abs())
             .sum();
         assert!(diff > 1e-6, "masking had no effect on output (diff={diff})");
@@ -1558,14 +1627,16 @@ mod tests {
             sliding_window: None,
         };
 
-        let h = cfg.hidden_size;       // 8
-        let q_dim = cfg.num_heads * cfg.head_dim;   // 8
+        let h = cfg.hidden_size; // 8
+        let q_dim = cfg.num_heads * cfg.head_dim; // 8
         let kv_dim = cfg.num_kv_heads * cfg.head_dim; // 8
         let inter = cfg.intermediate_size; // 16
 
         // Deterministic weight generator with per-matrix seed
         let weight_pattern = |size: usize, seed: usize| -> Vec<f32> {
-            (0..size).map(|i| ((i + seed) as f32 * 0.01).sin() * 0.1).collect()
+            (0..size)
+                .map(|i| ((i + seed) as f32 * 0.01).sin() * 0.1)
+                .collect()
         };
 
         let norm_w = vec![1.0f32; h];
@@ -1604,9 +1675,7 @@ mod tests {
         }
 
         // Input vector
-        let input_data: Vec<f32> = (0..h)
-            .map(|i| (i as f32 * 0.1 + 0.5).sin() * 0.5)
-            .collect();
+        let input_data: Vec<f32> = (0..h).map(|i| (i as f32 * 0.1 + 0.5).sin() * 0.5).collect();
         let input = unsafe { DeviceTensor::from_slice(&input_data) };
         let positions_data = vec![0.0f32; 1];
         let positions = unsafe { DeviceTensor::from_slice(&positions_data) };
@@ -1615,7 +1684,14 @@ mod tests {
 
         // Run the kernel path
         backend
-            .decoder_forward_reference_impl(&input, &positions, &mut kv_cache, &weights, &[1], &mut output)
+            .decoder_forward_reference_impl(
+                &input,
+                &positions,
+                &mut kv_cache,
+                &weights,
+                &[1],
+                &mut output,
+            )
             .unwrap();
         let kernel_out: Vec<f32> = unsafe { output.as_slice::<f32>() }.to_vec();
 
@@ -1641,17 +1717,14 @@ mod tests {
         };
 
         // SiLU: x / (1 + exp(-x))
-        let ref_silu = |x: &[f32]| -> Vec<f32> {
-            x.iter().map(|&v| v / (1.0 + (-v).exp())).collect()
-        };
+        let ref_silu =
+            |x: &[f32]| -> Vec<f32> { x.iter().map(|&v| v / (1.0 + (-v).exp())).collect() };
 
         // vec elementwise: a op b
-        let ref_add = |a: &[f32], b: &[f32]| -> Vec<f32> {
-            a.iter().zip(b).map(|(&x, &y)| x + y).collect()
-        };
-        let ref_mul = |a: &[f32], b: &[f32]| -> Vec<f32> {
-            a.iter().zip(b).map(|(&x, &y)| x * y).collect()
-        };
+        let ref_add =
+            |a: &[f32], b: &[f32]| -> Vec<f32> { a.iter().zip(b).map(|(&x, &y)| x + y).collect() };
+        let ref_mul =
+            |a: &[f32], b: &[f32]| -> Vec<f32> { a.iter().zip(b).map(|(&x, &y)| x * y).collect() };
 
         // Step 1: Attention RMSNorm
         let normed = ref_rms_norm(&input_data, &norm_w, cfg.norm_eps);
@@ -1754,12 +1827,22 @@ mod tests {
         let mut output = backend.alloc(cfg.vocab_size, DType::F32).unwrap();
 
         backend
-            .decoder_forward_reference_impl(&input, &positions, &mut kv_cache, &weights, &[1], &mut output)
+            .decoder_forward_reference_impl(
+                &input,
+                &positions,
+                &mut kv_cache,
+                &weights,
+                &[1],
+                &mut output,
+            )
             .unwrap();
 
         let logits: &[f32] = unsafe { output.as_slice() };
         assert_eq!(logits.len(), cfg.vocab_size);
-        assert!(logits.iter().all(|v| v.is_finite()), "logits contain non-finite values");
+        assert!(
+            logits.iter().all(|v| v.is_finite()),
+            "logits contain non-finite values"
+        );
         let first = logits[0];
         assert!(
             logits.iter().any(|&v| (v - first).abs() > 1e-8),
@@ -1810,7 +1893,10 @@ mod tests {
                 }
             }
             unsafe {
-                weights.final_norm.as_mut_slice::<f32>().copy_from_slice(&ones);
+                weights
+                    .final_norm
+                    .as_mut_slice::<f32>()
+                    .copy_from_slice(&ones);
                 let lm: &mut [f32] = weights.lm_head.as_mut_slice();
                 for (i, v) in lm.iter_mut().enumerate() {
                     *v = (i as f32 * 0.01).sin() * 0.1;
@@ -1827,7 +1913,14 @@ mod tests {
             let mut output = backend.alloc(cfg.vocab_size, DType::F32).unwrap();
 
             backend
-                .decoder_forward_reference_impl(&input, &positions, &mut kv_cache, &weights, &[1], &mut output)
+                .decoder_forward_reference_impl(
+                    &input,
+                    &positions,
+                    &mut kv_cache,
+                    &weights,
+                    &[1],
+                    &mut output,
+                )
                 .unwrap();
 
             unsafe { output.as_slice::<f32>() }.to_vec()
@@ -1839,7 +1932,11 @@ mod tests {
         assert_eq!(out_1.len(), 20);
         assert_eq!(out_2.len(), 20);
 
-        let diff: f32 = out_1.iter().zip(out_2.iter()).map(|(a, b)| (a - b).abs()).sum();
+        let diff: f32 = out_1
+            .iter()
+            .zip(out_2.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
         assert!(
             diff > 1e-6,
             "1-layer and 2-layer outputs are identical (diff={diff})"
@@ -1887,7 +1984,10 @@ mod tests {
                 fill_tensor_pattern(&mut lw.w_up, 0.01);
                 fill_tensor_pattern(&mut lw.w_down, 0.01);
             }
-            weights.final_norm.as_mut_slice::<f32>().copy_from_slice(&ones);
+            weights
+                .final_norm
+                .as_mut_slice::<f32>()
+                .copy_from_slice(&ones);
             let emb: &mut [f32] = weights.embedding.as_mut_slice();
             for (i, v) in emb.iter_mut().enumerate() {
                 *v = ((i as f32 * 0.07 + 0.3).sin()) * 0.5;
@@ -1899,7 +1999,9 @@ mod tests {
         }
 
         let prompt = vec![1u32, 2, 3];
-        let generated = backend.generate_reference(&weights, &prompt, 5, 0.0).unwrap();
+        let generated = backend
+            .generate_reference(&weights, &prompt, 5, 0.0)
+            .unwrap();
 
         assert_eq!(generated.len(), 5, "should generate exactly 5 tokens");
         for &tok in &generated {
@@ -1910,8 +2012,13 @@ mod tests {
             );
         }
 
-        let generated2 = backend.generate_reference(&weights, &prompt, 5, 0.0).unwrap();
-        assert_eq!(generated, generated2, "greedy generation should be deterministic");
+        let generated2 = backend
+            .generate_reference(&weights, &prompt, 5, 0.0)
+            .unwrap();
+        assert_eq!(
+            generated, generated2,
+            "greedy generation should be deterministic"
+        );
     }
 
     /// Test generate with zero max_new_tokens returns empty.
@@ -2019,14 +2126,20 @@ mod tests {
         let pages_per_seq = (cfg.max_seq_len + PAGE_SIZE - 1) / PAGE_SIZE;
         assert_eq!(cache.total_pages(), pages_per_seq * cfg.num_layers);
         assert_eq!(cache.free_page_count(), cache.total_pages());
-        assert_eq!(cache.bytes_per_page(), 2 * cfg.num_kv_heads * PAGE_SIZE * cfg.head_dim * cfg.dtype.size_bytes());
+        assert_eq!(
+            cache.bytes_per_page(),
+            2 * cfg.num_kv_heads * PAGE_SIZE * cfg.head_dim * cfg.dtype.size_bytes()
+        );
     }
 
     #[test]
     fn test_inference_error_display_variants() {
         let e1 = InferenceError::InvalidConfig("bad".into());
         assert!(e1.to_string().contains("bad"));
-        let e2 = InferenceError::OutOfMemory { requested: 1024, available: 512 };
+        let e2 = InferenceError::OutOfMemory {
+            requested: 1024,
+            available: 512,
+        };
         assert!(e2.to_string().contains("1024") && e2.to_string().contains("512"));
         let e3 = InferenceError::RuntimeError("crash".into());
         assert!(e3.to_string().contains("crash"));
@@ -2053,7 +2166,10 @@ mod tests {
         let original = qk.clone();
         apply_rope_inplace(&mut qk, &cos, &sin, num_heads, head_dim, 1.0);
         for (i, (&a, &b)) in original.iter().zip(qk.iter()).enumerate() {
-            assert!((a - b).abs() < 1e-10, "identity RoPE changed value at index {i}");
+            assert!(
+                (a - b).abs() < 1e-10,
+                "identity RoPE changed value at index {i}"
+            );
         }
     }
 
@@ -2069,7 +2185,13 @@ mod tests {
         let mask_data = vec![0.0f32; 0];
         let mask = unsafe { DeviceTensor::from_slice(&mask_data) };
         let mut output = DeviceTensor::alloc_cpu(1, DType::F32).unwrap();
-        let result = backend.encoder_forward_reference_impl(&input, &positions, &mask, &weights, &mut output);
+        let result = backend.encoder_forward_reference_impl(
+            &input,
+            &positions,
+            &mask,
+            &weights,
+            &mut output,
+        );
         assert!(result.is_ok());
     }
 
@@ -2108,7 +2230,10 @@ mod tests {
         let result = backend.upload_f32(&src, &mut t);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("4"), "error should mention 4 elements, got: {msg}");
+        assert!(
+            msg.contains("4"),
+            "error should mention 4 elements, got: {msg}"
+        );
     }
 
     // ── Test 34: download_f32 dtype mismatch error ──
@@ -2205,7 +2330,10 @@ mod tests {
     fn tiny_encoder_config_fields_consistent() {
         let cfg = tiny_encoder_config();
         assert_eq!(cfg.num_heads * cfg.head_dim, cfg.hidden_size);
-        assert_eq!(cfg.num_kv_heads * cfg.head_dim, cfg.num_kv_heads * cfg.head_dim);
+        assert_eq!(
+            cfg.num_kv_heads * cfg.head_dim,
+            cfg.num_kv_heads * cfg.head_dim
+        );
         assert_eq!(cfg.arch, ModelArch::Gpt2);
         assert!(cfg.vocab_size > 0);
         assert!(cfg.intermediate_size > cfg.hidden_size);
@@ -2264,7 +2392,10 @@ mod tests {
         let result = backend.download_f32(&t, &mut dst);
 
         // Assert
-        assert!(result.is_err(), "should error when dst is smaller than tensor");
+        assert!(
+            result.is_err(),
+            "should error when dst is smaller than tensor"
+        );
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("4"),
@@ -2342,10 +2473,16 @@ mod tests {
         assert_eq!(DeviceKind::Metal(0), DeviceKind::Metal(0));
 
         let debug = format!("{:?}", DeviceKind::Cpu);
-        assert!(debug.contains("Cpu"), "Debug should contain 'Cpu', got: {debug}");
+        assert!(
+            debug.contains("Cpu"),
+            "Debug should contain 'Cpu', got: {debug}"
+        );
 
         let debug_cuda = format!("{:?}", DeviceKind::Cuda(3));
-        assert!(debug_cuda.contains("3"), "Debug should contain device id, got: {debug_cuda}");
+        assert!(
+            debug_cuda.contains("3"),
+            "Debug should contain device id, got: {debug_cuda}"
+        );
     }
 
     // ── Test 48: apply_rope with minimal head_dim (2) ──
@@ -2414,7 +2551,10 @@ mod tests {
         // Act & Assert
         assert_eq!(cfg.num_heads * cfg.head_dim, cfg.hidden_size);
         assert_eq!(cfg.num_kv_heads * cfg.head_dim, 16); // kv_dim
-        assert!(cfg.num_heads % cfg.num_kv_heads == 0, "GQA ratio must be integer");
+        assert!(
+            cfg.num_heads % cfg.num_kv_heads == 0,
+            "GQA ratio must be integer"
+        );
         assert_eq!(cfg.num_heads / cfg.num_kv_heads, 4); // 4 query heads per KV head
     }
 
@@ -2423,14 +2563,20 @@ mod tests {
     #[test]
     fn inference_error_compile_error_display() {
         // Arrange
-        let compiler_err = crate::compiler::CompilerError::UnsupportedDType { dtype: DType::F4E2M1, isa: "avx2".into() };
+        let compiler_err = crate::compiler::CompilerError::UnsupportedDType {
+            dtype: DType::F4E2M1,
+            isa: "avx2".into(),
+        };
         let e = InferenceError::CompileError(compiler_err);
 
         // Act
         let msg = e.to_string();
 
         // Assert
-        assert!(msg.contains("compile error"), "should contain 'compile error', got: {msg}");
+        assert!(
+            msg.contains("compile error"),
+            "should contain 'compile error', got: {msg}"
+        );
     }
 
     // ── Test 52: upload_download round-trip with negative and extreme values ──
@@ -2459,7 +2605,10 @@ mod tests {
         // Assert — bitwise equality for normal values, bit-equivalent for -0.0
         for (i, (&expected, &got)) in src.iter().zip(dst.iter()).enumerate() {
             if expected == 0.0 && expected.is_sign_negative() {
-                assert!(got == 0.0 && got.is_sign_negative(), "idx {i}: -0.0 sign lost");
+                assert!(
+                    got == 0.0 && got.is_sign_negative(),
+                    "idx {i}: -0.0 sign lost"
+                );
             } else {
                 assert!(
                     (got - expected).abs() <= expected.abs() * f32::EPSILON,
@@ -2497,7 +2646,9 @@ mod tests {
         let sin = vec![1.0f32, 0.0];
 
         // Head 0: [1,2,3,4], Head 1: [10,20,30,40], Head 2: [100,200,300,400]
-        let mut qk = vec![1.0f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0, 100.0, 200.0, 300.0, 400.0];
+        let mut qk = vec![
+            1.0f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0, 100.0, 200.0, 300.0, 400.0,
+        ];
 
         // Act
         apply_rope_inplace(&mut qk, &cos, &sin, num_heads, head_dim, 1.0);
@@ -2535,8 +2686,14 @@ mod tests {
 
         // Assert
         let msg = e.to_string();
-        assert!(msg.contains("I/O error"), "should contain I/O prefix, got: {msg}");
-        assert!(msg.contains("access denied"), "should contain original message, got: {msg}");
+        assert!(
+            msg.contains("I/O error"),
+            "should contain I/O prefix, got: {msg}"
+        );
+        assert!(
+            msg.contains("access denied"),
+            "should contain original message, got: {msg}"
+        );
     }
 
     // ── Test 57: CompilerError display variants ──
@@ -2572,8 +2729,14 @@ mod tests {
 
         // Assert
         let msg = ie.to_string();
-        assert!(msg.contains("compile error"), "should wrap CompilerError, got: {msg}");
-        assert!(msg.contains("broken"), "should contain original message, got: {msg}");
+        assert!(
+            msg.contains("compile error"),
+            "should wrap CompilerError, got: {msg}"
+        );
+        assert!(
+            msg.contains("broken"),
+            "should contain original message, got: {msg}"
+        );
     }
 
     // ── Test 59: DType ptx/msl/hip type names are non-empty ──
@@ -2582,17 +2745,42 @@ mod tests {
     fn dtype_backend_type_names_nonempty() {
         // Arrange
         let all_dtypes = [
-            DType::F32, DType::F16, DType::BF16, DType::U8,
-            DType::F8E4M3, DType::F8E5M2, DType::F4E2M1,
+            DType::F32,
+            DType::F16,
+            DType::BF16,
+            DType::U8,
+            DType::F8E4M3,
+            DType::F8E5M2,
+            DType::F4E2M1,
         ];
 
         // Assert — all backend type strings must be non-empty
         for dt in &all_dtypes {
-            assert!(!dt.ptx_type().is_empty(), "DType {:?} ptx_type is empty", dt);
-            assert!(!dt.ptx_reg_type().is_empty(), "DType {:?} ptx_reg_type is empty", dt);
-            assert!(!dt.ptx_ld_type().is_empty(), "DType {:?} ptx_ld_type is empty", dt);
-            assert!(!dt.hip_type().is_empty(), "DType {:?} hip_type is empty", dt);
-            assert!(!dt.msl_type().is_empty(), "DType {:?} msl_type is empty", dt);
+            assert!(
+                !dt.ptx_type().is_empty(),
+                "DType {:?} ptx_type is empty",
+                dt
+            );
+            assert!(
+                !dt.ptx_reg_type().is_empty(),
+                "DType {:?} ptx_reg_type is empty",
+                dt
+            );
+            assert!(
+                !dt.ptx_ld_type().is_empty(),
+                "DType {:?} ptx_ld_type is empty",
+                dt
+            );
+            assert!(
+                !dt.hip_type().is_empty(),
+                "DType {:?} hip_type is empty",
+                dt
+            );
+            assert!(
+                !dt.msl_type().is_empty(),
+                "DType {:?} msl_type is empty",
+                dt
+            );
         }
     }
 
@@ -2719,7 +2907,10 @@ mod tests {
                 fill_tensor_pattern(&mut lw.w_up, 0.02);
                 fill_tensor_pattern(&mut lw.w_down, 0.02);
             }
-            weights.final_norm.as_mut_slice::<f32>().copy_from_slice(&ones);
+            weights
+                .final_norm
+                .as_mut_slice::<f32>()
+                .copy_from_slice(&ones);
             let lm: &mut [f32] = weights.lm_head.as_mut_slice();
             for (i, v) in lm.iter_mut().enumerate() {
                 *v = (i as f32 * 0.01).sin() * 0.1;
@@ -2736,15 +2927,30 @@ mod tests {
 
         // Act
         let result = backend.decoder_forward_reference_impl(
-            &input, &positions, &mut kv_cache, &weights, &[1], &mut output,
+            &input,
+            &positions,
+            &mut kv_cache,
+            &weights,
+            &[1],
+            &mut output,
         );
 
         // Assert — GELU path should complete without error and produce finite logits
-        assert!(result.is_ok(), "Gemma decoder_forward failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Gemma decoder_forward failed: {:?}",
+            result.err()
+        );
         let logits: &[f32] = unsafe { output.as_slice() };
         assert_eq!(logits.len(), cfg.vocab_size);
-        assert!(logits.iter().all(|v| v.is_finite()), "Gemma logits contain non-finite values");
-        assert!(logits.iter().any(|&v| v.abs() > 1e-8), "Gemma logits are all zero");
+        assert!(
+            logits.iter().all(|v| v.is_finite()),
+            "Gemma logits contain non-finite values"
+        );
+        assert!(
+            logits.iter().any(|&v| v.abs() > 1e-8),
+            "Gemma logits are all zero"
+        );
     }
 
     // ── Test 65: decoder_forward second token has longer KV context ──
@@ -2771,7 +2977,10 @@ mod tests {
             }
         }
         unsafe {
-            weights.final_norm.as_mut_slice::<f32>().copy_from_slice(&ones);
+            weights
+                .final_norm
+                .as_mut_slice::<f32>()
+                .copy_from_slice(&ones);
             let lm: &mut [f32] = weights.lm_head.as_mut_slice();
             for (i, v) in lm.iter_mut().enumerate() {
                 *v = (i as f32 * 0.01).sin() * 0.1;
@@ -2786,32 +2995,76 @@ mod tests {
         let mut output = backend.alloc(cfg.vocab_size, DType::F32).unwrap();
 
         // Act — process 3 tokens, verify KV cache grows each step
-        assert_eq!(kv_cache.seq_len(0, 0), 0, "initial KV cache should be empty");
+        assert_eq!(
+            kv_cache.seq_len(0, 0),
+            0,
+            "initial KV cache should be empty"
+        );
 
         let pos0 = unsafe { DeviceTensor::from_slice(&[0.0f32]) };
         backend
-            .decoder_forward_reference_impl(&input, &pos0, &mut kv_cache, &weights, &[1], &mut output)
+            .decoder_forward_reference_impl(
+                &input,
+                &pos0,
+                &mut kv_cache,
+                &weights,
+                &[1],
+                &mut output,
+            )
             .unwrap();
-        assert_eq!(kv_cache.seq_len(0, 0), 1, "after 1 token, seq_len should be 1");
+        assert_eq!(
+            kv_cache.seq_len(0, 0),
+            1,
+            "after 1 token, seq_len should be 1"
+        );
 
         let pos1 = unsafe { DeviceTensor::from_slice(&[1.0f32]) };
         backend
-            .decoder_forward_reference_impl(&input, &pos1, &mut kv_cache, &weights, &[1], &mut output)
+            .decoder_forward_reference_impl(
+                &input,
+                &pos1,
+                &mut kv_cache,
+                &weights,
+                &[1],
+                &mut output,
+            )
             .unwrap();
-        assert_eq!(kv_cache.seq_len(0, 0), 2, "after 2 tokens, seq_len should be 2");
+        assert_eq!(
+            kv_cache.seq_len(0, 0),
+            2,
+            "after 2 tokens, seq_len should be 2"
+        );
 
         let pos2 = unsafe { DeviceTensor::from_slice(&[2.0f32]) };
         backend
-            .decoder_forward_reference_impl(&input, &pos2, &mut kv_cache, &weights, &[1], &mut output)
+            .decoder_forward_reference_impl(
+                &input,
+                &pos2,
+                &mut kv_cache,
+                &weights,
+                &[1],
+                &mut output,
+            )
             .unwrap();
 
         // Assert — KV cache grew correctly across layers and positions
-        assert_eq!(kv_cache.seq_len(0, 0), 3, "after 3 tokens, seq_len should be 3");
-        assert_eq!(kv_cache.seq_len(1, 0), 3, "layer 1 seq_len should also be 3");
+        assert_eq!(
+            kv_cache.seq_len(0, 0),
+            3,
+            "after 3 tokens, seq_len should be 3"
+        );
+        assert_eq!(
+            kv_cache.seq_len(1, 0),
+            3,
+            "layer 1 seq_len should also be 3"
+        );
 
         // Final logits should be finite
         let logits: &[f32] = unsafe { output.as_slice() };
-        assert!(logits.iter().all(|v| v.is_finite()), "logits contain non-finite values");
+        assert!(
+            logits.iter().all(|v| v.is_finite()),
+            "logits contain non-finite values"
+        );
     }
 
     // ── Test 66: encoder_forward output is L2 normalized ──
@@ -2828,13 +3081,21 @@ mod tests {
         for lw in weights.layers.iter_mut() {
             unsafe {
                 let gamma: &mut [f32] = lw.attn_norm.as_mut_slice();
-                for v in gamma.iter_mut() { *v = 1.0; }
+                for v in gamma.iter_mut() {
+                    *v = 1.0;
+                }
                 let beta: &mut [f32] = lw.attn_norm_bias.as_mut_slice();
-                for v in beta.iter_mut() { *v = 0.0; }
+                for v in beta.iter_mut() {
+                    *v = 0.0;
+                }
                 let fg: &mut [f32] = lw.ffn_norm.as_mut_slice();
-                for v in fg.iter_mut() { *v = 1.0; }
+                for v in fg.iter_mut() {
+                    *v = 1.0;
+                }
                 let fb: &mut [f32] = lw.ffn_norm_bias.as_mut_slice();
-                for v in fb.iter_mut() { *v = 0.0; }
+                for v in fb.iter_mut() {
+                    *v = 0.0;
+                }
                 fill_tensor_pattern(&mut lw.wq, 0.01);
                 fill_tensor_pattern(&mut lw.wk, 0.01);
                 fill_tensor_pattern(&mut lw.wv, 0.01);
@@ -2908,7 +3169,10 @@ mod tests {
                 fill_tensor_pattern(&mut lw.w_up, 0.01);
                 fill_tensor_pattern(&mut lw.w_down, 0.01);
             }
-            weights.final_norm.as_mut_slice::<f32>().copy_from_slice(&ones);
+            weights
+                .final_norm
+                .as_mut_slice::<f32>()
+                .copy_from_slice(&ones);
             let emb: &mut [f32] = weights.embedding.as_mut_slice();
             for (i, v) in emb.iter_mut().enumerate() {
                 *v = ((i as f32 * 0.07 + 0.3).sin()) * 0.5;
@@ -2920,14 +3184,21 @@ mod tests {
         }
 
         // Act
-        let gen_a = backend.generate_reference(&weights, &[1u32, 2], 3, 0.0).unwrap();
-        let gen_b = backend.generate_reference(&weights, &[5u32, 8], 3, 0.0).unwrap();
+        let gen_a = backend
+            .generate_reference(&weights, &[1u32, 2], 3, 0.0)
+            .unwrap();
+        let gen_b = backend
+            .generate_reference(&weights, &[5u32, 8], 3, 0.0)
+            .unwrap();
 
         // Assert — different prompts should produce at least one different token
         assert_eq!(gen_a.len(), 3);
         assert_eq!(gen_b.len(), 3);
         let any_diff = gen_a.iter().zip(gen_b.iter()).any(|(a, b)| a != b);
-        assert!(any_diff, "different prompts produced identical output: {gen_a:?} vs {gen_b:?}");
+        assert!(
+            any_diff,
+            "different prompts produced identical output: {gen_a:?} vs {gen_b:?}"
+        );
     }
 
     // ── Test 68: sample with temperature 1.0 preserves argmax winner ──
@@ -2989,7 +3260,10 @@ mod tests {
                 fill_tensor_pattern(&mut lw.w_up, 0.02);
                 fill_tensor_pattern(&mut lw.w_down, 0.02);
             }
-            weights.final_norm.as_mut_slice::<f32>().copy_from_slice(&ones);
+            weights
+                .final_norm
+                .as_mut_slice::<f32>()
+                .copy_from_slice(&ones);
             let lm: &mut [f32] = weights.lm_head.as_mut_slice();
             for (i, v) in lm.iter_mut().enumerate() {
                 *v = (i as f32 * 0.01).sin() * 0.1;
@@ -3005,14 +3279,27 @@ mod tests {
         for pos in 0u32..6 {
             let pos_tensor = unsafe { DeviceTensor::from_slice(&[pos as f32]) };
             backend
-                .decoder_forward_reference_impl(&input, &pos_tensor, &mut kv_cache, &weights, &[1], &mut output)
+                .decoder_forward_reference_impl(
+                    &input,
+                    &pos_tensor,
+                    &mut kv_cache,
+                    &weights,
+                    &[1],
+                    &mut output,
+                )
                 .unwrap();
         }
 
         // Assert — sliding window masking didn't break computation
         let logits: &[f32] = unsafe { output.as_slice() };
-        assert!(logits.iter().all(|v| v.is_finite()), "sliding window produced non-finite logits");
-        assert!(logits.iter().any(|&v| v.abs() > 1e-8), "sliding window produced all-zero logits");
+        assert!(
+            logits.iter().all(|v| v.is_finite()),
+            "sliding window produced non-finite logits"
+        );
+        assert!(
+            logits.iter().any(|&v| v.abs() > 1e-8),
+            "sliding window produced all-zero logits"
+        );
     }
 
     // ── Test 70: tensor_as_mut_f32 writes are readable ──
@@ -3037,7 +3324,10 @@ mod tests {
         // Assert — values written through tensor_as_mut_f32 are preserved
         for (i, &v) in dst.iter().enumerate() {
             let expected = (i as f32).sqrt();
-            assert!((v - expected).abs() < 1e-6, "idx {i}: expected {expected}, got {v}");
+            assert!(
+                (v - expected).abs() < 1e-6,
+                "idx {i}: expected {expected}, got {v}"
+            );
         }
     }
 
@@ -3054,13 +3344,21 @@ mod tests {
         for lw in weights.layers.iter_mut() {
             unsafe {
                 let gamma: &mut [f32] = lw.attn_norm.as_mut_slice();
-                for v in gamma.iter_mut() { *v = 1.0; }
+                for v in gamma.iter_mut() {
+                    *v = 1.0;
+                }
                 let beta: &mut [f32] = lw.attn_norm_bias.as_mut_slice();
-                for v in beta.iter_mut() { *v = 0.0; }
+                for v in beta.iter_mut() {
+                    *v = 0.0;
+                }
                 let fg: &mut [f32] = lw.ffn_norm.as_mut_slice();
-                for v in fg.iter_mut() { *v = 1.0; }
+                for v in fg.iter_mut() {
+                    *v = 1.0;
+                }
                 let fb: &mut [f32] = lw.ffn_norm_bias.as_mut_slice();
-                for v in fb.iter_mut() { *v = 0.0; }
+                for v in fb.iter_mut() {
+                    *v = 0.0;
+                }
                 fill_tensor_pattern(&mut lw.wq, 0.01);
                 fill_tensor_pattern(&mut lw.wk, 0.01);
                 fill_tensor_pattern(&mut lw.wv, 0.01);
@@ -3084,9 +3382,15 @@ mod tests {
         // Assert — single token produces a valid L2-normalized embedding
         let out_slice: &[f32] = unsafe { output.as_slice() };
         assert_eq!(out_slice.len(), h);
-        assert!(out_slice.iter().all(|v| v.is_finite()), "single-token output contains non-finite values");
+        assert!(
+            out_slice.iter().all(|v| v.is_finite()),
+            "single-token output contains non-finite values"
+        );
         let l2: f32 = out_slice.iter().map(|v| v * v).sum::<f32>().sqrt();
-        assert!((l2 - 1.0).abs() < 1e-4, "single-token output L2 norm should be ~1.0, got {l2}");
+        assert!(
+            (l2 - 1.0).abs() < 1e-4,
+            "single-token output L2 norm should be ~1.0, got {l2}"
+        );
     }
 
     // ── Test 72: alloc_kv_cache batch_size scales page allocation ──
@@ -3105,7 +3409,8 @@ mod tests {
         let pages_b1 = cache_b1.total_pages();
         let pages_b3 = cache_b3.total_pages();
         assert_eq!(
-            pages_b3, pages_b1 * 3,
+            pages_b3,
+            pages_b1 * 3,
             "batch=3 pages ({pages_b3}) should be 3x batch=1 pages ({pages_b1})"
         );
     }
@@ -3127,19 +3432,60 @@ mod tests {
         let inter = cfg.intermediate_size;
 
         for (layer_idx, lw) in weights.layers.iter().enumerate() {
-            assert_eq!(lw.wq.num_elements(), h * q_dim, "layer {layer_idx} wq size mismatch");
-            assert_eq!(lw.wk.num_elements(), h * kv_dim, "layer {layer_idx} wk size mismatch");
-            assert_eq!(lw.wv.num_elements(), h * kv_dim, "layer {layer_idx} wv size mismatch");
-            assert_eq!(lw.wo.num_elements(), q_dim * h, "layer {layer_idx} wo size mismatch");
-            assert_eq!(lw.w_gate.num_elements(), h * inter, "layer {layer_idx} w_gate size mismatch");
-            assert_eq!(lw.w_up.num_elements(), h * inter, "layer {layer_idx} w_up size mismatch");
-            assert_eq!(lw.w_down.num_elements(), inter * h, "layer {layer_idx} w_down size mismatch");
-            assert_eq!(lw.attn_norm.num_elements(), h, "layer {layer_idx} attn_norm size mismatch");
-            assert_eq!(lw.ffn_norm.num_elements(), h, "layer {layer_idx} ffn_norm size mismatch");
+            assert_eq!(
+                lw.wq.num_elements(),
+                h * q_dim,
+                "layer {layer_idx} wq size mismatch"
+            );
+            assert_eq!(
+                lw.wk.num_elements(),
+                h * kv_dim,
+                "layer {layer_idx} wk size mismatch"
+            );
+            assert_eq!(
+                lw.wv.num_elements(),
+                h * kv_dim,
+                "layer {layer_idx} wv size mismatch"
+            );
+            assert_eq!(
+                lw.wo.num_elements(),
+                q_dim * h,
+                "layer {layer_idx} wo size mismatch"
+            );
+            assert_eq!(
+                lw.w_gate.num_elements(),
+                h * inter,
+                "layer {layer_idx} w_gate size mismatch"
+            );
+            assert_eq!(
+                lw.w_up.num_elements(),
+                h * inter,
+                "layer {layer_idx} w_up size mismatch"
+            );
+            assert_eq!(
+                lw.w_down.num_elements(),
+                inter * h,
+                "layer {layer_idx} w_down size mismatch"
+            );
+            assert_eq!(
+                lw.attn_norm.num_elements(),
+                h,
+                "layer {layer_idx} attn_norm size mismatch"
+            );
+            assert_eq!(
+                lw.ffn_norm.num_elements(),
+                h,
+                "layer {layer_idx} ffn_norm size mismatch"
+            );
         }
-        assert_eq!(weights.final_norm.num_elements(), h, "final_norm size mismatch");
         assert_eq!(
-            weights.lm_head.num_elements(), h * cfg.vocab_size,
+            weights.final_norm.num_elements(),
+            h,
+            "final_norm size mismatch"
+        );
+        assert_eq!(
+            weights.lm_head.num_elements(),
+            h * cfg.vocab_size,
             "lm_head size mismatch"
         );
     }
@@ -3191,8 +3537,16 @@ mod tests {
         assert_eq!(cfg.arch, ModelArch::Gemma);
         assert_eq!(cfg.num_heads, 8);
         assert_eq!(cfg.num_kv_heads, 1);
-        assert_eq!(cfg.num_heads % cfg.num_kv_heads, 0, "GQA ratio must be integer");
-        assert_eq!(cfg.num_heads / cfg.num_kv_heads, 8, "expected 8:1 GQA ratio");
+        assert_eq!(
+            cfg.num_heads % cfg.num_kv_heads,
+            0,
+            "GQA ratio must be integer"
+        );
+        assert_eq!(
+            cfg.num_heads / cfg.num_kv_heads,
+            8,
+            "expected 8:1 GQA ratio"
+        );
     }
 
     // ── Test 77: kv_cache_bytes_per_token calculation matches manual formula ──
@@ -3253,8 +3607,14 @@ mod tests {
         let msg = err.to_string();
 
         // Assert — all three pieces of info should appear
-        assert!(msg.contains("32"), "should mention needed registers, got: {msg}");
-        assert!(msg.contains("16"), "should mention available registers, got: {msg}");
+        assert!(
+            msg.contains("32"),
+            "should mention needed registers, got: {msg}"
+        );
+        assert!(
+            msg.contains("16"),
+            "should mention available registers, got: {msg}"
+        );
         assert!(msg.contains("GEMM"), "should mention context, got: {msg}");
     }
 
@@ -3285,8 +3645,14 @@ mod tests {
         let msg = err.to_string();
 
         // Assert
-        assert!(msg.contains("unsupported"), "should contain 'unsupported', got: {msg}");
-        assert!(msg.contains("batch_size"), "should contain reason, got: {msg}");
+        assert!(
+            msg.contains("unsupported"),
+            "should contain 'unsupported', got: {msg}"
+        );
+        assert!(
+            msg.contains("batch_size"),
+            "should contain reason, got: {msg}"
+        );
     }
 
     // ── Test 81: apply_rope negated rotation is approximate inverse ──
@@ -3358,7 +3724,10 @@ mod tests {
         );
         // The per-layer cost is (bytes_4 - bytes_2) / 2 per extra layer
         let per_layer_diff = (bytes_4 - bytes_2) / 2;
-        assert!(per_layer_diff > 0, "per-layer weight contribution should be positive");
+        assert!(
+            per_layer_diff > 0,
+            "per-layer weight contribution should be positive"
+        );
     }
 
     // ── Test 84: apply_rope single head dim=2 rotates correctly ──
@@ -3377,7 +3746,11 @@ mod tests {
 
         // Assert — x0*c - x1*s = 5*1 - (-3)*0 = 5; x0*s + x1*c = 5*0 + (-3)*1 = -3
         assert!((qk[0] - 5.0).abs() < 1e-6, "expected 5.0, got {}", qk[0]);
-        assert!((qk[1] - (-3.0)).abs() < 1e-6, "expected -3.0, got {}", qk[1]);
+        assert!(
+            (qk[1] - (-3.0)).abs() < 1e-6,
+            "expected -3.0, got {}",
+            qk[1]
+        );
     }
 
     // ── Test 85: InferenceError OutOfMemory display includes byte counts ──
@@ -3394,9 +3767,18 @@ mod tests {
         let msg = err.to_string();
 
         // Assert — both byte counts should appear in the message
-        assert!(msg.contains("1073741824"), "should mention requested bytes, got: {msg}");
-        assert!(msg.contains("536870912"), "should mention available bytes, got: {msg}");
-        assert!(msg.to_lowercase().contains("memory"), "should mention memory, got: {msg}");
+        assert!(
+            msg.contains("1073741824"),
+            "should mention requested bytes, got: {msg}"
+        );
+        assert!(
+            msg.contains("536870912"),
+            "should mention available bytes, got: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("memory"),
+            "should mention memory, got: {msg}"
+        );
     }
 
     // ── Test 86: ModelConfig with GQA has smaller kv_cache_bytes_per_token ──
@@ -3416,7 +3798,8 @@ mod tests {
 
         // Assert — GQA should use exactly half the KV bytes (2 vs 4 kv_heads)
         assert_eq!(
-            bytes_gqa * 2, bytes_mha,
+            bytes_gqa * 2,
+            bytes_mha,
             "GQA (2 kv_heads) should be half of MHA (4 kv_heads): got {bytes_gqa} vs {bytes_mha}"
         );
     }
@@ -3451,7 +3834,8 @@ mod tests {
         let cache = backend.alloc_kv_cache(1, cfg.max_seq_len).unwrap();
 
         // Assert — bytes_per_page should match the global PAGE_SIZE
-        let expected_bytes_per_page = PAGE_SIZE * cfg.num_kv_heads * cfg.head_dim * 2 * cfg.dtype.size_bytes();
+        let expected_bytes_per_page =
+            PAGE_SIZE * cfg.num_kv_heads * cfg.head_dim * 2 * cfg.dtype.size_bytes();
         assert_eq!(
             cache.bytes_per_page(),
             expected_bytes_per_page,
@@ -3468,8 +3852,14 @@ mod tests {
         let mistral = ModelConfig::mistral_7b();
 
         // Assert — LLaMA has no sliding window, Mistral has one
-        assert!(llama.sliding_window.is_none(), "LLaMA should have no sliding window");
-        assert!(mistral.sliding_window.is_some(), "Mistral should have sliding window");
+        assert!(
+            llama.sliding_window.is_none(),
+            "LLaMA should have no sliding window"
+        );
+        assert!(
+            mistral.sliding_window.is_some(),
+            "Mistral should have sliding window"
+        );
         assert_eq!(mistral.sliding_window.unwrap(), 4096);
     }
 
@@ -3524,7 +3914,8 @@ mod tests {
 
         // Assert
         assert_eq!(
-            weights.embedding.num_elements(), expected,
+            weights.embedding.num_elements(),
+            expected,
             "embedding tensor should have vocab_size * hidden_size elements"
         );
     }
@@ -3543,8 +3934,14 @@ mod tests {
         let result = backend.generate_reference(&weights, &[oob_token], 1, 0.0);
 
         // Assert — should fail because token_id >= vocab_size
-        assert!(result.is_err(), "generate should fail for token_id >= vocab_size");
+        assert!(
+            result.is_err(),
+            "generate should fail for token_id >= vocab_size"
+        );
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("token_id"), "error should mention token_id, got: {msg}");
+        assert!(
+            msg.contains("token_id"),
+            "error should mention token_id, got: {msg}"
+        );
     }
 }

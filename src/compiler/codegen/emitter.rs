@@ -11,10 +11,10 @@
 //!   and `DynasmArm64Backend`. The compiler pipeline depends only on `PlatformBackend`,
 //!   not on the concrete emitter type.
 
-use crate::compiler::graph::CompilerGraph;
+use crate::compiler::buffer_alloc::BufferAllocation;
 use crate::compiler::codegen::CodegenOutput;
 use crate::compiler::fusion::FusionPlan;
-use crate::compiler::buffer_alloc::BufferAllocation;
+use crate::compiler::graph::CompilerGraph;
 use crate::compiler::planner::ExecutionPlan;
 use crate::dispatch::DeviceProfile;
 use crate::types::CompilerError;
@@ -57,7 +57,10 @@ impl Platform {
         };
 
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        return Platform::X86_64 { avx512: false, amx: false };
+        return Platform::X86_64 {
+            avx512: false,
+            amx: false,
+        };
     }
 }
 
@@ -127,19 +130,23 @@ impl X86CodeGen {
     pub fn set_weight_layout(&mut self, layout: crate::compiler::graph::WeightLayout) {
         self.weight_layout = Some(layout);
     }
-    pub fn simd_width(&self) -> usize { self.simd_width }
+    pub fn simd_width(&self) -> usize {
+        self.simd_width
+    }
 
     pub fn set_jit_params(&mut self, _params: &crate::autotuning::search_space::JitParams) {}
 
     pub fn emit_standalone_gemm(
         &mut self,
-        _m: usize, _n: usize, _k: usize,
+        _m: usize,
+        _n: usize,
+        _k: usize,
         _dtype: crate::types::DType,
         _blocking: &crate::dispatch::GemmBlocking,
         _profile: &DeviceProfile,
     ) -> Result<Vec<u8>, CompilerError> {
         Err(CompilerError::CodegenViolation(
-            "emit_standalone_gemm: Register VM 迁移中。等待 vm::compile_layer() 实现。".into()
+            "emit_standalone_gemm: Register VM 迁移中。等待 vm::compile_layer() 实现。".into(),
         ))
     }
 
@@ -194,7 +201,8 @@ impl PlatformBackend for X86Backend {
         #[cfg(not(target_arch = "x86_64"))]
         let avx512 = false;
         #[cfg(target_arch = "x86_64")]
-        let amx = std::is_x86_feature_detected!("amx-tile") && std::is_x86_feature_detected!("amx-bf16");
+        let amx =
+            std::is_x86_feature_detected!("amx-tile") && std::is_x86_feature_detected!("amx-bf16");
         #[cfg(not(target_arch = "x86_64"))]
         let amx = false;
         Platform::X86_64 { avx512, amx }
@@ -216,14 +224,14 @@ mod tests {
         let platform = Platform::detect(&profile);
         // Just verify it returns a valid variant without panicking
         match platform {
-            Platform::X86_64 { .. } => {},
-            Platform::Aarch64 { .. } => {},
+            Platform::X86_64 { .. } => {}
+            Platform::Aarch64 { .. } => {}
             #[cfg(feature = "jit-cuda")]
-            Platform::Cuda { .. } => {},
+            Platform::Cuda { .. } => {}
             #[cfg(feature = "jit-hip")]
-            Platform::Hip { .. } => {},
+            Platform::Hip { .. } => {}
             #[cfg(feature = "jit-metal")]
-            Platform::Metal { .. } => {},
+            Platform::Metal { .. } => {}
         }
     }
 
@@ -248,9 +256,13 @@ mod tests {
     #[test]
     fn test_emitter_emit_plan_standalone_silu() {
         use super::X86CodeGen;
-        use crate::compiler::graph::{CompilerGraph, MultiOutputConfig, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
-        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan, GroupMarker};
         use crate::compiler::buffer_alloc::BufferAllocation;
+        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan, GroupMarker};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, MlaSpec, MultiOutputConfig, NormSpec, Op, QuantGemmSpec,
+            RopeSpec, SinksSpec,
+        };
         use crate::types::DType;
         use std::collections::HashMap;
 
@@ -271,10 +283,10 @@ mod tests {
                 mode: FusionMode::LoopFusion,
                 ops: vec![op_id],
                 multi_output: MultiOutputConfig::single(),
-            dominant_dtype: None,
-            marker: GroupMarker::None,
-            is_layer_group: false,
-            hetero_layer_type: None,
+                dominant_dtype: None,
+                marker: GroupMarker::None,
+                is_layer_group: false,
+                hetero_layer_type: None,
             }],
             op_to_group,
         };
@@ -283,18 +295,28 @@ mod tests {
         let exec_plan = ExecutionPlan::from_profile(&profile);
 
         let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
-        let mut emitter: Box<dyn MachineCodeEmitter> = Box::new(X86CodeGen::new(&profile, DType::F32));
-        let output = emitter.emit_plan(&plan, &g, &alloc, &exec_plan, Some(&registry)).unwrap();
-        assert!(!output.code.is_empty(), "emit_plan via trait should produce code");
+        let mut emitter: Box<dyn MachineCodeEmitter> =
+            Box::new(X86CodeGen::new(&profile, DType::F32));
+        let output = emitter
+            .emit_plan(&plan, &g, &alloc, &exec_plan, Some(&registry))
+            .unwrap();
+        assert!(
+            !output.code.is_empty(),
+            "emit_plan via trait should produce code"
+        );
     }
 
     #[cfg(feature = "jit-x86")]
     #[test]
     fn test_emitter_emit_plan_with_registry() {
         use super::X86CodeGen;
-        use crate::compiler::graph::{CompilerGraph, MultiOutputConfig, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
-        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan, GroupMarker};
         use crate::compiler::buffer_alloc::BufferAllocation;
+        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan, GroupMarker};
+        use crate::compiler::graph::{
+            AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+            DualRopeSpec, GemmSpec, MlaSpec, MultiOutputConfig, NormSpec, Op, QuantGemmSpec,
+            RopeSpec, SinksSpec,
+        };
         use crate::compiler::registry::ScalarOpRegistry;
         use crate::types::DType;
         use std::collections::HashMap;
@@ -316,10 +338,10 @@ mod tests {
                 mode: FusionMode::LoopFusion,
                 ops: vec![op_id],
                 multi_output: MultiOutputConfig::single(),
-            dominant_dtype: None,
-            marker: GroupMarker::None,
-            is_layer_group: false,
-            hetero_layer_type: None,
+                dominant_dtype: None,
+                marker: GroupMarker::None,
+                is_layer_group: false,
+                hetero_layer_type: None,
             }],
             op_to_group,
         };
@@ -329,8 +351,13 @@ mod tests {
         let registry = ScalarOpRegistry::with_defaults();
 
         let mut emitter = X86CodeGen::new(&profile, DType::F32);
-        let output = emitter.emit_plan(&plan, &g, &alloc, &exec_plan, Some(&registry)).unwrap();
-        assert!(!output.code.is_empty(), "registry-driven emit_plan should produce code");
+        let output = emitter
+            .emit_plan(&plan, &g, &alloc, &exec_plan, Some(&registry))
+            .unwrap();
+        assert!(
+            !output.code.is_empty(),
+            "registry-driven emit_plan should produce code"
+        );
     }
 
     #[cfg(feature = "jit-x86")]
@@ -346,7 +373,10 @@ mod tests {
         // Both should report X86_64 on x86_64 hosts
         match (detected, backend_plat) {
             (Platform::X86_64 { avx512: a, .. }, Platform::X86_64 { avx512: b, .. }) => {
-                assert_eq!(a, b, "Platform::detect and X86Backend::platform disagree on avx512");
+                assert_eq!(
+                    a, b,
+                    "Platform::detect and X86Backend::platform disagree on avx512"
+                );
             }
             _ => panic!("platform mismatch between detect and backend"),
         }
@@ -356,37 +386,68 @@ mod tests {
 
     #[test]
     fn test_platform_equality_same_variants() {
-        let a = Platform::X86_64 { avx512: true, amx: false };
-        let b = Platform::X86_64 { avx512: true, amx: false };
+        let a = Platform::X86_64 {
+            avx512: true,
+            amx: false,
+        };
+        let b = Platform::X86_64 {
+            avx512: true,
+            amx: false,
+        };
         assert_eq!(a, b, "identical Platform variants must be equal");
     }
 
     #[test]
     fn test_platform_equality_different_flags() {
-        let a = Platform::X86_64 { avx512: true, amx: false };
-        let b = Platform::X86_64 { avx512: false, amx: false };
-        assert_ne!(a, b, "Platform with different avx512 flags must not be equal");
+        let a = Platform::X86_64 {
+            avx512: true,
+            amx: false,
+        };
+        let b = Platform::X86_64 {
+            avx512: false,
+            amx: false,
+        };
+        assert_ne!(
+            a, b,
+            "Platform with different avx512 flags must not be equal"
+        );
     }
 
     #[test]
     fn test_platform_clone() {
-        let original = Platform::X86_64 { avx512: true, amx: true };
+        let original = Platform::X86_64 {
+            avx512: true,
+            amx: true,
+        };
         let cloned = original.clone();
         assert_eq!(original, cloned, "cloned Platform must equal original");
     }
 
     #[test]
     fn test_platform_copy() {
-        let original = Platform::Aarch64 { sve: true, amx: false };
+        let original = Platform::Aarch64 {
+            sve: true,
+            amx: false,
+        };
         let copied = original; // Copy semantics, original still valid
-        assert_eq!(original, copied, "copied Platform must equal original via Copy");
+        assert_eq!(
+            original, copied,
+            "copied Platform must equal original via Copy"
+        );
     }
 
     #[test]
     fn test_platform_debug_format() {
-        let p = Platform::X86_64 { avx512: false, amx: false };
+        let p = Platform::X86_64 {
+            avx512: false,
+            amx: false,
+        };
         let debug_str = format!("{:?}", p);
-        assert!(debug_str.contains("X86_64"), "Debug output must contain variant name, got: {}", debug_str);
+        assert!(
+            debug_str.contains("X86_64"),
+            "Debug output must contain variant name, got: {}",
+            debug_str
+        );
     }
 
     // ── X86CodeGen constructor + simd_width ─────────────────────────────
@@ -407,16 +468,19 @@ mod tests {
         assert!(width_f32 > 0, "F32 simd_width must be positive");
         assert!(width_bf16 > 0, "BF16 simd_width must be positive");
         // BF16 is half the size of F32, so twice as many fit per register
-        assert_eq!(width_bf16, width_f32 * 2,
-            "BF16 simd_width should be 2x F32 simd_width (same register, half element size)");
+        assert_eq!(
+            width_bf16,
+            width_f32 * 2,
+            "BF16 simd_width should be 2x F32 simd_width (same register, half element size)"
+        );
     }
 
     #[cfg(feature = "jit-x86")]
     #[test]
     fn test_x86_codegen_set_weight_layout_updates_field() {
         use super::X86CodeGen;
-        use crate::types::DType;
         use crate::compiler::graph::WeightLayout;
+        use crate::types::DType;
 
         let profile = DeviceProfile::detect();
         let mut emitter = X86CodeGen::new(&profile, DType::F32);
@@ -433,8 +497,8 @@ mod tests {
     #[test]
     fn test_x86_codegen_set_telemetry_no_panic() {
         use super::X86CodeGen;
-        use crate::types::DType;
         use crate::compiler::graph::EpilogueTelemetryConfig;
+        use crate::types::DType;
 
         let profile = DeviceProfile::detect();
         let mut emitter = X86CodeGen::new(&profile, DType::F32);
@@ -456,8 +520,8 @@ mod tests {
     #[test]
     fn test_x86_codegen_set_codegen_hints_no_panic() {
         use super::X86CodeGen;
-        use crate::types::DType;
         use crate::compiler::semantic_dag::CodegenHints;
+        use crate::types::DType;
 
         let profile = DeviceProfile::detect();
         let mut emitter = X86CodeGen::new(&profile, DType::F32);
@@ -474,8 +538,8 @@ mod tests {
     #[test]
     fn test_x86_codegen_set_jit_params_no_panic() {
         use super::X86CodeGen;
-        use crate::types::DType;
         use crate::autotuning::search_space::JitParams;
+        use crate::types::DType;
 
         let profile = DeviceProfile::detect();
         let mut emitter = X86CodeGen::new(&profile, DType::F32);
@@ -487,16 +551,23 @@ mod tests {
     #[test]
     fn test_x86_emit_standalone_gemm_returns_error() {
         use super::X86CodeGen;
-        use crate::types::DType;
         use crate::dispatch::DeviceProfile;
+        use crate::types::DType;
 
         let profile = DeviceProfile::detect();
         let mut emitter = X86CodeGen::new(&profile, DType::F32);
         let blocking = crate::dispatch::GemmBlocking {
-            kc: 64, mc: 64, nc: 64, mr: 6, nr: 8,
+            kc: 64,
+            mc: 64,
+            nc: 64,
+            mr: 6,
+            nr: 8,
         };
         let result = emitter.emit_standalone_gemm(16, 16, 16, DType::F32, &blocking, &profile);
-        assert!(result.is_err(), "emit_standalone_gemm should return error (Register VM migration)");
+        assert!(
+            result.is_err(),
+            "emit_standalone_gemm should return error (Register VM migration)"
+        );
     }
 
     #[cfg(feature = "jit-x86")]
@@ -505,47 +576,90 @@ mod tests {
         use super::X86Backend;
 
         let backend = X86Backend;
-        assert_eq!(backend.num_simd_regs(), 32,
-            "x86_64 with AVX-512 should have 32 SIMD registers (zmm0-zmm31)");
+        assert_eq!(
+            backend.num_simd_regs(),
+            32,
+            "x86_64 with AVX-512 should have 32 SIMD registers (zmm0-zmm31)"
+        );
     }
 
     // ── Additional tests ──
 
     #[test]
     fn test_platform_aarch64_construction() {
-        let p = Platform::Aarch64 { sve: true, amx: false };
-        assert_eq!(p, Platform::Aarch64 { sve: true, amx: false });
-        assert_ne!(p, Platform::Aarch64 { sve: false, amx: false });
+        let p = Platform::Aarch64 {
+            sve: true,
+            amx: false,
+        };
+        assert_eq!(
+            p,
+            Platform::Aarch64 {
+                sve: true,
+                amx: false
+            }
+        );
+        assert_ne!(
+            p,
+            Platform::Aarch64 {
+                sve: false,
+                amx: false
+            }
+        );
     }
 
     #[test]
     fn test_platform_aarch64_debug() {
-        let p = Platform::Aarch64 { sve: true, amx: true };
+        let p = Platform::Aarch64 {
+            sve: true,
+            amx: true,
+        };
         let debug = format!("{:?}", p);
-        assert!(debug.contains("Aarch64"), "Debug should contain Aarch64, got: {}", debug);
+        assert!(
+            debug.contains("Aarch64"),
+            "Debug should contain Aarch64, got: {}",
+            debug
+        );
         assert!(debug.contains("sve"));
     }
 
     #[test]
     fn test_platform_equality_aarch64_variants() {
-        let a = Platform::Aarch64 { sve: false, amx: false };
-        let b = Platform::Aarch64 { sve: false, amx: false };
+        let a = Platform::Aarch64 {
+            sve: false,
+            amx: false,
+        };
+        let b = Platform::Aarch64 {
+            sve: false,
+            amx: false,
+        };
         assert_eq!(a, b);
 
-        let c = Platform::Aarch64 { sve: true, amx: false };
+        let c = Platform::Aarch64 {
+            sve: true,
+            amx: false,
+        };
         assert_ne!(a, c);
     }
 
     #[test]
     fn test_platform_x86_64_amx_flag() {
-        let with_amx = Platform::X86_64 { avx512: true, amx: true };
-        let without_amx = Platform::X86_64 { avx512: true, amx: false };
+        let with_amx = Platform::X86_64 {
+            avx512: true,
+            amx: true,
+        };
+        let without_amx = Platform::X86_64 {
+            avx512: true,
+            amx: false,
+        };
         assert_ne!(with_amx, without_amx);
     }
 
     #[test]
     fn test_platform_copy_preserves_original() {
-        let original = Platform::X86_64 { avx512: true, amx: false };
+        let original = Platform::X86_64 {
+            avx512: true,
+            amx: false,
+        };
         let _moved = original; // Copy, original still usable
         let another = original; // Another copy
         assert_eq!(original, another);
@@ -553,7 +667,10 @@ mod tests {
 
     #[test]
     fn test_platform_clone_independent() {
-        let original = Platform::Aarch64 { sve: true, amx: false };
+        let original = Platform::Aarch64 {
+            sve: true,
+            amx: false,
+        };
         let cloned = original.clone();
         assert_eq!(original, cloned);
     }
@@ -568,8 +685,11 @@ mod tests {
         let emitter = X86CodeGen::new(&profile, DType::F32);
         // simd_width should be a positive, reasonable value
         let w = emitter.simd_width();
-        assert!(w == 4 || w == 8 || w == 16,
-            "F32 simd_width should be 4 (SSE), 8 (AVX2), or 16 (AVX-512), got {}", w);
+        assert!(
+            w == 4 || w == 8 || w == 16,
+            "F32 simd_width should be 4 (SSE), 8 (AVX2), or 16 (AVX-512), got {}",
+            w
+        );
     }
 
     #[cfg(feature = "jit-x86")]
@@ -599,8 +719,11 @@ mod tests {
         let profile = DeviceProfile::detect();
         for dtype in [DType::F32, DType::BF16, DType::F16] {
             let emitter = X86CodeGen::new(&profile, dtype);
-            assert!(emitter.simd_width() > 0,
-                "simd_width should be positive for {:?}", dtype);
+            assert!(
+                emitter.simd_width() > 0,
+                "simd_width should be positive for {:?}",
+                dtype
+            );
         }
     }
 

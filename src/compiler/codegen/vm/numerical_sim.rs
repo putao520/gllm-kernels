@@ -11,12 +11,8 @@
 //!
 //! SPEC: gllm-kernels/SPEC/25-JIT-LIFECYCLE-INFRASTRUCTURE.md REQ-LC-011
 
-use crate::compiler::trace::{
-    TraceOp, ValueId, ReduceKind, CmpOp, Fp8Format, ScaleSelector,
-};
-use crate::quant_format::{
-    PackedScaleAlgorithm, QuantFormatDescriptor, QuantDataKind, ZeroLayout,
-};
+use crate::compiler::trace::{CmpOp, Fp8Format, ReduceKind, ScaleSelector, TraceOp, ValueId};
+use crate::quant_format::{PackedScaleAlgorithm, QuantDataKind, QuantFormatDescriptor, ZeroLayout};
 use crate::types::CompilerError;
 use std::collections::HashMap;
 
@@ -43,7 +39,7 @@ impl SimValue {
                 Ok(i as f32)
             }
             SimValue::Invalid => Err(CompilerError::CodegenViolation(
-                "Simulation error: use of invalid value".to_string()
+                "Simulation error: use of invalid value".to_string(),
             )),
         }
     }
@@ -57,13 +53,14 @@ impl SimValue {
                 if f.fract() == 0.0 && f >= i32::MIN as f32 && f <= i32::MAX as f32 {
                     Ok(f as i64)
                 } else {
-                    Err(CompilerError::CodegenViolation(
-                        format!("Simulation error: cannot convert non-integer float {} to integer", f)
-                    ))
+                    Err(CompilerError::CodegenViolation(format!(
+                        "Simulation error: cannot convert non-integer float {} to integer",
+                        f
+                    )))
                 }
             }
             SimValue::Invalid => Err(CompilerError::CodegenViolation(
-                "Simulation error: use of invalid value".to_string()
+                "Simulation error: use of invalid value".to_string(),
             )),
         }
     }
@@ -120,9 +117,10 @@ impl SimState {
     /// 从内存加载字节 (返回整数).
     fn load_u8(&self, addr: i64) -> Result<u8, CompilerError> {
         if addr < 0 || addr >= self.memory.len() as i64 {
-            return Err(CompilerError::CodegenViolation(
-                format!("Simulation error: out-of-bounds memory access at {}", addr)
-            ));
+            return Err(CompilerError::CodegenViolation(format!(
+                "Simulation error: out-of-bounds memory access at {}",
+                addr
+            )));
         }
         Ok(self.memory[addr as usize])
     }
@@ -130,9 +128,10 @@ impl SimState {
     /// 从内存加载 i16.
     fn load_i16(&self, addr: i64) -> Result<i16, CompilerError> {
         if addr < 0 || addr + 1 >= self.memory.len() as i64 {
-            return Err(CompilerError::CodegenViolation(
-                format!("Simulation error: out-of-bounds memory access at {}", addr)
-            ));
+            return Err(CompilerError::CodegenViolation(format!(
+                "Simulation error: out-of-bounds memory access at {}",
+                addr
+            )));
         }
         let bytes = [self.memory[addr as usize], self.memory[addr as usize + 1]];
         Ok(i16::from_le_bytes(bytes))
@@ -141,9 +140,10 @@ impl SimState {
     /// 从内存加载 f16 (转换为 f32).
     fn load_f16(&self, addr: i64) -> Result<f32, CompilerError> {
         if addr < 0 || addr + 1 >= self.memory.len() as i64 {
-            return Err(CompilerError::CodegenViolation(
-                format!("Simulation error: out-of-bounds memory access at {}", addr)
-            ));
+            return Err(CompilerError::CodegenViolation(format!(
+                "Simulation error: out-of-bounds memory access at {}",
+                addr
+            )));
         }
         let bytes = [self.memory[addr as usize], self.memory[addr as usize + 1]];
         let u = u16::from_le_bytes(bytes);
@@ -169,9 +169,10 @@ impl SimState {
     /// 存储字节到内存。
     fn store_u8(&mut self, addr: i64, value: u8) -> Result<(), CompilerError> {
         if addr < 0 || addr >= self.memory.len() as i64 {
-            return Err(CompilerError::CodegenViolation(
-                format!("Simulation error: out-of-bounds memory access at {}", addr)
-            ));
+            return Err(CompilerError::CodegenViolation(format!(
+                "Simulation error: out-of-bounds memory access at {}",
+                addr
+            )));
         }
         self.memory[addr as usize] = value;
         Ok(())
@@ -365,19 +366,27 @@ impl NumericalSimulator {
         // 预扫描 trace 找到最大 Input 索引，推进 next_id 跳过 Input slot 空间。
         // Input(N) 使用 ValueId(N) 作为 slot，中间操作用 alloc_id() 分配。
         // next_id 必须从 max_input_idx+1 开始，防止与 Input ValueId 碰撞。
-        let max_input_idx = trace.iter().map(|op| {
-            if let TraceOp::Input(idx) = op { *idx as u32 + 1 } else { 0 }
-        }).max().unwrap_or(0);
+        let max_input_idx = trace
+            .iter()
+            .map(|op| {
+                if let TraceOp::Input(idx) = op {
+                    *idx as u32 + 1
+                } else {
+                    0
+                }
+            })
+            .max()
+            .unwrap_or(0);
         state.next_id = max_input_idx;
 
         // 准备输入值映射: Input(idx) → SimValue。
         // Input(N) 的 N 是输入参数编号，不是 trace 位置。模拟器在执行时
         // 将 Input(N) 映射为 ValueId(trace_pos)，并把 input_values[N] 存入。
         let input_values: Vec<SimValue> = vec![
-            SimValue::Integer(inputs.first().copied().unwrap_or(block_base_addr)),  // Input(0) = block_base
-            SimValue::Integer(inputs.get(1).copied().unwrap_or(block_base_addr)),   // Input(1) = data_ptr
-            SimValue::Integer(inputs.get(2).copied().unwrap_or(0)),                 // Input(2) = lane_offset
-            SimValue::Integer(inputs.get(3).copied().unwrap_or(block_base_addr)),   // Input(3) = high_bits_ptr
+            SimValue::Integer(inputs.first().copied().unwrap_or(block_base_addr)), // Input(0) = block_base
+            SimValue::Integer(inputs.get(1).copied().unwrap_or(block_base_addr)), // Input(1) = data_ptr
+            SimValue::Integer(inputs.get(2).copied().unwrap_or(0)), // Input(2) = lane_offset
+            SimValue::Integer(inputs.get(3).copied().unwrap_or(block_base_addr)), // Input(3) = high_bits_ptr
         ];
 
         // 执行 TraceOp 序列
@@ -387,18 +396,22 @@ impl NumericalSimulator {
             let result = match op {
                 TraceOp::Input(idx) => {
                     let id = ValueId(trace_pos);
-                    let val = input_values.get(*idx as usize)
+                    let val = input_values
+                        .get(*idx as usize)
                         .copied()
                         .unwrap_or(SimValue::Integer(0));
                     state.set(id, val);
                     Ok(Some(id))
                 }
-                _ => self.exec_op_with_pos(op, trace_pos, &mut state, desc)
+                _ => self.exec_op_with_pos(op, trace_pos, &mut state, desc),
             };
             let result = result.map_err(|e| {
                 CompilerError::CodegenViolation(format!(
                     "{} (at trace op #{}: {:?})",
-                    match &e { CompilerError::CodegenViolation(s) => s.clone(), _ => format!("{:?}", e) },
+                    match &e {
+                        CompilerError::CodegenViolation(s) => s.clone(),
+                        _ => format!("{:?}", e),
+                    },
                     i,
                     op
                 ))
@@ -411,9 +424,9 @@ impl NumericalSimulator {
         // 提取输出值
         // 假设最后一个操作产生输出向量
         // 由于我们是标量模拟，需要根据输出 lane 数量扩展
-        let output_slots = output_id.ok_or_else(|| CompilerError::CodegenViolation(
-            "Simulation error: no output produced".to_string()
-        ))?;
+        let output_slots = output_id.ok_or_else(|| {
+            CompilerError::CodegenViolation("Simulation error: no output produced".to_string())
+        })?;
 
         // 简化: 假设输出是一个标量值，广播到向量
         let scalar_val = state.get(output_slots).as_float()?;
@@ -447,7 +460,7 @@ impl NumericalSimulator {
                 state.set(ValueId(pos), src_val);
                 Ok(Some(ValueId(pos)))
             }
-            _ => self.exec_op_with_pos(op, pos, state, desc)
+            _ => self.exec_op_with_pos(op, pos, state, desc),
         }
     }
 
@@ -464,95 +477,108 @@ impl NumericalSimulator {
         desc: &QuantFormatDescriptor,
     ) -> Result<Option<ValueId>, CompilerError> {
         match op {
-                        TraceOp::Input(_) => self.exec_elementwise(op, trace_pos, state, desc),
-                        TraceOp::Const(_) => self.exec_elementwise(op, trace_pos, state, desc),
-                        TraceOp::Add(_, _) => self.exec_binary(op, trace_pos, state, desc),
-                        TraceOp::Sub(_, _) => self.exec_binary(op, trace_pos, state, desc),
-                        TraceOp::Mul(_, _) => self.exec_binary(op, trace_pos, state, desc),
-                        TraceOp::Div(_, _) => self.exec_binary(op, trace_pos, state, desc),
-                        TraceOp::Pow(_, _) => self.exec_binary(op, trace_pos, state, desc),
-                        TraceOp::Fma(_, _, _) => self.exec_binary(op, trace_pos, state, desc),
-                        TraceOp::Neg(_) => self.exec_elementwise(op, trace_pos, state, desc),
-                        TraceOp::Abs(_) => self.exec_elementwise(op, trace_pos, state, desc),
-                        TraceOp::Sqrt(_) => self.exec_elementwise(op, trace_pos, state, desc),
-                        TraceOp::Rsqrt(_) => self.exec_elementwise(op, trace_pos, state, desc),
-                        TraceOp::Max(_, _) => self.exec_binary(op, trace_pos, state, desc),
-                        TraceOp::Min(_, _) => self.exec_binary(op, trace_pos, state, desc),
-                        TraceOp::QuantBitAnd { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantBitOr { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantBroadcast { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantCastF16toF32 { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantCastI8toF32 { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantCastFp8toF32 { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantExtractBits { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantIntDivConst { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantPtrAddOffset { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantPtrAddDynamic { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantScalarLoad { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantDequantFma { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantIntMul { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantInterleave { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantConcatSeq { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantAndMask { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantLoadF16toF32 { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantLoadI8toF32 { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantLoadBytesVec { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantShiftLeft { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantShiftRight { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::Exp(_) => self.exec_elementwise(op, trace_pos, state, desc),
-                        TraceOp::Tanh(_) => self.exec_elementwise(op, trace_pos, state, desc),
-                        TraceOp::Recip(_) => self.exec_elementwise(op, trace_pos, state, desc),
-                        TraceOp::Log(_) => self.exec_elementwise(op, trace_pos, state, desc),
-                        TraceOp::Sigmoid(_) => self.exec_elementwise(op, trace_pos, state, desc),
-                        TraceOp::ConditionalBranch(_, _, _) => self.exec_elementwise(op, trace_pos, state, desc),
-                        TraceOp::QuantFma { .. } => self.exec_binary(op, trace_pos, state, desc),
-                        TraceOp::BlockScale { .. } => self.exec_binary(op, trace_pos, state, desc),
-                        TraceOp::Cast { .. } => self.exec_elementwise(op, trace_pos, state, desc),
-                        TraceOp::HReduce { .. } => self.exec_reduction(op, trace_pos, state, desc),
-                        TraceOp::Prefetch { .. } => self.exec_elementwise(op, trace_pos, state, desc),
-                        TraceOp::NonTemporalStore => self.exec_elementwise(op, trace_pos, state, desc),
-                        TraceOp::BitExtract { .. } => self.exec_binary(op, trace_pos, state, desc),
-                        TraceOp::Permute { .. } => self.exec_binary(op, trace_pos, state, desc),
-                        TraceOp::Compare { .. } => self.exec_elementwise(op, trace_pos, state, desc),
-                        TraceOp::MaskedOp { .. } => self.exec_binary(op, trace_pos, state, desc),
-                        TraceOp::AtomicAdd { .. } => self.exec_binary(op, trace_pos, state, desc),
-                        TraceOp::FWHT { .. } => self.exec_injective(op, trace_pos, state, desc),
-                        TraceOp::ScalarLoad { .. } => self.exec_injective(op, trace_pos, state, desc),
-                        TraceOp::StrideMul { .. } => self.exec_injective(op, trace_pos, state, desc),
-                        TraceOp::PtrAdd { .. } => self.exec_injective(op, trace_pos, state, desc),
-                        TraceOp::VecLoadIndexed { .. } => self.exec_injective(op, trace_pos, state, desc),
-                        TraceOp::VecStoreIndexed { .. } => self.exec_injective(op, trace_pos, state, desc),
-                        TraceOp::BroadcastScalar { .. } => self.exec_elementwise(op, trace_pos, state, desc),
-                        TraceOp::BroadcastLoad { .. } => self.exec_injective(op, trace_pos, state, desc),
-                        TraceOp::GatherLoad { .. } => self.exec_injective(op, trace_pos, state, desc),
-                        TraceOp::ScatterStore { .. } => self.exec_injective(op, trace_pos, state, desc),
-                        TraceOp::TableLookup { .. } => self.exec_injective(op, trace_pos, state, desc),
-                        TraceOp::Mxfp4Dequant { .. } => self.exec_injective(op, trace_pos, state, desc),
-                        TraceOp::BitAnd(_, _) => self.exec_binary(op, trace_pos, state, desc),
-                        TraceOp::QuantCodebookLookup { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantE2m1LutDecode { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantKQuantPackedScaleLookup { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantScaleLoad { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantDataLoad { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantZeroLoad { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantSubScaleLoad { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantHighBitsLoad { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::QuantCodebookDequant { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
-                        TraceOp::Loop { .. } => self.exec_injective(op, trace_pos, state, desc),
-                        TraceOp::PanelLoad { .. } => self.exec_injective(op, trace_pos, state, desc),
-                        TraceOp::PanelStore { .. } => self.exec_injective(op, trace_pos, state, desc),
-                        TraceOp::PackBuffer { .. } => self.exec_injective(op, trace_pos, state, desc),
-                        TraceOp::SharedMemDeclare { .. } => self.exec_injective(op, trace_pos, state, desc),
-                        TraceOp::AsyncCopyToShared { .. } => self.exec_injective(op, trace_pos, state, desc),
-                        TraceOp::Tma2DCopy { .. } => self.exec_injective(op, trace_pos, state, desc),
-                        TraceOp::AsyncWaitGroup { .. } => self.exec_injective(op, trace_pos, state, desc),
-                        TraceOp::SyncBarrier { .. } => self.exec_injective(op, trace_pos, state, desc),
-                        TraceOp::TileConfig { .. } => self.exec_injective(op, trace_pos, state, desc),
-                        TraceOp::TileMma { .. } => self.exec_gemm(op, trace_pos, state, desc),
-                        TraceOp::TileRelease => self.exec_injective(op, trace_pos, state, desc),
-                        TraceOp::Softmax { .. } => self.exec_normlike(op, trace_pos, state, desc),
-                        TraceOp::EpilogueChain { .. } => self.exec_injective(op, trace_pos, state, desc),
-                        TraceOp::QuantGather { .. } | TraceOp::QuantGemm { .. }
+            TraceOp::Input(_) => self.exec_elementwise(op, trace_pos, state, desc),
+            TraceOp::Const(_) => self.exec_elementwise(op, trace_pos, state, desc),
+            TraceOp::Add(_, _) => self.exec_binary(op, trace_pos, state, desc),
+            TraceOp::Sub(_, _) => self.exec_binary(op, trace_pos, state, desc),
+            TraceOp::Mul(_, _) => self.exec_binary(op, trace_pos, state, desc),
+            TraceOp::Div(_, _) => self.exec_binary(op, trace_pos, state, desc),
+            TraceOp::Pow(_, _) => self.exec_binary(op, trace_pos, state, desc),
+            TraceOp::Fma(_, _, _) => self.exec_binary(op, trace_pos, state, desc),
+            TraceOp::Neg(_) => self.exec_elementwise(op, trace_pos, state, desc),
+            TraceOp::Abs(_) => self.exec_elementwise(op, trace_pos, state, desc),
+            TraceOp::Sqrt(_) => self.exec_elementwise(op, trace_pos, state, desc),
+            TraceOp::Rsqrt(_) => self.exec_elementwise(op, trace_pos, state, desc),
+            TraceOp::Max(_, _) => self.exec_binary(op, trace_pos, state, desc),
+            TraceOp::Min(_, _) => self.exec_binary(op, trace_pos, state, desc),
+            TraceOp::QuantBitAnd { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::QuantBitOr { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::QuantBroadcast { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::QuantCastF16toF32 { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::QuantCastI8toF32 { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::QuantCastFp8toF32 { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::QuantExtractBits { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::QuantIntDivConst { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::QuantPtrAddOffset { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::QuantPtrAddDynamic { .. } => {
+                self.exec_quant_decode(op, trace_pos, state, desc)
+            }
+            TraceOp::QuantScalarLoad { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::QuantDequantFma { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::QuantIntMul { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::QuantInterleave { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::QuantConcatSeq { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::QuantAndMask { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::QuantLoadF16toF32 { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::QuantLoadI8toF32 { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::QuantLoadBytesVec { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::QuantShiftLeft { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::QuantShiftRight { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::Exp(_) => self.exec_elementwise(op, trace_pos, state, desc),
+            TraceOp::Tanh(_) => self.exec_elementwise(op, trace_pos, state, desc),
+            TraceOp::Recip(_) => self.exec_elementwise(op, trace_pos, state, desc),
+            TraceOp::Log(_) => self.exec_elementwise(op, trace_pos, state, desc),
+            TraceOp::Sigmoid(_) => self.exec_elementwise(op, trace_pos, state, desc),
+            TraceOp::ConditionalBranch(_, _, _) => {
+                self.exec_elementwise(op, trace_pos, state, desc)
+            }
+            TraceOp::QuantFma { .. } => self.exec_binary(op, trace_pos, state, desc),
+            TraceOp::BlockScale { .. } => self.exec_binary(op, trace_pos, state, desc),
+            TraceOp::Cast { .. } => self.exec_elementwise(op, trace_pos, state, desc),
+            TraceOp::HReduce { .. } => self.exec_reduction(op, trace_pos, state, desc),
+            TraceOp::Prefetch { .. } => self.exec_elementwise(op, trace_pos, state, desc),
+            TraceOp::NonTemporalStore => self.exec_elementwise(op, trace_pos, state, desc),
+            TraceOp::BitExtract { .. } => self.exec_binary(op, trace_pos, state, desc),
+            TraceOp::Permute { .. } => self.exec_binary(op, trace_pos, state, desc),
+            TraceOp::Compare { .. } => self.exec_elementwise(op, trace_pos, state, desc),
+            TraceOp::MaskedOp { .. } => self.exec_binary(op, trace_pos, state, desc),
+            TraceOp::AtomicAdd { .. } => self.exec_binary(op, trace_pos, state, desc),
+            TraceOp::FWHT { .. } => self.exec_injective(op, trace_pos, state, desc),
+            TraceOp::ScalarLoad { .. } => self.exec_injective(op, trace_pos, state, desc),
+            TraceOp::StrideMul { .. } => self.exec_injective(op, trace_pos, state, desc),
+            TraceOp::PtrAdd { .. } => self.exec_injective(op, trace_pos, state, desc),
+            TraceOp::VecLoadIndexed { .. } => self.exec_injective(op, trace_pos, state, desc),
+            TraceOp::VecStoreIndexed { .. } => self.exec_injective(op, trace_pos, state, desc),
+            TraceOp::BroadcastScalar { .. } => self.exec_elementwise(op, trace_pos, state, desc),
+            TraceOp::BroadcastLoad { .. } => self.exec_injective(op, trace_pos, state, desc),
+            TraceOp::GatherLoad { .. } => self.exec_injective(op, trace_pos, state, desc),
+            TraceOp::ScatterStore { .. } => self.exec_injective(op, trace_pos, state, desc),
+            TraceOp::TableLookup { .. } => self.exec_injective(op, trace_pos, state, desc),
+            TraceOp::Mxfp4Dequant { .. } => self.exec_injective(op, trace_pos, state, desc),
+            TraceOp::BitAnd(_, _) => self.exec_binary(op, trace_pos, state, desc),
+            TraceOp::QuantCodebookLookup { .. } => {
+                self.exec_quant_decode(op, trace_pos, state, desc)
+            }
+            TraceOp::QuantE2m1LutDecode { .. } => {
+                self.exec_quant_decode(op, trace_pos, state, desc)
+            }
+            TraceOp::QuantKQuantPackedScaleLookup { .. } => {
+                self.exec_quant_decode(op, trace_pos, state, desc)
+            }
+            TraceOp::QuantScaleLoad { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::QuantDataLoad { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::QuantZeroLoad { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::QuantSubScaleLoad { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::QuantHighBitsLoad { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+            TraceOp::QuantCodebookDequant { .. } => {
+                self.exec_quant_decode(op, trace_pos, state, desc)
+            }
+            TraceOp::Loop { .. } => self.exec_injective(op, trace_pos, state, desc),
+            TraceOp::PanelLoad { .. } => self.exec_injective(op, trace_pos, state, desc),
+            TraceOp::PanelStore { .. } => self.exec_injective(op, trace_pos, state, desc),
+            TraceOp::PackBuffer { .. } => self.exec_injective(op, trace_pos, state, desc),
+            TraceOp::SharedMemDeclare { .. } => self.exec_injective(op, trace_pos, state, desc),
+            TraceOp::AsyncCopyToShared { .. } => self.exec_injective(op, trace_pos, state, desc),
+            TraceOp::Tma2DCopy { .. } => self.exec_injective(op, trace_pos, state, desc),
+            TraceOp::AsyncWaitGroup { .. } => self.exec_injective(op, trace_pos, state, desc),
+            TraceOp::SyncBarrier { .. } => self.exec_injective(op, trace_pos, state, desc),
+            TraceOp::TileConfig { .. } => self.exec_injective(op, trace_pos, state, desc),
+            TraceOp::TileMma { .. } => self.exec_gemm(op, trace_pos, state, desc),
+            TraceOp::TileRelease => self.exec_injective(op, trace_pos, state, desc),
+            TraceOp::Softmax { .. } => self.exec_normlike(op, trace_pos, state, desc),
+            TraceOp::EpilogueChain { .. } => self.exec_injective(op, trace_pos, state, desc),
+            TraceOp::QuantGather { .. }
+            | TraceOp::QuantGemm { .. }
             | TraceOp::MtpDraft { .. }
             | TraceOp::MlaAttnScore { .. }
             | TraceOp::MlaRopeMerge { .. }
@@ -608,9 +634,10 @@ impl NumericalSimulator {
             TraceOp::Sqrt(a) => {
                 let a_val = state.get(*a).as_float()?;
                 if a_val < 0.0 {
-                    return Err(CompilerError::CodegenViolation(
-                        format!("Simulation error: sqrt of negative value {}", a_val)
-                    ));
+                    return Err(CompilerError::CodegenViolation(format!(
+                        "Simulation error: sqrt of negative value {}",
+                        a_val
+                    )));
                 }
                 let result = a_val.sqrt();
                 let id = ValueId(trace_pos);
@@ -621,9 +648,10 @@ impl NumericalSimulator {
             TraceOp::Rsqrt(a) => {
                 let a_val = state.get(*a).as_float()?;
                 if a_val <= 0.0 {
-                    return Err(CompilerError::CodegenViolation(
-                        format!("Simulation error: rsqrt of non-positive value {}", a_val)
-                    ));
+                    return Err(CompilerError::CodegenViolation(format!(
+                        "Simulation error: rsqrt of non-positive value {}",
+                        a_val
+                    )));
                 }
                 let result = 1.0 / a_val.sqrt();
                 let id = ValueId(trace_pos);
@@ -653,7 +681,7 @@ impl NumericalSimulator {
                 let a_val = state.get(*a).as_float()?;
                 if a_val == 0.0 {
                     return Err(CompilerError::CodegenViolation(
-                        "Simulation error: reciprocal of zero".to_string()
+                        "Simulation error: reciprocal of zero".to_string(),
                     ));
                 }
                 let result = 1.0 / a_val;
@@ -666,9 +694,10 @@ impl NumericalSimulator {
             TraceOp::Log(a) => {
                 let a_val = state.get(*a).as_float()?;
                 if a_val <= 0.0 {
-                    return Err(CompilerError::CodegenViolation(
-                        format!("Simulation error: log of non-positive value {}", a_val)
-                    ));
+                    return Err(CompilerError::CodegenViolation(format!(
+                        "Simulation error: log of non-positive value {}",
+                        a_val
+                    )));
                 }
                 let result = a_val.ln();
                 let id = ValueId(trace_pos);
@@ -697,7 +726,11 @@ impl NumericalSimulator {
             }
 
             // ── QuantFma (混合精度 FMA) ──
-            TraceOp::Cast { src, from: _, to: _ } => {
+            TraceOp::Cast {
+                src,
+                from: _,
+                to: _,
+            } => {
                 let val = state.get(*src);
                 match val {
                     SimValue::Float(_) => {
@@ -711,7 +744,7 @@ impl NumericalSimulator {
                         Ok(Some(id))
                     }
                     SimValue::Invalid => Err(CompilerError::CodegenViolation(
-                        "Simulation error: Cast on invalid value".to_string()
+                        "Simulation error: Cast on invalid value".to_string(),
                     )),
                 }
             }
@@ -737,12 +770,48 @@ impl NumericalSimulator {
                 let a_val = state.get(*a).as_float()?;
                 let b_val = state.get(*b).as_float()?;
                 let result = match op {
-                    CmpOp::Eq => if a_val == b_val { 1.0 } else { 0.0 },
-                    CmpOp::Ne => if a_val != b_val { 1.0 } else { 0.0 },
-                    CmpOp::Lt => if a_val < b_val { 1.0 } else { 0.0 },
-                    CmpOp::Le => if a_val <= b_val { 1.0 } else { 0.0 },
-                    CmpOp::Gt => if a_val > b_val { 1.0 } else { 0.0 },
-                    CmpOp::Ge => if a_val >= b_val { 1.0 } else { 0.0 },
+                    CmpOp::Eq => {
+                        if a_val == b_val {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    CmpOp::Ne => {
+                        if a_val != b_val {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    CmpOp::Lt => {
+                        if a_val < b_val {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    CmpOp::Le => {
+                        if a_val <= b_val {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    CmpOp::Gt => {
+                        if a_val > b_val {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    CmpOp::Ge => {
+                        if a_val >= b_val {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
                 };
                 let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
@@ -803,7 +872,7 @@ impl NumericalSimulator {
                 let b_val = state.get(*b).as_float()?;
                 if b_val == 0.0 {
                     return Err(CompilerError::CodegenViolation(
-                        "Simulation error: division by zero".to_string()
+                        "Simulation error: division by zero".to_string(),
                     ));
                 }
                 let result = a_val / b_val;
@@ -817,7 +886,7 @@ impl NumericalSimulator {
                 let b_val = state.get(*b).as_float()?;
                 if a_val < 0.0 {
                     return Err(CompilerError::CodegenViolation(
-                        "Simulation error: pow with negative base".to_string()
+                        "Simulation error: pow with negative base".to_string(),
                     ));
                 }
                 let result = a_val.powf(b_val);
@@ -856,7 +925,13 @@ impl NumericalSimulator {
             }
 
             // 量化操作
-            TraceOp::QuantFma { acc, act, weight, act_dtype: _, weight_dtype: _ } => {
+            TraceOp::QuantFma {
+                acc,
+                act,
+                weight,
+                act_dtype: _,
+                weight_dtype: _,
+            } => {
                 let acc_val = state.get(*acc).as_float()?;
                 let act_val = state.get(*act).as_float()?;
                 let weight_val = state.get(*weight).as_float()?;
@@ -867,7 +942,11 @@ impl NumericalSimulator {
             }
 
             // ── BlockScale ──
-            TraceOp::BlockScale { data, scale, block_size: _ } => {
+            TraceOp::BlockScale {
+                data,
+                scale,
+                block_size: _,
+            } => {
                 let data_val = state.get(*data).as_float()?;
                 let scale_val = state.get(*scale).as_float()?;
                 let result = data_val * scale_val;
@@ -987,7 +1066,11 @@ impl NumericalSimulator {
             }
 
             // ── VecStoreIndexed (标量模拟: 存储一个字节) ──
-            TraceOp::VecStoreIndexed { base, offset, value } => {
+            TraceOp::VecStoreIndexed {
+                base,
+                offset,
+                value,
+            } => {
                 let base_val = state.get(*base).as_integer()?;
                 let offset_val = state.get(*offset).as_integer()?;
                 let value_val = state.get(*value).as_float()?;
@@ -1010,7 +1093,11 @@ impl NumericalSimulator {
             }
 
             // ── GatherLoad (标量模拟: 加载一个元素) ──
-            TraceOp::GatherLoad { base, indices, stride } => {
+            TraceOp::GatherLoad {
+                base,
+                indices,
+                stride,
+            } => {
                 let base_val = state.get(*base).as_integer()?;
                 let idx_val = state.get(*indices).as_integer()?;
                 let addr = base_val + idx_val * (*stride as i64);
@@ -1021,7 +1108,12 @@ impl NumericalSimulator {
             }
 
             // ── ScatterStore (标量模拟: 存储一个元素) ──
-            TraceOp::ScatterStore { base, indices, value, stride } => {
+            TraceOp::ScatterStore {
+                base,
+                indices,
+                value,
+                stride,
+            } => {
                 let base_val = state.get(*base).as_integer()?;
                 let idx_val = state.get(*indices).as_integer()?;
                 let value_val = state.get(*value).as_float()?;
@@ -1033,7 +1125,11 @@ impl NumericalSimulator {
             }
 
             // ── TableLookup ──
-            TraceOp::TableLookup { base, row_index, row_bytes } => {
+            TraceOp::TableLookup {
+                base,
+                row_index,
+                row_bytes,
+            } => {
                 let base_val = state.get(*base).as_integer()?;
                 let row_idx = state.get(*row_index).as_integer()?;
                 let addr = base_val + row_idx * (*row_bytes as i64);
@@ -1044,7 +1140,17 @@ impl NumericalSimulator {
             }
 
             // ── Mxfp4Dequant (标量模拟: 加载并反量化一个 MXFP4 元素) ──
-            TraceOp::Mxfp4Dequant { data, scales, off_a: _, stride_a: _, off_b: _, stride_b: _, off_c: _, const_off: _, block_size: _ } => {
+            TraceOp::Mxfp4Dequant {
+                data,
+                scales,
+                off_a: _,
+                stride_a: _,
+                off_b: _,
+                stride_b: _,
+                off_c: _,
+                const_off: _,
+                block_size: _,
+            } => {
                 let data_val = state.get(*data).as_integer()?;
                 let scales_val = state.get(*scales).as_integer()?;
                 // MXFP4: data 是 packed nibble 地址, scales 是 scale 地址
@@ -1061,7 +1167,11 @@ impl NumericalSimulator {
             }
 
             // ── BitAnd ──
-            TraceOp::Loop { bound: _, step_bytes: _, body } => {
+            TraceOp::Loop {
+                bound: _,
+                step_bytes: _,
+                body,
+            } => {
                 // 标量模拟: 仅执行 body 一次。
                 // body 内的 op 共享外层 trace_pos 空间，使用 alloc_id 避免碰撞。
                 let mut last_id = None;
@@ -1077,7 +1187,9 @@ impl NumericalSimulator {
                             last_id = Some(id);
                         }
                         _ => {
-                            if let Ok(Some(id)) = self.exec_op_with_pos(inner_op, inner_pos, state, desc) {
+                            if let Ok(Some(id)) =
+                                self.exec_op_with_pos(inner_op, inner_pos, state, desc)
+                            {
                                 last_id = Some(id);
                             }
                         }
@@ -1087,7 +1199,12 @@ impl NumericalSimulator {
             }
 
             // ── PanelLoad (标量模拟: 加载 row 0, col 0 的一个元素) ──
-            TraceOp::PanelLoad { base, offset, rows: _, cols: _ } => {
+            TraceOp::PanelLoad {
+                base,
+                offset,
+                rows: _,
+                cols: _,
+            } => {
                 let base_val = state.get(*base).as_integer()?;
                 let offset_val = state.get(*offset).as_integer()?;
                 let addr = base_val + offset_val;
@@ -1098,7 +1215,12 @@ impl NumericalSimulator {
             }
 
             // ── PanelStore (标量模拟: 存储一个字节) ──
-            TraceOp::PanelStore { base, offset, rows: _, cols: _ } => {
+            TraceOp::PanelStore {
+                base,
+                offset,
+                rows: _,
+                cols: _,
+            } => {
                 let base_val = state.get(*base).as_integer()?;
                 let offset_val = state.get(*offset).as_integer()?;
                 // 标量模拟中，存储源的最后一个浮点值
@@ -1108,7 +1230,13 @@ impl NumericalSimulator {
             }
 
             // ── PackBuffer (标量模拟: NOP) ──
-            TraceOp::PackBuffer { src, dst: _, rows: _, cols: _, layout: _ } => {
+            TraceOp::PackBuffer {
+                src,
+                dst: _,
+                rows: _,
+                cols: _,
+                layout: _,
+            } => {
                 let val = state.get(*src);
                 let id = ValueId(trace_pos);
                 state.set(id, val);
@@ -1123,14 +1251,23 @@ impl NumericalSimulator {
             }
 
             // ── AsyncCopyToShared (标量模拟: NOP) ──
-            TraceOp::AsyncCopyToShared { name: _, src_offset: _, bytes: _ } => {
+            TraceOp::AsyncCopyToShared {
+                name: _,
+                src_offset: _,
+                bytes: _,
+            } => {
                 let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(0.0));
                 Ok(Some(id))
             }
 
             // ── Tma2DCopy (标量模拟: NOP) ──
-            TraceOp::Tma2DCopy { desc: _, coord_x: _, coord_y: _, bytes: _ } => {
+            TraceOp::Tma2DCopy {
+                desc: _,
+                coord_x: _,
+                coord_y: _,
+                bytes: _,
+            } => {
                 let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(0.0));
                 Ok(Some(id))
@@ -1189,8 +1326,11 @@ impl NumericalSimulator {
             TraceOp::HReduce { src, op } => {
                 let val = state.get(*src).as_float()?;
                 let result = match op {
-                    ReduceKind::Sum | ReduceKind::Prod | ReduceKind::Max
-                    | ReduceKind::Min | ReduceKind::LogSum => val,
+                    ReduceKind::Sum
+                    | ReduceKind::Prod
+                    | ReduceKind::Max
+                    | ReduceKind::Min
+                    | ReduceKind::LogSum => val,
                     ReduceKind::Count => 1.0,
                     ReduceKind::ArgMax => 0.0,
                 };
@@ -1235,7 +1375,14 @@ impl NumericalSimulator {
         desc: &QuantFormatDescriptor,
     ) -> Result<Option<ValueId>, CompilerError> {
         match op {
-            TraceOp::TileMma { c, a, b, m: _, n: _, k: _ } => {
+            TraceOp::TileMma {
+                c,
+                a,
+                b,
+                m: _,
+                n: _,
+                k: _,
+            } => {
                 let c_val = state.get(*c).as_float()?;
                 let a_val = state.get(*a).as_float()?;
                 let b_val = state.get(*b).as_float()?;
@@ -1316,7 +1463,11 @@ impl NumericalSimulator {
                 Ok(Some(id))
             }
 
-            TraceOp::QuantExtractBits { src, bit_offset, bit_width } => {
+            TraceOp::QuantExtractBits {
+                src,
+                bit_offset,
+                bit_width,
+            } => {
                 let src_val = state.get(*src).as_integer()?;
                 let mask = (1i64 << bit_width) - 1;
                 let result = (src_val >> bit_offset) & mask;
@@ -1329,7 +1480,7 @@ impl NumericalSimulator {
                 let src_val = state.get(*src).as_integer()?;
                 if *divisor == 0 {
                     return Err(CompilerError::CodegenViolation(
-                        "Simulation error: division by zero".to_string()
+                        "Simulation error: division by zero".to_string(),
                     ));
                 }
                 let result = src_val / divisor;
@@ -1424,7 +1575,12 @@ impl NumericalSimulator {
                 Ok(Some(id))
             }
 
-            TraceOp::QuantLoadBytesVec { ptr, offset_bytes, count: _, signed } => {
+            TraceOp::QuantLoadBytesVec {
+                ptr,
+                offset_bytes,
+                count: _,
+                signed,
+            } => {
                 let ptr_val = state.get(*ptr).as_integer()?;
                 let addr = ptr_val + offset_bytes;
                 let byte_val = state.load_u8(addr)?;
@@ -1455,7 +1611,12 @@ impl NumericalSimulator {
             }
 
             // ── Exp ──
-            TraceOp::QuantCodebookLookup { indices, codebook_data, vector_size: _, bits_per_entry: _ } => {
+            TraceOp::QuantCodebookLookup {
+                indices,
+                codebook_data,
+                vector_size: _,
+                bits_per_entry: _,
+            } => {
                 let idx = state.get(*indices).as_integer()?;
                 let codebook = *codebook_data;
                 let codebook_idx = idx as usize;
@@ -1465,14 +1626,20 @@ impl NumericalSimulator {
                     state.set(id, SimValue::Float(val));
                     Ok(Some(id))
                 } else {
-                    Err(CompilerError::CodegenViolation(
-                        format!("Simulation error: codebook index {} out of bounds (len {})", codebook_idx, codebook.len())
-                    ))
+                    Err(CompilerError::CodegenViolation(format!(
+                        "Simulation error: codebook index {} out of bounds (len {})",
+                        codebook_idx,
+                        codebook.len()
+                    )))
                 }
             }
 
             // ── QuantE2m1LutDecode (修正实现) ──
-            TraceOp::QuantE2m1LutDecode { packed_data_ptr, scale_byte, nvfp4_mode } => {
+            TraceOp::QuantE2m1LutDecode {
+                packed_data_ptr,
+                scale_byte,
+                nvfp4_mode,
+            } => {
                 let data_addr = state.get(*packed_data_ptr).as_integer()?;
                 let scale_addr = state.get(*scale_byte).as_integer()?;
                 let packed_byte = state.load_u8(data_addr)?;
@@ -1495,7 +1662,12 @@ impl NumericalSimulator {
             }
 
             // ── QuantKQuantPackedScaleLookup (修正实现) ──
-            TraceOp::QuantKQuantPackedScaleLookup { scales_base, sub_block_idx, scale_algo, selector } => {
+            TraceOp::QuantKQuantPackedScaleLookup {
+                scales_base,
+                sub_block_idx,
+                scale_algo,
+                selector,
+            } => {
                 let base_addr = state.get(*scales_base).as_integer()?;
                 let idx = state.get(*sub_block_idx).as_integer()?;
                 let j = idx as usize;
@@ -1540,7 +1712,11 @@ impl NumericalSimulator {
             }
 
             // ── QuantScaleLoad ──
-            TraceOp::QuantScaleLoad { source, offset, dtype: _ } => {
+            TraceOp::QuantScaleLoad {
+                source,
+                offset,
+                dtype: _,
+            } => {
                 let ptr = state.get(*source).as_integer()?;
                 let addr = ptr + *offset as i64;
                 let f32_val = state.load_f16(addr)?;
@@ -1550,7 +1726,12 @@ impl NumericalSimulator {
             }
 
             // ── QuantDataLoad ──
-            TraceOp::QuantDataLoad { source, offset, quant_type, block_size: _ } => {
+            TraceOp::QuantDataLoad {
+                source,
+                offset,
+                quant_type,
+                block_size: _,
+            } => {
                 let ptr = state.get(*source).as_integer()?;
                 let addr = ptr + *offset as i64;
                 let desc = crate::quant_format::QuantFormatDescriptor::for_type(*quant_type);
@@ -1574,14 +1755,18 @@ impl NumericalSimulator {
             }
 
             // ── QuantZeroLoad ──
-            TraceOp::QuantZeroLoad { source, offset, zp_type } => {
+            TraceOp::QuantZeroLoad {
+                source,
+                offset,
+                zp_type,
+            } => {
                 let ptr = state.get(*source).as_integer()?;
                 let addr = ptr + *offset as i64;
                 let val = match zp_type {
                     ZeroLayout::None | ZeroLayout::StaticBias { .. } => 0.0f32,
-                    ZeroLayout::BlockScalar { .. } | ZeroLayout::BlockMin { .. } | ZeroLayout::Hierarchical { .. } => {
-                        state.load_f16(addr)?
-                    }
+                    ZeroLayout::BlockScalar { .. }
+                    | ZeroLayout::BlockMin { .. }
+                    | ZeroLayout::Hierarchical { .. } => state.load_f16(addr)?,
                 };
                 let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(val));
@@ -1589,7 +1774,12 @@ impl NumericalSimulator {
             }
 
             // ── QuantSubScaleLoad ──
-            TraceOp::QuantSubScaleLoad { block_ptr, byte_offset, bits: _, sub_block_size: _ } => {
+            TraceOp::QuantSubScaleLoad {
+                block_ptr,
+                byte_offset,
+                bits: _,
+                sub_block_size: _,
+            } => {
                 let ptr = state.get(*block_ptr).as_integer()?;
                 let addr = ptr + *byte_offset as i64;
                 let val = state.load_f16(addr)?;
@@ -1599,7 +1789,11 @@ impl NumericalSimulator {
             }
 
             // ── QuantHighBitsLoad ──
-            TraceOp::QuantHighBitsLoad { block_ptr, byte_offset, bits_per_elem: _ } => {
+            TraceOp::QuantHighBitsLoad {
+                block_ptr,
+                byte_offset,
+                bits_per_elem: _,
+            } => {
                 let ptr = state.get(*block_ptr).as_integer()?;
                 let addr = ptr + *byte_offset as i64;
                 let byte = state.load_u8(addr)?;
@@ -1609,7 +1803,12 @@ impl NumericalSimulator {
             }
 
             // ── QuantCodebookDequant ──
-            TraceOp::QuantCodebookDequant { indices, codebook_ptr, vector_size: _, bits_per_entry: _ } => {
+            TraceOp::QuantCodebookDequant {
+                indices,
+                codebook_ptr,
+                vector_size: _,
+                bits_per_entry: _,
+            } => {
                 let idx = state.get(*indices).as_integer()?;
                 let cb_ptr = state.get(*codebook_ptr).as_integer()?;
                 let addr = cb_ptr + idx;
@@ -1620,7 +1819,8 @@ impl NumericalSimulator {
             }
 
             // ── Loop (标量模拟: 展开一次迭代) ──
-            TraceOp::QuantGather { .. } | TraceOp::QuantGemm { .. }
+            TraceOp::QuantGather { .. }
+            | TraceOp::QuantGemm { .. }
             | TraceOp::MtpDraft { .. }
             | TraceOp::MlaAttnScore { .. }
             | TraceOp::MlaRopeMerge { .. }
@@ -1638,29 +1838,29 @@ impl NumericalSimulator {
         }
     }
 
-
     /// 验证模拟结果 (REQ-LC-011).
     ///
     /// 检查输出是否包含 NaN/Inf，值域是否合理。
     pub fn verify_result(&self, result: &SimResult) -> Result<(), CompilerError> {
         if result.has_nan {
             return Err(CompilerError::CodegenViolation(
-                "Numerical simulation failed: output contains NaN".to_string()
+                "Numerical simulation failed: output contains NaN".to_string(),
             ));
         }
 
         if result.has_inf {
             return Err(CompilerError::CodegenViolation(
-                "Numerical simulation failed: output contains Inf".to_string()
+                "Numerical simulation failed: output contains Inf".to_string(),
             ));
         }
 
         // 检查所有值是否在合理范围内 (-1e6 到 1e6)
         for &val in &result.outputs {
             if val.abs() > 1e6 {
-                return Err(CompilerError::CodegenViolation(
-                    format!("Numerical simulation failed: output value {} out of reasonable range", val)
-                ));
+                return Err(CompilerError::CodegenViolation(format!(
+                    "Numerical simulation failed: output value {} out of reasonable range",
+                    val
+                )));
             }
         }
 
@@ -1670,7 +1870,8 @@ impl NumericalSimulator {
     /// 未分类 TraceOp 变体兜底 (镜像 auto_select::unreachable_pattern)。
     fn unreachable_pattern(&self, op: &TraceOp) -> Result<Option<ValueId>, CompilerError> {
         Err(CompilerError::CodegenViolation(format!(
-            "exec_op_with_pos: 未分类的 TraceOp 变体 {:?} (ComputePattern 分类缺失)", op
+            "exec_op_with_pos: 未分类的 TraceOp 变体 {:?} (ComputePattern 分类缺失)",
+            op
         )))
     }
 }
@@ -1698,7 +1899,9 @@ impl Default for NumericalSimulator {
 //   Mov / LoopBegin / LoopEnd / TileConfig / TileMma / TileRelease
 // 其余指令 (控制流/GPU/通信) 不在 GEMM-FMA 路径, 解释器遇之报错 (NO-SILENT-FALLBACK)。
 
-use super::instr::{BoundExpr, LoopStride, OffsetExpr, ScalarExpr, SimdWidth, VRegId, VmInstr, VmProgram};
+use super::instr::{
+    BoundExpr, LoopStride, OffsetExpr, ScalarExpr, SimdWidth, VRegId, VmInstr, VmProgram,
+};
 use crate::compiler::trace::QuantPrecision;
 
 /// 解释器寄存器值: 一个 SIMD 向量用 Vec<f32> 表示 (lane 0..lanes-1)。
@@ -1721,7 +1924,11 @@ struct TileVal {
 
 impl TileVal {
     fn zeros(rows: usize, cols: usize) -> Self {
-        Self { rows, cols, data: vec![0.0; rows * cols] }
+        Self {
+            rows,
+            cols,
+            data: vec![0.0; rows * cols],
+        }
     }
 }
 
@@ -1758,7 +1965,8 @@ impl VmInterpState {
     fn get_reg(&self, v: VRegId) -> Result<&[f32], CompilerError> {
         self.regs.get(&v).map(|v| v.as_slice()).ok_or_else(|| {
             CompilerError::CodegenViolation(format!(
-                "VmInterp: read of uninitialized VReg v{}", v.0
+                "VmInterp: read of uninitialized VReg v{}",
+                v.0
             ))
         })
     }
@@ -1767,9 +1975,7 @@ impl VmInterpState {
     fn get_scalar(&self, v: VRegId) -> Result<f32, CompilerError> {
         let lanes = self.get_reg(v)?;
         lanes.first().copied().ok_or_else(|| {
-            CompilerError::CodegenViolation(format!(
-                "VmInterp: scalar read of empty VReg v{}", v.0
-            ))
+            CompilerError::CodegenViolation(format!("VmInterp: scalar read of empty VReg v{}", v.0))
         })
     }
 
@@ -1820,7 +2026,8 @@ fn eval_offset(off: &OffsetExpr, state: &VmInterpState) -> Result<i64, CompilerE
                 Ok(*ct)
             } else {
                 Err(CompilerError::CodegenViolation(format!(
-                    "VmInterp: LoopOffset v{} not in active loop scope", v.0
+                    "VmInterp: LoopOffset v{} not in active loop scope",
+                    v.0
                 )))
             }
         }
@@ -1828,16 +2035,19 @@ fn eval_offset(off: &OffsetExpr, state: &VmInterpState) -> Result<i64, CompilerE
         OffsetExpr::Mul(inner, scale) => Ok(eval_offset(inner, state)? * *scale as i64),
         OffsetExpr::ScalarVReg(v) => state.loop_counters.get(v).copied().ok_or_else(|| {
             CompilerError::CodegenViolation(format!(
-                "VmInterp: ScalarVReg v{} not a loop counter", v.0
+                "VmInterp: ScalarVReg v{} not a loop counter",
+                v.0
             ))
         }),
         // ThreadOffset/ThreadCoord 引用 GPU SIMT 硬件变量 (%tid.x/%laneid), CPU 解释器无法求值。
         // GPU 路径不走 numerical_sim (走真实 PTX 执行); 命中此处 = codegen 路径错配。
         OffsetExpr::ThreadOffset(dim, _) => Err(CompilerError::CodegenViolation(format!(
-            "VmInterp: ThreadOffset({:?}) is GPU-only, cannot evaluate on CPU interpreter", dim
+            "VmInterp: ThreadOffset({:?}) is GPU-only, cannot evaluate on CPU interpreter",
+            dim
         ))),
         OffsetExpr::ThreadCoord(coord, _) => Err(CompilerError::CodegenViolation(format!(
-            "VmInterp: ThreadCoord({:?}) is GPU-only, cannot evaluate on CPU interpreter", coord
+            "VmInterp: ThreadCoord({:?}) is GPU-only, cannot evaluate on CPU interpreter",
+            coord
         ))),
     }
 }
@@ -1846,13 +2056,18 @@ fn eval_offset(off: &OffsetExpr, state: &VmInterpState) -> Result<i64, CompilerE
 ///
 /// `load_dtype`: 当 src=MemLoad 时, 按 load_dtype 解码字节 (广播时按当前元素的 dtype,
 ///               而非 buf 的原始存储 dtype; 解释器 buf 已按 encode_matrix_bytes 写入实际 dtype 字节)。
-fn eval_scalar(se: &ScalarExpr, state: &VmInterpState, load_dtype: QuantPrecision) -> Result<f32, CompilerError> {
+fn eval_scalar(
+    se: &ScalarExpr,
+    state: &VmInterpState,
+    load_dtype: QuantPrecision,
+) -> Result<f32, CompilerError> {
     match se {
         ScalarExpr::Const(c) => Ok(*c),
         ScalarExpr::MemLoad(base, off) => {
             let buf_name = state.ptr_names.get(base).ok_or_else(|| {
                 CompilerError::CodegenViolation(format!(
-                    "VmInterp: MemLoad base v{} not bound to a buffer", base.0
+                    "VmInterp: MemLoad base v{} not bound to a buffer",
+                    base.0
                 ))
             })?;
             let byte_off = eval_offset(off, state)? as usize;
@@ -1876,7 +2091,10 @@ fn load_scalar_from_buffer(
     // 但 Broadcast.MemLoad 取标量时按 buf 的实际 dtype)。这里用 4 字节 f32 little-endian。
     if byte_off + 4 > buf.len() {
         return Err(CompilerError::CodegenViolation(format!(
-            "VmInterp: MemLoad OOB in buf '{}': off {} (len {})", buf_name, byte_off, buf.len()
+            "VmInterp: MemLoad OOB in buf '{}': off {} (len {})",
+            buf_name,
+            byte_off,
+            buf.len()
         )));
     }
     let b = &buf[byte_off..byte_off + 4];
@@ -1897,7 +2115,10 @@ fn load_elem_from_buffer(
         QuantPrecision::F32 => {
             if byte_off + 4 > buf.len() {
                 return Err(CompilerError::CodegenViolation(format!(
-                    "VmInterp: VecLoad F32 OOB in '{}': off {} (len {})", buf_name, byte_off, buf.len()
+                    "VmInterp: VecLoad F32 OOB in '{}': off {} (len {})",
+                    buf_name,
+                    byte_off,
+                    buf.len()
                 )));
             }
             let b = &buf[byte_off..byte_off + 4];
@@ -1906,7 +2127,10 @@ fn load_elem_from_buffer(
         QuantPrecision::BF16 => {
             if byte_off + 2 > buf.len() {
                 return Err(CompilerError::CodegenViolation(format!(
-                    "VmInterp: VecLoad BF16 OOB in '{}': off {} (len {})", buf_name, byte_off, buf.len()
+                    "VmInterp: VecLoad BF16 OOB in '{}': off {} (len {})",
+                    buf_name,
+                    byte_off,
+                    buf.len()
                 )));
             }
             let bytes = [buf[byte_off], buf[byte_off + 1]];
@@ -1915,7 +2139,10 @@ fn load_elem_from_buffer(
         QuantPrecision::F16 => {
             if byte_off + 2 > buf.len() {
                 return Err(CompilerError::CodegenViolation(format!(
-                    "VmInterp: VecLoad F16 OOB in '{}': off {} (len {})", buf_name, byte_off, buf.len()
+                    "VmInterp: VecLoad F16 OOB in '{}': off {} (len {})",
+                    buf_name,
+                    byte_off,
+                    buf.len()
                 )));
             }
             let bytes = [buf[byte_off], buf[byte_off + 1]];
@@ -1924,7 +2151,10 @@ fn load_elem_from_buffer(
         QuantPrecision::FP8E4M3 => {
             if byte_off + 1 > buf.len() {
                 return Err(CompilerError::CodegenViolation(format!(
-                    "VmInterp: VecLoad FP8E4M3 OOB in '{}': off {} (len {})", buf_name, byte_off, buf.len()
+                    "VmInterp: VecLoad FP8E4M3 OOB in '{}': off {} (len {})",
+                    buf_name,
+                    byte_off,
+                    buf.len()
                 )));
             }
             Ok(e4m3_to_f32(buf[byte_off]))
@@ -1932,13 +2162,17 @@ fn load_elem_from_buffer(
         QuantPrecision::FP8E5M2 => {
             if byte_off + 1 > buf.len() {
                 return Err(CompilerError::CodegenViolation(format!(
-                    "VmInterp: VecLoad FP8E5M2 OOB in '{}': off {} (len {})", buf_name, byte_off, buf.len()
+                    "VmInterp: VecLoad FP8E5M2 OOB in '{}': off {} (len {})",
+                    buf_name,
+                    byte_off,
+                    buf.len()
                 )));
             }
             Ok(e5m2_to_f32(buf[byte_off]))
         }
         _ => Err(CompilerError::CodegenViolation(format!(
-            "VmInterp: VecLoad dtype {:?} not supported by interpreter", dtype
+            "VmInterp: VecLoad dtype {:?} not supported by interpreter",
+            dtype
         ))),
     }
 }
@@ -1958,7 +2192,10 @@ fn store_elem_to_buffer(
         QuantPrecision::F32 => {
             if byte_off + 4 > buf.len() {
                 return Err(CompilerError::CodegenViolation(format!(
-                    "VmInterp: VecStore F32 OOB in '{}': off {} (len {})", buf_name, byte_off, buf.len()
+                    "VmInterp: VecStore F32 OOB in '{}': off {} (len {})",
+                    buf_name,
+                    byte_off,
+                    buf.len()
                 )));
             }
             let b = val.to_le_bytes();
@@ -1968,7 +2205,10 @@ fn store_elem_to_buffer(
         QuantPrecision::BF16 => {
             if byte_off + 2 > buf.len() {
                 return Err(CompilerError::CodegenViolation(format!(
-                    "VmInterp: VecStore BF16 OOB in '{}': off {} (len {})", buf_name, byte_off, buf.len()
+                    "VmInterp: VecStore BF16 OOB in '{}': off {} (len {})",
+                    buf_name,
+                    byte_off,
+                    buf.len()
                 )));
             }
             let bf = half::bf16::from_f32(val);
@@ -1979,7 +2219,10 @@ fn store_elem_to_buffer(
         QuantPrecision::F16 => {
             if byte_off + 2 > buf.len() {
                 return Err(CompilerError::CodegenViolation(format!(
-                    "VmInterp: VecStore F16 OOB in '{}': off {} (len {})", buf_name, byte_off, buf.len()
+                    "VmInterp: VecStore F16 OOB in '{}': off {} (len {})",
+                    buf_name,
+                    byte_off,
+                    buf.len()
                 )));
             }
             let f = half::f16::from_f32(val);
@@ -1990,7 +2233,10 @@ fn store_elem_to_buffer(
         QuantPrecision::FP8E4M3 => {
             if byte_off + 1 > buf.len() {
                 return Err(CompilerError::CodegenViolation(format!(
-                    "VmInterp: VecStore FP8E4M3 OOB in '{}': off {} (len {})", buf_name, byte_off, buf.len()
+                    "VmInterp: VecStore FP8E4M3 OOB in '{}': off {} (len {})",
+                    buf_name,
+                    byte_off,
+                    buf.len()
                 )));
             }
             buf[byte_off] = f32_to_e4m3(val);
@@ -1999,14 +2245,18 @@ fn store_elem_to_buffer(
         QuantPrecision::FP8E5M2 => {
             if byte_off + 1 > buf.len() {
                 return Err(CompilerError::CodegenViolation(format!(
-                    "VmInterp: VecStore FP8E5M2 OOB in '{}': off {} (len {})", buf_name, byte_off, buf.len()
+                    "VmInterp: VecStore FP8E5M2 OOB in '{}': off {} (len {})",
+                    buf_name,
+                    byte_off,
+                    buf.len()
                 )));
             }
             buf[byte_off] = f32_to_e5m2(val);
             Ok(())
         }
         _ => Err(CompilerError::CodegenViolation(format!(
-            "VmInterp: VecStore dtype {:?} not supported by interpreter", dtype
+            "VmInterp: VecStore dtype {:?} not supported by interpreter",
+            dtype
         ))),
     }
 }
@@ -2016,7 +2266,8 @@ fn bound_to_iters(bound: &BoundExpr) -> Result<usize, CompilerError> {
     match bound {
         BoundExpr::Const(n) => Ok(*n),
         _ => Err(CompilerError::CodegenViolation(format!(
-            "VmInterp: non-Const loop bound {:?} not supported (GEMM emit 用 Const 上界)", bound
+            "VmInterp: non-Const loop bound {:?} not supported (GEMM emit 用 Const 上界)",
+            bound
         ))),
     }
 }
@@ -2032,18 +2283,32 @@ fn exec_vm_instr(
     match instr {
         VmInstr::DeclareVReg { .. } => Ok(()), // 声明, 解释器无需动作
 
-        VmInstr::Broadcast { dst, src, width: w, dtype, .. } => {
+        VmInstr::Broadcast {
+            dst,
+            src,
+            width: w,
+            dtype,
+            ..
+        } => {
             let lanes = w.f32_lanes().max(1);
             let v = eval_scalar(src, state, *dtype)?;
             state.set_reg(*dst, vec![v; lanes]);
             Ok(())
         }
 
-        VmInstr::VecLoad { dst, base, offset, width: w, dtype, predicate: None } => {
+        VmInstr::VecLoad {
+            dst,
+            base,
+            offset,
+            width: w,
+            dtype,
+            predicate: None,
+        } => {
             let lanes = w.f32_lanes().max(1);
             let buf_name = state.ptr_names.get(base).cloned().ok_or_else(|| {
                 CompilerError::CodegenViolation(format!(
-                    "VmInterp: VecLoad base v{} not bound", base.0
+                    "VmInterp: VecLoad base v{} not bound",
+                    base.0
                 ))
             })?;
             let base_off = eval_offset(offset, state)? as usize;
@@ -2057,22 +2322,35 @@ fn exec_vm_instr(
             Ok(())
         }
 
-        VmInstr::VecLoad { predicate: Some(_), .. } => Err(CompilerError::CodegenViolation(
-            "VmInterp: masked VecLoad not supported in GEMM-FMA cross-tier sim".to_string()
+        VmInstr::VecLoad {
+            predicate: Some(_), ..
+        } => Err(CompilerError::CodegenViolation(
+            "VmInterp: masked VecLoad not supported in GEMM-FMA cross-tier sim".to_string(),
         )),
 
-        VmInstr::VecStore { base, offset, src, width: w, dtype, predicate: None } => {
+        VmInstr::VecStore {
+            base,
+            offset,
+            src,
+            width: w,
+            dtype,
+            predicate: None,
+        } => {
             let lanes = w.f32_lanes().max(1);
             let buf_name = state.ptr_names.get(base).cloned().ok_or_else(|| {
                 CompilerError::CodegenViolation(format!(
-                    "VmInterp: VecStore base v{} not bound", base.0
+                    "VmInterp: VecStore base v{} not bound",
+                    base.0
                 ))
             })?;
             let base_off = eval_offset(offset, state)? as usize;
             let vals = state.get_reg(*src)?.to_vec();
             if vals.len() < lanes {
                 return Err(CompilerError::CodegenViolation(format!(
-                    "VmInterp: VecStore src v{} has {} lanes < {}", src.0, vals.len(), lanes
+                    "VmInterp: VecStore src v{} has {} lanes < {}",
+                    src.0,
+                    vals.len(),
+                    lanes
                 )));
             }
             let elem = dtype.elem_bytes();
@@ -2082,11 +2360,19 @@ fn exec_vm_instr(
             Ok(())
         }
 
-        VmInstr::VecStore { predicate: Some(_), .. } => Err(CompilerError::CodegenViolation(
-            "VmInterp: masked VecStore not supported in GEMM-FMA cross-tier sim".to_string()
+        VmInstr::VecStore {
+            predicate: Some(_), ..
+        } => Err(CompilerError::CodegenViolation(
+            "VmInterp: masked VecStore not supported in GEMM-FMA cross-tier sim".to_string(),
         )),
 
-        VmInstr::Fma { dst, acc, a, b, dtype: _ } => {
+        VmInstr::Fma {
+            dst,
+            acc,
+            a,
+            b,
+            dtype: _,
+        } => {
             // dst = acc + a × b (逐 lane)。GEMM 用 F32 累加 (acc_dtype), dtype 字段
             // 在 naive emit 里 = 输入 dtype (BF16/F32), 但 acc 寄存器始终是 F32 累加值。
             // 解释器按寄存器实际 f32 值计算, 无需 dtype 分支。
@@ -2097,7 +2383,12 @@ fn exec_vm_instr(
             if n == 0 {
                 return Err(CompilerError::CodegenViolation(format!(
                     "VmInterp: Fma empty operand (acc v{} len {}, a v{} len {}, b v{} len {})",
-                    acc.0, acc_v.len(), a.0, a_v.len(), b.0, b_v.len()
+                    acc.0,
+                    acc_v.len(),
+                    a.0,
+                    a_v.len(),
+                    b.0,
+                    b_v.len()
                 )));
             }
             let mut out = Vec::with_capacity(n);
@@ -2108,7 +2399,14 @@ fn exec_vm_instr(
             Ok(())
         }
 
-        VmInstr::VecNarrow { dst, src, dst_dtype, src_dtype: _, width: w, .. } => {
+        VmInstr::VecNarrow {
+            dst,
+            src,
+            dst_dtype,
+            src_dtype: _,
+            width: w,
+            ..
+        } => {
             // F32 累加器 → BF16/F16 存储: 截断到 dst_dtype 精度后, 重新转回 F32 表示
             // (解释器统一存 f32, 窄化效果用 round-trip 模拟)。
             let lanes = w.f32_lanes().max(1);
@@ -2122,7 +2420,12 @@ fn exec_vm_instr(
             Ok(())
         }
 
-        VmInstr::VecWiden { dst, src, src_dtype, .. } => {
+        VmInstr::VecWiden {
+            dst,
+            src,
+            src_dtype,
+            ..
+        } => {
             // 窄 dtype → F32: 解释器 buf 已统一存 f32 字节, widen 在解释器侧是恒等
             // (BF16 字节加载时已 to_f32)。但 src 寄存器若已存了窄值, 这里取 lane 0 即可。
             let src_v = state.get_reg(*src)?.to_vec();
@@ -2164,24 +2467,46 @@ fn exec_vm_instr(
                 super::instr::GprOp::Add => av + bv,
                 super::instr::GprOp::Sub => av - bv,
                 super::instr::GprOp::Mul => av * bv,
-                super::instr::GprOp::Div => if bv == 0 { return Err(CompilerError::CodegenViolation(
-                    "VmInterp: GprBinOp Div by zero".into())); } else { av / bv },
+                super::instr::GprOp::Div => {
+                    if bv == 0 {
+                        return Err(CompilerError::CodegenViolation(
+                            "VmInterp: GprBinOp Div by zero".into(),
+                        ));
+                    } else {
+                        av / bv
+                    }
+                }
                 super::instr::GprOp::Shl => av << bv,
                 super::instr::GprOp::Shr => av >> bv,
                 super::instr::GprOp::And => av & bv,
                 super::instr::GprOp::Or => av | bv,
                 super::instr::GprOp::Xor => av ^ bv,
-                super::instr::GprOp::BitTest => if (av & bv) != 0 { 1 } else { 0 },
+                super::instr::GprOp::BitTest => {
+                    if (av & bv) != 0 {
+                        1
+                    } else {
+                        0
+                    }
+                }
             };
             state.set_reg(*dst, vec![rv as f32]);
             Ok(())
         }
 
-        VmInstr::TileLoad { dst_tile, base_ptr, k_offset, row_stride, rows, cols, dtype } => {
+        VmInstr::TileLoad {
+            dst_tile,
+            base_ptr,
+            k_offset,
+            row_stride,
+            rows,
+            cols,
+            dtype,
+        } => {
             // 语义: dst_tile[r][c] = mem[base_ptr + k_offset + r*row_stride + c*elem_bytes]
             let buf_name = state.ptr_names.get(base_ptr).cloned().ok_or_else(|| {
                 CompilerError::CodegenViolation(format!(
-                    "VmInterp: TileLoad base v{} not bound", base_ptr.0
+                    "VmInterp: TileLoad base v{} not bound",
+                    base_ptr.0
                 ))
             })?;
             let base_off = state.resolve_byte_offset(*k_offset)? as usize;
@@ -2197,33 +2522,52 @@ fn exec_vm_instr(
                     data.push(narrowed);
                 }
             }
-            state.tile_regs.insert(*dst_tile, TileVal { rows: *rows, cols: *cols, data });
+            state.tile_regs.insert(
+                *dst_tile,
+                TileVal {
+                    rows: *rows,
+                    cols: *cols,
+                    data,
+                },
+            );
             Ok(())
         }
 
-        VmInstr::TileMma { c, a, b, m, n, k, dtype } => {
+        VmInstr::TileMma {
+            c,
+            a,
+            b,
+            m,
+            n,
+            k,
+            dtype,
+        } => {
             // 语义: c[m][n] += sum_k a[m][k] × b[k][n], F32 累加器, 输入按 dtype 窄化。
             let qp = dtype.to_quant_precision();
             // 取 a (m×k) 与 b (k×n)。先克隆以避免与 c 的可变借用冲突 (c 可能等于 a/b 的别名场景下需独立拷贝)。
             let ta = state.tile_regs.get(a).cloned().ok_or_else(|| {
                 CompilerError::CodegenViolation(format!(
-                    "VmInterp: TileMma a v{} not loaded (use TileLoad first)", a.0
+                    "VmInterp: TileMma a v{} not loaded (use TileLoad first)",
+                    a.0
                 ))
             })?;
             let tb = state.tile_regs.get(b).cloned().ok_or_else(|| {
                 CompilerError::CodegenViolation(format!(
-                    "VmInterp: TileMma b v{} not loaded (use TileLoad first)", b.0
+                    "VmInterp: TileMma b v{} not loaded (use TileLoad first)",
+                    b.0
                 ))
             })?;
             // 形状校验: a 为 m×k, b 为 k×n。
             if ta.rows != *m || ta.cols != *k {
                 return Err(CompilerError::CodegenViolation(format!(
-                    "VmInterp: TileMma a shape {}x{} != {}x{}", ta.rows, ta.cols, m, k
+                    "VmInterp: TileMma a shape {}x{} != {}x{}",
+                    ta.rows, ta.cols, m, k
                 )));
             }
             if tb.rows != *k || tb.cols != *n {
                 return Err(CompilerError::CodegenViolation(format!(
-                    "VmInterp: TileMma b shape {}x{} != {}x{}", tb.rows, tb.cols, k, n
+                    "VmInterp: TileMma b shape {}x{} != {}x{}",
+                    tb.rows, tb.cols, k, n
                 )));
             }
             // 取/初始化 c (m×n)。累加器 F32, 复用已有 tile 值 (跨 K 块累加), 不存在则 zeros。
@@ -2233,7 +2577,8 @@ fn exec_vm_instr(
                 .or_insert_with(|| TileVal::zeros(*m, *n));
             if tc.rows != *m || tc.cols != *n {
                 return Err(CompilerError::CodegenViolation(format!(
-                    "VmInterp: TileMma c shape {}x{} != {}x{}", tc.rows, tc.cols, m, n
+                    "VmInterp: TileMma c shape {}x{} != {}x{}",
+                    tc.rows, tc.cols, m, n
                 )));
             }
             for i in 0..*m {
@@ -2250,11 +2595,20 @@ fn exec_vm_instr(
             Ok(())
         }
 
-        VmInstr::TileStore { src_tile, base_ptr, out_offset, row_stride, rows, cols, dtype } => {
+        VmInstr::TileStore {
+            src_tile,
+            base_ptr,
+            out_offset,
+            row_stride,
+            rows,
+            cols,
+            dtype,
+        } => {
             // 语义: mem[base_ptr + out_offset + r*row_stride + c*elem_bytes] = src_tile[r][c]
             let tile = state.tile_regs.get(src_tile).cloned().ok_or_else(|| {
                 CompilerError::CodegenViolation(format!(
-                    "VmInterp: TileStore src v{} not computed (use TileMma first)", src_tile.0
+                    "VmInterp: TileStore src v{} not computed (use TileMma first)",
+                    src_tile.0
                 ))
             })?;
             if tile.rows != *rows || tile.cols != *cols {
@@ -2265,7 +2619,8 @@ fn exec_vm_instr(
             }
             let buf_name = state.ptr_names.get(base_ptr).cloned().ok_or_else(|| {
                 CompilerError::CodegenViolation(format!(
-                    "VmInterp: TileStore base v{} not bound", base_ptr.0
+                    "VmInterp: TileStore base v{} not bound",
+                    base_ptr.0
                 ))
             })?;
             let off = state.resolve_byte_offset(*out_offset)? as usize;
@@ -2283,7 +2638,8 @@ fn exec_vm_instr(
 
         // ── 不在 GEMM-FMA 路径的指令: 报错 (NO-SILENT-FALLBACK) ──
         _ => Err(CompilerError::CodegenViolation(format!(
-            "VmInterp: VmInstr {:?} not in GEMM-FMA cross-tier sim scope", instr
+            "VmInterp: VmInstr {:?} not in GEMM-FMA cross-tier sim scope",
+            instr
         ))),
     }
 }
@@ -2319,12 +2675,18 @@ fn interpret_instr_slice(
     let mut pc = 0;
     while pc < instrs.len() {
         match &instrs[pc] {
-            VmInstr::LoopBegin { counter, offsets, bound } => {
+            VmInstr::LoopBegin {
+                counter,
+                offsets,
+                bound,
+            } => {
                 let iters = bound_to_iters(bound)?;
-                let loop_end_idx = find_matching_loop_end(instrs, pc)
-                    .ok_or_else(|| CompilerError::CodegenViolation(
-                        format!("VmInterp: unmatched LoopBegin at pc {}", pc)
-                    ))?;
+                let loop_end_idx = find_matching_loop_end(instrs, pc).ok_or_else(|| {
+                    CompilerError::CodegenViolation(format!(
+                        "VmInterp: unmatched LoopBegin at pc {}",
+                        pc
+                    ))
+                })?;
                 let body = &instrs[pc + 1..loop_end_idx];
                 for i in 0..iters as i64 {
                     state.loop_counters.insert(*counter, i);
@@ -2333,7 +2695,9 @@ fn interpret_instr_slice(
                             LoopStride::FixedBytes(step_bytes) => step_bytes,
                             LoopStride::ScalableElemBytes(elem_bytes) => elem_bytes,
                         };
-                        state.loop_byte_offsets.insert(offset.vreg, i * step_bytes as i64);
+                        state
+                            .loop_byte_offsets
+                            .insert(offset.vreg, i * step_bytes as i64);
                     }
                     interpret_instr_slice(body, state, width)?;
                 }
@@ -2344,9 +2708,10 @@ fn interpret_instr_slice(
                 pc = loop_end_idx + 1;
             }
             VmInstr::LoopEnd => {
-                return Err(CompilerError::CodegenViolation(
-                    format!("VmInterp: orphan LoopEnd at pc {}", pc)
-                ));
+                return Err(CompilerError::CodegenViolation(format!(
+                    "VmInterp: orphan LoopEnd at pc {}",
+                    pc
+                )));
             }
             other => {
                 exec_vm_instr(other, state, width)?;
@@ -2384,7 +2749,9 @@ fn find_matching_loop_end(instrs: &[VmInstr], loop_begin_pc: usize) -> Option<us
 /// FP8 E4M3 编码: 1 符号 + 4 指数 + 3 尾数, bias=7, 无 inf (max=448), NaN=0x7F。
 /// 参考 OCP FP8 E4M3 规范。round-to-nearest-even。
 fn f32_to_e4m3(v: f32) -> u8 {
-    if v.is_nan() { return 0x7F; }
+    if v.is_nan() {
+        return 0x7F;
+    }
     let bits = v.to_bits();
     let sign = (bits >> 31) & 1;
     let abs = f32::from_bits(bits & 0x7FFF_FFFF);
@@ -2399,12 +2766,12 @@ fn f32_to_e4m3(v: f32) -> u8 {
         return (sign as u8) << 7;
     }
     let exp = e - f32_bias; // 真实指数
-    // E4M3 指数域 E ∈ [0,15], 真实指数 = E - 7 ∈ [-7, 8]
-    // 非正规: E=0, 真实指数 = 1-7 = -6 (隐含位=0)
-    // 规范: E∈[1,15], 真实指数 = E-7 ∈ [-6, 8]
-    // 把 f32 的 (exp, m23) round 到 3 位尾数 + 4 位指数
-    // 先求 E4M3 的 E: 真实指数 + 7, 但要处理非正规/规范边界
-    // 用 round-to-nearest: 把 f32 值量化到 E4M3 网格
+                            // E4M3 指数域 E ∈ [0,15], 真实指数 = E - 7 ∈ [-7, 8]
+                            // 非正规: E=0, 真实指数 = 1-7 = -6 (隐含位=0)
+                            // 规范: E∈[1,15], 真实指数 = E-7 ∈ [-6, 8]
+                            // 把 f32 的 (exp, m23) round 到 3 位尾数 + 4 位指数
+                            // 先求 E4M3 的 E: 真实指数 + 7, 但要处理非正规/规范边界
+                            // 用 round-to-nearest: 把 f32 值量化到 E4M3 网格
     let mut e4 = exp + 7;
     // 尾数: f32 23 位 → E4M3 规范 3 位 (隐含 1) 或非规范 3 位
     let m3 = if e4 <= 0 {
@@ -2447,7 +2814,11 @@ fn e4m3_to_f32(b: u8) -> f32 {
     let m = b & 0x07;
     let abs = if e == 0 {
         // 非规范: 0 或 m × 2^(-9)
-        if m == 0 { 0.0f32 } else { (m as f32) * (1.0f32 / 512.0f32) }
+        if m == 0 {
+            0.0f32
+        } else {
+            (m as f32) * (1.0f32 / 512.0f32)
+        }
     } else if e == 15 && m == 7 {
         // NaN
         return f32::NAN;
@@ -2456,17 +2827,27 @@ fn e4m3_to_f32(b: u8) -> f32 {
         let mant = 1.0f32 + (m as f32) / 8.0f32;
         mant * (2.0f32).powi(e as i32 - 7)
     };
-    if sign == 1 { -abs } else { abs }
+    if sign == 1 {
+        -abs
+    } else {
+        abs
+    }
 }
 
 /// FP8 E5M2 编码: 1 符号 + 5 指数 + 2 尾数, bias=15, inf=0x7C, NaN=0x7E/0x7F。
 fn f32_to_e5m2(v: f32) -> u8 {
-    if v.is_nan() { return 0x7F; }
-    if v.is_infinite() { return if v > 0.0 { 0x7C } else { 0xFC }; }
+    if v.is_nan() {
+        return 0x7F;
+    }
+    if v.is_infinite() {
+        return if v > 0.0 { 0x7C } else { 0xFC };
+    }
     let bits = v.to_bits();
     let sign = (bits >> 31) & 1;
     let abs = f32::from_bits(bits & 0x7FFF_FFFF);
-    if abs == 0.0 { return (sign as u8) << 7; }
+    if abs == 0.0 {
+        return (sign as u8) << 7;
+    }
     // E5M2 最大正规数 = 1.75 × 2^(30-15) = 57344
     let abs = if abs > 57344.0 { 57344.0 } else { abs };
     let e = (abs.to_bits() >> 23) as i32 - 127; // 真实指数
@@ -2483,9 +2864,17 @@ fn f32_to_e5m2(v: f32) -> u8 {
         let mut m = top2;
         if rem > half || (rem == half && (top2 & 1) == 1) {
             m += 1;
-            if m > 3 { m = 0; e5 += 1; }
+            if m > 3 {
+                m = 0;
+                e5 += 1;
+            }
         }
-        if e5 > 30 { e5 = 30; 3 } else { m }
+        if e5 > 30 {
+            e5 = 30;
+            3
+        } else {
+            m
+        }
     };
     let e5 = e5.clamp(0, 30);
     let m2 = m2.clamp(0, 3);
@@ -2498,14 +2887,26 @@ fn e5m2_to_f32(b: u8) -> f32 {
     let e = (b >> 2) & 0x1F;
     let m = b & 0x03;
     let abs = if e == 0 {
-        if m == 0 { 0.0f32 } else { (m as f32) * (1.0f32 / 1024.0f32) }
+        if m == 0 {
+            0.0f32
+        } else {
+            (m as f32) * (1.0f32 / 1024.0f32)
+        }
     } else if e == 31 {
-        if m == 0 { return f32::INFINITY; } else { return f32::NAN; }
+        if m == 0 {
+            return f32::INFINITY;
+        } else {
+            return f32::NAN;
+        }
     } else {
         let mant = 1.0f32 + (m as f32) / 4.0f32;
         mant * (2.0f32).powi(e as i32 - 15)
     };
-    if sign == 1 { -abs } else { abs }
+    if sign == 1 {
+        -abs
+    } else {
+        abs
+    }
 }
 
 /// f32 → dst_dtype round-trip (模拟窄化的精度损失)。
@@ -2528,9 +2929,7 @@ fn narrow_to_dtype(val: f32, dst_dtype: QuantPrecision) -> f32 {
 /// - F32: 全程 f32 (F32 输入的精确标尺)
 /// - BF16: 每次 mul-add 后 round 到 BF16 精度再继续累加 (模拟 BF16 WidenCompute 累加损失)
 ///         — 注: 真实 AVX2 BF16 路径用 F32 累加, 所以默认 acc=F32; 此参数仅供容差研究。
-pub fn scalar_gemm_reference(
-    a: &[f32], b: &[f32], m: usize, n: usize, k: usize,
-) -> Vec<f32> {
+pub fn scalar_gemm_reference(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
     let mut c = vec![0.0f32; m * n];
     for mi in 0..m {
         for ni in 0..n {
@@ -2583,13 +2982,18 @@ fn decode_matrix_bytes(buf: &[u8], count: usize, dtype: QuantPrecision) -> Vec<f
         let off = i * elem;
         match dtype {
             QuantPrecision::F32 => {
-                out.push(f32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]]));
+                out.push(f32::from_le_bytes([
+                    buf[off],
+                    buf[off + 1],
+                    buf[off + 2],
+                    buf[off + 3],
+                ]));
             }
             QuantPrecision::BF16 => {
-                out.push(half::bf16::from_le_bytes([buf[off], buf[off+1]]).to_f32());
+                out.push(half::bf16::from_le_bytes([buf[off], buf[off + 1]]).to_f32());
             }
             QuantPrecision::F16 => {
-                out.push(half::f16::from_le_bytes([buf[off], buf[off+1]]).to_f32());
+                out.push(half::f16::from_le_bytes([buf[off], buf[off + 1]]).to_f32());
             }
             QuantPrecision::FP8E4M3 => {
                 out.push(e4m3_to_f32(buf[off]));
@@ -2598,7 +3002,12 @@ fn decode_matrix_bytes(buf: &[u8], count: usize, dtype: QuantPrecision) -> Vec<f
                 out.push(e5m2_to_f32(buf[off]));
             }
             _ => {
-                out.push(f32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]]));
+                out.push(f32::from_le_bytes([
+                    buf[off],
+                    buf[off + 1],
+                    buf[off + 2],
+                    buf[off + 3],
+                ]));
             }
         }
     }
@@ -2608,9 +3017,9 @@ fn decode_matrix_bytes(buf: &[u8], count: usize, dtype: QuantPrecision) -> Vec<f
 /// 按 dtype 返回跨等级验证容差 (CR-TIER-SOVEREIGNTY-004: BF16 ~1e-2, F32 ~1e-5)。
 pub fn tolerance_for(dtype: QuantPrecision) -> f32 {
     match dtype {
-        QuantPrecision::F32 => 1e-5,  // F32: 23 mantissa bits → ~1.2e-7
-        QuantPrecision::BF16 => 1e-2, // BF16: 7 mantissa bits → ~0.008 relative
-        QuantPrecision::F16 => 1e-3,  // F16: 10 mantissa bits → ~0.001 relative
+        QuantPrecision::F32 => 1e-5,    // F32: 23 mantissa bits → ~1.2e-7
+        QuantPrecision::BF16 => 1e-2,   // BF16: 7 mantissa bits → ~0.008 relative
+        QuantPrecision::F16 => 1e-3,    // F16: 10 mantissa bits → ~0.001 relative
         QuantPrecision::FP8E4M3 => 1.0, // FP8 E4M3: 3 mantissa bits → ~0.06 rel; abs 1.0 (累加噪声)
         QuantPrecision::FP8E5M2 => 2.0, // FP8 E5M2: 2 mantissa bits → ~0.12 rel; abs 2.0 (累加噪声)
         _ => 1e-2,
@@ -2630,8 +3039,11 @@ pub fn tolerance_for(dtype: QuantPrecision) -> f32 {
 // @trace REQ-HW-TIER-006 [req:CrossTier-Equivalence] OpImpl 跨等级等价验证, BF16 容差 ~1e-2
 pub fn verify_op_impl_aligns_scalar(
     prog: &VmProgram,
-    a: &[f32], b: &[f32],
-    m: usize, n: usize, k: usize,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
     dtype: QuantPrecision,
     width: SimdWidth,
     ptr_bindings: &[(VRegId, &str)],
@@ -2675,8 +3087,8 @@ pub fn verify_op_impl_aligns_scalar(
         QuantPrecision::F32 => 1e-5,
         QuantPrecision::BF16 => 2e-2,
         QuantPrecision::F16 => 2e-3,
-        QuantPrecision::FP8E4M3 => 1e-1,  // FP8 E4M3: ~6% 相对, 累加噪声留 10%
-        QuantPrecision::FP8E5M2 => 2e-1,  // FP8 E5M2: ~12% 相对, 累加噪声留 20%
+        QuantPrecision::FP8E4M3 => 1e-1, // FP8 E4M3: ~6% 相对, 累加噪声留 10%
+        QuantPrecision::FP8E5M2 => 2e-1, // FP8 E5M2: ~12% 相对, 累加噪声留 20%
         _ => 2e-2,
     };
     let tol = abs_tol.max(rel_eps * max_abs);
@@ -2687,11 +3099,10 @@ pub fn verify_op_impl_aligns_scalar(
 mod tests {
     use super::*;
     use crate::compiler::trace::QuantPrecision;
-    use crate::quant_format::{
-        DataLayout, QuantDataKind, QuantFormatDescriptor, ScaleLayout, ZeroLayout,
-        StorageLayout,
-    };
     use crate::quant::QuantType;
+    use crate::quant_format::{
+        DataLayout, QuantDataKind, QuantFormatDescriptor, ScaleLayout, StorageLayout, ZeroLayout,
+    };
 
     /// 创建一个最小默认量化格式描述符（用于不需要特定格式的测试）。
     fn test_quant_desc() -> QuantFormatDescriptor {
@@ -2703,7 +3114,10 @@ mod tests {
             bits_per_element: 8,
             scale_layout: ScaleLayout::None,
             zero_layout: ZeroLayout::None,
-            data_layout: DataLayout::Bytes { offset: 0, signed: true },
+            data_layout: DataLayout::Bytes {
+                offset: 0,
+                signed: true,
+            },
             data_kind: QuantDataKind::Float32,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
@@ -2847,10 +3261,7 @@ mod tests {
     #[test]
     fn test_simulate_compile_nan_detection() {
         // 测试 NaN 检测: sqrt(-1) 应该产生 NaN
-        let trace = vec![
-            TraceOp::Input(0),
-            TraceOp::Sqrt(ValueId(0)),
-        ];
+        let trace = vec![TraceOp::Input(0), TraceOp::Sqrt(ValueId(0))];
 
         let desc = test_quant_desc();
         let block_data = vec![0u8; 64];
@@ -3267,12 +3678,20 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::Compare { a: ValueId(0), b: ValueId(1), op: CmpOp::Eq },
-            &mut state, &desc,
+            &TraceOp::Compare {
+                a: ValueId(0),
+                b: ValueId(1),
+                op: CmpOp::Eq,
+            },
+            &mut state,
+            &desc,
         );
         let id = result.unwrap().unwrap();
         let val = state.get(id).as_float().unwrap();
-        assert!((val - 1.0).abs() < 1e-6, "Eq should return 1.0 for equal values");
+        assert!(
+            (val - 1.0).abs() < 1e-6,
+            "Eq should return 1.0 for equal values"
+        );
     }
 
     #[test]
@@ -3284,8 +3703,13 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::Compare { a: ValueId(0), b: ValueId(1), op: CmpOp::Lt },
-            &mut state, &desc,
+            &TraceOp::Compare {
+                a: ValueId(0),
+                b: ValueId(1),
+                op: CmpOp::Lt,
+            },
+            &mut state,
+            &desc,
         );
         let id = result.unwrap().unwrap();
         let val = state.get(id).as_float().unwrap();
@@ -3301,8 +3725,13 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::Compare { a: ValueId(0), b: ValueId(1), op: CmpOp::Gt },
-            &mut state, &desc,
+            &TraceOp::Compare {
+                a: ValueId(0),
+                b: ValueId(1),
+                op: CmpOp::Gt,
+            },
+            &mut state,
+            &desc,
         );
         let id = result.unwrap().unwrap();
         let val = state.get(id).as_float().unwrap();
@@ -3315,36 +3744,44 @@ mod tests {
     fn test_simulator_conditional_branch_true() {
         let sim = NumericalSimulator::new();
         let mut state = SimState::new();
-        state.set_input(0, SimValue::Float(1.0));  // mask
+        state.set_input(0, SimValue::Float(1.0)); // mask
         state.set_input(1, SimValue::Float(42.0)); // true_val
         state.set_input(2, SimValue::Float(99.0)); // false_val
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
             &TraceOp::ConditionalBranch(ValueId(0), ValueId(1), ValueId(2)),
-            &mut state, &desc,
+            &mut state,
+            &desc,
         );
         let id = result.unwrap().unwrap();
         let val = state.get(id).as_float().unwrap();
-        assert!((val - 42.0).abs() < 1e-6, "Should select true_val when mask != 0");
+        assert!(
+            (val - 42.0).abs() < 1e-6,
+            "Should select true_val when mask != 0"
+        );
     }
 
     #[test]
     fn test_simulator_conditional_branch_false() {
         let sim = NumericalSimulator::new();
         let mut state = SimState::new();
-        state.set_input(0, SimValue::Float(0.0));  // mask
+        state.set_input(0, SimValue::Float(0.0)); // mask
         state.set_input(1, SimValue::Float(42.0)); // true_val
         state.set_input(2, SimValue::Float(99.0)); // false_val
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
             &TraceOp::ConditionalBranch(ValueId(0), ValueId(1), ValueId(2)),
-            &mut state, &desc,
+            &mut state,
+            &desc,
         );
         let id = result.unwrap().unwrap();
         let val = state.get(id).as_float().unwrap();
-        assert!((val - 99.0).abs() < 1e-6, "Should select false_val when mask == 0");
+        assert!(
+            (val - 99.0).abs() < 1e-6,
+            "Should select false_val when mask == 0"
+        );
     }
 
     // ── HReduce (scalar pass-through) ──
@@ -3357,12 +3794,19 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Sum },
-            &mut state, &desc,
+            &TraceOp::HReduce {
+                src: ValueId(0),
+                op: ReduceKind::Sum,
+            },
+            &mut state,
+            &desc,
         );
         let id = result.unwrap().unwrap();
         let val = state.get(id).as_float().unwrap();
-        assert!((val - 7.5).abs() < 1e-6, "HReduce Sum should pass through scalar value");
+        assert!(
+            (val - 7.5).abs() < 1e-6,
+            "HReduce Sum should pass through scalar value"
+        );
     }
 
     #[test]
@@ -3373,8 +3817,12 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Count },
-            &mut state, &desc,
+            &TraceOp::HReduce {
+                src: ValueId(0),
+                op: ReduceKind::Count,
+            },
+            &mut state,
+            &desc,
         );
         let id = result.unwrap().unwrap();
         let val = state.get(id).as_float().unwrap();
@@ -3389,8 +3837,12 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::HReduce { src: ValueId(0), op: ReduceKind::ArgMax },
-            &mut state, &desc,
+            &TraceOp::HReduce {
+                src: ValueId(0),
+                op: ReduceKind::ArgMax,
+            },
+            &mut state,
+            &desc,
         );
         let id = result.unwrap().unwrap();
         let val = state.get(id).as_float().unwrap();
@@ -3408,8 +3860,12 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::QuantBitAnd { lhs: ValueId(0), rhs: ValueId(1) },
-            &mut state, &desc,
+            &TraceOp::QuantBitAnd {
+                lhs: ValueId(0),
+                rhs: ValueId(1),
+            },
+            &mut state,
+            &desc,
         );
         let id = result.unwrap().unwrap();
         let val = state.get(id).as_integer().unwrap();
@@ -3425,8 +3881,12 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::QuantBitOr { lhs: ValueId(0), rhs: ValueId(1) },
-            &mut state, &desc,
+            &TraceOp::QuantBitOr {
+                lhs: ValueId(0),
+                rhs: ValueId(1),
+            },
+            &mut state,
+            &desc,
         );
         let id = result.unwrap().unwrap();
         let val = state.get(id).as_integer().unwrap();
@@ -3441,8 +3901,13 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::QuantExtractBits { src: ValueId(0), bit_offset: 4, bit_width: 4 },
-            &mut state, &desc,
+            &TraceOp::QuantExtractBits {
+                src: ValueId(0),
+                bit_offset: 4,
+                bit_width: 4,
+            },
+            &mut state,
+            &desc,
         );
         let id = result.unwrap().unwrap();
         let val = state.get(id).as_integer().unwrap();
@@ -3459,8 +3924,12 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::QuantPtrAddOffset { base: ValueId(0), offset_bytes: 42 },
-            &mut state, &desc,
+            &TraceOp::QuantPtrAddOffset {
+                base: ValueId(0),
+                offset_bytes: 42,
+            },
+            &mut state,
+            &desc,
         );
         let id = result.unwrap().unwrap();
         let val = state.get(id).as_integer().unwrap();
@@ -3584,8 +4053,13 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::Cast { src: ValueId(0), from: QuantPrecision::F32, to: QuantPrecision::F16 },
-            &mut state, &desc,
+            &TraceOp::Cast {
+                src: ValueId(0),
+                from: QuantPrecision::F32,
+                to: QuantPrecision::F16,
+            },
+            &mut state,
+            &desc,
         );
         let id = result.unwrap().unwrap();
         let val = state.get(id).as_float().unwrap();
@@ -3600,8 +4074,13 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::Cast { src: ValueId(0), from: QuantPrecision::INT8, to: QuantPrecision::F32 },
-            &mut state, &desc,
+            &TraceOp::Cast {
+                src: ValueId(0),
+                from: QuantPrecision::INT8,
+                to: QuantPrecision::F32,
+            },
+            &mut state,
+            &desc,
         );
         let id = result.unwrap().unwrap();
         let val = state.get(id).as_float().unwrap();
@@ -3634,12 +4113,20 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::BlockScale { data: ValueId(0), scale: ValueId(1), block_size: 32 },
-            &mut state, &desc,
+            &TraceOp::BlockScale {
+                data: ValueId(0),
+                scale: ValueId(1),
+                block_size: 32,
+            },
+            &mut state,
+            &desc,
         );
         let id = result.unwrap().unwrap();
         let val = state.get(id).as_float().unwrap();
-        assert!((val - 6.0).abs() < 1e-6, "BlockScale should multiply data * scale");
+        assert!(
+            (val - 6.0).abs() < 1e-6,
+            "BlockScale should multiply data * scale"
+        );
     }
 
     // ── E2M1 decode function ──
@@ -3719,8 +4206,8 @@ mod tests {
         let sim = NumericalSimulator::new();
         let mut state = SimState::new();
         state.set_input(0, SimValue::Float(10.0)); // acc
-        state.set_input(1, SimValue::Float(2.0));  // act
-        state.set_input(2, SimValue::Float(3.0));  // weight
+        state.set_input(1, SimValue::Float(2.0)); // act
+        state.set_input(2, SimValue::Float(3.0)); // weight
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
@@ -3731,7 +4218,8 @@ mod tests {
                 act_dtype: QuantPrecision::BF16,
                 weight_dtype: QuantPrecision::FP8E4M3,
             },
-            &mut state, &desc,
+            &mut state,
+            &desc,
         );
         let id = result.unwrap().unwrap();
         let val = state.get(id).as_float().unwrap();
@@ -3751,8 +4239,16 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::TileMma { c: ValueId(0), a: ValueId(1), b: ValueId(2), m: 1, n: 1, k: 1 },
-            &mut state, &desc,
+            &TraceOp::TileMma {
+                c: ValueId(0),
+                a: ValueId(1),
+                b: ValueId(2),
+                m: 1,
+                n: 1,
+                k: 1,
+            },
+            &mut state,
+            &desc,
         );
         let id = result.unwrap().unwrap();
         let val = state.get(id).as_float().unwrap();
@@ -3770,12 +4266,19 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::Softmax { src: ValueId(0), dst: ValueId(0) },
-            &mut state, &desc,
+            &TraceOp::Softmax {
+                src: ValueId(0),
+                dst: ValueId(0),
+            },
+            &mut state,
+            &desc,
         );
         let id = result.unwrap().unwrap();
         let val = state.get(id).as_float().unwrap();
-        assert!((val - 1.0).abs() < 1e-6, "Softmax of single scalar should be 1.0");
+        assert!(
+            (val - 1.0).abs() < 1e-6,
+            "Softmax of single scalar should be 1.0"
+        );
     }
 
     // ── SimState i16 load ──
@@ -3811,8 +4314,12 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::QuantIntDivConst { src: ValueId(0), divisor: 7 },
-            &mut state, &desc,
+            &TraceOp::QuantIntDivConst {
+                src: ValueId(0),
+                divisor: 7,
+            },
+            &mut state,
+            &desc,
         );
         assert!(result.is_ok());
         let id = result.unwrap().unwrap();
@@ -3828,10 +4335,17 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::QuantIntDivConst { src: ValueId(0), divisor: 0 },
-            &mut state, &desc,
+            &TraceOp::QuantIntDivConst {
+                src: ValueId(0),
+                divisor: 0,
+            },
+            &mut state,
+            &desc,
         );
-        assert!(result.is_err(), "Division by zero in QuantIntDivConst should error");
+        assert!(
+            result.is_err(),
+            "Division by zero in QuantIntDivConst should error"
+        );
     }
 
     // ── QuantIntMul: integer multiplication ──
@@ -3844,8 +4358,12 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::QuantIntMul { src: ValueId(0), factor: 11 },
-            &mut state, &desc,
+            &TraceOp::QuantIntMul {
+                src: ValueId(0),
+                factor: 11,
+            },
+            &mut state,
+            &desc,
         );
         assert!(result.is_ok());
         let id = result.unwrap().unwrap();
@@ -3864,8 +4382,12 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::QuantPtrAddDynamic { base: ValueId(0), index: ValueId(1) },
-            &mut state, &desc,
+            &TraceOp::QuantPtrAddDynamic {
+                base: ValueId(0),
+                index: ValueId(1),
+            },
+            &mut state,
+            &desc,
         );
         assert!(result.is_ok());
         let id = result.unwrap().unwrap();
@@ -3883,8 +4405,12 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::QuantShiftLeft { src: ValueId(0), amount: 4 },
-            &mut state, &desc,
+            &TraceOp::QuantShiftLeft {
+                src: ValueId(0),
+                amount: 4,
+            },
+            &mut state,
+            &desc,
         );
         assert!(result.is_ok());
         let id = result.unwrap().unwrap();
@@ -3900,8 +4426,12 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::QuantShiftRight { src: ValueId(0), amount: 8 },
-            &mut state, &desc,
+            &TraceOp::QuantShiftRight {
+                src: ValueId(0),
+                amount: 8,
+            },
+            &mut state,
+            &desc,
         );
         assert!(result.is_ok());
         let id = result.unwrap().unwrap();
@@ -3919,8 +4449,12 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::QuantAndMask { src: ValueId(0), mask: 0x0F },
-            &mut state, &desc,
+            &TraceOp::QuantAndMask {
+                src: ValueId(0),
+                mask: 0x0F,
+            },
+            &mut state,
+            &desc,
         );
         assert!(result.is_ok());
         let id = result.unwrap().unwrap();
@@ -3934,14 +4468,19 @@ mod tests {
     fn test_simulator_quant_dequant_fma() {
         let sim = NumericalSimulator::new();
         let mut state = SimState::new();
-        state.set_input(0, SimValue::Float(5.0));  // acc
-        state.set_input(1, SimValue::Float(1.5));  // a
-        state.set_input(2, SimValue::Float(2.0));  // b
+        state.set_input(0, SimValue::Float(5.0)); // acc
+        state.set_input(1, SimValue::Float(1.5)); // a
+        state.set_input(2, SimValue::Float(2.0)); // b
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::QuantDequantFma { acc: ValueId(0), a: ValueId(1), b: ValueId(2) },
-            &mut state, &desc,
+            &TraceOp::QuantDequantFma {
+                acc: ValueId(0),
+                a: ValueId(1),
+                b: ValueId(2),
+            },
+            &mut state,
+            &desc,
         );
         assert!(result.is_ok());
         let id = result.unwrap().unwrap();
@@ -3959,8 +4498,13 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::BitExtract { src: ValueId(0), offset: 4, width: 4 },
-            &mut state, &desc,
+            &TraceOp::BitExtract {
+                src: ValueId(0),
+                offset: 4,
+                width: 4,
+            },
+            &mut state,
+            &desc,
         );
         assert!(result.is_ok());
         let id = result.unwrap().unwrap();
@@ -3978,8 +4522,12 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::StrideMul { value: ValueId(0), stride: 4 },
-            &mut state, &desc,
+            &TraceOp::StrideMul {
+                value: ValueId(0),
+                stride: 4,
+            },
+            &mut state,
+            &desc,
         );
         assert!(result.is_ok());
         let id = result.unwrap().unwrap();
@@ -4044,7 +4592,10 @@ mod tests {
         // Act
         let val = decode_e2m1_scalar(nibble);
         // Assert
-        assert!((val - 6.0).abs() < 1e-6, "E2M1 nibble 0x07 should decode to 6.0");
+        assert!(
+            (val - 6.0).abs() < 1e-6,
+            "E2M1 nibble 0x07 should decode to 6.0"
+        );
     }
 
     #[test]
@@ -4054,7 +4605,10 @@ mod tests {
         // Act
         let val = decode_e2m1_scalar(nibble);
         // Assert
-        assert!((val - (-3.0)).abs() < 1e-6, "E2M1 nibble 0x0D should decode to -3.0");
+        assert!(
+            (val - (-3.0)).abs() < 1e-6,
+            "E2M1 nibble 0x0D should decode to -3.0"
+        );
     }
 
     // ── FP8 E4M3 decode: Inf and NaN ──
@@ -4066,7 +4620,10 @@ mod tests {
         // Act
         let val = decode_fp8_e4m3(byte);
         // Assert
-        assert!(val.is_infinite() && val.is_sign_positive(), "FP8 E4M3 byte 0x78 should decode to +Inf");
+        assert!(
+            val.is_infinite() && val.is_sign_positive(),
+            "FP8 E4M3 byte 0x78 should decode to +Inf"
+        );
     }
 
     #[test]
@@ -4091,13 +4648,21 @@ mod tests {
         let desc = test_quant_desc();
         // Act: compare -5.0 <= -5.0
         let result = sim.exec_op(
-            &TraceOp::Compare { a: ValueId(0), b: ValueId(1), op: CmpOp::Le },
-            &mut state, &desc,
+            &TraceOp::Compare {
+                a: ValueId(0),
+                b: ValueId(1),
+                op: CmpOp::Le,
+            },
+            &mut state,
+            &desc,
         );
         let id = result.unwrap().unwrap();
         let val = state.get(id).as_float().unwrap();
         // Assert: equal negative values should satisfy Le
-        assert!((val - 1.0).abs() < 1e-6, "Le should return 1.0 when a == b (both negative)");
+        assert!(
+            (val - 1.0).abs() < 1e-6,
+            "Le should return 1.0 when a == b (both negative)"
+        );
     }
 
     #[test]
@@ -4110,13 +4675,21 @@ mod tests {
         let desc = test_quant_desc();
         // Act: compare 0.0 >= -1.0
         let result = sim.exec_op(
-            &TraceOp::Compare { a: ValueId(0), b: ValueId(1), op: CmpOp::Ge },
-            &mut state, &desc,
+            &TraceOp::Compare {
+                a: ValueId(0),
+                b: ValueId(1),
+                op: CmpOp::Ge,
+            },
+            &mut state,
+            &desc,
         );
         let id = result.unwrap().unwrap();
         let val = state.get(id).as_float().unwrap();
         // Assert: 0.0 >= -1.0 should be true
-        assert!((val - 1.0).abs() < 1e-6, "Ge should return 1.0 when 0.0 >= -1.0");
+        assert!(
+            (val - 1.0).abs() < 1e-6,
+            "Ge should return 1.0 when 0.0 >= -1.0"
+        );
     }
 
     // ── Unary operations: abs and sqrt with zero ──
@@ -4170,7 +4743,10 @@ mod tests {
         // Act
         let val = NumericalSimulator::fp8_e5m2_to_f32(byte);
         // Assert
-        assert!(val.is_infinite() && val.is_sign_positive(), "FP8 E5M2 byte 0x7C should decode to +Inf");
+        assert!(
+            val.is_infinite() && val.is_sign_positive(),
+            "FP8 E5M2 byte 0x7C should decode to +Inf"
+        );
     }
 
     #[test]

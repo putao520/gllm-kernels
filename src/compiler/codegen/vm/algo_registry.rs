@@ -37,8 +37,12 @@ fn resolve_template(strategy: &AlgoStrategy) -> Option<&'static AlgoTemplate> {
         AlgoStrategy::NormLayer => Some(&algo_templates::attention_norm_rope_moe::NORM_LAYER),
         AlgoStrategy::RopeStandard => Some(&algo_templates::attention_norm_rope_moe::ROPE_STANDARD),
         AlgoStrategy::RopePartial => Some(&algo_templates::attention_norm_rope_moe::ROPE_PARTIAL),
-        AlgoStrategy::MoeRouterTopk => Some(&algo_templates::attention_norm_rope_moe::MOE_ROUTER_TOPK),
-        AlgoStrategy::MoePackedDispatch => Some(&algo_templates::attention_norm_rope_moe::MOE_PACKED_DISPATCH),
+        AlgoStrategy::MoeRouterTopk => {
+            Some(&algo_templates::attention_norm_rope_moe::MOE_ROUTER_TOPK)
+        }
+        AlgoStrategy::MoePackedDispatch => {
+            Some(&algo_templates::attention_norm_rope_moe::MOE_PACKED_DISPATCH)
+        }
         AlgoStrategy::SamplingArgmax => Some(&algo_templates::sampling::SAMPLING_ARGMAX),
         AlgoStrategy::SamplingTemperature => Some(&algo_templates::sampling::SAMPLING_TEMPERATURE),
         AlgoStrategy::SamplingSoftmax => Some(&algo_templates::sampling::SAMPLING_SOFTMAX),
@@ -130,7 +134,11 @@ mod tests {
             AlgoStrategy::GemmGpuTiled,
             AlgoStrategy::GemmGpuPipelined,
         ] {
-            assert!(resolve_template(&strategy).is_some(), "{:?} should resolve", strategy);
+            assert!(
+                resolve_template(&strategy).is_some(),
+                "{:?} should resolve",
+                strategy
+            );
         }
     }
 
@@ -141,14 +149,19 @@ mod tests {
             AlgoStrategy::AttnGqa,
             AlgoStrategy::AttnMla,
         ] {
-            assert!(resolve_template(&strategy).is_some(), "{:?} should resolve", strategy);
+            assert!(
+                resolve_template(&strategy).is_some(),
+                "{:?} should resolve",
+                strategy
+            );
         }
     }
 
     #[test]
     fn test_resolve_template_all_norm_strategies() {
         for strategy in [AlgoStrategy::NormRms, AlgoStrategy::NormLayer] {
-            let tmpl = resolve_template(&strategy).unwrap_or_else(|| panic!("{:?} should resolve", strategy));
+            let tmpl = resolve_template(&strategy)
+                .unwrap_or_else(|| panic!("{:?} should resolve", strategy));
             assert!(tmpl.name.contains("NORM"), "{}", tmpl.name);
         }
     }
@@ -156,14 +169,22 @@ mod tests {
     #[test]
     fn test_resolve_template_rope_strategies() {
         for strategy in [AlgoStrategy::RopeStandard, AlgoStrategy::RopePartial] {
-            assert!(resolve_template(&strategy).is_some(), "{:?} should resolve", strategy);
+            assert!(
+                resolve_template(&strategy).is_some(),
+                "{:?} should resolve",
+                strategy
+            );
         }
     }
 
     #[test]
     fn test_resolve_template_moe_strategies() {
         for strategy in [AlgoStrategy::MoeRouterTopk, AlgoStrategy::MoePackedDispatch] {
-            assert!(resolve_template(&strategy).is_some(), "{:?} should resolve", strategy);
+            assert!(
+                resolve_template(&strategy).is_some(),
+                "{:?} should resolve",
+                strategy
+            );
         }
     }
 
@@ -177,7 +198,11 @@ mod tests {
             AlgoStrategy::SamplingTopP,
             AlgoStrategy::SamplingMultinomial,
         ] {
-            assert!(resolve_template(&strategy).is_some(), "{:?} should resolve", strategy);
+            assert!(
+                resolve_template(&strategy).is_some(),
+                "{:?} should resolve",
+                strategy
+            );
         }
     }
 
@@ -197,21 +222,29 @@ mod tests {
     #[test]
     fn test_isa_capability_level_ordering() {
         assert!(isa_capability_level(&IsaLevel::Avx2) < isa_capability_level(&IsaLevel::Avx512));
-        assert!(isa_capability_level(&IsaLevel::Avx512) < isa_capability_level(&IsaLevel::Avx512Amx));
+        assert!(
+            isa_capability_level(&IsaLevel::Avx512) < isa_capability_level(&IsaLevel::Avx512Amx)
+        );
         assert!(isa_capability_level(&IsaLevel::Neon) < isa_capability_level(&IsaLevel::Sve));
         assert!(isa_capability_level(&IsaLevel::Sve) < isa_capability_level(&IsaLevel::Sve2));
     }
 
     #[test]
     fn test_isa_capability_level_amx_tie() {
-        assert_eq!(isa_capability_level(&IsaLevel::Avx512Amx), isa_capability_level(&IsaLevel::NeonAmx));
+        assert_eq!(
+            isa_capability_level(&IsaLevel::Avx512Amx),
+            isa_capability_level(&IsaLevel::NeonAmx)
+        );
     }
 
     // ── select_template integration ──
 
     #[test]
     fn test_select_template_blis_with_scalar_profile() {
-        let profile = DeviceProfile { isa: IsaLevel::Scalar, ..DeviceProfile::detect() };
+        let profile = DeviceProfile {
+            isa: IsaLevel::Scalar,
+            ..DeviceProfile::detect()
+        };
         let tmpl = select_template(&AlgoStrategy::GemmBlis, &profile);
         // GemmBlis has DeviceReq::Avx2Plus, scalar should not satisfy
         assert!(tmpl.is_none(), "GemmBlis should not match scalar ISA");
@@ -219,14 +252,20 @@ mod tests {
 
     #[test]
     fn test_select_template_naive_matches_scalar() {
-        let profile = DeviceProfile { isa: IsaLevel::Scalar, ..DeviceProfile::detect() };
+        let profile = DeviceProfile {
+            isa: IsaLevel::Scalar,
+            ..DeviceProfile::detect()
+        };
         let tmpl = select_template(&AlgoStrategy::GemmNaive, &profile);
         assert!(tmpl.is_some(), "GemmNaive should match scalar ISA");
     }
 
     #[test]
     fn test_select_template_norm_rms_matches_scalar() {
-        let profile = DeviceProfile { isa: IsaLevel::Scalar, ..DeviceProfile::detect() };
+        let profile = DeviceProfile {
+            isa: IsaLevel::Scalar,
+            ..DeviceProfile::detect()
+        };
         let tmpl = select_template(&AlgoStrategy::NormRms, &profile);
         assert!(tmpl.is_some(), "NormRms should match scalar ISA");
     }

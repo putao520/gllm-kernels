@@ -269,7 +269,7 @@ impl VmInstr {
 mod tests {
     #![allow(unused_imports)]
     use super::*;
-    use crate::compiler::codegen::vm::instr::{VRegId, SimdWidth};
+    use crate::compiler::codegen::vm::instr::{SimdWidth, VRegId};
 
     /// 穷举验证: 每个 VmInstr 变体必须命中且仅命中一个类别 (ARCH-LOWER-DISPATCH-LAYERING §4)。
     /// 此测试保证 category() 无 `_ =>` 通配,新增变体时若忘记补全会编译失败。

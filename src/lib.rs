@@ -19,28 +19,28 @@
     clippy::manual_div_ceil,
     clippy::manual_is_multiple_of,
     clippy::redundant_closure_for_method_calls,
-    clippy::macro_metavars_in_unsafe,
+    clippy::macro_metavars_in_unsafe
 )]
 
 pub mod traits;
 pub use traits::Activation;
-pub mod types;
+pub mod asm;
+pub mod autotuning;
+pub mod backend;
 pub mod cache_params;
+pub mod codebooks;
+pub mod cpu_kernels;
+pub mod dispatch;
+pub mod gpu;
+pub mod inference;
+pub mod macros;
 pub mod microarch;
 pub mod numa;
-pub mod macros;
-pub mod cpu_kernels;
-pub mod backend;
-pub mod gpu;
+pub mod profiling;
 pub mod quant;
 pub mod quant_format;
 pub mod quant_mxfp4;
-pub mod codebooks;
-pub mod asm;
-pub mod profiling;
-pub mod autotuning;
-pub mod dispatch;
-pub mod inference;
+pub mod types;
 /// Re-export scalar_ops from the `gllm-scalar-ops` subcrate.
 /// The subcrate is compiled at opt-level=1 (REQ-SCALAR-002) to preserve
 /// loop structure for symexec binary analysis.
@@ -50,28 +50,28 @@ pub mod ffi;
 pub mod isv;
 
 #[cfg(test)]
+mod check_isa;
+#[cfg(test)]
 pub mod tests;
+#[cfg(test)]
+mod tests_amx;
+#[cfg(test)]
+mod tests_int8;
 #[cfg(test)]
 mod tests_quant;
 #[cfg(test)]
 mod tests_simd;
-#[cfg(test)]
-mod tests_int8;
-#[cfg(test)]
-mod check_isa;
-#[cfg(test)]
-mod tests_amx;
 
-pub use quant_format::QuantFormatDescriptor;
 pub use compiler::quant_format::coverage_matrix;
 pub use compiler::quant_format::QuantFamily;
-pub use traits::{Element, Backend, Kernels};
+pub use quant_format::QuantFormatDescriptor;
+pub use traits::{Backend, Element, Kernels};
 
 /// Re-export distributed paging types from gllm-nccl (REQ-DP-014, §11.2).
 /// Only available when the `nccl` feature is enabled.
 #[cfg(feature = "nccl")]
 pub use gllm_nccl::paging::{
-    DistributedPageId, PageLocation, PageState, PageTableEntry, PageRoutingTable,
+    DistributedPageId, PageLocation, PageRoutingTable, PageState, PageTableEntry,
 };
 
 /// Type alias for the primitive `f16` type (core::f16).

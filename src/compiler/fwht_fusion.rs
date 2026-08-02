@@ -304,8 +304,13 @@ mod tests {
         let output_energy: f32 = data.iter().map(|x| x * x).sum();
         // Parseval's theorem: output_energy = n * input_energy
         let n = 8.0f32;
-        assert!((output_energy - n * input_energy).abs() < 1e-2,
-            "energy not preserved: input={}, output={}, expected={}", input_energy, output_energy, n * input_energy);
+        assert!(
+            (output_energy - n * input_energy).abs() < 1e-2,
+            "energy not preserved: input={}, output={}, expected={}",
+            input_energy,
+            output_energy,
+            n * input_energy
+        );
     }
 
     #[test]
@@ -317,7 +322,11 @@ mod tests {
         let b = 3.0f32;
 
         // Compute a*x + b*y, then FWHT
-        let mut combined: Vec<f32> = x.iter().zip(y.iter()).map(|(&xi, &yi)| a * xi + b * yi).collect();
+        let mut combined: Vec<f32> = x
+            .iter()
+            .zip(y.iter())
+            .map(|(&xi, &yi)| a * xi + b * yi)
+            .collect();
         FwhtEpilogueFusion::scalar_fwht_inplace(&mut combined);
 
         // Compute a*FWHT(x) + b*FWHT(y) separately
@@ -325,10 +334,20 @@ mod tests {
         let mut fy = y.clone();
         FwhtEpilogueFusion::scalar_fwht_inplace(&mut fx);
         FwhtEpilogueFusion::scalar_fwht_inplace(&mut fy);
-        let expected: Vec<f32> = fx.iter().zip(fy.iter()).map(|(&fxi, &fyi)| a * fxi + b * fyi).collect();
+        let expected: Vec<f32> = fx
+            .iter()
+            .zip(fy.iter())
+            .map(|(&fxi, &fyi)| a * fxi + b * fyi)
+            .collect();
 
         for (i, (c, e)) in combined.iter().zip(expected.iter()).enumerate() {
-            assert!((c - e).abs() < 1e-3, "linearity violated at index {}: got {}, expected {}", i, c, e);
+            assert!(
+                (c - e).abs() < 1e-3,
+                "linearity violated at index {}: got {}, expected {}",
+                i,
+                c,
+                e
+            );
         }
     }
 

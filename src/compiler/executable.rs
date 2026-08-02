@@ -4,10 +4,10 @@
 //! transformer layer. The code is stored in an executable memory region
 //! (via mmap) and called through a function pointer.
 
-use crate::types::InferenceError;
 use crate::compiler::graph::WeightLayout;
 use crate::compiler::hotpatch::HotPatchRegistry;
 use crate::types::CompilerError;
+use crate::types::InferenceError;
 
 // ═══════════════════════════════════════════════════════════════
 //  ABI 参数位置由 VmState 动态计算 (ARCH-VM-STATE-TRACKING)
@@ -116,29 +116,29 @@ impl CompiledLayer {
         let f = self.entry_point_as_mega_kernel();
         let output_tokens = output as *mut u32;
         f(
-            input as *const u32,   // arg 0: input_ids_ptr
-            weights,               // arg 1: weight_blob_ptr
-            std::ptr::null_mut(),  // arg 2: kv_cache_ptr
-            std::ptr::null(),      // arg 3: positions_ptr
-            std::ptr::null(),      // arg 4: aux_ptr
-            batch_size,            // arg 5: batch_size
-            seq_len,               // arg 6: prompt_len
-            scratchpad,            // arg 7: scratchpad_ptr
-            output_tokens,         // arg 8: output_tokens_ptr
-            0,                     // arg 9: temperature_u32
-            0,                     // arg 10: top_k
-            0,                     // arg 11: top_p_u32
-            0,                     // arg 12: max_new_tokens
-            0,                     // arg 13: eos_token_id
-            std::ptr::null(),      // arg 14: hook_ctx_ptr
-            std::ptr::null_mut(),  // arg 15: telemetry_ptr
-            0,                     // arg 16: session_position
-            std::ptr::null(),      // arg 17: fused_hidden_ptr
-            0,                     // arg 18: num_mm_tokens
-            std::ptr::null(),      // arg 19: callback_table_ptr
-            std::ptr::null(),      // arg 20: page_table_ptr
-            std::ptr::null(),      // arg 21: batch_ctx_ptr
-            std::ptr::null(),      // arg 22: kv_page_header_ptr
+            input as *const u32,  // arg 0: input_ids_ptr
+            weights,              // arg 1: weight_blob_ptr
+            std::ptr::null_mut(), // arg 2: kv_cache_ptr
+            std::ptr::null(),     // arg 3: positions_ptr
+            std::ptr::null(),     // arg 4: aux_ptr
+            batch_size,           // arg 5: batch_size
+            seq_len,              // arg 6: prompt_len
+            scratchpad,           // arg 7: scratchpad_ptr
+            output_tokens,        // arg 8: output_tokens_ptr
+            0,                    // arg 9: temperature_u32
+            0,                    // arg 10: top_k
+            0,                    // arg 11: top_p_u32
+            0,                    // arg 12: max_new_tokens
+            0,                    // arg 13: eos_token_id
+            std::ptr::null(),     // arg 14: hook_ctx_ptr
+            std::ptr::null_mut(), // arg 15: telemetry_ptr
+            0,                    // arg 16: session_position
+            std::ptr::null(),     // arg 17: fused_hidden_ptr
+            0,                    // arg 18: num_mm_tokens
+            std::ptr::null(),     // arg 19: callback_table_ptr
+            std::ptr::null(),     // arg 20: page_table_ptr
+            std::ptr::null(),     // arg 21: batch_ctx_ptr
+            std::ptr::null(),     // arg 22: kv_page_header_ptr
         );
         // Post-execution: copy output from scratchpad logits region to caller's output buffer.
         // All graphs write their output tensor to scratchpad[logits_scratch_offset].
@@ -165,7 +165,11 @@ impl CompiledLayer {
     /// # Safety
     /// - `patch_id` must be a valid patch registered via `register_hotpatch()`
     /// - `new_target` must be a valid code address within the compiled layer
-    pub unsafe fn apply_hotpatch(&self, patch_id: usize, new_target: u64) -> Result<(), CompilerError> {
+    pub unsafe fn apply_hotpatch(
+        &self,
+        patch_id: usize,
+        new_target: u64,
+    ) -> Result<(), CompilerError> {
         if let Some(ref registry) = self.hotpatch_registry {
             registry.patch(patch_id, new_target)
         } else {
@@ -191,7 +195,13 @@ impl CompiledLayer {
         self.code.with_write_access(|ptr, total| {
             if offset + len > total {
                 return Err(InferenceError::CompileError(
-                    format!("NOP region [{}, {}) out of bounds (code size {})", offset, offset + len, total).into(),
+                    format!(
+                        "NOP region [{}, {}) out of bounds (code size {})",
+                        offset,
+                        offset + len,
+                        total
+                    )
+                    .into(),
                 ));
             }
             unsafe { fill_nop_sled(ptr.add(offset), len) }
@@ -206,7 +216,13 @@ impl CompiledLayer {
         self.code.with_write_access(|ptr, total| {
             if offset + data.len() > total {
                 return Err(InferenceError::CompileError(
-                    format!("write region [{}, {}) out of bounds (code size {})", offset, offset + data.len(), total).into(),
+                    format!(
+                        "write region [{}, {}) out of bounds (code size {})",
+                        offset,
+                        offset + data.len(),
+                        total
+                    )
+                    .into(),
                 ));
             }
             unsafe {
@@ -220,7 +236,13 @@ impl CompiledLayer {
     pub fn save_code_region(&self, offset: usize, len: usize) -> Result<Vec<u8>, InferenceError> {
         if self.code.ptr.is_null() || offset + len > self.code.len {
             return Err(InferenceError::CompileError(
-                format!("save region [{}, {}) out of bounds (code size {})", offset, offset + len, self.code.len).into(),
+                format!(
+                    "save region [{}, {}) out of bounds (code size {})",
+                    offset,
+                    offset + len,
+                    self.code.len
+                )
+                .into(),
             ));
         }
         let mut buf = vec![0u8; len];
@@ -243,14 +265,14 @@ fn fill_nop_sled(ptr: *mut u8, len: usize) {
     #[cfg(target_arch = "x86_64")]
     {
         const MBNOP: &[&[u8]] = &[
-            &[0x90],                                           // 1B
-            &[0x66, 0x90],                                     // 2B
-            &[0x0F, 0x1F, 0x00],                               // 3B
-            &[0x0F, 0x1F, 0x40, 0x00],                         // 4B
-            &[0x0F, 0x1F, 0x44, 0x00, 0x00],                   // 5B
-            &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],             // 6B
-            &[0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],       // 7B
-            &[0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00], // 8B
+            &[0x90],                                                 // 1B
+            &[0x66, 0x90],                                           // 2B
+            &[0x0F, 0x1F, 0x00],                                     // 3B
+            &[0x0F, 0x1F, 0x40, 0x00],                               // 4B
+            &[0x0F, 0x1F, 0x44, 0x00, 0x00],                         // 5B
+            &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],                   // 6B
+            &[0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],             // 7B
+            &[0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],       // 8B
             &[0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00], // 9B
         ];
         let mut off = 0;
@@ -276,7 +298,9 @@ fn fill_nop_sled(ptr: *mut u8, len: usize) {
         }
         // Pad remaining bytes with 0x00 (shouldn't happen if caller aligns to 4)
         while off < len {
-            unsafe { *ptr.add(off) = 0x00; }
+            unsafe {
+                *ptr.add(off) = 0x00;
+            }
             off += 1;
         }
     }
@@ -284,7 +308,9 @@ fn fill_nop_sled(ptr: *mut u8, len: usize) {
     {
         // Fallback: zero-fill (no-op on unknown arch, caller should not use this)
         for i in 0..len {
-            unsafe { *ptr.add(i) = 0x00; }
+            unsafe {
+                *ptr.add(i) = 0x00;
+            }
         }
     }
 }
@@ -314,7 +340,11 @@ impl ExecutableBuffer {
 
         // RWX
         let ret = unsafe {
-            libc::mprotect(self.ptr as *mut _, self.len, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC)
+            libc::mprotect(
+                self.ptr as *mut _,
+                self.len,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+            )
         };
         if ret != 0 {
             return Err(InferenceError::CompileError("mprotect RWX failed".into()));
@@ -324,10 +354,16 @@ impl ExecutableBuffer {
 
         // Restore RX
         let ret = unsafe {
-            libc::mprotect(self.ptr as *mut _, self.len, libc::PROT_READ | libc::PROT_EXEC)
+            libc::mprotect(
+                self.ptr as *mut _,
+                self.len,
+                libc::PROT_READ | libc::PROT_EXEC,
+            )
         };
         if ret != 0 {
-            return Err(InferenceError::CompileError("mprotect RX restore failed".into()));
+            return Err(InferenceError::CompileError(
+                "mprotect RX restore failed".into(),
+            ));
         }
 
         // x86_64: serializing fence; aarch64: icache flush
@@ -385,7 +421,9 @@ impl ExecutableBuffer {
         // Make executable (and read-only)
         let ret = unsafe { libc::mprotect(ptr as *mut _, len, libc::PROT_READ | libc::PROT_EXEC) };
         if ret != 0 {
-            unsafe { libc::munmap(ptr as *mut _, len); }
+            unsafe {
+                libc::munmap(ptr as *mut _, len);
+            }
             return Err(InferenceError::CompileError(
                 "mprotect failed for executable buffer".into(),
             ));
@@ -463,7 +501,9 @@ impl GpuCompiledKernel {
 impl Drop for GpuCompiledKernel {
     fn drop(&mut self) {
         if self.module != 0 {
-            unsafe { (self.driver.cuModuleUnload)(self.module); }
+            unsafe {
+                (self.driver.cuModuleUnload)(self.module);
+            }
         }
     }
 }
@@ -505,15 +545,22 @@ impl GpuCompiledLayer {
         if let Ok(dir) = std::env::var("GLLM_DUMP_PTX") {
             let _ = std::fs::create_dir_all(&dir);
             let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
             let path = format!("{}/ptx_{}_{}.ptx", dir, config_hash, ts);
             let _ = std::fs::write(&path, ptx_source);
-            eprintln!("[DEBUG-DUMP-PTX] wrote {} bytes to {}", ptx_source.len(), path);
+            eprintln!(
+                "[DEBUG-DUMP-PTX] wrote {} bytes to {}",
+                ptx_source.len(),
+                path
+            );
         }
 
         // Load PTX module
         let mut module: CUmodule = 0;
-        let res = unsafe { (driver.cuModuleLoadData)(&mut module, ptx_source.as_ptr() as *const _) };
+        let res =
+            unsafe { (driver.cuModuleLoadData)(&mut module, ptx_source.as_ptr() as *const _) };
         if res != CUDA_SUCCESS {
             // dump PTX on failure too for debugging
             let _ = std::fs::write("/tmp/gllm_failed_ptx.ptx", ptx_source);
@@ -524,16 +571,16 @@ impl GpuCompiledLayer {
 
         let mut kernels = Vec::with_capacity(kernel_names.len());
         for (i, name) in kernel_names.iter().enumerate() {
-            let c_name = std::ffi::CString::new(*name).map_err(|e| {
-                GpuError::KernelLaunch(format!("invalid kernel name: {e}"))
-            })?;
+            let c_name = std::ffi::CString::new(*name)
+                .map_err(|e| GpuError::KernelLaunch(format!("invalid kernel name: {e}")))?;
             let mut function: CUfunction = 0;
-            let res = unsafe {
-                (driver.cuModuleGetFunction)(&mut function, module, c_name.as_ptr())
-            };
+            let res =
+                unsafe { (driver.cuModuleGetFunction)(&mut function, module, c_name.as_ptr()) };
             if res != CUDA_SUCCESS {
                 // Cleanup module on failure
-                unsafe { (driver.cuModuleUnload)(module); }
+                unsafe {
+                    (driver.cuModuleUnload)(module);
+                }
                 return Err(GpuError::KernelLaunch(format!(
                     "cuModuleGetFunction({name}) failed with error {res}"
                 )));
@@ -598,8 +645,12 @@ impl GpuCompiledLayer {
 
             let res = (kernel.driver.cuLaunchKernel)(
                 kernel.function,
-                kernel.grid_dim[0], kernel.grid_dim[1], kernel.grid_dim[2],
-                kernel.block_dim[0], kernel.block_dim[1], kernel.block_dim[2],
+                kernel.grid_dim[0],
+                kernel.grid_dim[1],
+                kernel.grid_dim[2],
+                kernel.block_dim[0],
+                kernel.block_dim[1],
+                kernel.block_dim[2],
                 kernel.shared_mem_bytes,
                 stream.handle(),
                 params.as_mut_ptr(),
@@ -715,7 +766,10 @@ mod tests {
             // Multi-byte NOP 8: 0x0F 0x1F 0x84 0x00 0x00 0x00 0x00 0x00
             // Verify it differs from single-byte NOP (0x90) pattern
             let saved = layer.save_code_region(2, 8).unwrap();
-            assert_ne!(saved, [0x90u8; 8], "region should be multi-byte NOP, not 0x90 fill");
+            assert_ne!(
+                saved, [0x90u8; 8],
+                "region should be multi-byte NOP, not 0x90 fill"
+            );
             assert_eq!(saved[0], 0x0F); // multi-byte NOP starts with 0x0F
 
             // ret at offset 15 still intact
@@ -888,7 +942,11 @@ mod tests {
         // Empty layer has no registry, so register_hotpatch should be a no-op
         let mut layer = CompiledLayer::from_code(&[], 0, 0).unwrap();
         layer.register_hotpatch(0, 0x100, vec![0x200]);
-        assert_eq!(layer.hotpatch_count(), 0, "no registry => register is no-op");
+        assert_eq!(
+            layer.hotpatch_count(),
+            0,
+            "no registry => register is no-op"
+        );
     }
 
     // @trace TEST-EXE-21 [req:REQ-JIT] [level:unit]
@@ -941,7 +999,10 @@ mod tests {
         let layer = CompiledLayer::from_code(&[], 0, 0).unwrap();
         // Empty layer has null ptr, so nop_code_region should fail
         let result = layer.nop_code_region(0, 1);
-        assert!(result.is_err(), "nop_code_region on empty layer should fail");
+        assert!(
+            result.is_err(),
+            "nop_code_region on empty layer should fail"
+        );
     }
 
     // @trace TEST-EXE-23 [req:REQ-JIT] [level:unit]
@@ -1015,7 +1076,10 @@ mod tests {
         let result = layer.write_code_region(0, &[0xC3]);
 
         // Assert: with_write_access should reject null/empty buffer
-        assert!(result.is_err(), "write_code_region on empty layer should fail");
+        assert!(
+            result.is_err(),
+            "write_code_region on empty layer should fail"
+        );
     }
 
     // @trace TEST-EXE-28 [req:REQ-JIT] [level:unit]
@@ -1053,14 +1117,14 @@ mod tests {
             // Arrange: test fill_nop_sled for all sizes 1..9 on a live buffer
             // Expected multi-byte NOP encodings (from MBNOP table)
             let expected: &[&[u8]] = &[
-                &[0x90],                                           // 1B
-                &[0x66, 0x90],                                     // 2B
-                &[0x0F, 0x1F, 0x00],                               // 3B
-                &[0x0F, 0x1F, 0x40, 0x00],                         // 4B
-                &[0x0F, 0x1F, 0x44, 0x00, 0x00],                   // 5B
-                &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],             // 6B
-                &[0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],       // 7B
-                &[0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00], // 8B
+                &[0x90],                                                 // 1B
+                &[0x66, 0x90],                                           // 2B
+                &[0x0F, 0x1F, 0x00],                                     // 3B
+                &[0x0F, 0x1F, 0x40, 0x00],                               // 4B
+                &[0x0F, 0x1F, 0x44, 0x00, 0x00],                         // 5B
+                &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],                   // 6B
+                &[0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],             // 7B
+                &[0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],       // 8B
                 &[0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00], // 9B
             ];
 
@@ -1136,7 +1200,10 @@ mod tests {
             let result = unsafe { layer.apply_hotpatch(99, 0xDEAD) };
 
             // Assert: should error because patch_id 99 does not exist
-            assert!(result.is_err(), "applying non-existent patch_id should fail");
+            assert!(
+                result.is_err(),
+                "applying non-existent patch_id should fail"
+            );
         }
     }
 
@@ -1177,7 +1244,11 @@ mod tests {
             let bytes = layer.code_bytes();
 
             // Assert: first 16 bytes exactly match original code
-            assert_eq!(&bytes[..16], &code[..], "code_bytes must preserve original content");
+            assert_eq!(
+                &bytes[..16],
+                &code[..],
+                "code_bytes must preserve original content"
+            );
         }
     }
 
@@ -1193,8 +1264,14 @@ mod tests {
             let layer = CompiledLayer::from_code(&code, 0, 0).unwrap();
 
             // Assert: optional fields default to None
-            assert!(layer.weight_layout.is_none(), "weight_layout should default to None");
-            assert!(layer.rope_cache.is_none(), "rope_cache should default to None");
+            assert!(
+                layer.weight_layout.is_none(),
+                "weight_layout should default to None"
+            );
+            assert!(
+                layer.rope_cache.is_none(),
+                "rope_cache should default to None"
+            );
             assert_eq!(layer.scratchpad_bytes, 0);
             assert_eq!(layer.config_hash, 0);
         }
@@ -1274,7 +1351,10 @@ mod tests {
             // Assert: succeeds, content unchanged
             assert!(result.is_ok(), "zero-length write should succeed");
             let saved = layer.save_code_region(5, 1).unwrap();
-            assert_eq!(saved[0], 0xCD, "content at write offset should be untouched");
+            assert_eq!(
+                saved[0], 0xCD,
+                "content at write offset should be untouched"
+            );
         }
     }
 
@@ -1290,7 +1370,9 @@ mod tests {
 
             // Act: sequence of NOP → write → NOP on different regions
             layer.nop_code_region(0, 4).unwrap();
-            layer.write_code_region(8, &[0xAA, 0xBB, 0xCC, 0xDD]).unwrap();
+            layer
+                .write_code_region(8, &[0xAA, 0xBB, 0xCC, 0xDD])
+                .unwrap();
             layer.nop_code_region(20, 6).unwrap();
 
             // Assert: each region has expected content, ret intact
@@ -1298,10 +1380,18 @@ mod tests {
             assert_eq!(nop4.as_slice(), &[0x0F, 0x1F, 0x40, 0x00], "4B NOP");
 
             let written = layer.save_code_region(8, 4).unwrap();
-            assert_eq!(written.as_slice(), &[0xAA, 0xBB, 0xCC, 0xDD], "written payload");
+            assert_eq!(
+                written.as_slice(),
+                &[0xAA, 0xBB, 0xCC, 0xDD],
+                "written payload"
+            );
 
             let nop6 = layer.save_code_region(20, 6).unwrap();
-            assert_eq!(nop6.as_slice(), &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00], "6B NOP");
+            assert_eq!(
+                nop6.as_slice(),
+                &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],
+                "6B NOP"
+            );
 
             let tail = layer.save_code_region(63, 1).unwrap();
             assert_eq!(tail[0], 0xC3, "ret must survive interleaved ops");
@@ -1370,7 +1460,11 @@ mod tests {
         let ps = page_size();
 
         // Assert: 1 byte rounds up to at least 1 page
-        assert_eq!(small_layer.code_size(), ps, "1-byte code should round up to page_size");
+        assert_eq!(
+            small_layer.code_size(),
+            ps,
+            "1-byte code should round up to page_size"
+        );
 
         #[cfg(target_arch = "x86_64")]
         {
@@ -1382,7 +1476,11 @@ mod tests {
             let exact_layer = CompiledLayer::from_code(&big_code, 0, 0).unwrap();
 
             // Assert: exactly page_size fits in exactly one page
-            assert_eq!(exact_layer.code_size(), ps, "page_size code should fit in one page");
+            assert_eq!(
+                exact_layer.code_size(),
+                ps,
+                "page_size code should fit in one page"
+            );
 
             // Arrange: code that's page_size + 1 bytes
             let mut over_code = vec![0x90u8; ps + 1];
@@ -1390,7 +1488,11 @@ mod tests {
             let over_layer = CompiledLayer::from_code(&over_code, 0, 0).unwrap();
 
             // Assert: page_size + 1 rounds up to 2 pages
-            assert_eq!(over_layer.code_size(), ps * 2, "page_size+1 should round up to 2 pages");
+            assert_eq!(
+                over_layer.code_size(),
+                ps * 2,
+                "page_size+1 should round up to 2 pages"
+            );
         }
     }
 

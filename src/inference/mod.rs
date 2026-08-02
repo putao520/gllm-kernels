@@ -4,18 +4,18 @@
 //! `CpuInferenceBackend` provides the reference implementation using Layer 1
 //! atomic operators as fallback, with JIT-compiled fused layers when available.
 
-pub mod tensor;
-pub mod weights;
-pub mod kv_cache;
 pub mod cpu_backend;
 pub mod flash_attn;
+pub mod kv_cache;
+pub mod tensor;
+pub mod weights;
 
-pub use crate::types::{DType, ModelArch, ModelConfig, InferenceError};
-pub use tensor::{DeviceTensor, DeviceKind};
-pub use weights::{ModelWeights, LayerWeights};
-pub use kv_cache::KvCache;
+pub use crate::types::{DType, InferenceError, ModelArch, ModelConfig};
 pub use cpu_backend::CpuInferenceBackend;
-pub use flash_attn::{FlashAttnConfig, flash_attn_single_head, flash_attn_multi_head};
+pub use flash_attn::{flash_attn_multi_head, flash_attn_single_head, FlashAttnConfig};
+pub use kv_cache::KvCache;
+pub use tensor::{DeviceKind, DeviceTensor};
+pub use weights::{LayerWeights, ModelWeights};
 
 /// The primary inference backend trait.
 ///
@@ -307,9 +307,15 @@ mod tests {
         let weights = ModelWeights::alloc_cpu(&config).unwrap();
 
         // Assert: embedding = [vocab_size, hidden_size]
-        assert_eq!(weights.embedding.num_elements(), config.vocab_size * config.hidden_size);
+        assert_eq!(
+            weights.embedding.num_elements(),
+            config.vocab_size * config.hidden_size
+        );
         // Assert: lm_head = [hidden_size, vocab_size]
-        assert_eq!(weights.lm_head.num_elements(), config.hidden_size * config.vocab_size);
+        assert_eq!(
+            weights.lm_head.num_elements(),
+            config.hidden_size * config.vocab_size
+        );
         // Assert: final_norm = [hidden_size]
         assert_eq!(weights.final_norm.num_elements(), config.hidden_size);
     }
@@ -327,13 +333,34 @@ mod tests {
 
         // Assert
         assert_eq!(layer.attn_norm.num_elements(), config.hidden_size);
-        assert_eq!(layer.wq.num_elements(), config.hidden_size * config.num_heads * config.head_dim);
-        assert_eq!(layer.wk.num_elements(), config.hidden_size * config.num_kv_heads * config.head_dim);
-        assert_eq!(layer.wv.num_elements(), config.hidden_size * config.num_kv_heads * config.head_dim);
-        assert_eq!(layer.wo.num_elements(), config.num_heads * config.head_dim * config.hidden_size);
-        assert_eq!(layer.w_gate.num_elements(), config.hidden_size * config.intermediate_size);
-        assert_eq!(layer.w_up.num_elements(), config.hidden_size * config.intermediate_size);
-        assert_eq!(layer.w_down.num_elements(), config.intermediate_size * config.hidden_size);
+        assert_eq!(
+            layer.wq.num_elements(),
+            config.hidden_size * config.num_heads * config.head_dim
+        );
+        assert_eq!(
+            layer.wk.num_elements(),
+            config.hidden_size * config.num_kv_heads * config.head_dim
+        );
+        assert_eq!(
+            layer.wv.num_elements(),
+            config.hidden_size * config.num_kv_heads * config.head_dim
+        );
+        assert_eq!(
+            layer.wo.num_elements(),
+            config.num_heads * config.head_dim * config.hidden_size
+        );
+        assert_eq!(
+            layer.w_gate.num_elements(),
+            config.hidden_size * config.intermediate_size
+        );
+        assert_eq!(
+            layer.w_up.num_elements(),
+            config.hidden_size * config.intermediate_size
+        );
+        assert_eq!(
+            layer.w_down.num_elements(),
+            config.intermediate_size * config.hidden_size
+        );
         // No QKV bias for Llama
         assert!(layer.qkv_bias.is_none());
         // No norm bias for Llama (RMSNorm)
@@ -505,15 +532,18 @@ mod tests {
         // Arrange: Qwen-style model with QKV bias
         let mut config = test_config(); // hidden=32, heads=4, kv_heads=4, head_dim=8
         config.has_qkv_bias = true;
-        let q_dim = config.num_heads * config.head_dim;   // 32
+        let q_dim = config.num_heads * config.head_dim; // 32
         let kv_dim = config.num_kv_heads * config.head_dim; // 32
-        let expected_bias_elems = q_dim + 2 * kv_dim;     // 96
+        let expected_bias_elems = q_dim + 2 * kv_dim; // 96
 
         // Act
         let weights = ModelWeights::alloc_cpu(&config).unwrap();
 
         // Assert
-        let bias = weights.layers[0].qkv_bias.as_ref().expect("qkv_bias should exist");
+        let bias = weights.layers[0]
+            .qkv_bias
+            .as_ref()
+            .expect("qkv_bias should exist");
         assert_eq!(bias.num_elements(), expected_bias_elems);
     }
 
@@ -522,7 +552,10 @@ mod tests {
     #[test]
     fn test_inference_error_display_variants() {
         // Arrange & Act
-        let oom = InferenceError::OutOfMemory { requested: 1024, available: 512 };
+        let oom = InferenceError::OutOfMemory {
+            requested: 1024,
+            available: 512,
+        };
         let shape = InferenceError::ShapeMismatch {
             expected: "32 bytes".to_string(),
             got: "16 bytes".to_string(),
@@ -531,13 +564,22 @@ mod tests {
 
         // Assert
         let oom_str = format!("{oom}");
-        assert!(oom_str.contains("1024") && oom_str.contains("512"), "OOM display: {oom_str}");
+        assert!(
+            oom_str.contains("1024") && oom_str.contains("512"),
+            "OOM display: {oom_str}"
+        );
 
         let shape_str = format!("{shape}");
-        assert!(shape_str.contains("32 bytes") && shape_str.contains("16 bytes"), "ShapeMismatch display: {shape_str}");
+        assert!(
+            shape_str.contains("32 bytes") && shape_str.contains("16 bytes"),
+            "ShapeMismatch display: {shape_str}"
+        );
 
         let rt_str = format!("{runtime}");
-        assert!(rt_str.contains("bad thing"), "RuntimeError display: {rt_str}");
+        assert!(
+            rt_str.contains("bad thing"),
+            "RuntimeError display: {rt_str}"
+        );
     }
 
     // ── CpuInferenceBackend upload/download with zero-length data ──────
@@ -575,7 +617,10 @@ mod tests {
         assert!(cuda3.contains("Cuda"), "Cuda debug: {cuda3}");
         assert!(cuda3.contains("3"), "Cuda(3) should contain '3': {cuda3}");
         assert!(metal7.contains("Metal"), "Metal debug: {metal7}");
-        assert!(metal7.contains("7"), "Metal(7) should contain '7': {metal7}");
+        assert!(
+            metal7.contains("7"),
+            "Metal(7) should contain '7': {metal7}"
+        );
     }
 
     // ── CpuInferenceBackend alloc_kv_cache with batch_size > 1 ─────────

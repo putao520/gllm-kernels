@@ -7,13 +7,13 @@
 //! SPEC 28 REQ-GRP-001: Extended with `TensorLifetime` cross-layer dimension
 //! and `CrossLayerLifetime` for single mega-kernel resource planning.
 
-use std::collections::{HashMap, HashSet};
-use crate::compiler::graph::{CompilerGraph, TensorId, OpId};
-use crate::compiler::fusion::{FusionPlan, FusionMode};
-use crate::compiler::virtual_tensor::VirtualTensorMap;
-use crate::compiler::virtual_activation::VirtualActivationMap;
+use crate::compiler::fusion::{FusionMode, FusionPlan};
+use crate::compiler::graph::{CompilerGraph, OpId, TensorId};
 use crate::compiler::layout_negotiator::LayoutAssignment;
+use crate::compiler::virtual_activation::VirtualActivationMap;
+use crate::compiler::virtual_tensor::VirtualTensorMap;
 use crate::types::DType;
+use std::collections::{HashMap, HashSet};
 
 /// Upper bound for sequence dimensions used in allocation and offset arithmetic.
 ///
@@ -80,11 +80,13 @@ fn resolve_alias_to_physical(
 /// logits output storage.
 pub(crate) fn logits_chain_tensors(graph: &CompilerGraph) -> HashSet<TensorId> {
     let mut chain = HashSet::new();
-    for sink_op in graph.ops.iter().filter(|op| matches!(
-        op.op_resolved(graph),
-        Some(crate::compiler::graph::Op::Argmax { .. })
-            | Some(crate::compiler::graph::Op::WriteLogits { .. })
-    )) {
+    for sink_op in graph.ops.iter().filter(|op| {
+        matches!(
+            op.op_resolved(graph),
+            Some(crate::compiler::graph::Op::Argmax { .. })
+                | Some(crate::compiler::graph::Op::WriteLogits { .. })
+        )
+    }) {
         let mut frontier: Vec<TensorId> = sink_op.inputs.iter().copied().collect();
         while let Some(tid) = frontier.pop() {
             let Some(producer) = graph.ops.iter().find(|op| op.outputs.contains(&tid)) else {
@@ -131,8 +133,7 @@ pub struct BufferSlot {
 }
 
 /// Result of buffer allocation.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct BufferAllocation {
     /// Per-tensor buffer assignments.
     pub slots: Vec<BufferSlot>,
@@ -167,7 +168,8 @@ pub struct BufferAllocation {
 impl BufferAllocation {
     /// Look up scratchpad offset for an intermediate tensor.
     pub fn offset_of(&self, tid: TensorId) -> Option<usize> {
-        self.slots.iter()
+        self.slots
+            .iter()
             .find(|s| s.tensor_id == tid)
             .map(|s| s.offset)
     }
@@ -176,7 +178,6 @@ impl BufferAllocation {
         Self::default()
     }
 }
-
 
 /// Analyze tensor lifetimes from the fusion plan's execution order.
 ///
@@ -206,7 +207,6 @@ pub fn analyze_lifetimes(
             }
         }
     }
-
 
     // Exclude graph inputs/outputs (externally managed)
     let graph_io: HashSet<TensorId> = graph
@@ -280,14 +280,23 @@ pub fn analyze_lifetimes(
         eprintln!("[buf-alloc] === SCHEDULE ({} ops) ===", schedule.len());
         for (step, &op_id) in schedule.iter().enumerate() {
             if let Some(op) = graph.op(op_id) {
-                let in_names: Vec<String> = op.inputs.iter()
+                let in_names: Vec<String> = op
+                    .inputs
+                    .iter()
                     .filter_map(|&tid| graph.tensor(tid).map(|t| format!("{}({:?})", t.name, tid)))
                     .collect();
-                let out_names: Vec<String> = op.outputs.iter()
+                let out_names: Vec<String> = op
+                    .outputs
+                    .iter()
                     .filter_map(|&tid| graph.tensor(tid).map(|t| format!("{}({:?})", t.name, tid)))
                     .collect();
-                eprintln!("[buf-alloc]   step {:3}: {:?} inputs=[{}] outputs=[{}]",
-                    step, op.op, in_names.join(", "), out_names.join(", "));
+                eprintln!(
+                    "[buf-alloc]   step {:3}: {:?} inputs=[{}] outputs=[{}]",
+                    step,
+                    op.op,
+                    in_names.join(", "),
+                    out_names.join(", ")
+                );
             }
         }
     }
@@ -315,9 +324,7 @@ pub fn analyze_lifetimes(
                 continue;
             }
         }
-        if let (Some(&first), Some(&last)) =
-            (first_use.get(&tensor.id), last_use.get(&tensor.id))
-        {
+        if let (Some(&first), Some(&last)) = (first_use.get(&tensor.id), last_use.get(&tensor.id)) {
             // Use max_for_allocation to account for symbolic dimensions (SymDim).
             // concrete_bytes() treats Symbolic as 1, causing massive under-allocation
             // for intermediate tensors with symbolic seq_len (e.g. FusedQkvRope Q/K outputs).
@@ -329,7 +336,9 @@ pub fn analyze_lifetimes(
             // per-layer intermediate 膨胀（Gemma4 E2B max_seq_len=131072 → 278GB OOM）。
             // 实际推理 seq_len 远小于 max_position_embeddings；ALLOC_SEQ_CAP 覆盖绝大多数场景。
             let alloc_max_seq_len = graph.max_seq_len.min(ALLOC_SEQ_CAP);
-            let numel: usize = tensor.shape.iter()
+            let numel: usize = tensor
+                .shape
+                .iter()
                 .map(|d| d.max_for_allocation_capped(alloc_max_seq_len))
                 .product::<usize>()
                 .max(1);
@@ -344,8 +353,10 @@ pub fn analyze_lifetimes(
                     last
                 };
                 if std::env::var("GLLM_DEBUG_BUFFER_ALLOC").is_ok() {
-                    eprintln!("[buf-alloc] {:40} {:?} lifetime=[{},{}] size={}",
-                        tensor.name, tensor.id, first, effective_last, size_bytes);
+                    eprintln!(
+                        "[buf-alloc] {:40} {:?} lifetime=[{},{}] size={}",
+                        tensor.name, tensor.id, first, effective_last, size_bytes
+                    );
                 }
                 lifetimes.push(Lifetime {
                     tensor_id: tensor.id,
@@ -473,9 +484,12 @@ pub fn allocate_buffers_aligned(
     // §0.2.8: Activation ping-pong compression
     // BCE-20260629-005: 排除 Gather/QuantGather 输出（如 embedding）
     // Gather 输出是数据加载，不是层间激活交换。
-    let gather_output_tids: HashSet<TensorId> = graph.ops.iter()
+    let gather_output_tids: HashSet<TensorId> = graph
+        .ops
+        .iter()
         .filter_map(|op| match &op.op {
-            crate::compiler::graph::Op::Gather { .. } | crate::compiler::graph::Op::QuantGather { .. } => op.outputs.first().copied(),
+            crate::compiler::graph::Op::Gather { .. }
+            | crate::compiler::graph::Op::QuantGather { .. } => op.outputs.first().copied(),
             _ => None,
         })
         .collect();
@@ -497,8 +511,9 @@ pub fn allocate_buffers_aligned(
     }
 
     // 分离 activation 和 non-activation lifetimes
-    let (activation_lifetimes, non_activation_lifetimes): (Vec<_>, Vec<_>) =
-        sorted.into_iter().partition(|lt| activation_tids.contains(&lt.tensor_id));
+    let (activation_lifetimes, non_activation_lifetimes): (Vec<_>, Vec<_>) = sorted
+        .into_iter()
+        .partition(|lt| activation_tids.contains(&lt.tensor_id));
     sorted = non_activation_lifetimes;
 
     let mut active: Vec<(usize, usize, usize)> = Vec::new();
@@ -531,7 +546,10 @@ pub fn allocate_buffers_aligned(
             for (&tid, slot) in &vam.activation_assignments {
                 let slot_idx = slot.buffer_idx; // 0=ping, 1=pong
                 if std::env::var("GLLM_DEBUG_BUFFER_ALLOC").is_ok() {
-                    eprintln!("[buf-alloc] activation {:?} → {} buffer idx={}", tid, slot_idx, slot.buffer_idx);
+                    eprintln!(
+                        "[buf-alloc] activation {:?} → {} buffer idx={}",
+                        tid, slot_idx, slot.buffer_idx
+                    );
                 }
                 let _ = (tid, slot_idx);
             }
@@ -559,12 +577,19 @@ pub fn allocate_buffers_aligned(
 
     let naive_total: usize = lifetimes.iter().map(|l| l.size_bytes).sum();
 
-
     if std::env::var("GLLM_DEBUG_BUFFER_ALLOC").is_ok() {
         eprintln!("[buf-alloc] === ALLOCATION RESULTS ===");
-        eprintln!("[buf-alloc] total_bytes={}, naive={}, saved={}", total_bytes, naive_total, naive_total.saturating_sub(total_bytes));
+        eprintln!(
+            "[buf-alloc] total_bytes={}, naive={}, saved={}",
+            total_bytes,
+            naive_total,
+            naive_total.saturating_sub(total_bytes)
+        );
         for slot in &slots {
-            eprintln!("[buf-alloc]   {:?} offset={} size={}", slot.tensor_id, slot.offset, slot.size_bytes);
+            eprintln!(
+                "[buf-alloc]   {:?} offset={} size={}",
+                slot.tensor_id, slot.offset, slot.size_bytes
+            );
         }
     }
 
@@ -598,7 +623,8 @@ pub fn allocate_buffers_aligned(
 
     // R3: Build tensor source classification (§0.2.3 虚拟内存)
     // ISA Lowering codegen 直接消费, 无需独立推导。
-    let tensor_sources = build_tensor_sources(graph, &slots, &activation_tids, activation_buffer_size, vam);
+    let tensor_sources =
+        build_tensor_sources(graph, &slots, &activation_tids, activation_buffer_size, vam);
 
     // §diagnostic-layer-capture: Ring-buffer capture region allocation.
     //
@@ -622,8 +648,15 @@ pub fn allocate_buffers_aligned(
         slots,
         total_bytes: total_bytes_with_capture,
         bytes_saved: naive_total.saturating_sub(total_bytes)
-            + skipped_virtual.iter().filter_map(|tid| graph.tensor(*tid).map(|t| t.concrete_bytes())).sum::<usize>()
-            + activation_lifetimes.iter().map(|lt| lt.size_bytes).sum::<usize>().saturating_sub(2 * activation_buffer_size),
+            + skipped_virtual
+                .iter()
+                .filter_map(|tid| graph.tensor(*tid).map(|t| t.concrete_bytes()))
+                .sum::<usize>()
+            + activation_lifetimes
+                .iter()
+                .map(|lt| lt.size_bytes)
+                .sum::<usize>()
+                .saturating_sub(2 * activation_buffer_size),
         virtual_source_map,
         activation_slots,
         skipped_virtual,
@@ -655,11 +688,16 @@ fn compute_layer_capture_region(
     #[cfg(feature = "diagnostic-layer-capture")]
     {
         // Only allocate when there's a layer loop (generative model).
-        let num_layers = graph.layer_loop_config.as_ref()
+        let num_layers = graph
+            .layer_loop_config
+            .as_ref()
             .map(|c| c.num_layers)
-            .or_else(|| graph.hetero_layer_loop_config.as_ref().map(|c| {
-                c.num_segments * (c.sliding_per_segment + 1)
-            }));
+            .or_else(|| {
+                graph
+                    .hetero_layer_loop_config
+                    .as_ref()
+                    .map(|c| c.num_segments * (c.sliding_per_segment + 1))
+            });
         let Some(num_layers) = num_layers else {
             return (0, 0, 0);
         };
@@ -673,7 +711,7 @@ fn compute_layer_capture_region(
             return (0, 0, 0);
         }
         let max_seq_len = graph.max_seq_len.min(ALLOC_SEQ_CAP).max(1); // BCE-20260728: limit alloc upper bound
-        // Compute dtype is F32 (see graph_dtype in context.inc.rs).
+                                                                       // Compute dtype is F32 (see graph_dtype in context.inc.rs).
         let elem_bytes = DType::F32.size_bytes();
         let per_layer_stride = max_seq_len * hidden * elem_bytes;
         let total_bytes = num_layers * per_layer_stride;
@@ -734,8 +772,11 @@ fn build_tensor_sources(
     {
         let mut cursor = 0usize;
         for &tid in &graph.outputs {
-            let numel = graph.tensor_numel_for_alloc(tid, graph.max_seq_len.min(ALLOC_SEQ_CAP)).unwrap_or(0);
-            let elem_bytes = graph.tensor(tid)
+            let numel = graph
+                .tensor_numel_for_alloc(tid, graph.max_seq_len.min(ALLOC_SEQ_CAP))
+                .unwrap_or(0);
+            let elem_bytes = graph
+                .tensor(tid)
                 .map(|t| t.dtype.size_bytes())
                 .unwrap_or(DType::F32.size_bytes()); // 安全回退: 无 tensor meta 时默认 F32
             map.insert(tid, TensorPtrSource::Output { offset: cursor });
@@ -752,7 +793,10 @@ fn build_tensor_sources(
 
     // Intermediate: BufferAllocation slots
     for slot in slots {
-        map.entry(slot.tensor_id).or_insert(TensorPtrSource::Intermediate { offset: slot.offset });
+        map.entry(slot.tensor_id)
+            .or_insert(TensorPtrSource::Intermediate {
+                offset: slot.offset,
+            });
     }
 
     // Activation alias tensors: the output of activation_alias shares the same
@@ -770,9 +814,12 @@ fn build_tensor_sources(
             // BCE-005 旧逻辑跳过 gather 输出是错的: gather 在循环前写 ping, layer0 读 ping=embedding,
             // ActivationSwap 后 layer1 读 ping=layer0_out. NaN 担心不成立 (gather 正确写 ping).
             // out_tid (layer 输出) 仍跳过 gather 输出 (输出不可能是 gather 输出, 保留防御).
-            let gather_outs: HashSet<TensorId> = graph.ops.iter()
+            let gather_outs: HashSet<TensorId> = graph
+                .ops
+                .iter()
                 .filter_map(|op| match &op.op {
-                    crate::compiler::graph::Op::Gather { .. } | crate::compiler::graph::Op::QuantGather { .. } => op.outputs.first().copied(),
+                    crate::compiler::graph::Op::Gather { .. }
+                    | crate::compiler::graph::Op::QuantGather { .. } => op.outputs.first().copied(),
                     _ => None,
                 })
                 .collect();
@@ -818,9 +865,15 @@ fn build_tensor_sources(
                 }
                 if !map.contains_key(&tid) {
                     match slot.buffer_idx {
-                        0 => { map.insert(tid, TensorPtrSource::ActivationPing); }
-                        1 => { map.insert(tid, TensorPtrSource::ActivationPong); }
-                        _ => { map.insert(tid, TensorPtrSource::Intermediate { offset: 0 }); }
+                        0 => {
+                            map.insert(tid, TensorPtrSource::ActivationPing);
+                        }
+                        1 => {
+                            map.insert(tid, TensorPtrSource::ActivationPong);
+                        }
+                        _ => {
+                            map.insert(tid, TensorPtrSource::Intermediate { offset: 0 });
+                        }
                     }
                 }
             }
@@ -854,8 +907,7 @@ fn build_tensor_sources(
     // Generic output-alias
     for op in &graph.ops {
         if let Some(input_idx) = op.op_output_aliases_input(graph) {
-            if let (Some(&in_tid), Some(&out_tid)) =
-                (op.inputs.get(input_idx), op.outputs.first())
+            if let (Some(&in_tid), Some(&out_tid)) = (op.inputs.get(input_idx), op.outputs.first())
             {
                 if let Some(&src) = map.get(&in_tid) {
                     map.insert(out_tid, src);
@@ -903,31 +955,34 @@ fn layout_align_for_tensor(
     default_align: usize,
 ) -> usize {
     use crate::compiler::accel_registry::LayoutConstraint;
-    let Some(la) = layout else { return default_align };
+    let Some(la) = layout else {
+        return default_align;
+    };
 
     let Some(producer_op_id) = graph.tensor(tid).and_then(|t| t.producer) else {
         return default_align;
     };
 
-    let Some(assign) = la.group_assignments.iter()
+    let Some(assign) = la
+        .group_assignments
+        .iter()
         .find_map(|ga| ga.op_layouts.get(&producer_op_id))
     else {
         return default_align;
     };
 
     match &assign.output_layout {
-        LayoutConstraint::PanelPacked { mr, nr } => {
-            (mr * nr * 4).max(default_align)
-        }
-        LayoutConstraint::SharedMemTile { tile_rows, tile_cols, .. } => {
-            (tile_rows * tile_cols * 4).max(default_align)
-        }
-        LayoutConstraint::TmaAligned2D { tile_m: _, tile_n: _ } => {
-            128_usize.max(default_align)
-        }
-        LayoutConstraint::AmxTileBF16 { rows, cols } => {
-            (rows * cols * 2).max(default_align)
-        }
+        LayoutConstraint::PanelPacked { mr, nr } => (mr * nr * 4).max(default_align),
+        LayoutConstraint::SharedMemTile {
+            tile_rows,
+            tile_cols,
+            ..
+        } => (tile_rows * tile_cols * 4).max(default_align),
+        LayoutConstraint::TmaAligned2D {
+            tile_m: _,
+            tile_n: _,
+        } => 128_usize.max(default_align),
+        LayoutConstraint::AmxTileBF16 { rows, cols } => (rows * cols * 2).max(default_align),
         _ => default_align,
     }
 }
@@ -1074,14 +1129,19 @@ fn determine_cross_layer_lifetime(tid: TensorId, graph: &CompilerGraph) -> Cross
     // Check if this is a KV-related tensor (name-based heuristic)
     if let Some(tensor) = graph.tensor(tid) {
         let name = &tensor.name;
-        if name.contains("_k_rope") || name.contains("_v_") || name.contains("_attn_out")
-            || name.contains("_kv_") || name.contains("_k_cache") || name.contains("_v_cache")
+        if name.contains("_k_rope")
+            || name.contains("_v_")
+            || name.contains("_attn_out")
+            || name.contains("_kv_")
+            || name.contains("_k_cache")
+            || name.contains("_v_cache")
         {
             return CrossLayerLifetime::SpanningAllLayers;
         }
         // AltUp PersistentActivation: per_layer_inputs [L,S,hpl] written once
         // before the layer loop, read-only during each layer iteration.
-        if name.contains("per_layer_input") || name.contains("altup.fat")
+        if name.contains("per_layer_input")
+            || name.contains("altup.fat")
             || name.contains("ple_combined")
         {
             return CrossLayerLifetime::PersistentActivation;
@@ -1103,7 +1163,9 @@ pub fn analyze_lifetimes_extended(
     vam: Option<&VirtualActivationMap>,
 ) -> Vec<TensorLifetimeExt> {
     let base = analyze_lifetimes(graph, plan, vtm, vam);
-    base.iter().map(|lt| TensorLifetimeExt::from_lifetime(lt, graph)).collect()
+    base.iter()
+        .map(|lt| TensorLifetimeExt::from_lifetime(lt, graph))
+        .collect()
 }
 
 /// Per-group scratch buffer requirement for TileLevelFusion.
@@ -1121,26 +1183,33 @@ pub struct GroupScratch {
 /// output (tile_rows × K × element_size). This is separate from the
 /// intermediate tensor allocation because it's a temporary within the
 /// microkernel's MC loop, not a full tensor.
-pub fn compute_scratch_requirements(
-    plan: &FusionPlan,
-    graph: &CompilerGraph,
-) -> Vec<GroupScratch> {
+pub fn compute_scratch_requirements(plan: &FusionPlan, graph: &CompilerGraph) -> Vec<GroupScratch> {
     plan.groups
         .iter()
         .filter_map(|group| {
             if let FusionMode::TileLevelFusion { tile_rows, .. } = group.mode {
                 // Find the GEMM op to get K dimension (胖 opcode 自描述)
-                let k = group.ops.iter().find_map(|&oid| {
-                    graph.op(oid).and_then(|o| o.op_gemm_dims(graph).map(|(_, _, k)| k))
-                }).unwrap_or(0);
+                let k = group
+                    .ops
+                    .iter()
+                    .find_map(|&oid| {
+                        graph
+                            .op(oid)
+                            .and_then(|o| o.op_gemm_dims(graph).map(|(_, _, k)| k))
+                    })
+                    .unwrap_or(0);
 
-                let elem_size = group.ops.iter().find_map(|&oid| {
-                    graph.op(oid).and_then(|o| {
-                        o.outputs.first().and_then(|&tid| {
-                            graph.tensor(tid).map(|t| t.dtype.size_bytes())
+                let elem_size = group
+                    .ops
+                    .iter()
+                    .find_map(|&oid| {
+                        graph.op(oid).and_then(|o| {
+                            o.outputs
+                                .first()
+                                .and_then(|&tid| graph.tensor(tid).map(|t| t.dtype.size_bytes()))
                         })
                     })
-                }).unwrap_or(DType::F32.size_bytes());
+                    .unwrap_or(DType::F32.size_bytes());
 
                 let scratch_bytes = tile_rows * k * elem_size;
                 if scratch_bytes > 0 {
@@ -1161,11 +1230,11 @@ pub fn compute_scratch_requirements(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compiler::fusion;
     use crate::compiler::graph::{CompilerGraph, GemmSpec, Op, SymDim, TensorId};
     use crate::compiler::ir::LayerIR;
-    use crate::compiler::fusion;
-    use crate::compiler::registry::ScalarOpRegistry;
     use crate::compiler::planner::ExecutionPlan;
+    use crate::compiler::registry::ScalarOpRegistry;
     use crate::dispatch::DeviceProfile;
     use crate::types::ModelConfig;
 
@@ -1306,7 +1375,10 @@ mod tests {
         let plan = fusion::fuse_with_dag(&graph, &registry, &exec_plan);
 
         let lifetimes = analyze_lifetimes(&graph, &plan, None, None);
-        assert!(!lifetimes.is_empty(), "LLaMA graph should have intermediate tensors");
+        assert!(
+            !lifetimes.is_empty(),
+            "LLaMA graph should have intermediate tensors"
+        );
 
         let alloc = allocate_buffers(&lifetimes);
 
@@ -1340,21 +1412,41 @@ mod tests {
     #[test]
     fn cacheline_128_alignment() {
         let lifetimes = vec![
-            Lifetime { tensor_id: TensorId(0), first_use: 0, last_use: 2, size_bytes: 100 },
-            Lifetime { tensor_id: TensorId(1), first_use: 1, last_use: 3, size_bytes: 200 },
+            Lifetime {
+                tensor_id: TensorId(0),
+                first_use: 0,
+                last_use: 2,
+                size_bytes: 100,
+            },
+            Lifetime {
+                tensor_id: TensorId(1),
+                first_use: 1,
+                last_use: 3,
+                size_bytes: 200,
+            },
         ];
-        let alloc = allocate_buffers_aligned(&lifetimes, 128, None, None, &CompilerGraph::new(), None);
+        let alloc =
+            allocate_buffers_aligned(&lifetimes, 128, None, None, &CompilerGraph::new(), None);
         for slot in &alloc.slots {
-            assert_eq!(slot.offset % 128, 0, "offset {} not aligned to 128", slot.offset);
+            assert_eq!(
+                slot.offset % 128,
+                0,
+                "offset {} not aligned to 128",
+                slot.offset
+            );
         }
     }
 
     #[test]
     fn default_64_alignment() {
-        let lifetimes = vec![
-            Lifetime { tensor_id: TensorId(0), first_use: 0, last_use: 2, size_bytes: 100 },
-        ];
-        let alloc = allocate_buffers_aligned(&lifetimes, 64, None, None, &CompilerGraph::new(), None);
+        let lifetimes = vec![Lifetime {
+            tensor_id: TensorId(0),
+            first_use: 0,
+            last_use: 2,
+            size_bytes: 100,
+        }];
+        let alloc =
+            allocate_buffers_aligned(&lifetimes, 64, None, None, &CompilerGraph::new(), None);
         assert_eq!(alloc.slots[0].offset % 64, 0);
     }
 
@@ -1368,10 +1460,21 @@ mod tests {
     #[test]
     fn aligned_non_overlapping_reuse() {
         let lifetimes = vec![
-            Lifetime { tensor_id: TensorId(0), first_use: 0, last_use: 1, size_bytes: 1024 },
-            Lifetime { tensor_id: TensorId(1), first_use: 2, last_use: 3, size_bytes: 1024 },
+            Lifetime {
+                tensor_id: TensorId(0),
+                first_use: 0,
+                last_use: 1,
+                size_bytes: 1024,
+            },
+            Lifetime {
+                tensor_id: TensorId(1),
+                first_use: 2,
+                last_use: 3,
+                size_bytes: 1024,
+            },
         ];
-        let alloc = allocate_buffers_aligned(&lifetimes, 64, None, None, &CompilerGraph::new(), None);
+        let alloc =
+            allocate_buffers_aligned(&lifetimes, 64, None, None, &CompilerGraph::new(), None);
         // Non-overlapping: second tensor can reuse first's space
         assert!(
             alloc.total_bytes < 2048 + 64,
@@ -1498,9 +1601,21 @@ mod tests {
     fn buffer_allocation_offset_of_finds_tensor() {
         let alloc = BufferAllocation {
             slots: vec![
-                BufferSlot { tensor_id: TensorId(0), offset: 0, size_bytes: 100 },
-                BufferSlot { tensor_id: TensorId(1), offset: 128, size_bytes: 200 },
-                BufferSlot { tensor_id: TensorId(2), offset: 384, size_bytes: 64 },
+                BufferSlot {
+                    tensor_id: TensorId(0),
+                    offset: 0,
+                    size_bytes: 100,
+                },
+                BufferSlot {
+                    tensor_id: TensorId(1),
+                    offset: 128,
+                    size_bytes: 200,
+                },
+                BufferSlot {
+                    tensor_id: TensorId(2),
+                    offset: 384,
+                    size_bytes: 64,
+                },
             ],
             total_bytes: 448,
             num_tensors: 3,
@@ -1521,9 +1636,11 @@ mod tests {
     #[test]
     fn buffer_allocation_offset_of_missing_returns_none() {
         let alloc = BufferAllocation {
-            slots: vec![
-                BufferSlot { tensor_id: TensorId(0), offset: 0, size_bytes: 100 },
-            ],
+            slots: vec![BufferSlot {
+                tensor_id: TensorId(0),
+                offset: 0,
+                size_bytes: 100,
+            }],
             total_bytes: 100,
             num_tensors: 1,
             bytes_saved: 0,
@@ -1541,7 +1658,11 @@ mod tests {
     #[test]
     fn buffer_allocation_clone() {
         let alloc = BufferAllocation {
-            slots: vec![BufferSlot { tensor_id: TensorId(0), offset: 0, size_bytes: 64 }],
+            slots: vec![BufferSlot {
+                tensor_id: TensorId(0),
+                offset: 0,
+                size_bytes: 64,
+            }],
             total_bytes: 64,
             num_tensors: 1,
             bytes_saved: 0,
@@ -1581,11 +1702,17 @@ mod tests {
 
         // Clone
         let weight_cloned = weight.clone();
-        assert!(matches!(weight_cloned, TensorPtrSource::Weight { offset: 4096 }));
+        assert!(matches!(
+            weight_cloned,
+            TensorPtrSource::Weight { offset: 4096 }
+        ));
 
         // Copy
         let output_copied = output;
-        assert!(matches!(output_copied, TensorPtrSource::Output { offset: 16384 }));
+        assert!(matches!(
+            output_copied,
+            TensorPtrSource::Output { offset: 16384 }
+        ));
     }
 
     #[test]
@@ -1625,7 +1752,9 @@ mod tests {
     #[test]
     fn cross_layer_lifetime_debug_format() {
         assert!(format!("{:?}", CrossLayerLifetime::PerLayer).contains("PerLayer"));
-        assert!(format!("{:?}", CrossLayerLifetime::SpanningAllLayers).contains("SpanningAllLayers"));
+        assert!(
+            format!("{:?}", CrossLayerLifetime::SpanningAllLayers).contains("SpanningAllLayers")
+        );
         let n = format!("{:?}", CrossLayerLifetime::SpanningNLayers(3));
         assert!(n.contains("SpanningNLayers"));
     }
@@ -1730,7 +1859,12 @@ mod tests {
         // A live range [0, 100) that ended before our tensor starts
         // Active: (offset=0, end=100, last_use=0)
         // Tensor starts at step 1, so active range is not live
-        let lt = Lifetime { tensor_id: TensorId(0), first_use: 5, last_use: 10, size_bytes: 50 };
+        let lt = Lifetime {
+            tensor_id: TensorId(0),
+            first_use: 5,
+            last_use: 10,
+            size_bytes: 50,
+        };
         let active = vec![(0usize, 100usize, 0usize)]; // last_use=0 < first_use=5, not live
         let offset = find_offset(&lt, &active);
         assert_eq!(offset, 0); // No live ranges overlap, should place at 0
@@ -1739,7 +1873,12 @@ mod tests {
     #[test]
     fn find_offset_stacks_after_live_range() {
         // One live range covering our first_use
-        let lt = Lifetime { tensor_id: TensorId(0), first_use: 0, last_use: 5, size_bytes: 50 };
+        let lt = Lifetime {
+            tensor_id: TensorId(0),
+            first_use: 0,
+            last_use: 5,
+            size_bytes: 50,
+        };
         let active = vec![(0usize, 100usize, 10usize)]; // last_use=10 >= first_use=0
         let offset = find_offset(&lt, &active);
         // Should be placed after the live range, aligned to 64
@@ -1749,7 +1888,12 @@ mod tests {
 
     #[test]
     fn find_offset_aligned_with_small_align() {
-        let lt = Lifetime { tensor_id: TensorId(0), first_use: 5, last_use: 10, size_bytes: 50 };
+        let lt = Lifetime {
+            tensor_id: TensorId(0),
+            first_use: 5,
+            last_use: 10,
+            size_bytes: 50,
+        };
         // No live ranges
         let offset = find_offset_aligned(&lt, &[], 32);
         assert_eq!(offset, 0);
@@ -1758,7 +1902,12 @@ mod tests {
     #[test]
     fn find_offset_aligned_fits_in_gap() {
         // Live range [0, 200), our tensor starts at step 5 which is after last_use=3
-        let lt = Lifetime { tensor_id: TensorId(0), first_use: 5, last_use: 10, size_bytes: 50 };
+        let lt = Lifetime {
+            tensor_id: TensorId(0),
+            first_use: 5,
+            last_use: 10,
+            size_bytes: 50,
+        };
         let active = vec![(0usize, 200usize, 3usize)];
         let offset = find_offset_aligned(&lt, &active, 64);
         assert_eq!(offset, 0);
@@ -1766,7 +1915,12 @@ mod tests {
 
     #[test]
     fn find_offset_aligned_stacks_after() {
-        let lt = Lifetime { tensor_id: TensorId(0), first_use: 0, last_use: 5, size_bytes: 80 };
+        let lt = Lifetime {
+            tensor_id: TensorId(0),
+            first_use: 0,
+            last_use: 5,
+            size_bytes: 80,
+        };
         let active = vec![(0usize, 100usize, 10usize)];
         let offset = find_offset_aligned(&lt, &active, 128);
         assert!(offset >= 100);
@@ -1777,9 +1931,12 @@ mod tests {
 
     #[test]
     fn allocate_buffers_single_tensor() {
-        let lifetimes = vec![
-            Lifetime { tensor_id: TensorId(0), first_use: 0, last_use: 5, size_bytes: 256 },
-        ];
+        let lifetimes = vec![Lifetime {
+            tensor_id: TensorId(0),
+            first_use: 0,
+            last_use: 5,
+            size_bytes: 256,
+        }];
         let alloc = allocate_buffers(&lifetimes);
         assert_eq!(alloc.num_tensors, 1);
         assert_eq!(alloc.slots.len(), 1);
@@ -1795,15 +1952,33 @@ mod tests {
         // B: [2,4] 512 bytes  — overlaps A
         // C: [6,8] 1024 bytes — no overlap with A or B
         let lifetimes = vec![
-            Lifetime { tensor_id: TensorId(0), first_use: 0, last_use: 5, size_bytes: 1024 },
-            Lifetime { tensor_id: TensorId(1), first_use: 2, last_use: 4, size_bytes: 512 },
-            Lifetime { tensor_id: TensorId(2), first_use: 6, last_use: 8, size_bytes: 1024 },
+            Lifetime {
+                tensor_id: TensorId(0),
+                first_use: 0,
+                last_use: 5,
+                size_bytes: 1024,
+            },
+            Lifetime {
+                tensor_id: TensorId(1),
+                first_use: 2,
+                last_use: 4,
+                size_bytes: 512,
+            },
+            Lifetime {
+                tensor_id: TensorId(2),
+                first_use: 6,
+                last_use: 8,
+                size_bytes: 1024,
+            },
         ];
         let alloc = allocate_buffers(&lifetimes);
         assert_eq!(alloc.num_tensors, 3);
         // C can reuse either A or B's space (they're both dead by step 6)
         let naive: usize = lifetimes.iter().map(|l| l.size_bytes).sum();
-        assert!(alloc.total_bytes < naive, "Partial overlap should enable reuse");
+        assert!(
+            alloc.total_bytes < naive,
+            "Partial overlap should enable reuse"
+        );
         assert!(alloc.bytes_saved > 0);
     }
 
@@ -1811,8 +1986,18 @@ mod tests {
     fn allocate_buffers_sorted_by_first_use_then_size() {
         // Two tensors with same first_use — larger should come first for better packing
         let lifetimes = vec![
-            Lifetime { tensor_id: TensorId(0), first_use: 0, last_use: 2, size_bytes: 100 },
-            Lifetime { tensor_id: TensorId(1), first_use: 0, last_use: 3, size_bytes: 500 },
+            Lifetime {
+                tensor_id: TensorId(0),
+                first_use: 0,
+                last_use: 2,
+                size_bytes: 100,
+            },
+            Lifetime {
+                tensor_id: TensorId(1),
+                first_use: 0,
+                last_use: 3,
+                size_bytes: 500,
+            },
         ];
         let alloc = allocate_buffers(&lifetimes);
         assert_eq!(alloc.num_tensors, 2);
@@ -1824,8 +2009,18 @@ mod tests {
     fn allocate_buffers_bytes_saved_calculation() {
         // Non-overlapping: naive=2048, actual should be close to 1024 (reuse)
         let lifetimes = vec![
-            Lifetime { tensor_id: TensorId(0), first_use: 0, last_use: 1, size_bytes: 1024 },
-            Lifetime { tensor_id: TensorId(1), first_use: 2, last_use: 3, size_bytes: 1024 },
+            Lifetime {
+                tensor_id: TensorId(0),
+                first_use: 0,
+                last_use: 1,
+                size_bytes: 1024,
+            },
+            Lifetime {
+                tensor_id: TensorId(1),
+                first_use: 2,
+                last_use: 3,
+                size_bytes: 1024,
+            },
         ];
         let alloc = allocate_buffers(&lifetimes);
         let naive: usize = 2048;
@@ -1835,10 +2030,14 @@ mod tests {
     #[test]
     fn allocate_buffers_aligned_minimum_alignment_is_64() {
         // Pass alignment=32, should be clamped to 64 minimum
-        let lifetimes = vec![
-            Lifetime { tensor_id: TensorId(0), first_use: 0, last_use: 2, size_bytes: 100 },
-        ];
-        let alloc = allocate_buffers_aligned(&lifetimes, 32, None, None, &CompilerGraph::new(), None);
+        let lifetimes = vec![Lifetime {
+            tensor_id: TensorId(0),
+            first_use: 0,
+            last_use: 2,
+            size_bytes: 100,
+        }];
+        let alloc =
+            allocate_buffers_aligned(&lifetimes, 32, None, None, &CompilerGraph::new(), None);
         assert_eq!(alloc.slots[0].offset, 0);
         // Total should be rounded up to at least 64
         assert!(alloc.total_bytes >= 64);
@@ -1847,18 +2046,36 @@ mod tests {
     #[test]
     fn allocate_buffers_aligned_total_is_aligned() {
         let lifetimes = vec![
-            Lifetime { tensor_id: TensorId(0), first_use: 0, last_use: 5, size_bytes: 100 },
-            Lifetime { tensor_id: TensorId(1), first_use: 1, last_use: 4, size_bytes: 200 },
+            Lifetime {
+                tensor_id: TensorId(0),
+                first_use: 0,
+                last_use: 5,
+                size_bytes: 100,
+            },
+            Lifetime {
+                tensor_id: TensorId(1),
+                first_use: 1,
+                last_use: 4,
+                size_bytes: 200,
+            },
         ];
-        let alloc = allocate_buffers_aligned(&lifetimes, 128, None, None, &CompilerGraph::new(), None);
-        assert_eq!(alloc.total_bytes % 128, 0, "total_bytes should be 128-aligned");
+        let alloc =
+            allocate_buffers_aligned(&lifetimes, 128, None, None, &CompilerGraph::new(), None);
+        assert_eq!(
+            alloc.total_bytes % 128,
+            0,
+            "total_bytes should be 128-aligned"
+        );
     }
 
     // ── compute_scratch_requirements tests ─────────────────────────
 
     #[test]
     fn compute_scratch_requirements_empty_plan() {
-        let plan = FusionPlan { groups: vec![], op_to_group: HashMap::new() };
+        let plan = FusionPlan {
+            groups: vec![],
+            op_to_group: HashMap::new(),
+        };
         let graph = CompilerGraph::new();
         let result = compute_scratch_requirements(&plan, &graph);
         assert!(result.is_empty());
@@ -1871,11 +2088,13 @@ mod tests {
         // Arrange: two live ranges with a gap between them, plus a gap before the first.
         // Active: (0, 50, 10), (200, 300, 10) — both live through step 5.
         // Tensor size = 80 bytes. Gap [50, 200) is 150 bytes wide -> fits.
-        let lt = Lifetime { tensor_id: TensorId(0), first_use: 5, last_use: 8, size_bytes: 80 };
-        let active = vec![
-            (0usize, 50usize, 10usize),
-            (200usize, 300usize, 10usize),
-        ];
+        let lt = Lifetime {
+            tensor_id: TensorId(0),
+            first_use: 5,
+            last_use: 8,
+            size_bytes: 80,
+        };
+        let active = vec![(0usize, 50usize, 10usize), (200usize, 300usize, 10usize)];
         // Act
         let offset = find_offset(&lt, &active);
         // Assert: should land in the first gap after the first live range.
@@ -1888,7 +2107,12 @@ mod tests {
     fn find_offset_no_gap_stacks_at_end() {
         // Arrange: three fully-overlapping live ranges with no usable gap.
         // total live span = [0, 300), all still live at first_use=1.
-        let lt = Lifetime { tensor_id: TensorId(0), first_use: 1, last_use: 5, size_bytes: 64 };
+        let lt = Lifetime {
+            tensor_id: TensorId(0),
+            first_use: 1,
+            last_use: 5,
+            size_bytes: 64,
+        };
         let active = vec![
             (0usize, 100usize, 10usize),
             (100usize, 200usize, 10usize),
@@ -1906,7 +2130,12 @@ mod tests {
         // Arrange: live range [0, 50) with last_use=10; our tensor first_use=1 (overlaps).
         // Align=128, so candidate 0 is aligned, but [0, 50) is live. Next candidate
         // after 50 aligned to 128 = 128.
-        let lt = Lifetime { tensor_id: TensorId(0), first_use: 1, last_use: 5, size_bytes: 40 };
+        let lt = Lifetime {
+            tensor_id: TensorId(0),
+            first_use: 1,
+            last_use: 5,
+            size_bytes: 40,
+        };
         let active = vec![(0usize, 50usize, 10usize)];
         // Act
         let offset = find_offset_aligned(&lt, &active, 128);
@@ -1919,9 +2148,24 @@ mod tests {
     fn allocate_buffers_identical_lifetimes_all_stacked() {
         // Arrange: three tensors all alive during [0, 5] — none can share space.
         let lifetimes = vec![
-            Lifetime { tensor_id: TensorId(0), first_use: 0, last_use: 5, size_bytes: 256 },
-            Lifetime { tensor_id: TensorId(1), first_use: 0, last_use: 5, size_bytes: 256 },
-            Lifetime { tensor_id: TensorId(2), first_use: 0, last_use: 5, size_bytes: 256 },
+            Lifetime {
+                tensor_id: TensorId(0),
+                first_use: 0,
+                last_use: 5,
+                size_bytes: 256,
+            },
+            Lifetime {
+                tensor_id: TensorId(1),
+                first_use: 0,
+                last_use: 5,
+                size_bytes: 256,
+            },
+            Lifetime {
+                tensor_id: TensorId(2),
+                first_use: 0,
+                last_use: 5,
+                size_bytes: 256,
+            },
         ];
         // Act
         let alloc = allocate_buffers(&lifetimes);
@@ -1933,7 +2177,9 @@ mod tests {
             alloc.total_bytes
         );
         // Verify each slot has a distinct, non-overlapping offset range.
-        let mut ranges: Vec<(usize, usize)> = alloc.slots.iter()
+        let mut ranges: Vec<(usize, usize)> = alloc
+            .slots
+            .iter()
             .map(|s| (s.offset, s.offset + s.size_bytes))
             .collect();
         ranges.sort_by_key(|r| r.0);
@@ -1949,9 +2195,12 @@ mod tests {
     #[test]
     fn allocate_buffers_zero_size_tensor() {
         // Arrange: a tensor with size_bytes=0 should not contribute to total.
-        let lifetimes = vec![
-            Lifetime { tensor_id: TensorId(0), first_use: 0, last_use: 5, size_bytes: 0 },
-        ];
+        let lifetimes = vec![Lifetime {
+            tensor_id: TensorId(0),
+            first_use: 0,
+            last_use: 5,
+            size_bytes: 0,
+        }];
         // Act
         let alloc = allocate_buffers(&lifetimes);
         // Assert: slot exists but total_bytes is effectively zero (plus alignment rounding).
@@ -1965,8 +2214,16 @@ mod tests {
         // Arrange: two slots with the same TensorId — offset_of should return the first.
         let alloc = BufferAllocation {
             slots: vec![
-                BufferSlot { tensor_id: TensorId(5), offset: 100, size_bytes: 50 },
-                BufferSlot { tensor_id: TensorId(5), offset: 200, size_bytes: 50 },
+                BufferSlot {
+                    tensor_id: TensorId(5),
+                    offset: 100,
+                    size_bytes: 50,
+                },
+                BufferSlot {
+                    tensor_id: TensorId(5),
+                    offset: 200,
+                    size_bytes: 50,
+                },
             ],
             total_bytes: 250,
             num_tensors: 2,
@@ -1982,7 +2239,11 @@ mod tests {
         // Act
         let result = alloc.offset_of(TensorId(5));
         // Assert
-        assert_eq!(result, Some(100), "offset_of should return the first matching slot");
+        assert_eq!(
+            result,
+            Some(100),
+            "offset_of should return the first matching slot"
+        );
     }
 
     #[test]
@@ -2103,24 +2364,52 @@ mod tests {
     #[test]
     fn allocate_buffers_large_alignment_clamps_to_minimum_64() {
         // Arrange: pass cacheline_bytes=1, should be clamped to 64.
-        let lifetimes = vec![
-            Lifetime { tensor_id: TensorId(0), first_use: 0, last_use: 2, size_bytes: 200 },
-        ];
+        let lifetimes = vec![Lifetime {
+            tensor_id: TensorId(0),
+            first_use: 0,
+            last_use: 2,
+            size_bytes: 200,
+        }];
         // Act
-        let alloc = allocate_buffers_aligned(&lifetimes, 1, None, None, &CompilerGraph::new(), None);
+        let alloc =
+            allocate_buffers_aligned(&lifetimes, 1, None, None, &CompilerGraph::new(), None);
         // Assert: offset is 0 (trivially aligned), total is rounded up to at least 64.
         assert_eq!(alloc.slots[0].offset, 0);
-        assert!(alloc.total_bytes >= 64, "total_bytes should be at least 64 after rounding, got {}", alloc.total_bytes);
+        assert!(
+            alloc.total_bytes >= 64,
+            "total_bytes should be at least 64 after rounding, got {}",
+            alloc.total_bytes
+        );
     }
 
     #[test]
     fn allocate_buffers_many_non_overlapping_reuse_single_slot() {
         // Arrange: four sequential tensors, none overlapping, all 1024 bytes.
         let lifetimes = vec![
-            Lifetime { tensor_id: TensorId(0), first_use: 0, last_use: 1, size_bytes: 1024 },
-            Lifetime { tensor_id: TensorId(1), first_use: 2, last_use: 3, size_bytes: 1024 },
-            Lifetime { tensor_id: TensorId(2), first_use: 4, last_use: 5, size_bytes: 1024 },
-            Lifetime { tensor_id: TensorId(3), first_use: 6, last_use: 7, size_bytes: 1024 },
+            Lifetime {
+                tensor_id: TensorId(0),
+                first_use: 0,
+                last_use: 1,
+                size_bytes: 1024,
+            },
+            Lifetime {
+                tensor_id: TensorId(1),
+                first_use: 2,
+                last_use: 3,
+                size_bytes: 1024,
+            },
+            Lifetime {
+                tensor_id: TensorId(2),
+                first_use: 4,
+                last_use: 5,
+                size_bytes: 1024,
+            },
+            Lifetime {
+                tensor_id: TensorId(3),
+                first_use: 6,
+                last_use: 7,
+                size_bytes: 1024,
+            },
         ];
         // Act
         let alloc = allocate_buffers(&lifetimes);
@@ -2139,9 +2428,24 @@ mod tests {
         // A and C do NOT overlap (A.last=2, C.first=2 — step 2 is shared but
         // allocate_buffers treats last_use >= first_use as overlap).
         let lifetimes = vec![
-            Lifetime { tensor_id: TensorId(0), first_use: 0, last_use: 2, size_bytes: 512 },
-            Lifetime { tensor_id: TensorId(1), first_use: 1, last_use: 3, size_bytes: 512 },
-            Lifetime { tensor_id: TensorId(2), first_use: 2, last_use: 4, size_bytes: 512 },
+            Lifetime {
+                tensor_id: TensorId(0),
+                first_use: 0,
+                last_use: 2,
+                size_bytes: 512,
+            },
+            Lifetime {
+                tensor_id: TensorId(1),
+                first_use: 1,
+                last_use: 3,
+                size_bytes: 512,
+            },
+            Lifetime {
+                tensor_id: TensorId(2),
+                first_use: 2,
+                last_use: 4,
+                size_bytes: 512,
+            },
         ];
         // Act
         let alloc = allocate_buffers(&lifetimes);
@@ -2152,15 +2456,24 @@ mod tests {
             for j in (i + 1)..alloc.slots.len() {
                 let a = &alloc.slots[i];
                 let b = &alloc.slots[j];
-                let a_lt = lifetimes.iter().find(|l| l.tensor_id == a.tensor_id).unwrap();
-                let b_lt = lifetimes.iter().find(|l| l.tensor_id == b.tensor_id).unwrap();
+                let a_lt = lifetimes
+                    .iter()
+                    .find(|l| l.tensor_id == a.tensor_id)
+                    .unwrap();
+                let b_lt = lifetimes
+                    .iter()
+                    .find(|l| l.tensor_id == b.tensor_id)
+                    .unwrap();
                 let overlaps = a_lt.last_use >= b_lt.first_use && b_lt.last_use >= a_lt.first_use;
                 if overlaps {
                     let a_range = (a.offset, a.offset + a.size_bytes);
                     let b_range = (b.offset, b.offset + b.size_bytes);
                     let ranges_overlap = a_range.0 < b_range.1 && b_range.0 < a_range.1;
-                    assert!(!ranges_overlap,
-                        "overlapping lifetimes must not share buffer: {:?} vs {:?}", a_range, b_range);
+                    assert!(
+                        !ranges_overlap,
+                        "overlapping lifetimes must not share buffer: {:?} vs {:?}",
+                        a_range, b_range
+                    );
                 }
             }
         }
@@ -2169,7 +2482,12 @@ mod tests {
     #[test]
     fn find_offset_aligned_empty_active_returns_zero() {
         // Arrange: no live ranges, any alignment.
-        let lt = Lifetime { tensor_id: TensorId(0), first_use: 0, last_use: 5, size_bytes: 1000 };
+        let lt = Lifetime {
+            tensor_id: TensorId(0),
+            first_use: 0,
+            last_use: 5,
+            size_bytes: 1000,
+        };
         // Act
         let offset = find_offset_aligned(&lt, &[], 256);
         // Assert: with no active ranges, offset is 0 (aligned to any value).
@@ -2202,7 +2520,10 @@ mod tests {
         // Extract and compare offsets.
         if let TensorPtrSource::Weight { offset: w } = weight {
             if let TensorPtrSource::Intermediate { offset: i } = intermediate {
-                assert_ne!(w, i, "weight and intermediate offsets should differ in this test");
+                assert_ne!(
+                    w, i,
+                    "weight and intermediate offsets should differ in this test"
+                );
             }
         }
     }
@@ -2211,14 +2532,30 @@ mod tests {
     fn allocate_buffers_aligned_two_non_overlapping_reuse_with_larger_align() {
         // Arrange: two non-overlapping tensors with 256-byte alignment.
         let lifetimes = vec![
-            Lifetime { tensor_id: TensorId(0), first_use: 0, last_use: 1, size_bytes: 100 },
-            Lifetime { tensor_id: TensorId(1), first_use: 2, last_use: 3, size_bytes: 100 },
+            Lifetime {
+                tensor_id: TensorId(0),
+                first_use: 0,
+                last_use: 1,
+                size_bytes: 100,
+            },
+            Lifetime {
+                tensor_id: TensorId(1),
+                first_use: 2,
+                last_use: 3,
+                size_bytes: 100,
+            },
         ];
         // Act
-        let alloc = allocate_buffers_aligned(&lifetimes, 256, None, None, &CompilerGraph::new(), None);
+        let alloc =
+            allocate_buffers_aligned(&lifetimes, 256, None, None, &CompilerGraph::new(), None);
         // Assert: both offsets are 256-aligned, total is 256-aligned, and reuse happens.
         for slot in &alloc.slots {
-            assert_eq!(slot.offset % 256, 0, "offset {} not 256-aligned", slot.offset);
+            assert_eq!(
+                slot.offset % 256,
+                0,
+                "offset {} not 256-aligned",
+                slot.offset
+            );
         }
         assert_eq!(alloc.total_bytes % 256, 0, "total not 256-aligned");
         assert!(
@@ -2243,8 +2580,17 @@ mod tests {
     #[test]
     fn determine_cross_layer_detects_per_layer_input() {
         let mut graph = CompilerGraph::new();
-        let tid = graph.add_tensor_concrete("altup.per_layer_inputs", &[35, 512, 256], crate::types::DType::F32);
-        let lt = Lifetime { tensor_id: tid, first_use: 0, last_use: 50, size_bytes: 35 * 512 * 256 * 4 };
+        let tid = graph.add_tensor_concrete(
+            "altup.per_layer_inputs",
+            &[35, 512, 256],
+            crate::types::DType::F32,
+        );
+        let lt = Lifetime {
+            tensor_id: tid,
+            first_use: 0,
+            last_use: 50,
+            size_bytes: 35 * 512 * 256 * 4,
+        };
         let ext = TensorLifetimeExt::from_lifetime(&lt, &graph);
         assert_eq!(ext.cross_layer, CrossLayerLifetime::PersistentActivation);
     }
@@ -2253,7 +2599,12 @@ mod tests {
     fn determine_cross_layer_detects_altup_fat_buffer() {
         let mut graph = CompilerGraph::new();
         let tid = graph.add_tensor_concrete("altup.fat_in", &[512, 4096], crate::types::DType::F32);
-        let lt = Lifetime { tensor_id: tid, first_use: 0, last_use: 50, size_bytes: 512 * 4096 * 4 };
+        let lt = Lifetime {
+            tensor_id: tid,
+            first_use: 0,
+            last_use: 50,
+            size_bytes: 512 * 4096 * 4,
+        };
         let ext = TensorLifetimeExt::from_lifetime(&lt, &graph);
         assert_eq!(ext.cross_layer, CrossLayerLifetime::PersistentActivation);
     }
@@ -2261,8 +2612,17 @@ mod tests {
     #[test]
     fn determine_cross_layer_default_intermediate_is_per_layer() {
         let mut graph = CompilerGraph::new();
-        let tid = graph.add_tensor_concrete("layer.ffn_intermediate", &[512, 2048], crate::types::DType::F32);
-        let lt = Lifetime { tensor_id: tid, first_use: 2, last_use: 5, size_bytes: 512 * 2048 * 4 };
+        let tid = graph.add_tensor_concrete(
+            "layer.ffn_intermediate",
+            &[512, 2048],
+            crate::types::DType::F32,
+        );
+        let lt = Lifetime {
+            tensor_id: tid,
+            first_use: 2,
+            last_use: 5,
+            size_bytes: 512 * 2048 * 4,
+        };
         let ext = TensorLifetimeExt::from_lifetime(&lt, &graph);
         assert_eq!(ext.cross_layer, CrossLayerLifetime::PerLayer);
     }

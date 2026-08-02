@@ -366,10 +366,12 @@ mod tests {
             seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
             block.qs[i] = (seed >> 16) as u8;
         }
-        let other: Vec<f32> = (0..256).map(|i| {
-            let x = (i as f32) * 0.01;
-            (x * 2.7).sin()
-        }).collect();
+        let other: Vec<f32> = (0..256)
+            .map(|i| {
+                let x = (i as f32) * 0.01;
+                (x * 2.7).sin()
+            })
+            .collect();
         let s = scalar_dot!(q4_k, BlockQ4K, &block, &other);
         let v = avx2_dot!(q4_k, BlockQ4K, &block, &other);
         assert_dot_close(s, v, "q4_k dot (random)", 1e-1);

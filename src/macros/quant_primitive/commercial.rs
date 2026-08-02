@@ -4,125 +4,133 @@
 /// Currently scalar-only.
 #[macro_export]
 macro_rules! quant_primitive_commercial {
-    (scalar, awq4, decode, $block_ptr:expr, $out_ptr:expr) => {
-        {
-            let block = unsafe { &*$block_ptr };
-            let d: f32 = block.scales.to_f32();
-            let qw = &block.qweight;
-            let out_ptr = $out_ptr;
-            // AWQ4 block_size=128: 32 u32 words, each holding 8 nibbles
-            for w in 0..32 {
-                let word = qw[w];
-                for nib in 0..8 {
-                    let q = ((word >> (nib * 4)) & 0xF) as f32;
-                    unsafe { *out_ptr.add(w * 8 + nib) = d * (q - 8.0); }
+    (scalar, awq4, decode, $block_ptr:expr, $out_ptr:expr) => {{
+        let block = unsafe { &*$block_ptr };
+        let d: f32 = block.scales.to_f32();
+        let qw = &block.qweight;
+        let out_ptr = $out_ptr;
+        // AWQ4 block_size=128: 32 u32 words, each holding 8 nibbles
+        for w in 0..32 {
+            let word = qw[w];
+            for nib in 0..8 {
+                let q = ((word >> (nib * 4)) & 0xF) as f32;
+                unsafe {
+                    *out_ptr.add(w * 8 + nib) = d * (q - 8.0);
                 }
             }
         }
-    };
+    }};
 
-    (scalar, awq4, dot, $block_ptr:expr, $other_ptr:expr) => {
-        {
-            let block = unsafe { &*$block_ptr };
-            let d: f32 = block.scales.to_f32();
-            let qw = &block.qweight;
-            let other = $other_ptr;
-            let mut sum = 0.0f32;
-            for w in 0..32 {
-                let word = qw[w];
-                for nib in 0..8 {
-                    let q = ((word >> (nib * 4)) & 0xF) as f32;
-                    unsafe { sum += (d * (q - 8.0)) * *other.add(w * 8 + nib); }
+    (scalar, awq4, dot, $block_ptr:expr, $other_ptr:expr) => {{
+        let block = unsafe { &*$block_ptr };
+        let d: f32 = block.scales.to_f32();
+        let qw = &block.qweight;
+        let other = $other_ptr;
+        let mut sum = 0.0f32;
+        for w in 0..32 {
+            let word = qw[w];
+            for nib in 0..8 {
+                let q = ((word >> (nib * 4)) & 0xF) as f32;
+                unsafe {
+                    sum += (d * (q - 8.0)) * *other.add(w * 8 + nib);
                 }
             }
-            sum
         }
-    };
+        sum
+    }};
 
     // GPTQ4: same layout as AWQ4 for decode/dot
-    (scalar, gptq4, decode, $block_ptr:expr, $out_ptr:expr) => {
-        {
-            let block = unsafe { &*$block_ptr };
-            let d: f32 = block.scales.to_f32();
-            let zero = (block.zeros & 0xF) as f32;
-            let qw = &block.qweight;
-            let out_ptr = $out_ptr;
-            for w in 0..32 {
-                let word = qw[w];
-                for nib in 0..8 {
-                    let q = ((word >> (nib * 4)) & 0xF) as f32;
-                    unsafe { *out_ptr.add(w * 8 + nib) = d * (q - zero); }
+    (scalar, gptq4, decode, $block_ptr:expr, $out_ptr:expr) => {{
+        let block = unsafe { &*$block_ptr };
+        let d: f32 = block.scales.to_f32();
+        let zero = (block.zeros & 0xF) as f32;
+        let qw = &block.qweight;
+        let out_ptr = $out_ptr;
+        for w in 0..32 {
+            let word = qw[w];
+            for nib in 0..8 {
+                let q = ((word >> (nib * 4)) & 0xF) as f32;
+                unsafe {
+                    *out_ptr.add(w * 8 + nib) = d * (q - zero);
                 }
             }
         }
-    };
+    }};
 
-    (scalar, gptq4, dot, $block_ptr:expr, $other_ptr:expr) => {
-        {
-            let block = unsafe { &*$block_ptr };
-            let d: f32 = block.scales.to_f32();
-            let zero = (block.zeros & 0xF) as f32;
-            let qw = &block.qweight;
-            let other = $other_ptr;
-            let mut sum = 0.0f32;
-            for w in 0..32 {
-                let word = qw[w];
-                for nib in 0..8 {
-                    let q = ((word >> (nib * 4)) & 0xF) as f32;
-                    unsafe { sum += (d * (q - zero)) * *other.add(w * 8 + nib); }
+    (scalar, gptq4, dot, $block_ptr:expr, $other_ptr:expr) => {{
+        let block = unsafe { &*$block_ptr };
+        let d: f32 = block.scales.to_f32();
+        let zero = (block.zeros & 0xF) as f32;
+        let qw = &block.qweight;
+        let other = $other_ptr;
+        let mut sum = 0.0f32;
+        for w in 0..32 {
+            let word = qw[w];
+            for nib in 0..8 {
+                let q = ((word >> (nib * 4)) & 0xF) as f32;
+                unsafe {
+                    sum += (d * (q - zero)) * *other.add(w * 8 + nib);
                 }
             }
-            sum
         }
-    };
+        sum
+    }};
 
     // Squeeze: 3-bit SqueezeLLM
-    (scalar, squeeze, decode, $block_ptr:expr, $out_ptr:expr) => {
-        {
-            let block = unsafe { &*$block_ptr };
-            let d: f32 = block.d.to_f32();
-            let qs = &block.qs;
-            let out_ptr = $out_ptr;
-            // 3-bit packed: 256 values in 96 bytes (256*3/8=96), but block has 128 bytes qs
-            for i in 0..256 {
-                let bit_offset = i * 3;
-                let byte_idx = bit_offset / 8;
-                let bit_idx = bit_offset % 8;
-                let q = if bit_idx <= 5 {
-                    (qs[byte_idx] >> bit_idx) & 0x07
+    (scalar, squeeze, decode, $block_ptr:expr, $out_ptr:expr) => {{
+        let block = unsafe { &*$block_ptr };
+        let d: f32 = block.d.to_f32();
+        let qs = &block.qs;
+        let out_ptr = $out_ptr;
+        // 3-bit packed: 256 values in 96 bytes (256*3/8=96), but block has 128 bytes qs
+        for i in 0..256 {
+            let bit_offset = i * 3;
+            let byte_idx = bit_offset / 8;
+            let bit_idx = bit_offset % 8;
+            let q = if bit_idx <= 5 {
+                (qs[byte_idx] >> bit_idx) & 0x07
+            } else {
+                let lo = qs[byte_idx] >> bit_idx;
+                let hi = if byte_idx + 1 < qs.len() {
+                    qs[byte_idx + 1] << (8 - bit_idx)
                 } else {
-                    let lo = qs[byte_idx] >> bit_idx;
-                    let hi = if byte_idx + 1 < qs.len() { qs[byte_idx + 1] << (8 - bit_idx) } else { 0 };
-                    (lo | hi) & 0x07
+                    0
                 };
-                unsafe { *out_ptr.add(i) = (q as f32).mul_add(d, -d * 4.0); }
+                (lo | hi) & 0x07
+            };
+            unsafe {
+                *out_ptr.add(i) = (q as f32).mul_add(d, -d * 4.0);
             }
         }
-    };
+    }};
 
-    (scalar, squeeze, dot, $block_ptr:expr, $other_ptr:expr) => {
-        {
-            let block = unsafe { &*$block_ptr };
-            let d: f32 = block.d.to_f32();
-            let qs = &block.qs;
-            let other = $other_ptr;
-            let mut sum = 0.0f32;
-            for i in 0..256 {
-                let bit_offset = i * 3;
-                let byte_idx = bit_offset / 8;
-                let bit_idx = bit_offset % 8;
-                let q = if bit_idx <= 5 {
-                    (qs[byte_idx] >> bit_idx) & 0x07
+    (scalar, squeeze, dot, $block_ptr:expr, $other_ptr:expr) => {{
+        let block = unsafe { &*$block_ptr };
+        let d: f32 = block.d.to_f32();
+        let qs = &block.qs;
+        let other = $other_ptr;
+        let mut sum = 0.0f32;
+        for i in 0..256 {
+            let bit_offset = i * 3;
+            let byte_idx = bit_offset / 8;
+            let bit_idx = bit_offset % 8;
+            let q = if bit_idx <= 5 {
+                (qs[byte_idx] >> bit_idx) & 0x07
+            } else {
+                let lo = qs[byte_idx] >> bit_idx;
+                let hi = if byte_idx + 1 < qs.len() {
+                    qs[byte_idx + 1] << (8 - bit_idx)
                 } else {
-                    let lo = qs[byte_idx] >> bit_idx;
-                    let hi = if byte_idx + 1 < qs.len() { qs[byte_idx + 1] << (8 - bit_idx) } else { 0 };
-                    (lo | hi) & 0x07
+                    0
                 };
-                unsafe { sum += (q as f32).mul_add(d, -d * 4.0) * *other.add(i); }
+                (lo | hi) & 0x07
+            };
+            unsafe {
+                sum += (q as f32).mul_add(d, -d * 4.0) * *other.add(i);
             }
-            sum
         }
-    };
+        sum
+    }};
 
     // ========================================================================
     // AVX2 Squeeze decode/dot
@@ -134,8 +142,6 @@ macro_rules! quant_primitive_commercial {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                
-
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let vd = $crate::simd_primitive!(avx2, f32, splat, d);
@@ -153,7 +159,11 @@ macro_rules! quant_primitive_commercial {
                             (qs[byte_idx] >> bit_idx) & 0x07
                         } else {
                             let lo = qs[byte_idx] >> bit_idx;
-                            let hi = if byte_idx + 1 < qs.len() { qs[byte_idx + 1] << (8 - bit_idx) } else { 0 };
+                            let hi = if byte_idx + 1 < qs.len() {
+                                qs[byte_idx + 1] << (8 - bit_idx)
+                            } else {
+                                0
+                            };
                             (lo | hi) & 0x07
                         };
                         vals[j] = q as f32 - 4.0;
@@ -171,8 +181,6 @@ macro_rules! quant_primitive_commercial {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                
-
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let vd = $crate::simd_primitive!(avx2, f32, splat, d);
@@ -191,7 +199,11 @@ macro_rules! quant_primitive_commercial {
                             (qs[byte_idx] >> bit_idx) & 0x07
                         } else {
                             let lo = qs[byte_idx] >> bit_idx;
-                            let hi = if byte_idx + 1 < qs.len() { qs[byte_idx + 1] << (8 - bit_idx) } else { 0 };
+                            let hi = if byte_idx + 1 < qs.len() {
+                                qs[byte_idx + 1] << (8 - bit_idx)
+                            } else {
+                                0
+                            };
                             (lo | hi) & 0x07
                         };
                         vals[j] = q as f32 - 4.0;
@@ -217,8 +229,6 @@ macro_rules! quant_primitive_commercial {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                
-
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let vd = $crate::simd_primitive!(avx512, f32, splat, d);
@@ -236,7 +246,11 @@ macro_rules! quant_primitive_commercial {
                             (qs[byte_idx] >> bit_idx) & 0x07
                         } else {
                             let lo = qs[byte_idx] >> bit_idx;
-                            let hi = if byte_idx + 1 < qs.len() { qs[byte_idx + 1] << (8 - bit_idx) } else { 0 };
+                            let hi = if byte_idx + 1 < qs.len() {
+                                qs[byte_idx + 1] << (8 - bit_idx)
+                            } else {
+                                0
+                            };
                             (lo | hi) & 0x07
                         };
                         vals[j] = q as f32 - 4.0;
@@ -254,8 +268,6 @@ macro_rules! quant_primitive_commercial {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                
-
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let vd = $crate::simd_primitive!(avx512, f32, splat, d);
@@ -274,7 +286,11 @@ macro_rules! quant_primitive_commercial {
                             (qs[byte_idx] >> bit_idx) & 0x07
                         } else {
                             let lo = qs[byte_idx] >> bit_idx;
-                            let hi = if byte_idx + 1 < qs.len() { qs[byte_idx + 1] << (8 - bit_idx) } else { 0 };
+                            let hi = if byte_idx + 1 < qs.len() {
+                                qs[byte_idx + 1] << (8 - bit_idx)
+                            } else {
+                                0
+                            };
                             (lo | hi) & 0x07
                         };
                         vals[j] = q as f32 - 4.0;
@@ -319,7 +335,11 @@ macro_rules! quant_primitive_commercial {
                             (qs[byte_idx] >> bit_idx) & 0x07
                         } else {
                             let lo = qs[byte_idx] >> bit_idx;
-                            let hi = if byte_idx + 1 < qs.len() { qs[byte_idx + 1] << (8 - bit_idx) } else { 0 };
+                            let hi = if byte_idx + 1 < qs.len() {
+                                qs[byte_idx + 1] << (8 - bit_idx)
+                            } else {
+                                0
+                            };
                             (lo | hi) & 0x07
                         };
                         vals[j] = q as f32 - 4.0;
@@ -357,7 +377,11 @@ macro_rules! quant_primitive_commercial {
                             (qs[byte_idx] >> bit_idx) & 0x07
                         } else {
                             let lo = qs[byte_idx] >> bit_idx;
-                            let hi = if byte_idx + 1 < qs.len() { qs[byte_idx + 1] << (8 - bit_idx) } else { 0 };
+                            let hi = if byte_idx + 1 < qs.len() {
+                                qs[byte_idx + 1] << (8 - bit_idx)
+                            } else {
+                                0
+                            };
                             (lo | hi) & 0x07
                         };
                         vals[j] = q as f32 - 4.0;
@@ -383,8 +407,6 @@ macro_rules! quant_primitive_commercial {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                
-
                 let block = &*$block_ptr;
                 let d: f32 = block.scales.to_f32();
                 let vd = $crate::simd_primitive!(avx2, f32, splat, d);
@@ -397,9 +419,9 @@ macro_rules! quant_primitive_commercial {
                     let word = qw[w];
                     // Extract 8 nibbles into f32 array
                     let nibbles: [f32; 8] = [
-                        ((word      ) & 0xF) as f32,
-                        ((word >>  4) & 0xF) as f32,
-                        ((word >>  8) & 0xF) as f32,
+                        ((word) & 0xF) as f32,
+                        ((word >> 4) & 0xF) as f32,
+                        ((word >> 8) & 0xF) as f32,
                         ((word >> 12) & 0xF) as f32,
                         ((word >> 16) & 0xF) as f32,
                         ((word >> 20) & 0xF) as f32,
@@ -420,8 +442,6 @@ macro_rules! quant_primitive_commercial {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                
-
                 let block = &*$block_ptr;
                 let d: f32 = block.scales.to_f32();
                 let vd = $crate::simd_primitive!(avx2, f32, splat, d);
@@ -433,9 +453,9 @@ macro_rules! quant_primitive_commercial {
                 for w in 0..32 {
                     let word = qw[w];
                     let nibbles: [f32; 8] = [
-                        ((word      ) & 0xF) as f32,
-                        ((word >>  4) & 0xF) as f32,
-                        ((word >>  8) & 0xF) as f32,
+                        ((word) & 0xF) as f32,
+                        ((word >> 4) & 0xF) as f32,
+                        ((word >> 8) & 0xF) as f32,
                         ((word >> 12) & 0xF) as f32,
                         ((word >> 16) & 0xF) as f32,
                         ((word >> 20) & 0xF) as f32,
@@ -462,8 +482,6 @@ macro_rules! quant_primitive_commercial {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                
-
                 let block = &*$block_ptr;
                 let d: f32 = block.scales.to_f32();
                 let zero = (block.zeros & 0xF) as f32;
@@ -475,9 +493,9 @@ macro_rules! quant_primitive_commercial {
                 for w in 0..32 {
                     let word = qw[w];
                     let nibbles: [f32; 8] = [
-                        ((word      ) & 0xF) as f32,
-                        ((word >>  4) & 0xF) as f32,
-                        ((word >>  8) & 0xF) as f32,
+                        ((word) & 0xF) as f32,
+                        ((word >> 4) & 0xF) as f32,
+                        ((word >> 8) & 0xF) as f32,
                         ((word >> 12) & 0xF) as f32,
                         ((word >> 16) & 0xF) as f32,
                         ((word >> 20) & 0xF) as f32,
@@ -498,8 +516,6 @@ macro_rules! quant_primitive_commercial {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                
-
                 let block = &*$block_ptr;
                 let d: f32 = block.scales.to_f32();
                 let zero = (block.zeros & 0xF) as f32;
@@ -512,9 +528,9 @@ macro_rules! quant_primitive_commercial {
                 for w in 0..32 {
                     let word = qw[w];
                     let nibbles: [f32; 8] = [
-                        ((word      ) & 0xF) as f32,
-                        ((word >>  4) & 0xF) as f32,
-                        ((word >>  8) & 0xF) as f32,
+                        ((word) & 0xF) as f32,
+                        ((word >> 4) & 0xF) as f32,
+                        ((word >> 8) & 0xF) as f32,
                         ((word >> 12) & 0xF) as f32,
                         ((word >> 16) & 0xF) as f32,
                         ((word >> 20) & 0xF) as f32,
@@ -542,8 +558,6 @@ macro_rules! quant_primitive_commercial {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                
-
                 let block = &*$block_ptr;
                 let d: f32 = block.scales.to_f32();
                 let vd = $crate::simd_primitive!(avx512, f32, splat, d);
@@ -556,14 +570,22 @@ macro_rules! quant_primitive_commercial {
                     let w0 = qw[pair * 2];
                     let w1 = qw[pair * 2 + 1];
                     let nibbles: [f32; 16] = [
-                        ((w0      ) & 0xF) as f32, ((w0 >>  4) & 0xF) as f32,
-                        ((w0 >>  8) & 0xF) as f32, ((w0 >> 12) & 0xF) as f32,
-                        ((w0 >> 16) & 0xF) as f32, ((w0 >> 20) & 0xF) as f32,
-                        ((w0 >> 24) & 0xF) as f32, ((w0 >> 28) & 0xF) as f32,
-                        ((w1      ) & 0xF) as f32, ((w1 >>  4) & 0xF) as f32,
-                        ((w1 >>  8) & 0xF) as f32, ((w1 >> 12) & 0xF) as f32,
-                        ((w1 >> 16) & 0xF) as f32, ((w1 >> 20) & 0xF) as f32,
-                        ((w1 >> 24) & 0xF) as f32, ((w1 >> 28) & 0xF) as f32,
+                        ((w0) & 0xF) as f32,
+                        ((w0 >> 4) & 0xF) as f32,
+                        ((w0 >> 8) & 0xF) as f32,
+                        ((w0 >> 12) & 0xF) as f32,
+                        ((w0 >> 16) & 0xF) as f32,
+                        ((w0 >> 20) & 0xF) as f32,
+                        ((w0 >> 24) & 0xF) as f32,
+                        ((w0 >> 28) & 0xF) as f32,
+                        ((w1) & 0xF) as f32,
+                        ((w1 >> 4) & 0xF) as f32,
+                        ((w1 >> 8) & 0xF) as f32,
+                        ((w1 >> 12) & 0xF) as f32,
+                        ((w1 >> 16) & 0xF) as f32,
+                        ((w1 >> 20) & 0xF) as f32,
+                        ((w1 >> 24) & 0xF) as f32,
+                        ((w1 >> 28) & 0xF) as f32,
                     ];
                     let vq = $crate::simd_primitive!(avx512, f32, load, nibbles.as_ptr());
                     let res = $crate::simd_primitive!(avx512, f32, fma, vd, vq, v_neg_d_offset);
@@ -578,8 +600,6 @@ macro_rules! quant_primitive_commercial {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                
-
                 let block = &*$block_ptr;
                 let d: f32 = block.scales.to_f32();
                 let vd = $crate::simd_primitive!(avx512, f32, splat, d);
@@ -592,14 +612,22 @@ macro_rules! quant_primitive_commercial {
                     let w0 = qw[pair * 2];
                     let w1 = qw[pair * 2 + 1];
                     let nibbles: [f32; 16] = [
-                        ((w0      ) & 0xF) as f32, ((w0 >>  4) & 0xF) as f32,
-                        ((w0 >>  8) & 0xF) as f32, ((w0 >> 12) & 0xF) as f32,
-                        ((w0 >> 16) & 0xF) as f32, ((w0 >> 20) & 0xF) as f32,
-                        ((w0 >> 24) & 0xF) as f32, ((w0 >> 28) & 0xF) as f32,
-                        ((w1      ) & 0xF) as f32, ((w1 >>  4) & 0xF) as f32,
-                        ((w1 >>  8) & 0xF) as f32, ((w1 >> 12) & 0xF) as f32,
-                        ((w1 >> 16) & 0xF) as f32, ((w1 >> 20) & 0xF) as f32,
-                        ((w1 >> 24) & 0xF) as f32, ((w1 >> 28) & 0xF) as f32,
+                        ((w0) & 0xF) as f32,
+                        ((w0 >> 4) & 0xF) as f32,
+                        ((w0 >> 8) & 0xF) as f32,
+                        ((w0 >> 12) & 0xF) as f32,
+                        ((w0 >> 16) & 0xF) as f32,
+                        ((w0 >> 20) & 0xF) as f32,
+                        ((w0 >> 24) & 0xF) as f32,
+                        ((w0 >> 28) & 0xF) as f32,
+                        ((w1) & 0xF) as f32,
+                        ((w1 >> 4) & 0xF) as f32,
+                        ((w1 >> 8) & 0xF) as f32,
+                        ((w1 >> 12) & 0xF) as f32,
+                        ((w1 >> 16) & 0xF) as f32,
+                        ((w1 >> 20) & 0xF) as f32,
+                        ((w1 >> 24) & 0xF) as f32,
+                        ((w1 >> 28) & 0xF) as f32,
                     ];
                     let vq = $crate::simd_primitive!(avx512, f32, load, nibbles.as_ptr());
                     let dq = $crate::simd_primitive!(avx512, f32, fma, vd, vq, v_neg_d_offset);
@@ -618,8 +646,6 @@ macro_rules! quant_primitive_commercial {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                
-
                 let block = &*$block_ptr;
                 let d: f32 = block.scales.to_f32();
                 let zero = (block.zeros & 0xF) as f32;
@@ -632,14 +658,22 @@ macro_rules! quant_primitive_commercial {
                     let w0 = qw[pair * 2];
                     let w1 = qw[pair * 2 + 1];
                     let nibbles: [f32; 16] = [
-                        ((w0      ) & 0xF) as f32, ((w0 >>  4) & 0xF) as f32,
-                        ((w0 >>  8) & 0xF) as f32, ((w0 >> 12) & 0xF) as f32,
-                        ((w0 >> 16) & 0xF) as f32, ((w0 >> 20) & 0xF) as f32,
-                        ((w0 >> 24) & 0xF) as f32, ((w0 >> 28) & 0xF) as f32,
-                        ((w1      ) & 0xF) as f32, ((w1 >>  4) & 0xF) as f32,
-                        ((w1 >>  8) & 0xF) as f32, ((w1 >> 12) & 0xF) as f32,
-                        ((w1 >> 16) & 0xF) as f32, ((w1 >> 20) & 0xF) as f32,
-                        ((w1 >> 24) & 0xF) as f32, ((w1 >> 28) & 0xF) as f32,
+                        ((w0) & 0xF) as f32,
+                        ((w0 >> 4) & 0xF) as f32,
+                        ((w0 >> 8) & 0xF) as f32,
+                        ((w0 >> 12) & 0xF) as f32,
+                        ((w0 >> 16) & 0xF) as f32,
+                        ((w0 >> 20) & 0xF) as f32,
+                        ((w0 >> 24) & 0xF) as f32,
+                        ((w0 >> 28) & 0xF) as f32,
+                        ((w1) & 0xF) as f32,
+                        ((w1 >> 4) & 0xF) as f32,
+                        ((w1 >> 8) & 0xF) as f32,
+                        ((w1 >> 12) & 0xF) as f32,
+                        ((w1 >> 16) & 0xF) as f32,
+                        ((w1 >> 20) & 0xF) as f32,
+                        ((w1 >> 24) & 0xF) as f32,
+                        ((w1 >> 28) & 0xF) as f32,
                     ];
                     let vq = $crate::simd_primitive!(avx512, f32, load, nibbles.as_ptr());
                     let res = $crate::simd_primitive!(avx512, f32, fma, vd, vq, v_neg_d_zero);
@@ -654,8 +688,6 @@ macro_rules! quant_primitive_commercial {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                
-
                 let block = &*$block_ptr;
                 let d: f32 = block.scales.to_f32();
                 let zero = (block.zeros & 0xF) as f32;
@@ -669,14 +701,22 @@ macro_rules! quant_primitive_commercial {
                     let w0 = qw[pair * 2];
                     let w1 = qw[pair * 2 + 1];
                     let nibbles: [f32; 16] = [
-                        ((w0      ) & 0xF) as f32, ((w0 >>  4) & 0xF) as f32,
-                        ((w0 >>  8) & 0xF) as f32, ((w0 >> 12) & 0xF) as f32,
-                        ((w0 >> 16) & 0xF) as f32, ((w0 >> 20) & 0xF) as f32,
-                        ((w0 >> 24) & 0xF) as f32, ((w0 >> 28) & 0xF) as f32,
-                        ((w1      ) & 0xF) as f32, ((w1 >>  4) & 0xF) as f32,
-                        ((w1 >>  8) & 0xF) as f32, ((w1 >> 12) & 0xF) as f32,
-                        ((w1 >> 16) & 0xF) as f32, ((w1 >> 20) & 0xF) as f32,
-                        ((w1 >> 24) & 0xF) as f32, ((w1 >> 28) & 0xF) as f32,
+                        ((w0) & 0xF) as f32,
+                        ((w0 >> 4) & 0xF) as f32,
+                        ((w0 >> 8) & 0xF) as f32,
+                        ((w0 >> 12) & 0xF) as f32,
+                        ((w0 >> 16) & 0xF) as f32,
+                        ((w0 >> 20) & 0xF) as f32,
+                        ((w0 >> 24) & 0xF) as f32,
+                        ((w0 >> 28) & 0xF) as f32,
+                        ((w1) & 0xF) as f32,
+                        ((w1 >> 4) & 0xF) as f32,
+                        ((w1 >> 8) & 0xF) as f32,
+                        ((w1 >> 12) & 0xF) as f32,
+                        ((w1 >> 16) & 0xF) as f32,
+                        ((w1 >> 20) & 0xF) as f32,
+                        ((w1 >> 24) & 0xF) as f32,
+                        ((w1 >> 28) & 0xF) as f32,
                     ];
                     let vq = $crate::simd_primitive!(avx512, f32, load, nibbles.as_ptr());
                     let dq = $crate::simd_primitive!(avx512, f32, fma, vd, vq, v_neg_d_zero);
@@ -711,9 +751,9 @@ macro_rules! quant_primitive_commercial {
                 for w in 0..32 {
                     let word = qw[w];
                     let nibbles: [f32; 8] = [
-                        ((word      ) & 0xF) as f32,
-                        ((word >>  4) & 0xF) as f32,
-                        ((word >>  8) & 0xF) as f32,
+                        ((word) & 0xF) as f32,
+                        ((word >> 4) & 0xF) as f32,
+                        ((word >> 8) & 0xF) as f32,
                         ((word >> 12) & 0xF) as f32,
                         ((word >> 16) & 0xF) as f32,
                         ((word >> 20) & 0xF) as f32,
@@ -750,9 +790,9 @@ macro_rules! quant_primitive_commercial {
                 for w in 0..32 {
                     let word = qw[w];
                     let nibbles: [f32; 8] = [
-                        ((word      ) & 0xF) as f32,
-                        ((word >>  4) & 0xF) as f32,
-                        ((word >>  8) & 0xF) as f32,
+                        ((word) & 0xF) as f32,
+                        ((word >> 4) & 0xF) as f32,
+                        ((word >> 8) & 0xF) as f32,
                         ((word >> 12) & 0xF) as f32,
                         ((word >> 16) & 0xF) as f32,
                         ((word >> 20) & 0xF) as f32,
@@ -794,9 +834,9 @@ macro_rules! quant_primitive_commercial {
                 for w in 0..32 {
                     let word = qw[w];
                     let nibbles: [f32; 8] = [
-                        ((word      ) & 0xF) as f32,
-                        ((word >>  4) & 0xF) as f32,
-                        ((word >>  8) & 0xF) as f32,
+                        ((word) & 0xF) as f32,
+                        ((word >> 4) & 0xF) as f32,
+                        ((word >> 8) & 0xF) as f32,
                         ((word >> 12) & 0xF) as f32,
                         ((word >> 16) & 0xF) as f32,
                         ((word >> 20) & 0xF) as f32,
@@ -834,9 +874,9 @@ macro_rules! quant_primitive_commercial {
                 for w in 0..32 {
                     let word = qw[w];
                     let nibbles: [f32; 8] = [
-                        ((word      ) & 0xF) as f32,
-                        ((word >>  4) & 0xF) as f32,
-                        ((word >>  8) & 0xF) as f32,
+                        ((word) & 0xF) as f32,
+                        ((word >> 4) & 0xF) as f32,
+                        ((word >> 8) & 0xF) as f32,
                         ((word >> 12) & 0xF) as f32,
                         ((word >> 16) & 0xF) as f32,
                         ((word >> 20) & 0xF) as f32,

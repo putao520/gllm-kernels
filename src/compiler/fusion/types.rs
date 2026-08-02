@@ -1,8 +1,8 @@
 //! Fusion types — FusionGroup, FusionMode, FusionPlan, FusionCost, GroupMarker, HeteroLayerType.
 
-use std::collections::HashMap;
 use crate::compiler::graph::{CompilerGraph, MultiOutputConfig, OpId};
 use crate::compiler::trace::QuantPrecision;
+use std::collections::HashMap;
 
 /// REQ-UMK-012: 异构层类型枚举 (Gemma 4 风格: sliding/full × small/large FFN).
 /// 携带在 FusionGroup.hetero_layer_type 上，从图拓扑推导而非 label 前缀。
@@ -330,10 +330,16 @@ impl ComputeDensity {
 
 /// Estimate FLOPs for a single op within a fusion group.
 /// GEMM variants: 2*M*N*K. Others: 0 (negligible for roofline classification).
-fn estimate_group_op_flops(op: &crate::compiler::graph::CompilerOp, graph: &crate::compiler::graph::CompilerGraph, max_seq_len: usize) -> u64 {
+fn estimate_group_op_flops(
+    op: &crate::compiler::graph::CompilerOp,
+    graph: &crate::compiler::graph::CompilerGraph,
+    max_seq_len: usize,
+) -> u64 {
     match op.op_gemm_dims(graph) {
         Some((m, n, k)) => {
-            2 * (m.max_for_allocation_strict().unwrap_or(max_seq_len) as u64) * (n as u64) * (k as u64)
+            2 * (m.max_for_allocation_strict().unwrap_or(max_seq_len) as u64)
+                * (n as u64)
+                * (k as u64)
         }
         None => 0,
     }
@@ -448,7 +454,10 @@ mod tests {
 
     #[test]
     fn fusion_mode_clone() {
-        let mode = FusionMode::TileLevelFusion { predecessor: OpId(5), tile_rows: 64 };
+        let mode = FusionMode::TileLevelFusion {
+            predecessor: OpId(5),
+            tile_rows: 64,
+        };
         let cloned = mode.clone();
         assert_eq!(mode, cloned);
     }
@@ -639,8 +648,13 @@ mod tests {
         assert_ne!(FusionMode::QkvSharedInput, FusionMode::NormIntoGemm);
         assert_ne!(FusionMode::EpilogueInjection, FusionMode::QkvSharedInput);
         assert_ne!(
-            FusionMode::TileLevelFusion { predecessor: OpId(0), tile_rows: 64 },
-            FusionMode::ComputeRoot { predecessor: OpId(0) }
+            FusionMode::TileLevelFusion {
+                predecessor: OpId(0),
+                tile_rows: 64
+            },
+            FusionMode::ComputeRoot {
+                predecessor: OpId(0)
+            }
         );
     }
 
@@ -665,18 +679,28 @@ mod tests {
         let op1 = OpId(1);
         let op2 = OpId(2);
         let g0 = make_group(0, FusionMode::NormIntoGemm, vec![op0]);
-        let g1 = make_group(1, FusionMode::FFNBlock {
-            gate_gemm: op1,
-            up_gemm: OpId(3),
-            activation: OpId(4),
-            combine: OpId(5),
-        }, vec![op1, OpId(3), OpId(4), OpId(5)]);
+        let g1 = make_group(
+            1,
+            FusionMode::FFNBlock {
+                gate_gemm: op1,
+                up_gemm: OpId(3),
+                activation: OpId(4),
+                combine: OpId(5),
+            },
+            vec![op1, OpId(3), OpId(4), OpId(5)],
+        );
         let plan = FusionPlan {
             groups: vec![g0, g1],
             op_to_group: HashMap::from([(op0, 0), (op1, 1)]),
         };
-        assert!(matches!(plan.group_of(op0).unwrap().mode, FusionMode::NormIntoGemm));
-        assert!(matches!(plan.group_of(op1).unwrap().mode, FusionMode::FFNBlock { .. }));
+        assert!(matches!(
+            plan.group_of(op0).unwrap().mode,
+            FusionMode::NormIntoGemm
+        ));
+        assert!(matches!(
+            plan.group_of(op1).unwrap().mode,
+            FusionMode::FFNBlock { .. }
+        ));
     }
 
     #[test]

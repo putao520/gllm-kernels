@@ -30,19 +30,9 @@
 //! | [`IQ3XXS`](QuantAlgoKind::IQ3XXS) | 3-bit codebook | FP16 block scalar | — | RowMajor |
 
 pub use crate::quant_format::{
-    QuantFormatDescriptor,
-    QuantFormatRegistry,
-    QuantDataKind,
-    StorageLayout,
-    NativeIsa,
-    ScaleLayout,
-    ZeroLayout,
-    DataLayout,
-    ScaleDType,
-    CodebookSpec,
-    PackedScaleLayout,
-    PackedScaleAlgorithm,
-    registry,
+    registry, CodebookSpec, DataLayout, NativeIsa, PackedScaleAlgorithm, PackedScaleLayout,
+    QuantDataKind, QuantFormatDescriptor, QuantFormatRegistry, ScaleDType, ScaleLayout,
+    StorageLayout, ZeroLayout,
 };
 
 use crate::quant::QuantType;
@@ -74,10 +64,18 @@ impl QuantFamily {
     /// Classify a [`QuantType`] into its [`QuantFamily`].
     pub fn from_quant_type(quant_type: QuantType) -> Self {
         match quant_type {
-            _ if matches!(quant_type, QuantType::F32 | QuantType::Bf16 | QuantType::F16) => {
+            _ if matches!(
+                quant_type,
+                QuantType::F32 | QuantType::Bf16 | QuantType::F16
+            ) =>
+            {
                 QuantFamily::Float
             }
-            _ if matches!(quant_type, QuantType::Q8_0 | QuantType::Q8_1 | QuantType::Q8K) => {
+            _ if matches!(
+                quant_type,
+                QuantType::Q8_0 | QuantType::Q8_1 | QuantType::Q8K
+            ) =>
+            {
                 QuantFamily::Int8
             }
             _ if matches!(
@@ -90,7 +88,10 @@ impl QuantFamily {
                     | QuantType::Q5K
                     | QuantType::AWQ4
                     | QuantType::GPTQ4
-            ) => QuantFamily::Int4,
+            ) =>
+            {
+                QuantFamily::Int4
+            }
             QuantType::Nvfp4 => QuantFamily::NvFp4,
             QuantType::Mxfp4 { .. } => QuantFamily::MxFp4,
             _ => QuantFamily::Other,
@@ -176,9 +177,12 @@ impl QuantAlgoKind {
     pub fn descriptor(self) -> QuantFormatDescriptor {
         let reg = registry();
         let qt = self.quant_type();
-        reg.get(&qt)
-            .cloned()
-            .unwrap_or_else(|| panic!("QuantAlgoKind::{:?}: no QuantFormatDescriptor registered for {:?}", self, qt))
+        reg.get(&qt).cloned().unwrap_or_else(|| {
+            panic!(
+                "QuantAlgoKind::{:?}: no QuantFormatDescriptor registered for {:?}",
+                self, qt
+            )
+        })
     }
 
     /// Map this algorithmic kind to the corresponding [`QuantType`].
@@ -217,14 +221,33 @@ impl QuantAlgoKind {
     /// Return all registered algorithmic kinds.
     pub fn all() -> &'static [QuantAlgoKind] {
         &[
-            Self::Mxfp4, Self::Nvfp4, Self::Awq4, Self::Gptq4, Self::SqueezeLlm,
+            Self::Mxfp4,
+            Self::Nvfp4,
+            Self::Awq4,
+            Self::Gptq4,
+            Self::SqueezeLlm,
             // Classic GGML (SPEC §2.3)
-            Self::Q4_0, Self::Q4_1, Self::Q5_0, Self::Q5_1, Self::Q8_0,
+            Self::Q4_0,
+            Self::Q4_1,
+            Self::Q5_0,
+            Self::Q5_1,
+            Self::Q8_0,
             // K-Quant (SPEC §2.3)
-            Self::Q2K, Self::Q3K, Self::Q4K, Self::Q5K, Self::Q6K,
+            Self::Q2K,
+            Self::Q3K,
+            Self::Q4K,
+            Self::Q5K,
+            Self::Q6K,
             // IQ series (SPEC §2.3)
-            Self::IQ1S, Self::IQ1M, Self::IQ2XXS, Self::IQ2XS,
-            Self::IQ2S, Self::IQ3XXS, Self::IQ3S, Self::IQ4NL, Self::IQ4XS,
+            Self::IQ1S,
+            Self::IQ1M,
+            Self::IQ2XXS,
+            Self::IQ2XS,
+            Self::IQ2S,
+            Self::IQ3XXS,
+            Self::IQ3S,
+            Self::IQ4NL,
+            Self::IQ4XS,
         ]
     }
 }
@@ -381,7 +404,13 @@ pub enum IsaKind {
 impl IsaKind {
     /// All 5 ISA families.
     pub const fn all() -> &'static [IsaKind; 5] {
-        &[IsaKind::X86, IsaKind::Arm, IsaKind::GpuPtx, IsaKind::GpuHip, IsaKind::GpuMsl]
+        &[
+            IsaKind::X86,
+            IsaKind::Arm,
+            IsaKind::GpuPtx,
+            IsaKind::GpuHip,
+            IsaKind::GpuMsl,
+        ]
     }
 }
 
@@ -403,7 +432,13 @@ pub enum OpCategory {
 impl OpCategory {
     /// All 5 operator categories.
     pub const fn all() -> &'static [OpCategory; 5] {
-        &[OpCategory::Gemm, OpCategory::Attention, OpCategory::Norm, OpCategory::Activation, OpCategory::Quant]
+        &[
+            OpCategory::Gemm,
+            OpCategory::Attention,
+            OpCategory::Norm,
+            OpCategory::Activation,
+            OpCategory::Quant,
+        ]
     }
 }
 
@@ -498,7 +533,9 @@ impl CoverageMatrix {
         let mut report = String::with_capacity(1024);
         report.push_str(&format!("Coverage Matrix for {:?}:\n", quant_type));
         report.push_str("ISA       | Gemm       | Attention  | Norm       | Activation | Quant\n");
-        report.push_str("----------|------------|------------|------------|------------|------------\n");
+        report.push_str(
+            "----------|------------|------------|------------|------------|------------\n",
+        );
 
         let isa_names = [
             (IsaKind::X86, "x86_64"),
@@ -510,7 +547,13 @@ impl CoverageMatrix {
 
         for (isa, name) in &isa_names {
             report.push_str(&format!("{:<10}|", name));
-            for op in &[OpCategory::Gemm, OpCategory::Attention, OpCategory::Norm, OpCategory::Activation, OpCategory::Quant] {
+            for op in &[
+                OpCategory::Gemm,
+                OpCategory::Attention,
+                OpCategory::Norm,
+                OpCategory::Activation,
+                OpCategory::Quant,
+            ] {
                 let entry = &self.entries[isa_to_index(*isa) * 5 + op_to_index(*op)];
                 let path_str = match entry.path {
                     CoveragePath::Native => "Native  ",
@@ -525,7 +568,10 @@ impl CoverageMatrix {
         // Verify completeness: every cell must have a path
         for entry in &self.entries {
             assert!(
-                matches!(entry.path, CoveragePath::Native | CoveragePath::Assisted | CoveragePath::DequantFMA),
+                matches!(
+                    entry.path,
+                    CoveragePath::Native | CoveragePath::Assisted | CoveragePath::DequantFMA
+                ),
                 "Uncovered cell: isa={:?} op={:?}",
                 entry.isa,
                 entry.op,
@@ -588,13 +634,17 @@ fn gemm_path(isa: IsaKind, quant_family: QuantFamily) -> CoveragePath {
             QuantFamily::Float => CoveragePath::Native,
             QuantFamily::Int8 => CoveragePath::Native,
             QuantFamily::Int4 => CoveragePath::Assisted,
-            QuantFamily::NvFp4 | QuantFamily::MxFp4 | QuantFamily::Other => CoveragePath::DequantFMA,
+            QuantFamily::NvFp4 | QuantFamily::MxFp4 | QuantFamily::Other => {
+                CoveragePath::DequantFMA
+            }
         },
         IsaKind::Arm => match quant_family {
             QuantFamily::Float => CoveragePath::Native,
             QuantFamily::Int8 => CoveragePath::Native,
             QuantFamily::Int4 => CoveragePath::Assisted,
-            QuantFamily::NvFp4 | QuantFamily::MxFp4 | QuantFamily::Other => CoveragePath::DequantFMA,
+            QuantFamily::NvFp4 | QuantFamily::MxFp4 | QuantFamily::Other => {
+                CoveragePath::DequantFMA
+            }
         },
         IsaKind::GpuPtx => match quant_family {
             QuantFamily::Float => CoveragePath::Native,
@@ -607,12 +657,16 @@ fn gemm_path(isa: IsaKind, quant_family: QuantFamily) -> CoveragePath {
             QuantFamily::Float => CoveragePath::Native,
             QuantFamily::Int8 => CoveragePath::Native,
             QuantFamily::Int4 => CoveragePath::Assisted,
-            QuantFamily::NvFp4 | QuantFamily::MxFp4 | QuantFamily::Other => CoveragePath::DequantFMA,
+            QuantFamily::NvFp4 | QuantFamily::MxFp4 | QuantFamily::Other => {
+                CoveragePath::DequantFMA
+            }
         },
         IsaKind::GpuMsl => match quant_family {
             QuantFamily::Float => CoveragePath::Native,
             QuantFamily::Int8 => CoveragePath::Assisted,
-            QuantFamily::Int4 | QuantFamily::NvFp4 | QuantFamily::MxFp4 | QuantFamily::Other => CoveragePath::DequantFMA,
+            QuantFamily::Int4 | QuantFamily::NvFp4 | QuantFamily::MxFp4 | QuantFamily::Other => {
+                CoveragePath::DequantFMA
+            }
         },
     }
 }
@@ -622,7 +676,9 @@ fn attention_path(isa: IsaKind, quant_family: QuantFamily) -> CoveragePath {
     match quant_family {
         QuantFamily::Float => CoveragePath::Native,
         _ => match isa {
-            IsaKind::X86 | IsaKind::Arm | IsaKind::GpuPtx | IsaKind::GpuHip => CoveragePath::Assisted,
+            IsaKind::X86 | IsaKind::Arm | IsaKind::GpuPtx | IsaKind::GpuHip => {
+                CoveragePath::Assisted
+            }
             IsaKind::GpuMsl => CoveragePath::DequantFMA,
         },
     }
@@ -708,8 +764,14 @@ mod tests {
 
     #[test]
     fn algo_kind_quant_type_specific() {
-        assert!(matches!(QuantAlgoKind::Mxfp4.quant_type(), QuantType::Mxfp4 { block_size: 32 }));
-        assert!(matches!(QuantAlgoKind::Nvfp4.quant_type(), QuantType::Nvfp4));
+        assert!(matches!(
+            QuantAlgoKind::Mxfp4.quant_type(),
+            QuantType::Mxfp4 { block_size: 32 }
+        ));
+        assert!(matches!(
+            QuantAlgoKind::Nvfp4.quant_type(),
+            QuantType::Nvfp4
+        ));
         assert_eq!(QuantAlgoKind::Awq4.quant_type(), QuantType::AWQ4);
         assert_eq!(QuantAlgoKind::Gptq4.quant_type(), QuantType::GPTQ4);
         assert_eq!(QuantAlgoKind::SqueezeLlm.quant_type(), QuantType::Squeeze);
@@ -790,39 +852,68 @@ mod tests {
     fn coverage_matrix_f32_gemm_native_everywhere() {
         let m = CoverageMatrix::new(QuantType::F32);
         for &isa in IsaKind::all() {
-            assert_eq!(m.get(isa, OpCategory::Gemm), CoveragePath::Native,
-                "F32 GEMM should be Native on {:?}", isa);
+            assert_eq!(
+                m.get(isa, OpCategory::Gemm),
+                CoveragePath::Native,
+                "F32 GEMM should be Native on {:?}",
+                isa
+            );
         }
     }
 
     #[test]
     fn coverage_matrix_f32_norm_gpu_native_cpu_assisted() {
         let m = CoverageMatrix::new(QuantType::F32);
-        assert_eq!(m.get(IsaKind::X86, OpCategory::Norm), CoveragePath::Assisted);
-        assert_eq!(m.get(IsaKind::Arm, OpCategory::Norm), CoveragePath::Assisted);
-        assert_eq!(m.get(IsaKind::GpuPtx, OpCategory::Norm), CoveragePath::Native);
+        assert_eq!(
+            m.get(IsaKind::X86, OpCategory::Norm),
+            CoveragePath::Assisted
+        );
+        assert_eq!(
+            m.get(IsaKind::Arm, OpCategory::Norm),
+            CoveragePath::Assisted
+        );
+        assert_eq!(
+            m.get(IsaKind::GpuPtx, OpCategory::Norm),
+            CoveragePath::Native
+        );
     }
 
     #[test]
     fn coverage_matrix_int4_gemm_x86_assisted() {
         let m = CoverageMatrix::new(QuantType::Q4_0);
-        assert_eq!(m.get(IsaKind::X86, OpCategory::Gemm), CoveragePath::Assisted);
-        assert_eq!(m.get(IsaKind::Arm, OpCategory::Gemm), CoveragePath::Assisted);
+        assert_eq!(
+            m.get(IsaKind::X86, OpCategory::Gemm),
+            CoveragePath::Assisted
+        );
+        assert_eq!(
+            m.get(IsaKind::Arm, OpCategory::Gemm),
+            CoveragePath::Assisted
+        );
     }
 
     #[test]
     fn coverage_matrix_nvfp4_gpu_native() {
         let m = CoverageMatrix::new(QuantType::Nvfp4);
-        assert_eq!(m.get(IsaKind::GpuPtx, OpCategory::Gemm), CoveragePath::Native);
-        assert_eq!(m.get(IsaKind::X86, OpCategory::Gemm), CoveragePath::DequantFMA);
+        assert_eq!(
+            m.get(IsaKind::GpuPtx, OpCategory::Gemm),
+            CoveragePath::Native
+        );
+        assert_eq!(
+            m.get(IsaKind::X86, OpCategory::Gemm),
+            CoveragePath::DequantFMA
+        );
     }
 
     #[test]
     fn coverage_matrix_int8_gemm_native() {
         let m = CoverageMatrix::new(QuantType::Q8_0);
         for &isa in &[IsaKind::X86, IsaKind::Arm, IsaKind::GpuPtx, IsaKind::GpuHip] {
-            assert_eq!(m.get(isa, OpCategory::Gemm), CoveragePath::Native,
-                "INT8 GEMM should be Native on {:?}", isa);
+            assert_eq!(
+                m.get(isa, OpCategory::Gemm),
+                CoveragePath::Native,
+                "INT8 GEMM should be Native on {:?}",
+                isa
+            );
         }
     }
 
@@ -830,8 +921,10 @@ mod tests {
     fn coverage_matrix_no_uncovered_cells() {
         let m = CoverageMatrix::new(QuantType::AWQ4);
         for entry in m.iter() {
-            assert!(matches!(entry.path,
-                CoveragePath::Native | CoveragePath::Assisted | CoveragePath::DequantFMA));
+            assert!(matches!(
+                entry.path,
+                CoveragePath::Native | CoveragePath::Assisted | CoveragePath::DequantFMA
+            ));
         }
     }
 
@@ -887,7 +980,10 @@ mod tests {
     #[test]
     fn isa_op_matrix_api() {
         let m = isa_op_matrix(QuantType::Bf16);
-        assert_eq!(m.get(IsaKind::GpuPtx, OpCategory::Gemm), CoveragePath::Native);
+        assert_eq!(
+            m.get(IsaKind::GpuPtx, OpCategory::Gemm),
+            CoveragePath::Native
+        );
     }
 
     // ── Additional coverage tests ────────────────────────────────────
@@ -897,35 +993,68 @@ mod tests {
         // Bf16 is a float type — same fast paths as F32 for GEMM/Attention/Activation/Quant.
         let m = CoverageMatrix::new(QuantType::Bf16);
         assert_eq!(m.get(IsaKind::X86, OpCategory::Gemm), CoveragePath::Native);
-        assert_eq!(m.get(IsaKind::Arm, OpCategory::Attention), CoveragePath::Native);
-        assert_eq!(m.get(IsaKind::GpuMsl, OpCategory::Quant), CoveragePath::Native);
+        assert_eq!(
+            m.get(IsaKind::Arm, OpCategory::Attention),
+            CoveragePath::Native
+        );
+        assert_eq!(
+            m.get(IsaKind::GpuMsl, OpCategory::Quant),
+            CoveragePath::Native
+        );
     }
 
     #[test]
     fn coverage_matrix_mxfp4_gpu_native_x86_dequant() {
         // MXFP4: PTX GEMM Native (WGMMA), x86 GEMM DequantFMA (no native 4-bit float).
         let m = CoverageMatrix::new(QuantType::Mxfp4 { block_size: 32 });
-        assert_eq!(m.get(IsaKind::GpuPtx, OpCategory::Gemm), CoveragePath::Native);
-        assert_eq!(m.get(IsaKind::X86, OpCategory::Gemm), CoveragePath::DequantFMA);
-        assert_eq!(m.get(IsaKind::Arm, OpCategory::Gemm), CoveragePath::DequantFMA);
+        assert_eq!(
+            m.get(IsaKind::GpuPtx, OpCategory::Gemm),
+            CoveragePath::Native
+        );
+        assert_eq!(
+            m.get(IsaKind::X86, OpCategory::Gemm),
+            CoveragePath::DequantFMA
+        );
+        assert_eq!(
+            m.get(IsaKind::Arm, OpCategory::Gemm),
+            CoveragePath::DequantFMA
+        );
     }
 
     #[test]
     fn coverage_matrix_quantized_attention_assisted() {
         // Quantized formats use Assisted attention on x86/ARM/GPU PTX/HIP (dequantized activations).
         let m = CoverageMatrix::new(QuantType::AWQ4);
-        assert_eq!(m.get(IsaKind::X86, OpCategory::Attention), CoveragePath::Assisted);
-        assert_eq!(m.get(IsaKind::Arm, OpCategory::Attention), CoveragePath::Assisted);
-        assert_eq!(m.get(IsaKind::GpuPtx, OpCategory::Attention), CoveragePath::Assisted);
-        assert_eq!(m.get(IsaKind::GpuHip, OpCategory::Attention), CoveragePath::Assisted);
-        assert_eq!(m.get(IsaKind::GpuMsl, OpCategory::Attention), CoveragePath::DequantFMA);
+        assert_eq!(
+            m.get(IsaKind::X86, OpCategory::Attention),
+            CoveragePath::Assisted
+        );
+        assert_eq!(
+            m.get(IsaKind::Arm, OpCategory::Attention),
+            CoveragePath::Assisted
+        );
+        assert_eq!(
+            m.get(IsaKind::GpuPtx, OpCategory::Attention),
+            CoveragePath::Assisted
+        );
+        assert_eq!(
+            m.get(IsaKind::GpuHip, OpCategory::Attention),
+            CoveragePath::Assisted
+        );
+        assert_eq!(
+            m.get(IsaKind::GpuMsl, OpCategory::Attention),
+            CoveragePath::DequantFMA
+        );
     }
 
     #[test]
     fn coverage_matrix_metal_int8_gemm_assisted() {
         // Metal has no native INT8 tensor core, so INT8 GEMM is Assisted (not Native).
         let m = CoverageMatrix::new(QuantType::Q8_0);
-        assert_eq!(m.get(IsaKind::GpuMsl, OpCategory::Gemm), CoveragePath::Assisted);
+        assert_eq!(
+            m.get(IsaKind::GpuMsl, OpCategory::Gemm),
+            CoveragePath::Assisted
+        );
     }
 
     #[test]
@@ -933,8 +1062,12 @@ mod tests {
         // SqueezeLLM (3-bit codebook): no hardware GEMM support anywhere → DequantFMA.
         let m = CoverageMatrix::new(QuantType::Squeeze);
         for &isa in IsaKind::all() {
-            assert_eq!(m.get(isa, OpCategory::Gemm), CoveragePath::DequantFMA,
-                "SqueezeLLM GEMM should be DequantFMA on {:?}", isa);
+            assert_eq!(
+                m.get(isa, OpCategory::Gemm),
+                CoveragePath::DequantFMA,
+                "SqueezeLLM GEMM should be DequantFMA on {:?}",
+                isa
+            );
         }
     }
 
@@ -943,7 +1076,10 @@ mod tests {
         // Non-float formats must show DequantFMA in at least some cells.
         let m = CoverageMatrix::new(QuantType::Q2K);
         let report = m.coverage_report(QuantType::Q2K);
-        assert!(report.contains("DeqFMA"), "Q2K report must show DequantFMA for some cells");
+        assert!(
+            report.contains("DeqFMA"),
+            "Q2K report must show DequantFMA for some cells"
+        );
         assert!(report.contains("GPU PTX"), "Report must list GPU PTX ISA");
     }
 
@@ -962,15 +1098,28 @@ mod tests {
     fn descriptor_block_bytes_consistency() {
         // All convenience constructors must return descriptors with non-zero block_bytes.
         let descriptors = [
-            mxfp4_descriptor(), nvfp4_descriptor(), awq4_descriptor(),
-            gptq4_descriptor(), squeeze_llm_descriptor(),
-            q4_0_descriptor(), q4_1_descriptor(), q5_0_descriptor(),
-            q5_1_descriptor(), q8_0_descriptor(),
-            q2_k_descriptor(), q3_k_descriptor(), q4_k_descriptor(),
-            q5_k_descriptor(), q6_k_descriptor(),
+            mxfp4_descriptor(),
+            nvfp4_descriptor(),
+            awq4_descriptor(),
+            gptq4_descriptor(),
+            squeeze_llm_descriptor(),
+            q4_0_descriptor(),
+            q4_1_descriptor(),
+            q5_0_descriptor(),
+            q5_1_descriptor(),
+            q8_0_descriptor(),
+            q2_k_descriptor(),
+            q3_k_descriptor(),
+            q4_k_descriptor(),
+            q5_k_descriptor(),
+            q6_k_descriptor(),
         ];
         for desc in &descriptors {
-            assert!(desc.block_bytes > 0, "{}: block_bytes must be > 0", desc.name);
+            assert!(
+                desc.block_bytes > 0,
+                "{}: block_bytes must be > 0",
+                desc.name
+            );
             assert!(desc.block_size > 0, "{}: block_size must be > 0", desc.name);
             assert!(!desc.name.is_empty(), "Descriptor name must not be empty");
         }
@@ -981,11 +1130,26 @@ mod tests {
         // Norm: CPU (x86, ARM) → Assisted; GPU (PTX, HIP, MSL) → Native.
         // This holds regardless of quant_type (norm operates on dequantized values).
         let m = CoverageMatrix::new(QuantType::Q4_0);
-        assert_eq!(m.get(IsaKind::X86, OpCategory::Norm), CoveragePath::Assisted);
-        assert_eq!(m.get(IsaKind::Arm, OpCategory::Norm), CoveragePath::Assisted);
-        assert_eq!(m.get(IsaKind::GpuPtx, OpCategory::Norm), CoveragePath::Native);
-        assert_eq!(m.get(IsaKind::GpuHip, OpCategory::Norm), CoveragePath::Native);
-        assert_eq!(m.get(IsaKind::GpuMsl, OpCategory::Norm), CoveragePath::Native);
+        assert_eq!(
+            m.get(IsaKind::X86, OpCategory::Norm),
+            CoveragePath::Assisted
+        );
+        assert_eq!(
+            m.get(IsaKind::Arm, OpCategory::Norm),
+            CoveragePath::Assisted
+        );
+        assert_eq!(
+            m.get(IsaKind::GpuPtx, OpCategory::Norm),
+            CoveragePath::Native
+        );
+        assert_eq!(
+            m.get(IsaKind::GpuHip, OpCategory::Norm),
+            CoveragePath::Native
+        );
+        assert_eq!(
+            m.get(IsaKind::GpuMsl, OpCategory::Norm),
+            CoveragePath::Native
+        );
     }
 
     #[test]
@@ -993,15 +1157,47 @@ mod tests {
         // Spot-check coverage_check for several QuantTypes to verify the public API
         // returns valid paths for diverse format families.
         let cases = [
-            (QuantType::Q6K, IsaKind::X86, OpCategory::Gemm, CoveragePath::DequantFMA),
-            (QuantType::Q8K, IsaKind::Arm, OpCategory::Gemm, CoveragePath::Native),
-            (QuantType::F16, IsaKind::GpuHip, OpCategory::Attention, CoveragePath::Native),
-            (QuantType::GPTQ4, IsaKind::GpuPtx, OpCategory::Activation, CoveragePath::Native),
-            (QuantType::AWQ4, IsaKind::X86, OpCategory::Quant, CoveragePath::Assisted),
+            (
+                QuantType::Q6K,
+                IsaKind::X86,
+                OpCategory::Gemm,
+                CoveragePath::DequantFMA,
+            ),
+            (
+                QuantType::Q8K,
+                IsaKind::Arm,
+                OpCategory::Gemm,
+                CoveragePath::Native,
+            ),
+            (
+                QuantType::F16,
+                IsaKind::GpuHip,
+                OpCategory::Attention,
+                CoveragePath::Native,
+            ),
+            (
+                QuantType::GPTQ4,
+                IsaKind::GpuPtx,
+                OpCategory::Activation,
+                CoveragePath::Native,
+            ),
+            (
+                QuantType::AWQ4,
+                IsaKind::X86,
+                OpCategory::Quant,
+                CoveragePath::Assisted,
+            ),
         ];
         for (qt, isa, op, expected) in cases {
-            assert_eq!(coverage_check(qt, isa, op), expected,
-                "coverage_check({:?}, {:?}, {:?}) should be {:?}", qt, isa, op, expected);
+            assert_eq!(
+                coverage_check(qt, isa, op),
+                expected,
+                "coverage_check({:?}, {:?}, {:?}) should be {:?}",
+                qt,
+                isa,
+                op,
+                expected
+            );
         }
     }
 
@@ -1046,8 +1242,14 @@ mod tests {
         let assisted = CoveragePath::Assisted.rank();
         let dequant = CoveragePath::DequantFMA.rank();
         assert!(native < assisted, "Native rank must be less than Assisted");
-        assert!(assisted < dequant, "Assisted rank must be less than DequantFMA");
-        assert!(native < dequant, "Native rank must be less than DequantFMA (transitive)");
+        assert!(
+            assisted < dequant,
+            "Assisted rank must be less than DequantFMA"
+        );
+        assert!(
+            native < dequant,
+            "Native rank must be less than DequantFMA (transitive)"
+        );
     }
 
     #[test]
@@ -1065,7 +1267,11 @@ mod tests {
             iq4_xs_descriptor(),
         ];
         for desc in &iq_descriptors {
-            assert!(desc.block_bytes > 0, "{}: block_bytes must be > 0", desc.name);
+            assert!(
+                desc.block_bytes > 0,
+                "{}: block_bytes must be > 0",
+                desc.name
+            );
             assert!(desc.block_size > 0, "{}: block_size must be > 0", desc.name);
             assert!(!desc.name.is_empty(), "Descriptor name must not be empty");
         }
@@ -1076,26 +1282,58 @@ mod tests {
         // Q4K and Q5K are INT4-class (is_int4 match): Assisted on x86/ARM/GPU PTX/GPU HIP.
         for qt in [QuantType::Q4K, QuantType::Q5K] {
             let m = CoverageMatrix::new(qt);
-            assert_eq!(m.get(IsaKind::X86, OpCategory::Gemm), CoveragePath::Assisted,
-                "{:?} GEMM x86 should be Assisted", qt);
-            assert_eq!(m.get(IsaKind::Arm, OpCategory::Gemm), CoveragePath::Assisted,
-                "{:?} GEMM ARM should be Assisted", qt);
-            assert_eq!(m.get(IsaKind::GpuPtx, OpCategory::Gemm), CoveragePath::Assisted,
-                "{:?} GEMM GPU PTX should be Assisted", qt);
-            assert_eq!(m.get(IsaKind::GpuHip, OpCategory::Gemm), CoveragePath::Assisted,
-                "{:?} GEMM GPU HIP should be Assisted", qt);
-            assert_eq!(m.get(IsaKind::GpuMsl, OpCategory::Gemm), CoveragePath::DequantFMA,
-                "{:?} GEMM GPU MSL should be DequantFMA", qt);
+            assert_eq!(
+                m.get(IsaKind::X86, OpCategory::Gemm),
+                CoveragePath::Assisted,
+                "{:?} GEMM x86 should be Assisted",
+                qt
+            );
+            assert_eq!(
+                m.get(IsaKind::Arm, OpCategory::Gemm),
+                CoveragePath::Assisted,
+                "{:?} GEMM ARM should be Assisted",
+                qt
+            );
+            assert_eq!(
+                m.get(IsaKind::GpuPtx, OpCategory::Gemm),
+                CoveragePath::Assisted,
+                "{:?} GEMM GPU PTX should be Assisted",
+                qt
+            );
+            assert_eq!(
+                m.get(IsaKind::GpuHip, OpCategory::Gemm),
+                CoveragePath::Assisted,
+                "{:?} GEMM GPU HIP should be Assisted",
+                qt
+            );
+            assert_eq!(
+                m.get(IsaKind::GpuMsl, OpCategory::Gemm),
+                CoveragePath::DequantFMA,
+                "{:?} GEMM GPU MSL should be DequantFMA",
+                qt
+            );
         }
         // Q3K (3-bit) and Q2K (2-bit) are NOT in the is_int4 match; DequantFMA on x86/ARM.
         for qt in [QuantType::Q3K, QuantType::Q2K] {
             let m = CoverageMatrix::new(qt);
-            assert_eq!(m.get(IsaKind::X86, OpCategory::Gemm), CoveragePath::DequantFMA,
-                "{:?} GEMM x86 should be DequantFMA (not INT4-class)", qt);
-            assert_eq!(m.get(IsaKind::Arm, OpCategory::Gemm), CoveragePath::DequantFMA,
-                "{:?} GEMM ARM should be DequantFMA (not INT4-class)", qt);
-            assert_eq!(m.get(IsaKind::GpuMsl, OpCategory::Gemm), CoveragePath::DequantFMA,
-                "{:?} GEMM GPU MSL should be DequantFMA", qt);
+            assert_eq!(
+                m.get(IsaKind::X86, OpCategory::Gemm),
+                CoveragePath::DequantFMA,
+                "{:?} GEMM x86 should be DequantFMA (not INT4-class)",
+                qt
+            );
+            assert_eq!(
+                m.get(IsaKind::Arm, OpCategory::Gemm),
+                CoveragePath::DequantFMA,
+                "{:?} GEMM ARM should be DequantFMA (not INT4-class)",
+                qt
+            );
+            assert_eq!(
+                m.get(IsaKind::GpuMsl, OpCategory::Gemm),
+                CoveragePath::DequantFMA,
+                "{:?} GEMM GPU MSL should be DequantFMA",
+                qt
+            );
         }
     }
 
@@ -1110,7 +1348,10 @@ mod tests {
         assert_eq!(set.len(), QuantAlgoKind::all().len());
 
         // Verify re-inserting the same kind does not increase size.
-        assert!(!set.insert(QuantAlgoKind::Mxfp4), "Re-inserting Mxfp4 should be a no-op");
+        assert!(
+            !set.insert(QuantAlgoKind::Mxfp4),
+            "Re-inserting Mxfp4 should be a no-op"
+        );
         assert_eq!(set.len(), QuantAlgoKind::all().len());
     }
 
@@ -1137,7 +1378,10 @@ mod tests {
             assert!(!seen[idx], "Duplicate op_to_index for index {}", idx);
             seen[idx] = true;
         }
-        assert!(seen.iter().all(|&s| s), "Not all OpCategory indices were covered");
+        assert!(
+            seen.iter().all(|&s| s),
+            "Not all OpCategory indices were covered"
+        );
     }
 
     #[test]
@@ -1147,8 +1391,13 @@ mod tests {
         let f16m = CoverageMatrix::new(QuantType::F16);
         for &isa in IsaKind::all() {
             for &op in OpCategory::all() {
-                assert_eq!(f32m.get(isa, op), f16m.get(isa, op),
-                    "FP16 path differs from F32 for isa={:?} op={:?}", isa, op);
+                assert_eq!(
+                    f32m.get(isa, op),
+                    f16m.get(isa, op),
+                    "FP16 path differs from F32 for isa={:?} op={:?}",
+                    isa,
+                    op
+                );
             }
         }
     }
@@ -1202,10 +1451,18 @@ mod tests {
     #[test]
     fn native_isa_none_for_sub_int4_descriptors() {
         // Sub-4-bit formats (Q2K, Q3K, IQ family) have no native hardware ISA.
-        for qt in [QuantType::Q2K, QuantType::Q3K, QuantType::IQ1S, QuantType::IQ3XXS] {
+        for qt in [
+            QuantType::Q2K,
+            QuantType::Q3K,
+            QuantType::IQ1S,
+            QuantType::IQ3XXS,
+        ] {
             let desc = QuantFormatDescriptor::for_type(qt);
-            assert!(desc.native_isa.is_none(),
-                "{:?} should have no native ISA (sub-4-bit)", qt);
+            assert!(
+                desc.native_isa.is_none(),
+                "{:?} should have no native ISA (sub-4-bit)",
+                qt
+            );
         }
     }
 
@@ -1213,12 +1470,18 @@ mod tests {
     fn storage_layout_gptq4_col_interleaved() {
         // GPTQ4 is the only format using ColInterleaved storage; AWQ4 uses RowMajor.
         let gptq4 = gptq4_descriptor();
-        assert_eq!(gptq4.storage_layout, StorageLayout::ColInterleaved,
-            "GPTQ4 must use ColInterleaved storage");
+        assert_eq!(
+            gptq4.storage_layout,
+            StorageLayout::ColInterleaved,
+            "GPTQ4 must use ColInterleaved storage"
+        );
 
         let awq4 = awq4_descriptor();
-        assert_eq!(awq4.storage_layout, StorageLayout::RowMajor,
-            "AWQ4 must use RowMajor storage");
+        assert_eq!(
+            awq4.storage_layout,
+            StorageLayout::RowMajor,
+            "AWQ4 must use RowMajor storage"
+        );
     }
 
     #[test]
@@ -1248,7 +1511,13 @@ mod tests {
         assert_eq!(q8_0.zero_layout, ZeroLayout::None);
 
         let q4_1 = q4_1_descriptor();
-        assert_eq!(q4_1.zero_layout, ZeroLayout::BlockMin { offset_bytes: 2, dtype: ScaleDType::F16 });
+        assert_eq!(
+            q4_1.zero_layout,
+            ZeroLayout::BlockMin {
+                offset_bytes: 2,
+                dtype: ScaleDType::F16
+            }
+        );
     }
 
     #[test]
@@ -1258,9 +1527,17 @@ mod tests {
         for (qt, name) in [(QuantType::Q4K, "Q4K"), (QuantType::Q5K, "Q5K")] {
             let desc = QuantFormatDescriptor::for_type(qt);
             match &desc.scale_layout {
-                ScaleLayout::Hierarchical { sub_scales_bits, sub_block_elements, .. } => {
+                ScaleLayout::Hierarchical {
+                    sub_scales_bits,
+                    sub_block_elements,
+                    ..
+                } => {
                     assert_eq!(*sub_scales_bits, 6, "{} sub_scales_bits must be 6", name);
-                    assert_eq!(*sub_block_elements, 32, "{} sub_block_elements must be 32", name);
+                    assert_eq!(
+                        *sub_block_elements, 32,
+                        "{} sub_block_elements must be 32",
+                        name
+                    );
                 }
                 other => panic!("{} expected Hierarchical scale, got {:?}", name, other),
             }
@@ -1272,9 +1549,15 @@ mod tests {
         // NVFP4: GPU HIP does not have native FP4 tensor core (NVIDIA-only),
         // so GEMM path is DequantFMA on GPU HIP.
         let m = CoverageMatrix::new(QuantType::Nvfp4);
-        assert_eq!(m.get(IsaKind::GpuHip, OpCategory::Gemm), CoveragePath::DequantFMA);
+        assert_eq!(
+            m.get(IsaKind::GpuHip, OpCategory::Gemm),
+            CoveragePath::DequantFMA
+        );
         // Activation is always Native regardless of format.
-        assert_eq!(m.get(IsaKind::GpuHip, OpCategory::Activation), CoveragePath::Native);
+        assert_eq!(
+            m.get(IsaKind::GpuHip, OpCategory::Activation),
+            CoveragePath::Native
+        );
     }
 
     #[test]
@@ -1285,8 +1568,13 @@ mod tests {
         let via_fn = coverage_matrix(QuantType::GPTQ4);
         for &isa in IsaKind::all() {
             for &op in OpCategory::all() {
-                assert_eq!(via_new.get(isa, op), via_fn.get(isa, op),
-                    "coverage_matrix() differs from new() for ({:?}, {:?})", isa, op);
+                assert_eq!(
+                    via_new.get(isa, op),
+                    via_fn.get(isa, op),
+                    "coverage_matrix() differs from new() for ({:?}, {:?})",
+                    isa,
+                    op
+                );
             }
         }
     }
@@ -1298,7 +1586,10 @@ mod tests {
         for qt in [QuantType::Q4_0, QuantType::Q5_0, QuantType::Q8_0] {
             let desc = QuantFormatDescriptor::for_type(qt);
             match &desc.scale_layout {
-                ScaleLayout::BlockScalar { offset_bytes, dtype } => {
+                ScaleLayout::BlockScalar {
+                    offset_bytes,
+                    dtype,
+                } => {
                     assert_eq!(*offset_bytes, 0, "{:?} scale offset must be 0", qt);
                     assert_eq!(*dtype, ScaleDType::F16, "{:?} scale dtype must be F16", qt);
                 }
@@ -1312,7 +1603,10 @@ mod tests {
                 ScaleLayout::BlockScalarWithMin { dtype, .. } => {
                     assert_eq!(*dtype, ScaleDType::F16, "{:?} scale dtype must be F16", qt);
                 }
-                other => panic!("{:?} expected BlockScalarWithMin scale, got {:?}", qt, other),
+                other => panic!(
+                    "{:?} expected BlockScalarWithMin scale, got {:?}",
+                    qt, other
+                ),
             }
         }
     }
@@ -1325,9 +1619,14 @@ mod tests {
         // whose quant_type field matches the kind's own quant_type() mapping.
         for &kind in QuantAlgoKind::all() {
             let desc = kind.descriptor();
-            assert_eq!(desc.quant_type, kind.quant_type(),
+            assert_eq!(
+                desc.quant_type,
+                kind.quant_type(),
                 "QuantAlgoKind {:?}: descriptor quant_type {:?} != kind.quant_type {:?}",
-                kind, desc.quant_type, kind.quant_type());
+                kind,
+                desc.quant_type,
+                kind.quant_type()
+            );
         }
     }
 
@@ -1363,8 +1662,18 @@ mod tests {
         for (isa_idx, &isa) in IsaKind::all().iter().enumerate() {
             for (op_idx, &op) in OpCategory::all().iter().enumerate() {
                 let entry = entries[isa_idx * 5 + op_idx];
-                assert_eq!(entry.isa, isa, "Entry at index {} has wrong ISA", isa_idx * 5 + op_idx);
-                assert_eq!(entry.op, op, "Entry at index {} has wrong OpCategory", isa_idx * 5 + op_idx);
+                assert_eq!(
+                    entry.isa,
+                    isa,
+                    "Entry at index {} has wrong ISA",
+                    isa_idx * 5 + op_idx
+                );
+                assert_eq!(
+                    entry.op,
+                    op,
+                    "Entry at index {} has wrong OpCategory",
+                    isa_idx * 5 + op_idx
+                );
             }
         }
     }
@@ -1374,11 +1683,20 @@ mod tests {
         // FP8 E4M3 is not float (not F32/BF16/F16), not INT8, not INT4;
         // its Quant GEMM path should be DequantFMA on x86 (no native instruction).
         let m = CoverageMatrix::new(QuantType::Fp8E4M3);
-        assert_eq!(m.get(IsaKind::X86, OpCategory::Gemm), CoveragePath::DequantFMA);
+        assert_eq!(
+            m.get(IsaKind::X86, OpCategory::Gemm),
+            CoveragePath::DequantFMA
+        );
         // Activation is always Native regardless of format.
-        assert_eq!(m.get(IsaKind::X86, OpCategory::Activation), CoveragePath::Native);
+        assert_eq!(
+            m.get(IsaKind::X86, OpCategory::Activation),
+            CoveragePath::Native
+        );
         // Quant path for non-float, non-INT8, non-INT4 on x86: DequantFMA.
-        assert_eq!(m.get(IsaKind::X86, OpCategory::Quant), CoveragePath::DequantFMA);
+        assert_eq!(
+            m.get(IsaKind::X86, OpCategory::Quant),
+            CoveragePath::DequantFMA
+        );
     }
 
     #[test]
@@ -1386,11 +1704,26 @@ mod tests {
         // SqueezeLLM (3-bit codebook) has no native ISA; Quant path on x86/ARM/Metal is DequantFMA.
         // GPU PTX/HIP: Assisted (software unpack path exists).
         let m = CoverageMatrix::new(QuantType::Squeeze);
-        assert_eq!(m.get(IsaKind::X86, OpCategory::Quant), CoveragePath::DequantFMA);
-        assert_eq!(m.get(IsaKind::Arm, OpCategory::Quant), CoveragePath::DequantFMA);
-        assert_eq!(m.get(IsaKind::GpuMsl, OpCategory::Quant), CoveragePath::DequantFMA);
-        assert_eq!(m.get(IsaKind::GpuPtx, OpCategory::Quant), CoveragePath::Assisted);
-        assert_eq!(m.get(IsaKind::GpuHip, OpCategory::Quant), CoveragePath::Assisted);
+        assert_eq!(
+            m.get(IsaKind::X86, OpCategory::Quant),
+            CoveragePath::DequantFMA
+        );
+        assert_eq!(
+            m.get(IsaKind::Arm, OpCategory::Quant),
+            CoveragePath::DequantFMA
+        );
+        assert_eq!(
+            m.get(IsaKind::GpuMsl, OpCategory::Quant),
+            CoveragePath::DequantFMA
+        );
+        assert_eq!(
+            m.get(IsaKind::GpuPtx, OpCategory::Quant),
+            CoveragePath::Assisted
+        );
+        assert_eq!(
+            m.get(IsaKind::GpuHip, OpCategory::Quant),
+            CoveragePath::Assisted
+        );
     }
 
     #[test]
@@ -1400,8 +1733,11 @@ mod tests {
         for (i, kind_i) in all.iter().enumerate() {
             for (j, kind_j) in all.iter().enumerate() {
                 if i != j {
-                    assert_ne!(kind_i, kind_j,
-                        "QuantAlgoKind::all() has duplicate at indices {} and {}: {:?}", i, j, kind_i);
+                    assert_ne!(
+                        kind_i, kind_j,
+                        "QuantAlgoKind::all() has duplicate at indices {} and {}: {:?}",
+                        i, j, kind_i
+                    );
                 }
             }
         }
@@ -1415,21 +1751,41 @@ mod tests {
         assert_eq!(original, copy);
         // Ensure descriptor() produces identical results for both.
         assert_eq!(original.descriptor().name, copy.descriptor().name);
-        assert_eq!(original.descriptor().block_size, copy.descriptor().block_size);
+        assert_eq!(
+            original.descriptor().block_size,
+            copy.descriptor().block_size
+        );
     }
 
     #[test]
     fn coverage_matrix_int4_quant_path_x86_assisted() {
         // INT4-class formats (AWQ4, GPTQ4, Q4_0, Q4K) have Assisted quant on x86
         // because VPDPBUSD does not handle 4-bit; DequantFMA on Metal.
-        for qt in [QuantType::AWQ4, QuantType::GPTQ4, QuantType::Q4_0, QuantType::Q4K] {
+        for qt in [
+            QuantType::AWQ4,
+            QuantType::GPTQ4,
+            QuantType::Q4_0,
+            QuantType::Q4K,
+        ] {
             let m = CoverageMatrix::new(qt);
-            assert_eq!(m.get(IsaKind::X86, OpCategory::Quant), CoveragePath::Assisted,
-                "{:?} Quant on x86 should be Assisted", qt);
-            assert_eq!(m.get(IsaKind::Arm, OpCategory::Quant), CoveragePath::Assisted,
-                "{:?} Quant on ARM should be Assisted", qt);
-            assert_eq!(m.get(IsaKind::GpuMsl, OpCategory::Quant), CoveragePath::DequantFMA,
-                "{:?} Quant on Metal should be DequantFMA", qt);
+            assert_eq!(
+                m.get(IsaKind::X86, OpCategory::Quant),
+                CoveragePath::Assisted,
+                "{:?} Quant on x86 should be Assisted",
+                qt
+            );
+            assert_eq!(
+                m.get(IsaKind::Arm, OpCategory::Quant),
+                CoveragePath::Assisted,
+                "{:?} Quant on ARM should be Assisted",
+                qt
+            );
+            assert_eq!(
+                m.get(IsaKind::GpuMsl, OpCategory::Quant),
+                CoveragePath::DequantFMA,
+                "{:?} Quant on Metal should be DequantFMA",
+                qt
+            );
         }
     }
 
@@ -1442,8 +1798,17 @@ mod tests {
             path: CoveragePath::Native,
         };
         let debug_str = format!("{:?}", entry);
-        assert!(debug_str.contains("X86"), "Debug output must contain ISA name");
-        assert!(debug_str.contains("Gemm"), "Debug output must contain OpCategory name");
-        assert!(debug_str.contains("Native"), "Debug output must contain CoveragePath name");
+        assert!(
+            debug_str.contains("X86"),
+            "Debug output must contain ISA name"
+        );
+        assert!(
+            debug_str.contains("Gemm"),
+            "Debug output must contain OpCategory name"
+        );
+        assert!(
+            debug_str.contains("Native"),
+            "Debug output must contain CoveragePath name"
+        );
     }
 }

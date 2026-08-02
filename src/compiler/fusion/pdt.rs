@@ -9,10 +9,10 @@
 //! The PDT approach naturally discovers fusion opportunities that
 //! pattern-matching misses (e.g., cross-branch fusion, nested consumers).
 
-use std::collections::{HashMap, HashSet, VecDeque};
 use crate::compiler::graph::{CompilerGraph, OpId};
-use crate::compiler::semantic_dag::{SemanticDAG, OpClass};
 use crate::compiler::pain_point::OpBottleneckMap;
+use crate::compiler::semantic_dag::{OpClass, SemanticDAG};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Post-Dominator Tree node.
 #[derive(Debug, Clone)]
@@ -142,10 +142,8 @@ impl PostDominatorTree {
         // Compute immediate post-dominator (ipostdom) for each node.
         // ipostdom(n) = the post-dominator of n that is closest to n in the
         // topological order, excluding n itself.
-        let topo_idx: HashMap<OpId, usize> = topo.iter()
-            .enumerate()
-            .map(|(i, &id)| (id, i))
-            .collect();
+        let topo_idx: HashMap<OpId, usize> =
+            topo.iter().enumerate().map(|(i, &id)| (id, i)).collect();
 
         let mut nodes: HashMap<u32, PdtNode> = HashMap::new();
         let mut ipostdom_map: HashMap<OpId, Option<OpId>> = HashMap::new();
@@ -164,7 +162,9 @@ impl PostDominatorTree {
                     if pd_idx > my_idx {
                         match &best {
                             None => best = Some((pd_idx, pd_id)),
-                            Some((best_idx, _)) if pd_idx < *best_idx => best = Some((pd_idx, pd_id)),
+                            Some((best_idx, _)) if pd_idx < *best_idx => {
+                                best = Some((pd_idx, pd_id))
+                            }
                             _ => {}
                         }
                     }
@@ -186,11 +186,14 @@ impl PostDominatorTree {
         }
 
         for &op_id in &topo {
-            nodes.insert(op_id.0, PdtNode {
-                op_id,
-                ipostdom: ipostdom_map[&op_id],
-                children: children_map.get(&op_id).cloned().unwrap_or_default(),
-            });
+            nodes.insert(
+                op_id.0,
+                PdtNode {
+                    op_id,
+                    ipostdom: ipostdom_map[&op_id],
+                    children: children_map.get(&op_id).cloned().unwrap_or_default(),
+                },
+            );
         }
 
         PostDominatorTree { nodes, exit_id }
@@ -203,7 +206,10 @@ impl PostDominatorTree {
 
     /// Get the PDT children of a node.
     pub fn children(&self, op_id: OpId) -> &[OpId] {
-        self.nodes.get(&op_id.0).map(|n| n.children.as_slice()).unwrap_or(&[])
+        self.nodes
+            .get(&op_id.0)
+            .map(|n| n.children.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Collect all nodes in the PDT subtree rooted at `op_id` (BFS).
@@ -274,7 +280,8 @@ pub fn score_fusion(
     // 寄存器开销。penalty 权重 = bytes_saved 的 0.1%，确保融合决策仍以带宽为主。
     let reg_penalty = estimate_reg_penalty(producer, consumer, graph, dag);
     let base_reg_cost = profile.map(|p| p.reg_cost_factor()).unwrap_or(0.001);
-    let reg_cost_factor = base_reg_cost * bytes_saved.max(1) as f64 / (reg_penalty.max(1) as f64 * 1000.0);
+    let reg_cost_factor =
+        base_reg_cost * bytes_saved.max(1) as f64 / (reg_penalty.max(1) as f64 * 1000.0);
 
     (bytes_saved as f64) * scale * strategy_weight - (reg_penalty as f64 * reg_cost_factor)
 }
@@ -303,19 +310,22 @@ fn compute_bottleneck_scale(
     dag: &SemanticDAG,
     bottleneck_map: Option<&OpBottleneckMap>,
 ) -> f64 {
-    let producer_class = dag.node(producer).map(|n| n.op_class).unwrap_or(OpClass::Opaque);
+    let producer_class = dag
+        .node(producer)
+        .map(|n| n.op_class)
+        .unwrap_or(OpClass::Opaque);
 
     // Use R0 bottleneck analysis when available.
     if let Some(bmap) = bottleneck_map {
         if let Some(gemm_bn) = bmap.gemm_bottlenecks.get(&producer) {
             use crate::compiler::pain_point::BottleneckType;
             return match gemm_bn.bottleneck {
-                BottleneckType::MemoryBound { bandwidth_utilization } => {
-                    bandwidth_utilization.max(0.1)
-                }
-                BottleneckType::ComputeBound { compute_utilization } => {
-                    compute_utilization.max(0.1).min(1.0)
-                }
+                BottleneckType::MemoryBound {
+                    bandwidth_utilization,
+                } => bandwidth_utilization.max(0.1),
+                BottleneckType::ComputeBound {
+                    compute_utilization,
+                } => compute_utilization.max(0.1).min(1.0),
                 BottleneckType::LatencyBound { .. } => 0.5,
             };
         }
@@ -326,8 +336,15 @@ fn compute_bottleneck_scale(
         OpClass::Gemm => 1.0, // GEMM fusion is always potentially beneficial
         OpClass::Reduction => 0.8,
         OpClass::ElemWise => {
-            let ai = dag.node(producer).map(|n| n.arithmetic_intensity).unwrap_or(0.0);
-            if ai < 2.0 { 1.0 } else { 0.8 }
+            let ai = dag
+                .node(producer)
+                .map(|n| n.arithmetic_intensity)
+                .unwrap_or(0.0);
+            if ai < 2.0 {
+                1.0
+            } else {
+                0.8
+            }
         }
         OpClass::Injective => 0.7,
         OpClass::Opaque => 0.0,
@@ -345,10 +362,15 @@ fn compute_strategy_weight(
         if let Some(gemm_bn) = bmap.gemm_bottlenecks.get(&producer) {
             // Use R0's precomputed fusion_benefits to find the best matching
             // strategy weight. Default weight = 1.0 if no specific match.
-            let consumer_class = dag.node(consumer).map(|n| n.op_class).unwrap_or(OpClass::Opaque);
+            let consumer_class = dag
+                .node(consumer)
+                .map(|n| n.op_class)
+                .unwrap_or(OpClass::Opaque);
             // EpilogueInjection for GEMM + ElemWise/Reduction is the highest-value fusion.
             if consumer_class == OpClass::Reduction || consumer_class == OpClass::ElemWise {
-                return gemm_bn.fusion_benefits.values()
+                return gemm_bn
+                    .fusion_benefits
+                    .values()
                     .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                     .copied()
                     .unwrap_or(1.0)
@@ -380,7 +402,10 @@ fn estimate_reg_penalty(
     // Simple heuristic: each fused op adds some register pressure.
     // The actual register count depends on the ISA lowering, but we approximate
     // based on OpClass.
-    let consumer_class = dag.node(_consumer).map(|n| n.op_class).unwrap_or(OpClass::Opaque);
+    let consumer_class = dag
+        .node(_consumer)
+        .map(|n| n.op_class)
+        .unwrap_or(OpClass::Opaque);
     match consumer_class {
         OpClass::ElemWise => 64,   // 2 SIMD regs for elementwise temporary
         OpClass::Injective => 128, // More regs for index computation
@@ -395,7 +420,10 @@ pub fn can_fuse(anchor_class: OpClass, consumer_class: OpClass) -> bool {
     match anchor_class {
         OpClass::Gemm => {
             // GEMM can fuse with Reduction, ElemWise, Injective as epilogue.
-            matches!(consumer_class, OpClass::Reduction | OpClass::ElemWise | OpClass::Injective)
+            matches!(
+                consumer_class,
+                OpClass::Reduction | OpClass::ElemWise | OpClass::Injective
+            )
         }
         OpClass::Reduction => {
             // Reduction can fuse with downstream ElemWise (rare but valid).
@@ -439,7 +467,10 @@ impl PdtFusionEngine {
                 continue;
             }
 
-            let anchor_class = dag.node(op_id).map(|n| n.op_class).unwrap_or(OpClass::Opaque);
+            let anchor_class = dag
+                .node(op_id)
+                .map(|n| n.op_class)
+                .unwrap_or(OpClass::Opaque);
             if anchor_class == OpClass::Opaque {
                 continue;
             }
@@ -466,7 +497,10 @@ impl PdtFusionEngine {
                 if claimed.contains(&consumer_id) {
                     continue;
                 }
-                let consumer_class = dag.node(consumer_id).map(|n| n.op_class).unwrap_or(OpClass::Opaque);
+                let consumer_class = dag
+                    .node(consumer_id)
+                    .map(|n| n.op_class)
+                    .unwrap_or(OpClass::Opaque);
                 if !can_fuse(anchor_class, consumer_class) {
                     continue;
                 }
@@ -525,7 +559,9 @@ impl PdtFusionEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::graph::{CompilerGraph, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, SymDim};
+    use crate::compiler::graph::{
+        CompilerGraph, GemmSpec, NormSpec, Op, QuantGemmSpec, RopeSpec, SymDim,
+    };
     use crate::compiler::registry::ScalarOpRegistry;
     use crate::types::DType;
 
@@ -539,7 +575,15 @@ mod tests {
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 64], dt);
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 64], dt);
 
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: dt, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 64,
+                k: 64,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
@@ -587,7 +631,11 @@ mod tests {
         let (g, dag, _pdt) = build_simple_graph();
         let score = score_fusion(OpId(0), OpId(1), &g, &dag, None, None);
         // GEMM → SiLU should have positive score (eliminates intermediate tensor).
-        assert!(score > 0.0, "GEMM → SiLU fusion score should be positive, got {}", score);
+        assert!(
+            score > 0.0,
+            "GEMM → SiLU fusion score should be positive, got {}",
+            score
+        );
     }
 
     #[test]
@@ -600,7 +648,19 @@ mod tests {
         let b = g.add_tensor_concrete("b", &[1, 64], dt);
         let c = g.add_tensor_concrete("c", &[1, 64], dt);
 
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![out], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 64,
+                k: 64,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![out],
+            "gemm",
+        );
         g.add_op(Op::Silu, vec![b], vec![c], "silu_unrelated");
 
         let registry = ScalarOpRegistry::with_defaults();
@@ -616,7 +676,10 @@ mod tests {
         let (g, dag, pdt) = build_simple_graph();
         let candidates = PdtFusionEngine::discover_candidates(&g, &dag, &pdt, None);
 
-        assert!(!candidates.is_empty(), "Should find at least one fusion candidate");
+        assert!(
+            !candidates.is_empty(),
+            "Should find at least one fusion candidate"
+        );
         let first = &candidates[0];
         assert_eq!(first.anchor, OpId(0)); // GEMM is anchor
         assert!(first.consumers.contains(&OpId(1))); // SiLU is consumer
@@ -720,7 +783,7 @@ mod tests {
         assert!(can_fuse(OpClass::Gemm, OpClass::ElemWise));
         assert!(can_fuse(OpClass::Gemm, OpClass::Reduction));
         assert!(can_fuse(OpClass::Gemm, OpClass::Injective));
-        assert!(!can_fuse(OpClass::Gemm, OpClass::Gemm));    // GEMM cannot fuse with GEMM
+        assert!(!can_fuse(OpClass::Gemm, OpClass::Gemm)); // GEMM cannot fuse with GEMM
         assert!(!can_fuse(OpClass::Gemm, OpClass::Opaque));
 
         // Reduction anchor
@@ -764,8 +827,18 @@ mod tests {
         let b = g.add_tensor_concrete("b", &[1, 64], dt);
         let out2 = g.add_tensor_concrete("out2", &[1, 64], dt);
 
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: dt, trans_b: false, has_bias: false }),
-            vec![a, w], vec![out1], "gemm",
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 64,
+                k: 64,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![out1],
+            "gemm",
         );
         g.add_op(Op::Silu, vec![b], vec![out2], "silu");
 
@@ -802,8 +875,18 @@ mod tests {
         let bias = g.add_tensor_concrete("bias", &[1, 64], dt);
         let add_out = g.add_tensor_concrete("add_out", &[1, 64], dt);
 
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: dt, trans_b: false, has_bias: false }),
-            vec![a, w], vec![gemm_out], "gemm",
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 64,
+                k: 64,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![gemm_out],
+            "gemm",
         );
         g.add_op(Op::Silu, vec![gemm_out], vec![silu_out], "silu");
         g.add_op(Op::Add, vec![silu_out, bias], vec![add_out], "add");
@@ -833,7 +916,12 @@ mod tests {
         let logits = g.add_tensor_concrete("logits", &[1, 100], dt);
         let token_out = g.add_tensor_concrete("token_out", &[1], dt);
 
-        g.add_op(Op::CheckStopCondition, vec![logits], vec![token_out], "stop_check");
+        g.add_op(
+            Op::CheckStopCondition,
+            vec![logits],
+            vec![token_out],
+            "stop_check",
+        );
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&g, &registry);
@@ -843,7 +931,10 @@ mod tests {
         let candidates = PdtFusionEngine::discover_candidates(&g, &dag, &pdt, None);
 
         // Assert: Opaque ops should not produce fusion candidates.
-        assert!(candidates.is_empty(), "Opaque-only graph should have no fusion candidates");
+        assert!(
+            candidates.is_empty(),
+            "Opaque-only graph should have no fusion candidates"
+        );
     }
 
     // @trace TEST-PDT-16 [req:REQ-FUSION] [level:unit]
@@ -852,7 +943,10 @@ mod tests {
         // Arrange: GEMM → SiLU with an OpBottleneckMap providing MemoryBound bottleneck.
         let (g, dag, _pdt) = build_simple_graph();
 
-        use crate::compiler::pain_point::{BottleneckType, GemmBottleneck, GemmRole, FusionPriority, OpBottleneckMap, ExecPattern, ParallelismDesc};
+        use crate::compiler::pain_point::{
+            BottleneckType, ExecPattern, FusionPriority, GemmBottleneck, GemmRole, OpBottleneckMap,
+            ParallelismDesc,
+        };
 
         let mut fusion_benefits = std::collections::HashMap::new();
         fusion_benefits.insert(FusionPriority::EpilogueInjection, 2.5);
@@ -860,19 +954,33 @@ mod tests {
         let bottleneck_map = OpBottleneckMap {
             gemm_bottlenecks: {
                 let mut m = std::collections::HashMap::new();
-                m.insert(OpId(0), GemmBottleneck {
-                    gemm_role: GemmRole::LmHead,
-                    shape: (1, 64, 64),
-                    arithmetic_intensity: 1.0,
-                    ridge_point: 10.0,
-                    bottleneck: BottleneckType::MemoryBound { bandwidth_utilization: 0.8 },
-                    optimal_fusion: FusionPriority::EpilogueInjection,
-                    fusion_benefits: fusion_benefits,
-                    exec_pattern: ExecPattern::TileGemm {
-                        tile_m: 4, tile_n: 4, tile_k: 64, warp_m: 0, warp_n: 0, mma_k: 0, pipeline_depth: 0,
+                m.insert(
+                    OpId(0),
+                    GemmBottleneck {
+                        gemm_role: GemmRole::LmHead,
+                        shape: (1, 64, 64),
+                        arithmetic_intensity: 1.0,
+                        ridge_point: 10.0,
+                        bottleneck: BottleneckType::MemoryBound {
+                            bandwidth_utilization: 0.8,
+                        },
+                        optimal_fusion: FusionPriority::EpilogueInjection,
+                        fusion_benefits: fusion_benefits,
+                        exec_pattern: ExecPattern::TileGemm {
+                            tile_m: 4,
+                            tile_n: 4,
+                            tile_k: 64,
+                            warp_m: 0,
+                            warp_n: 0,
+                            mma_k: 0,
+                            pipeline_depth: 0,
+                        },
+                        parallelism: ParallelismDesc::SimdVectorize {
+                            element_width: 8,
+                            unroll_factor: 1,
+                        },
                     },
-                    parallelism: ParallelismDesc::SimdVectorize { element_width: 8, unroll_factor: 1 },
-                });
+                );
                 m
             },
             ridge_point: 10.0,
@@ -882,12 +990,19 @@ mod tests {
         let score_with_bn = score_fusion(OpId(0), OpId(1), &g, &dag, Some(&bottleneck_map), None);
 
         // Assert: score should be positive and reflect the bottleneck scale (0.8).
-        assert!(score_with_bn > 0.0, "Score with bottleneck map should be positive, got {}", score_with_bn);
+        assert!(
+            score_with_bn > 0.0,
+            "Score with bottleneck map should be positive, got {}",
+            score_with_bn
+        );
         // The bottleneck scale for MemoryBound(0.8) is max(0.8, 0.1) = 0.8.
         // Score without bottleneck uses scale=1.0 for GEMM, so bottleneck score should differ.
         let score_without = score_fusion(OpId(0), OpId(1), &g, &dag, None, None);
         // With MemoryBound 0.8 scale, the bytes_saved component is scaled down.
-        assert_ne!(score_with_bn, score_without, "Bottleneck map should affect fusion score");
+        assert_ne!(
+            score_with_bn, score_without,
+            "Bottleneck map should affect fusion score"
+        );
     }
 
     // @trace TEST-PDT-17 [req:REQ-FUSION] [level:unit]
@@ -896,7 +1011,10 @@ mod tests {
         // Arrange: GEMM → SiLU with ComputeBound bottleneck.
         let (g, dag, _pdt) = build_simple_graph();
 
-        use crate::compiler::pain_point::{BottleneckType, GemmBottleneck, GemmRole, FusionPriority, OpBottleneckMap, ExecPattern, ParallelismDesc};
+        use crate::compiler::pain_point::{
+            BottleneckType, ExecPattern, FusionPriority, GemmBottleneck, GemmRole, OpBottleneckMap,
+            ParallelismDesc,
+        };
 
         let mut fusion_benefits = std::collections::HashMap::new();
         fusion_benefits.insert(FusionPriority::EpilogueInjection, 1.5);
@@ -904,19 +1022,33 @@ mod tests {
         let bottleneck_map = OpBottleneckMap {
             gemm_bottlenecks: {
                 let mut m = std::collections::HashMap::new();
-                m.insert(OpId(0), GemmBottleneck {
-                    gemm_role: GemmRole::OutputProjection,
-                    shape: (1, 64, 64),
-                    arithmetic_intensity: 50.0,
-                    ridge_point: 10.0,
-                    bottleneck: BottleneckType::ComputeBound { compute_utilization: 0.6 },
-                    optimal_fusion: FusionPriority::EpilogueInjection,
-                    fusion_benefits: fusion_benefits,
-                    exec_pattern: ExecPattern::TileGemm {
-                        tile_m: 4, tile_n: 4, tile_k: 64, warp_m: 0, warp_n: 0, mma_k: 0, pipeline_depth: 0,
+                m.insert(
+                    OpId(0),
+                    GemmBottleneck {
+                        gemm_role: GemmRole::OutputProjection,
+                        shape: (1, 64, 64),
+                        arithmetic_intensity: 50.0,
+                        ridge_point: 10.0,
+                        bottleneck: BottleneckType::ComputeBound {
+                            compute_utilization: 0.6,
+                        },
+                        optimal_fusion: FusionPriority::EpilogueInjection,
+                        fusion_benefits: fusion_benefits,
+                        exec_pattern: ExecPattern::TileGemm {
+                            tile_m: 4,
+                            tile_n: 4,
+                            tile_k: 64,
+                            warp_m: 0,
+                            warp_n: 0,
+                            mma_k: 0,
+                            pipeline_depth: 0,
+                        },
+                        parallelism: ParallelismDesc::SimdVectorize {
+                            element_width: 8,
+                            unroll_factor: 1,
+                        },
                     },
-                    parallelism: ParallelismDesc::SimdVectorize { element_width: 8, unroll_factor: 1 },
-                });
+                );
                 m
             },
             ridge_point: 10.0,
@@ -927,7 +1059,11 @@ mod tests {
 
         // Assert: ComputeBound(0.6) scale = max(0.6, 0.1).min(1.0) = 0.6.
         // Score should still be positive but lower than without bottleneck.
-        assert!(score > 0.0, "ComputeBound score should be positive, got {}", score);
+        assert!(
+            score > 0.0,
+            "ComputeBound score should be positive, got {}",
+            score
+        );
     }
 
     // @trace TEST-PDT-18 [req:REQ-FUSION] [level:unit]
@@ -936,24 +1072,41 @@ mod tests {
         // Arrange: GEMM → SiLU with LatencyBound bottleneck.
         let (g, dag, _pdt) = build_simple_graph();
 
-        use crate::compiler::pain_point::{BottleneckType, GemmBottleneck, GemmRole, FusionPriority, OpBottleneckMap, ExecPattern, ParallelismDesc};
+        use crate::compiler::pain_point::{
+            BottleneckType, ExecPattern, FusionPriority, GemmBottleneck, GemmRole, OpBottleneckMap,
+            ParallelismDesc,
+        };
 
         let bottleneck_map = OpBottleneckMap {
             gemm_bottlenecks: {
                 let mut m = std::collections::HashMap::new();
-                m.insert(OpId(0), GemmBottleneck {
-                    gemm_role: GemmRole::Other,
-                    shape: (1, 64, 64),
-                    arithmetic_intensity: 0.1,
-                    ridge_point: 10.0,
-                    bottleneck: BottleneckType::LatencyBound { estimated_latency_ns: 100.0 },
-                    optimal_fusion: FusionPriority::EpilogueInjection,
-                    fusion_benefits: std::collections::HashMap::new(),
-                    exec_pattern: ExecPattern::TileGemm {
-                        tile_m: 4, tile_n: 4, tile_k: 64, warp_m: 0, warp_n: 0, mma_k: 0, pipeline_depth: 0,
+                m.insert(
+                    OpId(0),
+                    GemmBottleneck {
+                        gemm_role: GemmRole::Other,
+                        shape: (1, 64, 64),
+                        arithmetic_intensity: 0.1,
+                        ridge_point: 10.0,
+                        bottleneck: BottleneckType::LatencyBound {
+                            estimated_latency_ns: 100.0,
+                        },
+                        optimal_fusion: FusionPriority::EpilogueInjection,
+                        fusion_benefits: std::collections::HashMap::new(),
+                        exec_pattern: ExecPattern::TileGemm {
+                            tile_m: 4,
+                            tile_n: 4,
+                            tile_k: 64,
+                            warp_m: 0,
+                            warp_n: 0,
+                            mma_k: 0,
+                            pipeline_depth: 0,
+                        },
+                        parallelism: ParallelismDesc::SimdVectorize {
+                            element_width: 8,
+                            unroll_factor: 1,
+                        },
                     },
-                    parallelism: ParallelismDesc::SimdVectorize { element_width: 8, unroll_factor: 1 },
-                });
+                );
                 m
             },
             ridge_point: 10.0,
@@ -963,7 +1116,11 @@ mod tests {
         let score = score_fusion(OpId(0), OpId(1), &g, &dag, Some(&bottleneck_map), None);
 
         // Assert: LatencyBound scale = 0.5 (hardcoded in compute_bottleneck_scale).
-        assert!(score > 0.0, "LatencyBound score should be positive, got {}", score);
+        assert!(
+            score > 0.0,
+            "LatencyBound score should be positive, got {}",
+            score
+        );
     }
 
     // @trace TEST-PDT-19 [req:REQ-FUSION] [level:unit]
@@ -1016,10 +1173,16 @@ mod tests {
         // Assert: Silu (ElemWise) should be anchor, Mul (ElemWise) should be fused consumer.
         // Add (ElemWise) is a consumer of Mul but also takes external input b —
         // it has two inputs so its output tensor has single consumer pattern check.
-        assert!(!candidates.is_empty(), "Should find fusion candidates in ElemWise chain");
+        assert!(
+            !candidates.is_empty(),
+            "Should find fusion candidates in ElemWise chain"
+        );
         let first = &candidates[0];
         assert_eq!(first.anchor, OpId(0));
-        assert!(first.consumers.contains(&OpId(1)), "Mul should be fused into Silu anchor");
+        assert!(
+            first.consumers.contains(&OpId(1)),
+            "Mul should be fused into Silu anchor"
+        );
     }
 
     // @trace TEST-PDT-21 [req:REQ-FUSION] [level:unit]
@@ -1174,7 +1337,11 @@ mod tests {
 
         // Act: Silu → Mul should have positive fusion score
         let score = score_fusion(OpId(0), OpId(1), &g, &dag, None, None);
-        assert!(score > 0.0, "ElemWise chain fusion score should be positive, got {}", score);
+        assert!(
+            score > 0.0,
+            "ElemWise chain fusion score should be positive, got {}",
+            score
+        );
     }
 
     // ── Test 32: discover_candidates empty graph ──
@@ -1187,7 +1354,10 @@ mod tests {
         let pdt = PostDominatorTree::build(&g, &dag);
 
         let candidates = PdtFusionEngine::discover_candidates(&g, &dag, &pdt, None);
-        assert!(candidates.is_empty(), "Empty graph should yield no candidates");
+        assert!(
+            candidates.is_empty(),
+            "Empty graph should yield no candidates"
+        );
     }
 
     // ── Test 33: PostDominatorTree exit_id matches last op ──
@@ -1285,8 +1455,18 @@ mod tests {
         let w_s = g_small.add_tensor_concrete("w", &[16, 16], dt);
         let gemm_out_s = g_small.add_tensor_concrete("gemm_out", &[1, 16], dt);
         let silu_out_s = g_small.add_tensor_concrete("silu_out", &[1, 16], dt);
-        g_small.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: dt, trans_b: false, has_bias: false }),
-            vec![a_s, w_s], vec![gemm_out_s], "gemm",
+        g_small.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 16,
+                k: 16,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a_s, w_s],
+            vec![gemm_out_s],
+            "gemm",
         );
         g_small.add_op(Op::Silu, vec![gemm_out_s], vec![silu_out_s], "silu");
 
@@ -1295,8 +1475,18 @@ mod tests {
         let w_l = g_large.add_tensor_concrete("w", &[256, 256], dt);
         let gemm_out_l = g_large.add_tensor_concrete("gemm_out", &[1, 256], dt);
         let silu_out_l = g_large.add_tensor_concrete("silu_out", &[1, 256], dt);
-        g_large.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: dt, trans_b: false, has_bias: false }),
-            vec![a_l, w_l], vec![gemm_out_l], "gemm",
+        g_large.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a_l, w_l],
+            vec![gemm_out_l],
+            "gemm",
         );
         g_large.add_op(Op::Silu, vec![gemm_out_l], vec![silu_out_l], "silu");
 
@@ -1312,9 +1502,13 @@ mod tests {
         assert!(
             score_large > score_small,
             "Larger tensor should yield higher fusion score: large={} vs small={}",
-            score_large, score_small,
+            score_large,
+            score_small,
         );
-        assert!(score_small > 0.0, "Small fusion score should still be positive");
+        assert!(
+            score_small > 0.0,
+            "Small fusion score should still be positive"
+        );
         assert!(score_large > 0.0, "Large fusion score should be positive");
     }
 
@@ -1347,9 +1541,13 @@ mod tests {
         for candidate in &candidates {
             all_consumers.extend_from_slice(&candidate.consumers);
         }
-        let unique_count = all_consumers.iter().collect::<std::collections::HashSet<_>>().len();
+        let unique_count = all_consumers
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
         assert_eq!(
-            unique_count, all_consumers.len(),
+            unique_count,
+            all_consumers.len(),
             "No consumer should appear in more than one fusion candidate"
         );
     }
@@ -1398,7 +1596,18 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 64], dt);
         let freq = g.add_tensor_concrete("freq", &[32], dt);
 
-        g.add_op(Op::RoPE(RopeSpec { num_heads: 4, head_dim: 16, theta: 10000.0, partial: 1.0, rope_scaling: None }), vec![input, freq], vec![rope_out], "rope");
+        g.add_op(
+            Op::RoPE(RopeSpec {
+                num_heads: 4,
+                head_dim: 16,
+                theta: 10000.0,
+                partial: 1.0,
+                rope_scaling: None,
+            }),
+            vec![input, freq],
+            vec![rope_out],
+            "rope",
+        );
         g.add_op(Op::Silu, vec![rope_out], vec![silu_out], "silu");
 
         let registry = ScalarOpRegistry::with_defaults();
@@ -1410,10 +1619,13 @@ mod tests {
 
         // Assert: Rope (Injective) should fuse with Silu (ElemWise).
         // can_fuse(Injective, ElemWise) == true.
-        assert!(!candidates.is_empty(), "Injective → ElemWise should produce fusion candidates");
-        let found = candidates.iter().any(|c| {
-            c.anchor_class == OpClass::Injective && c.consumers.contains(&OpId(1))
-        });
+        assert!(
+            !candidates.is_empty(),
+            "Injective → ElemWise should produce fusion candidates"
+        );
+        let found = candidates
+            .iter()
+            .any(|c| c.anchor_class == OpClass::Injective && c.consumers.contains(&OpId(1)));
         assert!(found, "Should find Injective anchor with Silu consumer");
     }
 
@@ -1430,7 +1642,17 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 64], dt);
         let weight = g.add_tensor_concrete("weight", &[64], dt);
 
-        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![input, weight], vec![norm_out], "rmsnorm");
+        g.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![input, weight],
+            vec![norm_out],
+            "rmsnorm",
+        );
         g.add_op(Op::Silu, vec![norm_out], vec![silu_out], "silu");
 
         let registry = ScalarOpRegistry::with_defaults();
@@ -1450,7 +1672,9 @@ mod tests {
             "RmsNorm (Reduction) should be an anchor with Silu consumer"
         );
         assert!(
-            reduction_anchors.iter().any(|c| c.consumers.contains(&OpId(1))),
+            reduction_anchors
+                .iter()
+                .any(|c| c.consumers.contains(&OpId(1))),
             "Reduction anchor should have Silu as consumer"
         );
     }
@@ -1468,11 +1692,31 @@ mod tests {
         let w2 = g.add_tensor_concrete("w2", &[64, 64], dt);
         let gemm2_out = g.add_tensor_concrete("gemm2_out", &[1, 64], dt);
 
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: dt, trans_b: false, has_bias: false }),
-            vec![a, w1], vec![gemm1_out], "gemm1",
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 64,
+                k: 64,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w1],
+            vec![gemm1_out],
+            "gemm1",
         );
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: dt, trans_b: false, has_bias: false }),
-            vec![gemm1_out, w2], vec![gemm2_out], "gemm2",
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 64,
+                k: 64,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![gemm1_out, w2],
+            vec![gemm2_out],
+            "gemm2",
         );
 
         let registry = ScalarOpRegistry::with_defaults();
@@ -1485,9 +1729,13 @@ mod tests {
         // Assert: GEMM→GEMM is not fusable, so no candidate should have Gemm consumer.
         for candidate in &candidates {
             for consumer in &candidate.consumers {
-                let consumer_class = dag.node(*consumer).map(|n| n.op_class).unwrap_or(OpClass::Opaque);
+                let consumer_class = dag
+                    .node(*consumer)
+                    .map(|n| n.op_class)
+                    .unwrap_or(OpClass::Opaque);
                 assert_ne!(
-                    consumer_class, OpClass::Gemm,
+                    consumer_class,
+                    OpClass::Gemm,
                     "GEMM should never appear as a fusion consumer of another GEMM"
                 );
             }
@@ -1523,7 +1771,10 @@ mod tests {
         let subtree_add = pdt.subtree(OpId(2));
 
         // Assert: The subtree contains OpId(2) itself at minimum.
-        assert!(subtree_add.contains(&OpId(2)), "Subtree should contain the root node");
+        assert!(
+            subtree_add.contains(&OpId(2)),
+            "Subtree should contain the root node"
+        );
         // The exit node OpId(3) should NOT be in subtree of OpId(2) because
         // OpId(3) has no ipostdom pointing to OpId(2).
         assert!(
@@ -1547,8 +1798,18 @@ mod tests {
         let w_s = g_small.add_tensor_concrete("w", &[32, 32], DType::F32);
         let out_s = g_small.add_tensor_concrete("out", &[1, 32], DType::F32);
         let silu_s = g_small.add_tensor_concrete("silu", &[1, 32], DType::F32);
-        g_small.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 32, k: 32, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a_s, w_s], vec![out_s], "gemm",
+        g_small.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 32,
+                k: 32,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a_s, w_s],
+            vec![out_s],
+            "gemm",
         );
         g_small.add_op(Op::Silu, vec![out_s], vec![silu_s], "silu");
 
@@ -1557,8 +1818,18 @@ mod tests {
         let w_l = g_large.add_tensor_concrete("w", &[128, 128], DType::F32);
         let out_l = g_large.add_tensor_concrete("out", &[1, 128], DType::F32);
         let silu_l = g_large.add_tensor_concrete("silu", &[1, 128], DType::F32);
-        g_large.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a_l, w_l], vec![out_l], "gemm",
+        g_large.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 128,
+                k: 128,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a_l, w_l],
+            vec![out_l],
+            "gemm",
         );
         g_large.add_op(Op::Silu, vec![out_l], vec![silu_l], "silu");
 
@@ -1568,11 +1839,20 @@ mod tests {
 
         // Assert: 128 elements × 4 bytes = 512, 32 elements × 4 bytes = 128.
         // Large should be exactly 4x small.
-        assert!(bytes_small > 0, "Small graph bytes saved should be positive");
-        assert!(bytes_large > 0, "Large graph bytes saved should be positive");
-        assert_eq!(bytes_large, bytes_small * 4,
+        assert!(
+            bytes_small > 0,
+            "Small graph bytes saved should be positive"
+        );
+        assert!(
+            bytes_large > 0,
+            "Large graph bytes saved should be positive"
+        );
+        assert_eq!(
+            bytes_large,
+            bytes_small * 4,
             "Larger intermediate tensor should have proportionally more bytes: small={} large={}",
-            bytes_small, bytes_large,
+            bytes_small,
+            bytes_large,
         );
     }
 }

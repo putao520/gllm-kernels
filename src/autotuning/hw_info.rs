@@ -236,12 +236,17 @@ fn detect_linux_physical_cores() -> Option<usize> {
     let mut current_physical = None;
     for line in content.lines() {
         if line.starts_with("physical id") {
-            current_physical = line.split(':').nth(1).and_then(|s| s.trim().parse::<usize>().ok());
+            current_physical = line
+                .split(':')
+                .nth(1)
+                .and_then(|s| s.trim().parse::<usize>().ok());
         }
         if line.starts_with("core id") {
             if let (Some(phys), Some(core)) = (
                 current_physical,
-                line.split(':').nth(1).and_then(|s| s.trim().parse::<usize>().ok()),
+                line.split(':')
+                    .nth(1)
+                    .and_then(|s| s.trim().parse::<usize>().ok()),
             ) {
                 core_ids.insert((phys, core));
             }
@@ -364,7 +369,19 @@ mod tests {
             l2_bytes: 2048 * 1024,
             l3_bytes: 36 * 1024 * 1024,
             cacheline_bytes: 64,
-            isa: IsaFeatures { avx2: true, fma: true, avx512f: false, avx512bw: false, avx512vnni: false, avx512fp16: false, avx512bf16: false, neon: false, sve: false, sve2: false, sve_vl_bytes: 0 },
+            isa: IsaFeatures {
+                avx2: true,
+                fma: true,
+                avx512f: false,
+                avx512bw: false,
+                avx512vnni: false,
+                avx512fp16: false,
+                avx512bf16: false,
+                neon: false,
+                sve: false,
+                sve2: false,
+                sve_vl_bytes: 0,
+            },
         };
         let display = format!("{hw}");
         assert!(display.contains("i9-13900K"));
@@ -383,7 +400,19 @@ mod tests {
             l2_bytes: 512 * 1024,
             l3_bytes: 8 * 1024 * 1024,
             cacheline_bytes: 64,
-            isa: IsaFeatures { avx2: true, fma: true, avx512f: false, avx512bw: false, avx512vnni: false, avx512fp16: false, avx512bf16: false, neon: false, sve: false, sve2: false, sve_vl_bytes: 0 },
+            isa: IsaFeatures {
+                avx2: true,
+                fma: true,
+                avx512f: false,
+                avx512bw: false,
+                avx512vnni: false,
+                avx512fp16: false,
+                avx512bf16: false,
+                neon: false,
+                sve: false,
+                sve2: false,
+                sve_vl_bytes: 0,
+            },
         };
         let fp = hw.fingerprint();
         assert!(fp.contains("8c"));
@@ -392,13 +421,37 @@ mod tests {
 
     #[test]
     fn isa_features_display_scalar() {
-        let isa = IsaFeatures { avx2: false, fma: false, avx512f: false, avx512bw: false, avx512vnni: false, avx512fp16: false, avx512bf16: false, neon: false, sve: false, sve2: false, sve_vl_bytes: 0 };
+        let isa = IsaFeatures {
+            avx2: false,
+            fma: false,
+            avx512f: false,
+            avx512bw: false,
+            avx512vnni: false,
+            avx512fp16: false,
+            avx512bf16: false,
+            neon: false,
+            sve: false,
+            sve2: false,
+            sve_vl_bytes: 0,
+        };
         assert_eq!(format!("{isa}"), "Scalar");
     }
 
     #[test]
     fn isa_features_display_avx512() {
-        let isa = IsaFeatures { avx2: true, fma: true, avx512f: true, avx512bw: true, avx512vnni: true, avx512fp16: true, avx512bf16: true, neon: false, sve: false, sve2: false, sve_vl_bytes: 0 };
+        let isa = IsaFeatures {
+            avx2: true,
+            fma: true,
+            avx512f: true,
+            avx512bw: true,
+            avx512vnni: true,
+            avx512fp16: true,
+            avx512bf16: true,
+            neon: false,
+            sve: false,
+            sve2: false,
+            sve_vl_bytes: 0,
+        };
         let display = format!("{isa}");
         assert!(display.contains("AVX-512"));
         assert!(display.contains("FP16"));
@@ -408,7 +461,19 @@ mod tests {
 
     #[test]
     fn isa_features_display_sve2() {
-        let isa = IsaFeatures { avx2: false, fma: false, avx512f: false, avx512bw: false, avx512vnni: false, avx512fp16: false, avx512bf16: false, neon: true, sve: true, sve2: true, sve_vl_bytes: 256 };
+        let isa = IsaFeatures {
+            avx2: false,
+            fma: false,
+            avx512f: false,
+            avx512bw: false,
+            avx512vnni: false,
+            avx512fp16: false,
+            avx512bf16: false,
+            neon: true,
+            sve: true,
+            sve2: true,
+            sve_vl_bytes: 256,
+        };
         let display = format!("{isa}");
         assert!(display.contains("SVE2"));
         assert!(display.contains("NEON"));
@@ -417,11 +482,27 @@ mod tests {
     #[test]
     fn hw_info_equality_and_hash() {
         let a = HwInfo {
-            vendor: "Test".into(), model_name: "CPU".into(),
-            physical_cores: 4, logical_cores: 8,
-            l1d_bytes: 32768, l2_bytes: 262144, l3_bytes: 8388608,
+            vendor: "Test".into(),
+            model_name: "CPU".into(),
+            physical_cores: 4,
+            logical_cores: 8,
+            l1d_bytes: 32768,
+            l2_bytes: 262144,
+            l3_bytes: 8388608,
             cacheline_bytes: 64,
-            isa: IsaFeatures { avx2: true, fma: true, avx512f: false, avx512bw: false, avx512vnni: false, avx512fp16: false, avx512bf16: false, neon: false, sve: false, sve2: false, sve_vl_bytes: 0 },
+            isa: IsaFeatures {
+                avx2: true,
+                fma: true,
+                avx512f: false,
+                avx512bw: false,
+                avx512vnni: false,
+                avx512fp16: false,
+                avx512bf16: false,
+                neon: false,
+                sve: false,
+                sve2: false,
+                sve_vl_bytes: 0,
+            },
         };
         let b = a.clone();
         assert_eq!(a, b);
@@ -440,19 +521,40 @@ mod tests {
             model_name: "AMD Ryzen 9 7950X".into(),
             physical_cores: 16,
             logical_cores: 32,
-            l1d_bytes: 32 * 1024,          // 32 KiB
-            l2_bytes: 1024 * 1024,         // 1024 KiB = 1 MiB
-            l3_bytes: 64 * 1024 * 1024,    // 64 MiB
+            l1d_bytes: 32 * 1024,       // 32 KiB
+            l2_bytes: 1024 * 1024,      // 1024 KiB = 1 MiB
+            l3_bytes: 64 * 1024 * 1024, // 64 MiB
             cacheline_bytes: 64,
-            isa: IsaFeatures { avx2: true, fma: true, avx512f: true, avx512bw: true, avx512vnni: false, avx512fp16: false, avx512bf16: false, neon: false, sve: false, sve2: false, sve_vl_bytes: 0 },
+            isa: IsaFeatures {
+                avx2: true,
+                fma: true,
+                avx512f: true,
+                avx512bw: true,
+                avx512vnni: false,
+                avx512fp16: false,
+                avx512bf16: false,
+                neon: false,
+                sve: false,
+                sve2: false,
+                sve_vl_bytes: 0,
+            },
         };
         let display = format!("{hw}");
         // L1D = 32 KiB → "32K"
-        assert!(display.contains("L1D=32K"), "L1D should be 32K, got: {display}");
+        assert!(
+            display.contains("L1D=32K"),
+            "L1D should be 32K, got: {display}"
+        );
         // L2 = 1024 KiB → "1024K"
-        assert!(display.contains("L2=1024K"), "L2 should be 1024K, got: {display}");
+        assert!(
+            display.contains("L2=1024K"),
+            "L2 should be 1024K, got: {display}"
+        );
         // L3 = 64 MiB → "64M"
-        assert!(display.contains("L3=64M"), "L3 should be 64M, got: {display}");
+        assert!(
+            display.contains("L3=64M"),
+            "L3 should be 64M, got: {display}"
+        );
     }
 
     /// Display shows vendor-derived model name, not the vendor field directly.
@@ -467,11 +569,29 @@ mod tests {
             l2_bytes: 2048 * 1024,
             l3_bytes: 105 * 1024 * 1024,
             cacheline_bytes: 64,
-            isa: IsaFeatures { avx2: true, fma: true, avx512f: true, avx512bw: true, avx512vnni: true, avx512fp16: false, avx512bf16: true, neon: false, sve: false, sve2: false, sve_vl_bytes: 0 },
+            isa: IsaFeatures {
+                avx2: true,
+                fma: true,
+                avx512f: true,
+                avx512bw: true,
+                avx512vnni: true,
+                avx512fp16: false,
+                avx512bf16: true,
+                neon: false,
+                sve: false,
+                sve2: false,
+                sve_vl_bytes: 0,
+            },
         };
         let display = format!("{hw}");
-        assert!(display.contains("w9-3495X"), "model name should appear, got: {display}");
-        assert!(!display.contains("GenuineIntel"), "vendor field should not appear, got: {display}");
+        assert!(
+            display.contains("w9-3495X"),
+            "model name should appear, got: {display}"
+        );
+        assert!(
+            !display.contains("GenuineIntel"),
+            "vendor field should not appear, got: {display}"
+        );
     }
 
     /// Fingerprint strips non-alphanumeric characters from model name.
@@ -486,17 +606,47 @@ mod tests {
             l2_bytes: 2048 * 1024,
             l3_bytes: 30 * 1024 * 1024,
             cacheline_bytes: 64,
-            isa: IsaFeatures { avx2: true, fma: true, avx512f: false, avx512bw: false, avx512vnni: false, avx512fp16: false, avx512bf16: false, neon: false, sve: false, sve2: false, sve_vl_bytes: 0 },
+            isa: IsaFeatures {
+                avx2: true,
+                fma: true,
+                avx512f: false,
+                avx512bw: false,
+                avx512vnni: false,
+                avx512fp16: false,
+                avx512bf16: false,
+                neon: false,
+                sve: false,
+                sve2: false,
+                sve_vl_bytes: 0,
+            },
         };
         let fp = hw.fingerprint();
         // Parentheses, hyphens, spaces, @, dots should be stripped
-        assert!(!fp.contains('('), "fingerprint should not contain '(': {fp}");
-        assert!(!fp.contains(')'), "fingerprint should not contain ')': {fp}");
-        assert!(!fp.contains(' '), "fingerprint should not contain spaces: {fp}");
-        assert!(!fp.contains('@'), "fingerprint should not contain '@': {fp}");
-        assert!(!fp.contains('.'), "fingerprint should not contain '.': {fp}");
+        assert!(
+            !fp.contains('('),
+            "fingerprint should not contain '(': {fp}"
+        );
+        assert!(
+            !fp.contains(')'),
+            "fingerprint should not contain ')': {fp}"
+        );
+        assert!(
+            !fp.contains(' '),
+            "fingerprint should not contain spaces: {fp}"
+        );
+        assert!(
+            !fp.contains('@'),
+            "fingerprint should not contain '@': {fp}"
+        );
+        assert!(
+            !fp.contains('.'),
+            "fingerprint should not contain '.': {fp}"
+        );
         // Core meaningful text should remain
-        assert!(fp.contains("IntelRCoreTMi713700K"), "alphanumeric chars should remain: {fp}");
+        assert!(
+            fp.contains("IntelRCoreTMi713700K"),
+            "alphanumeric chars should remain: {fp}"
+        );
     }
 
     /// Two HwInfo instances differing only in ISA are not equal.
@@ -511,13 +661,40 @@ mod tests {
             l2_bytes: 512 * 1024,
             l3_bytes: 8 * 1024 * 1024,
             cacheline_bytes: 64,
-            isa: IsaFeatures { avx2: false, fma: false, avx512f: false, avx512bw: false, avx512vnni: false, avx512fp16: false, avx512bf16: false, neon: false, sve: false, sve2: false, sve_vl_bytes: 0 },
+            isa: IsaFeatures {
+                avx2: false,
+                fma: false,
+                avx512f: false,
+                avx512bw: false,
+                avx512vnni: false,
+                avx512fp16: false,
+                avx512bf16: false,
+                neon: false,
+                sve: false,
+                sve2: false,
+                sve_vl_bytes: 0,
+            },
         };
         let with_avx2 = HwInfo {
-            isa: IsaFeatures { avx2: true, fma: false, avx512f: false, avx512bw: false, avx512vnni: false, avx512fp16: false, avx512bf16: false, neon: false, sve: false, sve2: false, sve_vl_bytes: 0 },
+            isa: IsaFeatures {
+                avx2: true,
+                fma: false,
+                avx512f: false,
+                avx512bw: false,
+                avx512vnni: false,
+                avx512fp16: false,
+                avx512bf16: false,
+                neon: false,
+                sve: false,
+                sve2: false,
+                sve_vl_bytes: 0,
+            },
             ..base.clone()
         };
-        assert_ne!(base, with_avx2, "HwInfo with different ISA should not be equal");
+        assert_ne!(
+            base, with_avx2,
+            "HwInfo with different ISA should not be equal"
+        );
     }
 
     /// Two HwInfo differing in physical_cores produce different fingerprints.
@@ -532,7 +709,19 @@ mod tests {
             l2_bytes: 256 * 1024,
             l3_bytes: 4 * 1024 * 1024,
             cacheline_bytes: 64,
-            isa: IsaFeatures { avx2: true, fma: true, avx512f: false, avx512bw: false, avx512vnni: false, avx512fp16: false, avx512bf16: false, neon: false, sve: false, sve2: false, sve_vl_bytes: 0 },
+            isa: IsaFeatures {
+                avx2: true,
+                fma: true,
+                avx512f: false,
+                avx512bw: false,
+                avx512vnni: false,
+                avx512fp16: false,
+                avx512bf16: false,
+                neon: false,
+                sve: false,
+                sve2: false,
+                sve_vl_bytes: 0,
+            },
         };
         let hw_8c = HwInfo {
             physical_cores: 8,
@@ -546,15 +735,24 @@ mod tests {
     #[test]
     fn isa_features_display_sve_without_sve2() {
         let isa = IsaFeatures {
-            avx2: false, fma: false,
-            avx512f: false, avx512bw: false, avx512vnni: false,
-            avx512fp16: false, avx512bf16: false,
+            avx2: false,
+            fma: false,
+            avx512f: false,
+            avx512bw: false,
+            avx512vnni: false,
+            avx512fp16: false,
+            avx512bf16: false,
             neon: true,
-            sve: true, sve2: false, sve_vl_bytes: 128,
+            sve: true,
+            sve2: false,
+            sve_vl_bytes: 128,
         };
         let display = format!("{isa}");
         assert!(display.contains("SVE"), "SVE should appear: {display}");
-        assert!(!display.contains("SVE2"), "SVE2 should not appear when sve2=false: {display}");
+        assert!(
+            !display.contains("SVE2"),
+            "SVE2 should not appear when sve2=false: {display}"
+        );
         assert!(display.contains("NEON"), "NEON should appear: {display}");
     }
 
@@ -562,63 +760,112 @@ mod tests {
     #[test]
     fn isa_features_display_fma_only() {
         let isa = IsaFeatures {
-            avx2: false, fma: true,
-            avx512f: false, avx512bw: false, avx512vnni: false,
-            avx512fp16: false, avx512bf16: false,
-            neon: false, sve: false, sve2: false, sve_vl_bytes: 0,
+            avx2: false,
+            fma: true,
+            avx512f: false,
+            avx512bw: false,
+            avx512vnni: false,
+            avx512fp16: false,
+            avx512bf16: false,
+            neon: false,
+            sve: false,
+            sve2: false,
+            sve_vl_bytes: 0,
         };
         let display = format!("{isa}");
         assert!(display.contains("FMA"), "FMA should appear: {display}");
-        assert!(!display.contains("AVX2"), "AVX2 should not appear when avx2=false: {display}");
-        assert!(!display.contains("Scalar"), "Scalar should not appear when features present: {display}");
+        assert!(
+            !display.contains("AVX2"),
+            "AVX2 should not appear when avx2=false: {display}"
+        );
+        assert!(
+            !display.contains("Scalar"),
+            "Scalar should not appear when features present: {display}"
+        );
     }
 
     /// IsaFeatures Display: AVX-512 FP16 implies AVX-512 base but not necessarily VNNI.
     #[test]
     fn isa_features_display_avx512fp16_without_vnni() {
         let isa = IsaFeatures {
-            avx2: true, fma: true,
-            avx512f: true, avx512bw: true, avx512vnni: false,
-            avx512fp16: true, avx512bf16: false,
-            neon: false, sve: false, sve2: false, sve_vl_bytes: 0,
+            avx2: true,
+            fma: true,
+            avx512f: true,
+            avx512bw: true,
+            avx512vnni: false,
+            avx512fp16: true,
+            avx512bf16: false,
+            neon: false,
+            sve: false,
+            sve2: false,
+            sve_vl_bytes: 0,
         };
         let display = format!("{isa}");
-        assert!(display.contains("AVX-512"), "AVX-512 should appear: {display}");
+        assert!(
+            display.contains("AVX-512"),
+            "AVX-512 should appear: {display}"
+        );
         assert!(display.contains("FP16"), "FP16 should appear: {display}");
-        assert!(!display.contains("VNNI"), "VNNI should not appear when vnni=false: {display}");
-        assert!(!display.contains("BF16"), "BF16 should not appear when bf16=false: {display}");
+        assert!(
+            !display.contains("VNNI"),
+            "VNNI should not appear when vnni=false: {display}"
+        );
+        assert!(
+            !display.contains("BF16"),
+            "BF16 should not appear when bf16=false: {display}"
+        );
     }
 
     /// IsaFeatures equality: sve_vl_bytes matters for equality.
     #[test]
     fn isa_features_inequality_on_sve_vl_bytes() {
         let isa_128 = IsaFeatures {
-            avx2: false, fma: false,
-            avx512f: false, avx512bw: false, avx512vnni: false,
-            avx512fp16: false, avx512bf16: false,
-            neon: true, sve: true, sve2: true, sve_vl_bytes: 128,
+            avx2: false,
+            fma: false,
+            avx512f: false,
+            avx512bw: false,
+            avx512vnni: false,
+            avx512fp16: false,
+            avx512bf16: false,
+            neon: true,
+            sve: true,
+            sve2: true,
+            sve_vl_bytes: 128,
         };
         let isa_256 = IsaFeatures {
             sve_vl_bytes: 256,
             ..isa_128
         };
-        assert_ne!(isa_128, isa_256, "different sve_vl_bytes should not be equal");
+        assert_ne!(
+            isa_128, isa_256,
+            "different sve_vl_bytes should not be equal"
+        );
     }
 
     /// IsaFeatures Copy trait: modifying a copy does not affect the original.
     #[test]
     fn isa_features_copy_is_independent() {
         let original = IsaFeatures {
-            avx2: true, fma: true,
-            avx512f: false, avx512bw: false, avx512vnni: false,
-            avx512fp16: false, avx512bf16: false,
-            neon: false, sve: false, sve2: false, sve_vl_bytes: 0,
+            avx2: true,
+            fma: true,
+            avx512f: false,
+            avx512bw: false,
+            avx512vnni: false,
+            avx512fp16: false,
+            avx512bf16: false,
+            neon: false,
+            sve: false,
+            sve2: false,
+            sve_vl_bytes: 0,
         };
         let mut copy = original;
         copy.avx2 = false;
         copy.avx512f = true;
         assert!(original.avx2, "original should still have avx2=true");
-        assert!(!original.avx512f, "original should still have avx512f=false");
+        assert!(
+            !original.avx512f,
+            "original should still have avx512f=false"
+        );
         assert!(!copy.avx2, "copy should have avx2=false");
         assert!(copy.avx512f, "copy should have avx512f=true");
     }
@@ -630,7 +877,8 @@ mod tests {
         assert!(
             hw.logical_cores >= hw.physical_cores,
             "logical_cores ({}) must be >= physical_cores ({})",
-            hw.logical_cores, hw.physical_cores,
+            hw.logical_cores,
+            hw.physical_cores,
         );
     }
 
@@ -649,7 +897,11 @@ mod tests {
         assert!(hw.l1d_bytes > 0, "L1D must be > 0, got {}", hw.l1d_bytes);
         assert!(hw.l2_bytes > 0, "L2 must be > 0, got {}", hw.l2_bytes);
         assert!(hw.l3_bytes > 0, "L3 must be > 0, got {}", hw.l3_bytes);
-        assert!(hw.cacheline_bytes > 0, "cacheline must be > 0, got {}", hw.cacheline_bytes);
+        assert!(
+            hw.cacheline_bytes > 0,
+            "cacheline must be > 0, got {}",
+            hw.cacheline_bytes
+        );
     }
 
     // ── 10 additional tests ─────────────────────────────────────────────────
@@ -667,13 +919,31 @@ mod tests {
             l2_bytes: 512 * 1024,
             l3_bytes: 16 * 1024 * 1024,
             cacheline_bytes: 64,
-            isa: IsaFeatures { avx2: false, fma: false, avx512f: false, avx512bw: false, avx512vnni: false, avx512fp16: false, avx512bf16: false, neon: false, sve: false, sve2: false, sve_vl_bytes: 0 },
+            isa: IsaFeatures {
+                avx2: false,
+                fma: false,
+                avx512f: false,
+                avx512bw: false,
+                avx512vnni: false,
+                avx512fp16: false,
+                avx512bf16: false,
+                neon: false,
+                sve: false,
+                sve2: false,
+                sve_vl_bytes: 0,
+            },
         };
         // Act
         let display = format!("{hw}");
         // Assert
-        assert!(display.contains("12P"), "physical cores should appear: {display}");
-        assert!(display.contains("24L"), "logical cores should appear: {display}");
+        assert!(
+            display.contains("12P"),
+            "physical cores should appear: {display}"
+        );
+        assert!(
+            display.contains("24L"),
+            "logical cores should appear: {display}"
+        );
     }
 
     /// Fingerprint includes cache sizes in KiB units.
@@ -685,11 +955,23 @@ mod tests {
             model_name: "Model".into(),
             physical_cores: 4,
             logical_cores: 8,
-            l1d_bytes: 64 * 1024,       // 64 KiB
-            l2_bytes: 256 * 1024,       // 256 KiB
-            l3_bytes: 8192 * 1024,      // 8192 KiB = 8 MiB
+            l1d_bytes: 64 * 1024,  // 64 KiB
+            l2_bytes: 256 * 1024,  // 256 KiB
+            l3_bytes: 8192 * 1024, // 8192 KiB = 8 MiB
             cacheline_bytes: 64,
-            isa: IsaFeatures { avx2: false, fma: false, avx512f: false, avx512bw: false, avx512vnni: false, avx512fp16: false, avx512bf16: false, neon: false, sve: false, sve2: false, sve_vl_bytes: 0 },
+            isa: IsaFeatures {
+                avx2: false,
+                fma: false,
+                avx512f: false,
+                avx512bw: false,
+                avx512vnni: false,
+                avx512fp16: false,
+                avx512bf16: false,
+                neon: false,
+                sve: false,
+                sve2: false,
+                sve_vl_bytes: 0,
+            },
         };
         // Act
         let fp = hw.fingerprint();
@@ -712,14 +994,29 @@ mod tests {
             l2_bytes: 256 * 1024,
             l3_bytes: 8 * 1024 * 1024,
             cacheline_bytes: 64,
-            isa: IsaFeatures { avx2: true, fma: true, avx512f: false, avx512bw: false, avx512vnni: false, avx512fp16: false, avx512bf16: false, neon: false, sve: false, sve2: false, sve_vl_bytes: 0 },
+            isa: IsaFeatures {
+                avx2: true,
+                fma: true,
+                avx512f: false,
+                avx512bw: false,
+                avx512vnni: false,
+                avx512fp16: false,
+                avx512bf16: false,
+                neon: false,
+                sve: false,
+                sve2: false,
+                sve_vl_bytes: 0,
+            },
         };
         let hw_b = HwInfo {
             vendor: "AuthenticAMD".into(),
             ..hw_a.clone()
         };
         // Act & Assert
-        assert_ne!(hw_a, hw_b, "HwInfo with different vendor should not be equal");
+        assert_ne!(
+            hw_a, hw_b,
+            "HwInfo with different vendor should not be equal"
+        );
     }
 
     /// HwInfo equality: differing cacheline_bytes means not equal.
@@ -735,14 +1032,29 @@ mod tests {
             l2_bytes: 256 * 1024,
             l3_bytes: 4 * 1024 * 1024,
             cacheline_bytes: 64,
-            isa: IsaFeatures { avx2: true, fma: true, avx512f: false, avx512bw: false, avx512vnni: false, avx512fp16: false, avx512bf16: false, neon: false, sve: false, sve2: false, sve_vl_bytes: 0 },
+            isa: IsaFeatures {
+                avx2: true,
+                fma: true,
+                avx512f: false,
+                avx512bw: false,
+                avx512vnni: false,
+                avx512fp16: false,
+                avx512bf16: false,
+                neon: false,
+                sve: false,
+                sve2: false,
+                sve_vl_bytes: 0,
+            },
         };
         let hw_128 = HwInfo {
             cacheline_bytes: 128,
             ..hw_64.clone()
         };
         // Act & Assert
-        assert_ne!(hw_64, hw_128, "HwInfo with different cacheline should not be equal");
+        assert_ne!(
+            hw_64, hw_128,
+            "HwInfo with different cacheline should not be equal"
+        );
     }
 
     /// IsaFeatures Display: AVX-512 BF16 shown without FP16.
@@ -750,17 +1062,30 @@ mod tests {
     fn isa_features_display_avx512bf16_without_fp16() {
         // Arrange
         let isa = IsaFeatures {
-            avx2: true, fma: true,
-            avx512f: true, avx512bw: true, avx512vnni: true,
-            avx512fp16: false, avx512bf16: true,
-            neon: false, sve: false, sve2: false, sve_vl_bytes: 0,
+            avx2: true,
+            fma: true,
+            avx512f: true,
+            avx512bw: true,
+            avx512vnni: true,
+            avx512fp16: false,
+            avx512bf16: true,
+            neon: false,
+            sve: false,
+            sve2: false,
+            sve_vl_bytes: 0,
         };
         // Act
         let display = format!("{isa}");
         // Assert
         assert!(display.contains("BF16"), "BF16 should appear: {display}");
-        assert!(!display.contains("FP16"), "FP16 should not appear when fp16=false: {display}");
-        assert!(display.contains("AVX-512"), "AVX-512 should appear: {display}");
+        assert!(
+            !display.contains("FP16"),
+            "FP16 should not appear when fp16=false: {display}"
+        );
+        assert!(
+            display.contains("AVX-512"),
+            "AVX-512 should appear: {display}"
+        );
     }
 
     /// IsaFeatures Display: NEON alone (no SVE/SVE2).
@@ -768,17 +1093,30 @@ mod tests {
     fn isa_features_display_neon_only() {
         // Arrange
         let isa = IsaFeatures {
-            avx2: false, fma: false,
-            avx512f: false, avx512bw: false, avx512vnni: false,
-            avx512fp16: false, avx512bf16: false,
-            neon: true, sve: false, sve2: false, sve_vl_bytes: 0,
+            avx2: false,
+            fma: false,
+            avx512f: false,
+            avx512bw: false,
+            avx512vnni: false,
+            avx512fp16: false,
+            avx512bf16: false,
+            neon: true,
+            sve: false,
+            sve2: false,
+            sve_vl_bytes: 0,
         };
         // Act
         let display = format!("{isa}");
         // Assert
         assert!(display.contains("NEON"), "NEON should appear: {display}");
-        assert!(!display.contains("SVE"), "SVE should not appear when sve=false: {display}");
-        assert!(!display.contains("Scalar"), "Scalar should not appear when NEON present: {display}");
+        assert!(
+            !display.contains("SVE"),
+            "SVE should not appear when sve=false: {display}"
+        );
+        assert!(
+            !display.contains("Scalar"),
+            "Scalar should not appear when NEON present: {display}"
+        );
     }
 
     /// IsaFeatures Display: multiple features joined with '+' separator.
@@ -786,15 +1124,25 @@ mod tests {
     fn isa_features_display_joins_with_plus() {
         // Arrange
         let isa = IsaFeatures {
-            avx2: true, fma: true,
-            avx512f: false, avx512bw: false, avx512vnni: false,
-            avx512fp16: false, avx512bf16: false,
-            neon: false, sve: false, sve2: false, sve_vl_bytes: 0,
+            avx2: true,
+            fma: true,
+            avx512f: false,
+            avx512bw: false,
+            avx512vnni: false,
+            avx512fp16: false,
+            avx512bf16: false,
+            neon: false,
+            sve: false,
+            sve2: false,
+            sve_vl_bytes: 0,
         };
         // Act
         let display = format!("{isa}");
         // Assert
-        assert!(display.contains("AVX2+FMA"), "features should be joined with '+': {display}");
+        assert!(
+            display.contains("AVX2+FMA"),
+            "features should be joined with '+': {display}"
+        );
     }
 
     /// HwInfo fingerprint: different model names produce different fingerprints.
@@ -810,7 +1158,19 @@ mod tests {
             l2_bytes: 256 * 1024,
             l3_bytes: 8 * 1024 * 1024,
             cacheline_bytes: 64,
-            isa: IsaFeatures { avx2: true, fma: true, avx512f: false, avx512bw: false, avx512vnni: false, avx512fp16: false, avx512bf16: false, neon: false, sve: false, sve2: false, sve_vl_bytes: 0 },
+            isa: IsaFeatures {
+                avx2: true,
+                fma: true,
+                avx512f: false,
+                avx512bw: false,
+                avx512vnni: false,
+                avx512fp16: false,
+                avx512bf16: false,
+                neon: false,
+                sve: false,
+                sve2: false,
+                sve_vl_bytes: 0,
+            },
         };
         let hw_b = HwInfo {
             model_name: "CPU-Model-B".into(),
@@ -820,7 +1180,10 @@ mod tests {
         let fp_a = hw_a.fingerprint();
         let fp_b = hw_b.fingerprint();
         // Assert
-        assert_ne!(fp_a, fp_b, "fingerprints should differ for different model names");
+        assert_ne!(
+            fp_a, fp_b,
+            "fingerprints should differ for different model names"
+        );
     }
 
     /// HwInfo fingerprint: different L3 cache sizes produce different fingerprints.
@@ -836,7 +1199,19 @@ mod tests {
             l2_bytes: 256 * 1024,
             l3_bytes: 4 * 1024 * 1024,
             cacheline_bytes: 64,
-            isa: IsaFeatures { avx2: true, fma: true, avx512f: false, avx512bw: false, avx512vnni: false, avx512fp16: false, avx512bf16: false, neon: false, sve: false, sve2: false, sve_vl_bytes: 0 },
+            isa: IsaFeatures {
+                avx2: true,
+                fma: true,
+                avx512f: false,
+                avx512bw: false,
+                avx512vnni: false,
+                avx512fp16: false,
+                avx512bf16: false,
+                neon: false,
+                sve: false,
+                sve2: false,
+                sve_vl_bytes: 0,
+            },
         };
         let hw_large_l3 = HwInfo {
             l3_bytes: 32 * 1024 * 1024,
@@ -846,7 +1221,10 @@ mod tests {
         let fp_small = hw_small_l3.fingerprint();
         let fp_large = hw_large_l3.fingerprint();
         // Assert
-        assert_ne!(fp_small, fp_large, "fingerprints should differ for different L3 sizes");
+        assert_ne!(
+            fp_small, fp_large,
+            "fingerprints should differ for different L3 sizes"
+        );
     }
 
     /// HwInfo Hash: two equal instances have the same hash.
@@ -864,7 +1242,19 @@ mod tests {
             l2_bytes: 256 * 1024,
             l3_bytes: 12 * 1024 * 1024,
             cacheline_bytes: 64,
-            isa: IsaFeatures { avx2: true, fma: true, avx512f: false, avx512bw: false, avx512vnni: false, avx512fp16: false, avx512bf16: false, neon: false, sve: false, sve2: false, sve_vl_bytes: 0 },
+            isa: IsaFeatures {
+                avx2: true,
+                fma: true,
+                avx512f: false,
+                avx512bw: false,
+                avx512vnni: false,
+                avx512fp16: false,
+                avx512bf16: false,
+                neon: false,
+                sve: false,
+                sve2: false,
+                sve_vl_bytes: 0,
+            },
         };
         let hw_clone = hw.clone();
         // Act
@@ -875,6 +1265,9 @@ mod tests {
         hw_clone.hash(&mut hasher2);
         let hash2 = hasher2.finish();
         // Assert
-        assert_eq!(hash1, hash2, "equal HwInfo instances should have the same hash");
+        assert_eq!(
+            hash1, hash2,
+            "equal HwInfo instances should have the same hash"
+        );
     }
 }

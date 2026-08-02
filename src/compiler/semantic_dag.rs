@@ -4,8 +4,8 @@
 //! (from ComputePattern). This replaces the old hand-maintained OpSemantics mapping.
 
 use crate::compiler::graph::{CompilerGraph, CompilerOp, Op, OpId, TensorId};
-use crate::compiler::trace::{OpTrace, ComputePattern};
 use crate::compiler::registry::ScalarOpRegistry;
+use crate::compiler::trace::{ComputePattern, OpTrace};
 
 /// TVM-style operator classification.
 /// Auto-derived from ComputePattern — no manual mapping table needed.
@@ -36,9 +36,9 @@ impl OpClass {
         matches!(
             (self, other),
             (OpClass::ElemWise, OpClass::ElemWise)
-            | (OpClass::ElemWise, OpClass::Injective)
-            | (OpClass::Injective, OpClass::ElemWise)
-            | (OpClass::Injective, OpClass::Injective)
+                | (OpClass::ElemWise, OpClass::Injective)
+                | (OpClass::Injective, OpClass::ElemWise)
+                | (OpClass::Injective, OpClass::Injective)
         )
     }
 
@@ -119,7 +119,9 @@ impl SemanticDAG {
         let mut nodes = Vec::with_capacity(topo_order.len());
         for &op_id in &topo_order {
             // SAFETY: topological_sort only returns OpIds that exist in the graph
-            let op = graph.op(op_id).expect("SAFETY: topological_sort returned invalid OpId");
+            let op = graph
+                .op(op_id)
+                .expect("SAFETY: topological_sort returned invalid OpId");
             let key = ScalarOpRegistry::key_from_op(&op.op);
             let op_trace = registry.get_trace(&key).cloned();
             // Pattern-derived classification: trust the registered OpTrace.
@@ -191,29 +193,60 @@ impl SemanticDAG {
     /// 胖 opcode 自描述 OpClass 分类（OpKind legacy 已删除）。
     fn fallback_op_class_from_op(op: &Op) -> OpClass {
         match op {
-            Op::Silu | Op::Gelu | Op::Tanh | Op::Sigmoid | Op::Relu | Op::Exp | Op::Erf | Op::Add | Op::Mul | Op::Sub | Op::Div | Op::Pow | Op::Sqrt | Op::ScaleConst { .. }
-            | Op::Residual | Op::LogitSoftcap { .. } | Op::SwiGlu | Op::SwiGluClipped { .. }
-            | Op::GeGlu | Op::Dequantize { .. } | Op::WeightedSum { .. }
+            Op::Silu
+            | Op::Gelu
+            | Op::Tanh
+            | Op::Sigmoid
+            | Op::Relu
+            | Op::Exp
+            | Op::Erf
+            | Op::Add
+            | Op::Mul
+            | Op::Sub
+            | Op::Div
+            | Op::Pow
+            | Op::Sqrt
+            | Op::ScaleConst { .. }
+            | Op::Residual
+            | Op::LogitSoftcap { .. }
+            | Op::SwiGlu
+            | Op::SwiGluClipped { .. }
+            | Op::GeGlu
+            | Op::Dequantize { .. }
+            | Op::WeightedSum { .. }
             | Op::LearnedPos2D { .. } => OpClass::ElemWise,
-            Op::RoPE(_) | Op::DualRoPE(_) | Op::Transpose { .. } | Op::Reshape { .. }
-            | Op::SliceView { .. } | Op::Gather { .. } | Op::QuantGather { .. }
-            | Op::ColumnSlice { .. } | Op::MlaRopeMerge { .. } => OpClass::Injective,
-            Op::Softmax | Op::RmsNorm(_) | Op::LayerNorm(_) | Op::ValueNorm(_)
-            | Op::MeanPool { .. } | Op::L2Normalize { .. } | Op::QkNorm { .. }
-            | Op::HeadRmsNorm { .. } | Op::Argmax { .. } | Op::TopK { .. } => OpClass::Reduction,
-            Op::Gemm(_) | Op::GemmBias(_) | Op::QuantGemm(_) | Op::MoEGate { .. }
-            | Op::MlaKvCompress { .. } | Op::MlaQAbsorb { .. }
+            Op::RoPE(_)
+            | Op::DualRoPE(_)
+            | Op::Transpose { .. }
+            | Op::Reshape { .. }
+            | Op::SliceView { .. }
+            | Op::Gather { .. }
+            | Op::QuantGather { .. }
+            | Op::ColumnSlice { .. }
+            | Op::MlaRopeMerge { .. } => OpClass::Injective,
+            Op::Softmax
+            | Op::RmsNorm(_)
+            | Op::LayerNorm(_)
+            | Op::ValueNorm(_)
+            | Op::MeanPool { .. }
+            | Op::L2Normalize { .. }
+            | Op::QkNorm { .. }
+            | Op::HeadRmsNorm { .. }
+            | Op::Argmax { .. }
+            | Op::TopK { .. } => OpClass::Reduction,
+            Op::Gemm(_)
+            | Op::GemmBias(_)
+            | Op::QuantGemm(_)
+            | Op::MoEGate { .. }
+            | Op::MlaKvCompress { .. }
+            | Op::MlaQAbsorb { .. }
             | Op::MlaVRestore { .. } => OpClass::Gemm,
             _ => OpClass::Opaque,
         }
     }
 
-
     /// Compute arithmetic intensity and bottleneck classification.
-    fn compute_arithmetic_intensity(
-        op: &CompilerOp,
-        graph: &CompilerGraph,
-    ) -> (f32, Bottleneck) {
+    fn compute_arithmetic_intensity(op: &CompilerOp, graph: &CompilerGraph) -> (f32, Bottleneck) {
         // Total input + output bytes
         let mut total_bytes = 0usize;
         for &tid in op.inputs.iter().chain(op.outputs.iter()) {
@@ -231,11 +264,17 @@ impl SemanticDAG {
         let flops: usize = match op.op_resolved(graph) {
             Some(Op::Gemm(_)) | Some(Op::QuantGemm(_)) => {
                 let (m, n, k) = op.op_gemm_dims(graph).expect("Gemm/QuantGemm 必有 dims");
-                2 * m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model") * n * k
+                2 * m
+                    .max_for_allocation_strict()
+                    .expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model")
+                    * n
+                    * k
             }
             Some(Op::GemmBias(_)) => {
                 let (m, n, k) = op.op_gemm_dims(graph).expect("GemmBias 必有 dims");
-                let m_val = m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model");
+                let m_val = m
+                    .max_for_allocation_strict()
+                    .expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model");
                 2 * m_val * n * k + m_val * n
             }
             Some(Op::Silu) | Some(Op::Gelu) | Some(Op::Tanh) | Some(Op::Sigmoid) => {
@@ -361,7 +400,10 @@ impl CodegenHints {
             Boundness::ComputeBound
         };
         // NTA for memory-bound (streaming, no cache pollution), T0 for compute-bound
-        let prefetch_hint = match boundness { Boundness::MemoryBound => 3, _ => 0 };
+        let prefetch_hint = match boundness {
+            Boundness::MemoryBound => 3,
+            _ => 0,
+        };
         let use_nt_stores = boundness == Boundness::MemoryBound && avg_ai < 1.0;
 
         CodegenHints {
@@ -376,7 +418,11 @@ impl CodegenHints {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::graph::{CompilerGraph, KvSource, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+    use crate::compiler::graph::{
+        AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+        DualRopeSpec, GemmSpec, KvSource, MlaSpec, NormSpec, Op, QuantGemmSpec, RopeSpec,
+        SinksSpec, SymDim,
+    };
     use crate::compiler::ir::LayerIR;
     use crate::compiler::registry::ScalarOpRegistry;
     use crate::compiler::trace::{ComputePattern, QuantPrecision, TraceOp};
@@ -481,8 +527,11 @@ mod tests {
         for node in &dag.nodes {
             eprintln!(
                 "  [{:>2}] {:?} {:?} AI={:.1} {:?}",
-                node.node_id.0, node.op_class, node.bottleneck,
-                node.arithmetic_intensity, node.label
+                node.node_id.0,
+                node.op_class,
+                node.bottleneck,
+                node.arithmetic_intensity,
+                node.label
             );
         }
     }
@@ -502,7 +551,8 @@ mod tests {
             assert!(
                 node.op_trace.is_some(),
                 "Node {} ({}) missing OpTrace",
-                node.node_id.0, node.label
+                node.node_id.0,
+                node.label
             );
         }
     }
@@ -560,7 +610,13 @@ mod tests {
     fn test_cannot_reorder_reduction_with_anything() {
         // Arrange
         let reduction = OpClass::Reduction;
-        let others = [OpClass::ElemWise, OpClass::Injective, OpClass::Gemm, OpClass::Opaque, OpClass::Reduction];
+        let others = [
+            OpClass::ElemWise,
+            OpClass::Injective,
+            OpClass::Gemm,
+            OpClass::Opaque,
+            OpClass::Reduction,
+        ];
         // Act & Assert
         for other in &others {
             assert!(
@@ -575,7 +631,13 @@ mod tests {
     fn test_cannot_reorder_gemm_with_anything() {
         // Arrange
         let gemm = OpClass::Gemm;
-        let others = [OpClass::ElemWise, OpClass::Injective, OpClass::Reduction, OpClass::Gemm, OpClass::Opaque];
+        let others = [
+            OpClass::ElemWise,
+            OpClass::Injective,
+            OpClass::Reduction,
+            OpClass::Gemm,
+            OpClass::Opaque,
+        ];
         // Act & Assert
         for other in &others {
             assert!(
@@ -590,7 +652,13 @@ mod tests {
     fn test_cannot_reorder_opaque_with_anything() {
         // Arrange
         let opaque = OpClass::Opaque;
-        let others = [OpClass::ElemWise, OpClass::Injective, OpClass::Reduction, OpClass::Gemm, OpClass::Opaque];
+        let others = [
+            OpClass::ElemWise,
+            OpClass::Injective,
+            OpClass::Reduction,
+            OpClass::Gemm,
+            OpClass::Opaque,
+        ];
         // Act & Assert
         for other in &others {
             assert!(
@@ -604,7 +672,13 @@ mod tests {
     #[test]
     fn test_can_reorder_is_symmetric() {
         // Arrange
-        let classes = [OpClass::ElemWise, OpClass::Injective, OpClass::Reduction, OpClass::Gemm, OpClass::Opaque];
+        let classes = [
+            OpClass::ElemWise,
+            OpClass::Injective,
+            OpClass::Reduction,
+            OpClass::Gemm,
+            OpClass::Opaque,
+        ];
         // Act & Assert
         for a in &classes {
             for b in &classes {
@@ -612,7 +686,8 @@ mod tests {
                     a.can_reorder_with(b),
                     b.can_reorder_with(a),
                     "can_reorder_with should be symmetric for {:?} and {:?}",
-                    a, b
+                    a,
+                    b
                 );
             }
         }
@@ -717,9 +792,20 @@ mod tests {
             invoke_fallback(&Op::SwiGluClipped { limit: 7.0 }),
             OpClass::ElemWise
         );
-        assert_eq!(invoke_fallback(&Op::WeightedSum { seq_len: SymDim::Concrete(1), hidden: 4096, top_k: 8 }), OpClass::ElemWise);
         assert_eq!(
-            invoke_fallback(&Op::Dequantize { num_elements: 1024, block_size: 32, bits: 4 }),
+            invoke_fallback(&Op::WeightedSum {
+                seq_len: SymDim::Concrete(1),
+                hidden: 4096,
+                top_k: 8
+            }),
+            OpClass::ElemWise
+        );
+        assert_eq!(
+            invoke_fallback(&Op::Dequantize {
+                num_elements: 1024,
+                block_size: 32,
+                bits: 4
+            }),
             OpClass::ElemWise
         );
         assert_eq!(
@@ -727,7 +813,10 @@ mod tests {
             OpClass::ElemWise
         );
         assert_eq!(
-            invoke_fallback(&Op::LearnedPos2D { num_patches: 256, embed_dim: 1152 }),
+            invoke_fallback(&Op::LearnedPos2D {
+                num_patches: 256,
+                embed_dim: 1152
+            }),
             OpClass::ElemWise
         );
     }
@@ -736,45 +825,70 @@ mod tests {
     fn test_fallback_op_class_injective_variants() {
         // Arrange & Act & Assert
         assert_eq!(
-            invoke_fallback(&Op::RoPE(RopeSpec { num_heads: 32, head_dim: 128, theta: 10000.0, partial: 1.0, rope_scaling: None })),
+            invoke_fallback(&Op::RoPE(RopeSpec {
+                num_heads: 32,
+                head_dim: 128,
+                theta: 10000.0,
+                partial: 1.0,
+                rope_scaling: None
+            })),
             OpClass::Injective
         );
         assert_eq!(
-            invoke_fallback(&Op::Transpose { perm: vec![0, 2, 1] }),
+            invoke_fallback(&Op::Transpose {
+                perm: vec![0, 2, 1]
+            }),
             OpClass::Injective
         );
         assert_eq!(
-            invoke_fallback(&Op::Reshape { target_shape: vec![] }),
+            invoke_fallback(&Op::Reshape {
+                target_shape: vec![]
+            }),
             OpClass::Injective
         );
         assert_eq!(
-            invoke_fallback(&Op::SliceView { axis: 1, start: 0, end: 128 }),
+            invoke_fallback(&Op::SliceView {
+                axis: 1,
+                start: 0,
+                end: 128
+            }),
             OpClass::Injective
         );
         assert_eq!(
-            invoke_fallback(&Op::Gather { table_rows: 32000,
+            invoke_fallback(&Op::Gather {
+                table_rows: 32000,
                 embed_dim: 4096,
                 index_dim: SymDim::Concrete(1),
                 indices_kind: crate::compiler::graph::GatherIndicesKind::Tensor,
-                scale: None, }),
+                scale: None,
+            }),
             OpClass::Injective
         );
         assert_eq!(
-            invoke_fallback(&Op::QuantGather { quant_type: QuantType::Q8_0,
+            invoke_fallback(&Op::QuantGather {
+                quant_type: QuantType::Q8_0,
                 vocab_size: 32000,
                 hidden_dim: 4096,
                 index_dim: SymDim::Concrete(1),
-                scale: None, }),
+                scale: None,
+            }),
             OpClass::Injective
         );
         assert_eq!(
-            invoke_fallback(&Op::ColumnSlice { seq_len: SymDim::Concrete(1), input_inner: 256, start: 0, slice_dim: 128 }),
+            invoke_fallback(&Op::ColumnSlice {
+                seq_len: SymDim::Concrete(1),
+                input_inner: 256,
+                start: 0,
+                slice_dim: 128
+            }),
             OpClass::Injective
         );
         assert_eq!(
-            invoke_fallback(&Op::MlaRopeMerge { seq_len: SymDim::Concrete(1),
+            invoke_fallback(&Op::MlaRopeMerge {
+                seq_len: SymDim::Concrete(1),
                 d_c: 512,
-                d_rope: 64, }),
+                d_rope: 64,
+            }),
             OpClass::Injective
         );
     }
@@ -783,20 +897,39 @@ mod tests {
     fn test_fallback_op_class_reduction_variants() {
         // Arrange & Act & Assert
         assert_eq!(
-            invoke_fallback(&Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true })),
+            invoke_fallback(&Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true
+            })),
             OpClass::Reduction
         );
         assert_eq!(
-            invoke_fallback(&Op::LayerNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true })),
+            invoke_fallback(&Op::LayerNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true
+            })),
             OpClass::Reduction
         );
         assert_eq!(
-            invoke_fallback(&Op::ValueNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: false })),
+            invoke_fallback(&Op::ValueNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-6,
+                dtype: DType::F32,
+                has_weight: false
+            })),
             OpClass::Reduction
         );
         assert_eq!(invoke_fallback(&Op::Softmax), OpClass::Reduction);
         assert_eq!(
-            invoke_fallback(&Op::MeanPool { seq_len: 128, hidden: 768, cls_mode: false }),
+            invoke_fallback(&Op::MeanPool {
+                seq_len: 128,
+                hidden: 768,
+                cls_mode: false
+            }),
             OpClass::Reduction
         );
         assert_eq!(
@@ -804,11 +937,18 @@ mod tests {
             OpClass::Reduction
         );
         assert_eq!(
-            invoke_fallback(&Op::QkNorm { head_dim: 128, eps: 1e-6 }),
+            invoke_fallback(&Op::QkNorm {
+                head_dim: 128,
+                eps: 1e-6
+            }),
             OpClass::Reduction
         );
         assert_eq!(
-            invoke_fallback(&Op::HeadRmsNorm { head_dim: 128, eps: 1e-6, dtype: DType::F32 }),
+            invoke_fallback(&Op::HeadRmsNorm {
+                head_dim: 128,
+                eps: 1e-6,
+                dtype: DType::F32
+            }),
             OpClass::Reduction
         );
         assert_eq!(
@@ -816,7 +956,11 @@ mod tests {
             OpClass::Reduction
         );
         assert_eq!(
-            invoke_fallback(&Op::TopK { seq_len: SymDim::Concrete(1), num_experts: 64, top_k: 8 }),
+            invoke_fallback(&Op::TopK {
+                seq_len: SymDim::Concrete(1),
+                num_experts: 64,
+                top_k: 8
+            }),
             OpClass::Reduction
         );
     }
@@ -825,38 +969,60 @@ mod tests {
     fn test_fallback_op_class_gemm_variants() {
         // Arrange & Act & Assert
         assert_eq!(
-            invoke_fallback(&Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false })),
+            invoke_fallback(&Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false
+            })),
             OpClass::Gemm
         );
         assert_eq!(
-            invoke_fallback(&Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: true })),
+            invoke_fallback(&Op::GemmBias(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: true
+            })),
             OpClass::Gemm
         );
         assert_eq!(
-            invoke_fallback(&Op::MoEGate { seq_len: SymDim::Concrete(1),
+            invoke_fallback(&Op::MoEGate {
+                seq_len: SymDim::Concrete(1),
                 num_experts: 64,
                 hidden: 4096,
-                top_k: 8, }),
+                top_k: 8,
+            }),
             OpClass::Gemm
         );
         assert_eq!(
-            invoke_fallback(&Op::MlaKvCompress { m: SymDim::Concrete(1),
+            invoke_fallback(&Op::MlaKvCompress {
+                m: SymDim::Concrete(1),
                 d_c: 512,
-                hidden: 4096, }),
+                hidden: 4096,
+            }),
             OpClass::Gemm
         );
         assert_eq!(
-            invoke_fallback(&Op::MlaQAbsorb { seq_len: SymDim::Concrete(1),
+            invoke_fallback(&Op::MlaQAbsorb {
+                seq_len: SymDim::Concrete(1),
                 num_heads: 32,
                 head_dim: 128,
-                d_c: 512, }),
+                d_c: 512,
+            }),
             OpClass::Gemm
         );
         assert_eq!(
-            invoke_fallback(&Op::MlaVRestore { seq_len: SymDim::Concrete(1),
+            invoke_fallback(&Op::MlaVRestore {
+                seq_len: SymDim::Concrete(1),
                 num_heads: 32,
                 head_dim: 128,
-                d_c: 512, }),
+                d_c: 512,
+            }),
             OpClass::Gemm
         );
     }
@@ -865,15 +1031,48 @@ mod tests {
     fn test_fallback_op_class_opaque_variants() {
         // Arrange & Act & Assert — key opaque OpKinds
         assert_eq!(
-            invoke_fallback(&Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 8, head_dim: 128 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(128), kv_cache_layer: 0, kv_write: false  })),
+            invoke_fallback(&Op::MultiHeadAttention(AttentionSpec {
+                geometry: AttentionGeometry {
+                    num_q_heads: 32,
+                    num_kv_heads: 8,
+                    head_dim: 128
+                },
+                mask: if true {
+                    AttentionMask::Causal
+                } else {
+                    AttentionMask::Full
+                },
+                kv_source: KvSource::FromTensor,
+                sinks: if false {
+                    SinksSpec::Learnable
+                } else {
+                    SinksSpec::None
+                },
+                seq_len: SymDim::Concrete(128),
+                kv_cache_layer: 0,
+                kv_write: false
+            })),
             OpClass::Opaque
         );
         assert_eq!(
-            invoke_fallback(&Op::CachedGqa(CachedGqaSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 8, head_dim: 128 }, mask: AttentionMask::Causal, kv_source: KvSource::FromTensor, seq_len: SymDim::Concrete(128), total_seq: 256, kv_dtype: DType::F32, strategy: crate::compiler::graph::AttentionStrategy::Naive })),
+            invoke_fallback(&Op::CachedGqa(CachedGqaSpec {
+                geometry: AttentionGeometry {
+                    num_q_heads: 32,
+                    num_kv_heads: 8,
+                    head_dim: 128
+                },
+                mask: AttentionMask::Causal,
+                kv_source: KvSource::FromTensor,
+                seq_len: SymDim::Concrete(128),
+                total_seq: 256,
+                kv_dtype: DType::F32,
+                strategy: crate::compiler::graph::AttentionStrategy::Naive
+            })),
             OpClass::Opaque
         );
         assert_eq!(
-            invoke_fallback(&Op::KvScatterWrite { seq_len: 128,
+            invoke_fallback(&Op::KvScatterWrite {
+                seq_len: 128,
                 num_kv_heads: 8,
                 head_dim: 128,
                 kv_dim: 1024,
@@ -881,53 +1080,65 @@ mod tests {
                 layer_offset: 0,
                 half_offset: 0,
                 head_stride: 0,
-                dtype_size: 4, }),
+                dtype_size: 4,
+            }),
             OpClass::Opaque
         );
         assert_eq!(
-            invoke_fallback(&Op::PatchEmbed { patch_size: 14, in_channels: 3, embed_dim: 1152, image_size: 224 }),
+            invoke_fallback(&Op::PatchEmbed {
+                patch_size: 14,
+                in_channels: 3,
+                embed_dim: 1152,
+                image_size: 224
+            }),
             OpClass::Opaque
         );
         assert_eq!(
-            invoke_fallback(&Op::DepthwiseConv1D { channels: 512, kernel_size: 7, causal: true }),
+            invoke_fallback(&Op::DepthwiseConv1D {
+                channels: 512,
+                kernel_size: 7,
+                causal: true
+            }),
             OpClass::Opaque
         );
         assert_eq!(
-            invoke_fallback(&Op::MoERouter { num_experts: 64,
+            invoke_fallback(&Op::MoERouter {
+                num_experts: 64,
                 top_k: 8,
                 hidden: 4096,
-                seq_len: SymDim::Concrete(1), }),
+                seq_len: SymDim::Concrete(1),
+            }),
             OpClass::Opaque
         );
         assert_eq!(
-            invoke_fallback(&Op::QTapSTG { sink_ptr: 0,
+            invoke_fallback(&Op::QTapSTG {
+                sink_ptr: 0,
                 step_index_ptr: 0,
                 dtype: DType::F32,
                 q_dim: SymDim::Concrete(4096),
                 position: crate::compiler::graph::QTapPosition::LastToken,
-                num_slots: 4, }),
+                num_slots: 4,
+            }),
+            OpClass::Opaque
+        );
+        assert_eq!(invoke_fallback(&Op::StoreToken), OpClass::Opaque);
+        assert_eq!(invoke_fallback(&Op::CheckStopCondition), OpClass::Opaque);
+        assert_eq!(
+            invoke_fallback(&Op::WriteLogits {
+                target_indices: vec![]
+            }),
             OpClass::Opaque
         );
         assert_eq!(
-            invoke_fallback(&Op::StoreToken),
-            OpClass::Opaque
-        );
-        assert_eq!(
-            invoke_fallback(&Op::CheckStopCondition),
-            OpClass::Opaque
-        );
-        assert_eq!(
-            invoke_fallback(&Op::WriteLogits { target_indices: vec![] }),
-            OpClass::Opaque
-        );
-        assert_eq!(
-            invoke_fallback(&Op::MlaAttention(MlaSpec { seq_len: SymDim::Concrete(128),
+            invoke_fallback(&Op::MlaAttention(MlaSpec {
+                seq_len: SymDim::Concrete(128),
                 num_heads: 32,
                 head_dim: 128,
                 d_c: 512,
                 d_rope: 64,
                 causal: true,
-                kv_source: KvSource::FromTensor })),
+                kv_source: KvSource::FromTensor
+            })),
             OpClass::Opaque
         );
     }
@@ -992,7 +1203,15 @@ mod tests {
         let a = graph.add_tensor_concrete("A", &[4, 8], DType::F32);
         let b = graph.add_tensor_concrete("B", &[8, 16], DType::F32);
         let c = graph.add_tensor_concrete("C", &[4, 16], DType::F32);
-        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(4), n: 16, k: 8, dtype: DType::F32, trans_b: false, has_bias: false }),
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(4),
+                n: 16,
+                k: 8,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, b],
             vec![c],
             "gemm",
@@ -1020,7 +1239,13 @@ mod tests {
         let weight = graph.add_tensor_concrete("w", &[32], DType::F32);
         let normed = graph.add_tensor_concrete("normed", &[4, 32], DType::F32);
         let activated = graph.add_tensor_concrete("activated", &[4, 32], DType::F32);
-        graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }),
+        graph.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
             vec![input, weight],
             vec![normed],
             "rms_norm",
@@ -1036,7 +1261,11 @@ mod tests {
         assert_eq!(dag.nodes[0].op_class, OpClass::Reduction);
         assert_eq!(dag.nodes[1].op_class, OpClass::ElemWise);
         // The intermediate tensor (normed) has exactly 1 consumer
-        let normed_edge = dag.edges.iter().find(|e| e.tensor_id == normed).expect("normed edge");
+        let normed_edge = dag
+            .edges
+            .iter()
+            .find(|e| e.tensor_id == normed)
+            .expect("normed edge");
         assert_eq!(normed_edge.num_consumers, 1);
         assert!(normed_edge.can_register_pass);
     }
@@ -1119,7 +1348,13 @@ mod tests {
         let input = graph.add_tensor_concrete("img", &[3, 224, 224], DType::F32);
         let weight = graph.add_tensor_concrete("patch_w", &[1152, 3 * 14 * 14], DType::F32);
         let output = graph.add_tensor_concrete("patches", &[256, 1152], DType::F32);
-        graph.add_op(Op::PatchEmbed { patch_size: 14, embed_dim: 1152, in_channels: 3, image_size: 224 },
+        graph.add_op(
+            Op::PatchEmbed {
+                patch_size: 14,
+                embed_dim: 1152,
+                in_channels: 3,
+                image_size: 224,
+            },
             vec![input, weight],
             vec![output],
             "patch_embed",
@@ -1129,7 +1364,11 @@ mod tests {
         let dag = SemanticDAG::from_graph(&graph, &registry);
         // Assert
         let node = dag.node(OpId(0)).expect("node should exist");
-        assert_eq!(node.op_class, OpClass::Opaque, "PatchEmbed must be forced Opaque");
+        assert_eq!(
+            node.op_class,
+            OpClass::Opaque,
+            "PatchEmbed must be forced Opaque"
+        );
     }
 
     #[test]
@@ -1139,7 +1378,12 @@ mod tests {
         let input = graph.add_tensor_concrete("audio", &[128, 512], DType::F32);
         let weight = graph.add_tensor_concrete("dw_w", &[512, 7], DType::F32);
         let output = graph.add_tensor_concrete("conv_out", &[128, 512], DType::F32);
-        graph.add_op(Op::DepthwiseConv1D { channels: 512, kernel_size: 7, causal: false },
+        graph.add_op(
+            Op::DepthwiseConv1D {
+                channels: 512,
+                kernel_size: 7,
+                causal: false,
+            },
             vec![input, weight],
             vec![output],
             "dw_conv",
@@ -1149,7 +1393,11 @@ mod tests {
         let dag = SemanticDAG::from_graph(&graph, &registry);
         // Assert
         let node = dag.node(OpId(0)).expect("node should exist");
-        assert_eq!(node.op_class, OpClass::Opaque, "DepthwiseConv1D must be forced Opaque");
+        assert_eq!(
+            node.op_class,
+            OpClass::Opaque,
+            "DepthwiseConv1D must be forced Opaque"
+        );
     }
 
     // ── TensorEdge: multi-consumer tensor ──
@@ -1167,10 +1415,17 @@ mod tests {
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&graph, &registry);
         // Act
-        let shared_edge = dag.edges.iter().find(|e| e.tensor_id == shared).expect("shared edge");
+        let shared_edge = dag
+            .edges
+            .iter()
+            .find(|e| e.tensor_id == shared)
+            .expect("shared edge");
         // Assert
         assert_eq!(shared_edge.num_consumers, 2);
-        assert!(!shared_edge.can_register_pass, "multi-consumer tensor should not be register-passable");
+        assert!(
+            !shared_edge.can_register_pass,
+            "multi-consumer tensor should not be register-passable"
+        );
     }
 
     #[test]
@@ -1185,7 +1440,11 @@ mod tests {
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&graph, &registry);
         // Act
-        let input_edge = dag.edges.iter().find(|e| e.tensor_id == input).expect("input edge");
+        let input_edge = dag
+            .edges
+            .iter()
+            .find(|e| e.tensor_id == input)
+            .expect("input edge");
         // Assert
         assert_eq!(input_edge.num_consumers, 1);
         // Graph input tensor uses declared dtype (F32), not accumulator F32
@@ -1201,7 +1460,15 @@ mod tests {
         let a = graph.add_tensor_concrete("A", &[1, 4], DType::F32);
         let b = graph.add_tensor_concrete("B", &[4, 4], DType::F32);
         let c = graph.add_tensor_concrete("C", &[1, 4], DType::F32);
-        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 4,
+                k: 4,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, b],
             vec![c],
             "tiny_gemm",
@@ -1224,7 +1491,15 @@ mod tests {
         let a = graph.add_tensor_concrete("A", &[512, 512], DType::F32);
         let b = graph.add_tensor_concrete("B", &[512, 1024], DType::F32);
         let c = graph.add_tensor_concrete("C", &[512, 1024], DType::F32);
-        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(512),
+                n: 1024,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, b],
             vec![c],
             "large_gemm",
@@ -1267,7 +1542,15 @@ mod tests {
         let a = graph.add_tensor_concrete("A", &[16, 128], DType::F32);
         let b = graph.add_tensor_concrete("B", &[128, 64], DType::F32);
         let c = graph.add_tensor_concrete("C", &[16, 64], DType::F32);
-        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(16), n: 64, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }),
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(16),
+                n: 64,
+                k: 128,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, b],
             vec![c],
             "medium_gemm",
@@ -1317,7 +1600,15 @@ mod tests {
         let a = graph.add_tensor_concrete("A", &[512, 512], DType::F32);
         let b = graph.add_tensor_concrete("B", &[512, 1024], DType::F32);
         let c = graph.add_tensor_concrete("C", &[512, 1024], DType::F32);
-        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(512),
+                n: 1024,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, b],
             vec![c],
             "gemm",
@@ -1329,7 +1620,10 @@ mod tests {
         // Assert
         assert!(hints.boundness != Boundness::MemoryBound);
         assert!(hints.arithmetic_intensity > 8.0);
-        assert_eq!(hints.prefetch_hint, 0, "compute-bound should use T0 prefetch");
+        assert_eq!(
+            hints.prefetch_hint, 0,
+            "compute-bound should use T0 prefetch"
+        );
         assert!(!hints.use_nt_stores);
     }
 
@@ -1348,8 +1642,15 @@ mod tests {
         // Act
         let hints = CodegenHints::from_semantic_dag(&dag);
         // Assert
-        assert_eq!(hints.boundness, Boundness::MemoryBound, "all memory-bound ops should make DAG memory-bound");
-        assert_eq!(hints.prefetch_hint, 3, "memory-bound should use NTA prefetch");
+        assert_eq!(
+            hints.boundness,
+            Boundness::MemoryBound,
+            "all memory-bound ops should make DAG memory-bound"
+        );
+        assert_eq!(
+            hints.prefetch_hint, 3,
+            "memory-bound should use NTA prefetch"
+        );
     }
 
     #[test]
@@ -1457,7 +1758,11 @@ mod tests {
         // Assert
         assert_eq!(dag.num_nodes(), 3);
         // input tensor has 2 consumers
-        let input_edge = dag.edges.iter().find(|e| e.tensor_id == input).expect("input edge");
+        let input_edge = dag
+            .edges
+            .iter()
+            .find(|e| e.tensor_id == input)
+            .expect("input edge");
         assert_eq!(input_edge.num_consumers, 2);
         assert!(!input_edge.can_register_pass);
         // merge is the last in topo order
@@ -1474,7 +1779,13 @@ mod tests {
         let a = graph.add_tensor_concrete("A", &[16, 128], DType::F32);
         let b = graph.add_tensor_concrete("B", &[128, 64], DType::F32);
         let c = graph.add_tensor_concrete("C", &[16, 64], DType::F32);
-        graph.add_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(16), n: 64, k: 128, quant_type: QuantType::Q4_0 }),
+        graph.add_op(
+            Op::QuantGemm(QuantGemmSpec {
+                m: SymDim::Concrete(16),
+                n: 64,
+                k: 128,
+                quant_type: QuantType::Q4_0,
+            }),
             vec![a, b],
             vec![c],
             "qgemm",
@@ -1502,7 +1813,15 @@ mod tests {
         let b = graph.add_tensor_concrete("B", &[k, n], DType::F32);
         let bias = graph.add_tensor_concrete("bias", &[n], DType::F32);
         let c = graph.add_tensor_concrete("C", &[m, n], DType::F32);
-        graph.add_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: true }),
+        graph.add_op(
+            Op::GemmBias(GemmSpec {
+                m: SymDim::Concrete(m),
+                n: n,
+                k: k,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: true,
+            }),
             vec![a, b, bias],
             vec![c],
             "gemm_bias",
@@ -1516,7 +1835,11 @@ mod tests {
         // bytes = (4*32 + 32*16 + 16 + 4*16)*4 = (128+512+16+64)*4 = 2880
         // AI = 4160/2880 ≈ 1.44
         assert_eq!(node.op_class, OpClass::Gemm);
-        assert!(node.arithmetic_intensity > 0.0, "AI should be positive, got {}", node.arithmetic_intensity);
+        assert!(
+            node.arithmetic_intensity > 0.0,
+            "AI should be positive, got {}",
+            node.arithmetic_intensity
+        );
     }
 
     // ── Op trace present when registered, absent when not ──
@@ -1543,7 +1866,7 @@ mod tests {
         let tout = graph.add_tensor_concrete("out", &[4], DType::F32);
         graph.add_op(Op::Silu, vec![tin], vec![tout], "silu");
         let registry = ScalarOpRegistry::new(); // empty registry
-        // Act
+                                                // Act
         let dag = SemanticDAG::from_graph(&graph, &registry);
         // Assert: fallback classification should still produce correct OpClass
         assert!(dag.nodes[0].op_trace.is_none());
@@ -1565,10 +1888,20 @@ mod tests {
     #[test]
     fn test_op_class_variants_distinct() {
         // Arrange & Act & Assert
-        let variants = [OpClass::ElemWise, OpClass::Injective, OpClass::Reduction, OpClass::Gemm, OpClass::Opaque];
+        let variants = [
+            OpClass::ElemWise,
+            OpClass::Injective,
+            OpClass::Reduction,
+            OpClass::Gemm,
+            OpClass::Opaque,
+        ];
         for i in 0..variants.len() {
             for j in (i + 1)..variants.len() {
-                assert_ne!(variants[i], variants[j], "{:?} should differ from {:?}", variants[i], variants[j]);
+                assert_ne!(
+                    variants[i], variants[j],
+                    "{:?} should differ from {:?}",
+                    variants[i], variants[j]
+                );
             }
         }
     }
@@ -1582,7 +1915,13 @@ mod tests {
         let input = graph.add_tensor_concrete("x", &[2, 4], DType::F32);
         let weight = graph.add_tensor_concrete("w", &[4], DType::F32);
         let output = graph.add_tensor_concrete("y", &[2, 4], DType::F32);
-        let op_id = graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }),
+        let op_id = graph.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-6,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
             vec![input, weight],
             vec![output],
             "norm",
@@ -1594,7 +1933,15 @@ mod tests {
         let node = dag.node(op_id).expect("node should exist");
         // Assert
         assert_eq!(node.node_id, op_id);
-        assert_eq!(node.op, Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }));
+        assert_eq!(
+            node.op,
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-6,
+                dtype: DType::F32,
+                has_weight: true
+            })
+        );
         assert_eq!(node.op_class, OpClass::Reduction);
         assert_eq!(node.inputs, vec![input, weight]);
         assert_eq!(node.outputs, vec![output]);
@@ -1621,7 +1968,15 @@ mod tests {
 
         graph.add_op(Op::Silu, vec![x], vec![y], "silu");
         graph.add_op(Op::Tanh, vec![y], vec![z], "tanh");
-        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(512),
+                n: 1024,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, b],
             vec![c],
             "gemm",
@@ -1632,7 +1987,11 @@ mod tests {
         // Act
         let hints = CodegenHints::from_semantic_dag(&dag);
         // Assert: 2 memory ops out of 3 → 2 > 3/2 = 1 → memory_bound
-        assert_eq!(hints.boundness, Boundness::MemoryBound, "2 of 3 memory-bound should make DAG memory-bound");
+        assert_eq!(
+            hints.boundness,
+            Boundness::MemoryBound,
+            "2 of 3 memory-bound should make DAG memory-bound"
+        );
     }
 
     #[test]
@@ -1647,7 +2006,15 @@ mod tests {
         let a1 = graph.add_tensor_concrete("A1", &[512, 512], DType::F32);
         let b1 = graph.add_tensor_concrete("B1", &[512, 1024], DType::F32);
         let c1 = graph.add_tensor_concrete("C1", &[512, 1024], DType::F32);
-        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(512),
+                n: 1024,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a1, b1],
             vec![c1],
             "gemm1",
@@ -1656,7 +2023,15 @@ mod tests {
         let a2 = graph.add_tensor_concrete("A2", &[512, 512], DType::F32);
         let b2 = graph.add_tensor_concrete("B2", &[512, 1024], DType::F32);
         let c2 = graph.add_tensor_concrete("C2", &[512, 1024], DType::F32);
-        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(512),
+                n: 1024,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a2, b2],
             vec![c2],
             "gemm2",
@@ -1667,7 +2042,10 @@ mod tests {
         // Act
         let hints = CodegenHints::from_semantic_dag(&dag);
         // Assert: 1 memory out of 3 → 1 ≤ 3/2 = 1 → NOT memory_bound
-        assert!(hints.boundness != Boundness::MemoryBound, "1 of 3 memory-bound should NOT make DAG memory-bound");
+        assert!(
+            hints.boundness != Boundness::MemoryBound,
+            "1 of 3 memory-bound should NOT make DAG memory-bound"
+        );
     }
 
     // ── RmsNorm flops model (5 flops/elem) ──
@@ -1681,7 +2059,13 @@ mod tests {
         let input = graph.add_tensor_concrete("x", &[2, 32], DType::F32);
         let weight = graph.add_tensor_concrete("w", &[32], DType::F32);
         let output = graph.add_tensor_concrete("y", &[2, 32], DType::F32);
-        graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }),
+        graph.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
             vec![input, weight],
             vec![output],
             "rms_norm",
@@ -1695,7 +2079,8 @@ mod tests {
         assert!(
             (node.arithmetic_intensity - expected_ai).abs() < 0.01,
             "AI should be ~{}, got {}",
-            expected_ai, node.arithmetic_intensity,
+            expected_ai,
+            node.arithmetic_intensity,
         );
         assert_eq!(node.bottleneck, Bottleneck::Memory);
     }
@@ -1734,8 +2119,15 @@ mod tests {
         let hints = CodegenHints::from_semantic_dag(&dag);
         // Assert
         assert_eq!(hints.boundness, Boundness::MemoryBound);
-        assert!(hints.arithmetic_intensity < 1.0, "AI should be < 1.0, got {}", hints.arithmetic_intensity);
-        assert!(hints.use_nt_stores, "use_nt_stores should be true when memory_bound and avg AI < 1.0");
+        assert!(
+            hints.arithmetic_intensity < 1.0,
+            "AI should be < 1.0, got {}",
+            hints.arithmetic_intensity
+        );
+        assert!(
+            hints.use_nt_stores,
+            "use_nt_stores should be true when memory_bound and avg AI < 1.0"
+        );
     }
 
     // ── CodegenHints: mixed DAG produces NTA prefetch but no nt_stores ──
@@ -1783,7 +2175,8 @@ mod tests {
         assert!(
             (node.arithmetic_intensity - expected_ai).abs() < 0.01,
             "Gelu AI should be ~{}, got {}",
-            expected_ai, node.arithmetic_intensity,
+            expected_ai,
+            node.arithmetic_intensity,
         );
         assert_eq!(node.bottleneck, Bottleneck::Memory);
     }
@@ -1810,7 +2203,8 @@ mod tests {
         assert!(
             (node.arithmetic_intensity - expected_ai).abs() < 0.01,
             "Residual AI should be ~{}, got {}",
-            expected_ai, node.arithmetic_intensity,
+            expected_ai,
+            node.arithmetic_intensity,
         );
     }
 
@@ -1853,8 +2247,16 @@ mod tests {
         // Act
         let dag = SemanticDAG::from_graph(&graph, &registry);
         // Assert
-        let input_edge = dag.edges.iter().find(|e| e.tensor_id == input).expect("input edge");
-        let output_edge = dag.edges.iter().find(|e| e.tensor_id == output).expect("output edge");
+        let input_edge = dag
+            .edges
+            .iter()
+            .find(|e| e.tensor_id == input)
+            .expect("input edge");
+        let output_edge = dag
+            .edges
+            .iter()
+            .find(|e| e.tensor_id == output)
+            .expect("output edge");
         assert_eq!(input_edge.data_bytes, 8 * 16 * 4);
         assert_eq!(output_edge.data_bytes, 8 * 16 * 4);
     }
@@ -1894,15 +2296,53 @@ mod tests {
     #[test]
     fn test_fallback_op_class_business_config_ops() {
         // Arrange & Act & Assert -- side-effect / control ops all map to Opaque
-        assert_eq!(invoke_fallback(&Op::WriteLogits { target_indices: vec![0, 2] }), OpClass::Opaque);
-        assert_eq!(invoke_fallback(&Op::EarlyExit { anchor_layer: 16 }), OpClass::Opaque);
-        assert_eq!(invoke_fallback(&Op::GuardrailCheck { probe_offset: 0 }), OpClass::Opaque);
-        assert_eq!(invoke_fallback(&Op::SgInject { knowledge_offset: 0, dim: 4096 }), OpClass::Opaque);
-        assert_eq!(invoke_fallback(&Op::SgDetect { detect_offset: 0, hidden_dim: 0 }), OpClass::Opaque);
-        assert_eq!(invoke_fallback(&Op::CotStepCheck { shared_mem_offset: 0 }), OpClass::Opaque);
+        assert_eq!(
+            invoke_fallback(&Op::WriteLogits {
+                target_indices: vec![0, 2]
+            }),
+            OpClass::Opaque
+        );
+        assert_eq!(
+            invoke_fallback(&Op::EarlyExit { anchor_layer: 16 }),
+            OpClass::Opaque
+        );
+        assert_eq!(
+            invoke_fallback(&Op::GuardrailCheck { probe_offset: 0 }),
+            OpClass::Opaque
+        );
+        assert_eq!(
+            invoke_fallback(&Op::SgInject {
+                knowledge_offset: 0,
+                dim: 4096
+            }),
+            OpClass::Opaque
+        );
+        assert_eq!(
+            invoke_fallback(&Op::SgDetect {
+                detect_offset: 0,
+                hidden_dim: 0
+            }),
+            OpClass::Opaque
+        );
+        assert_eq!(
+            invoke_fallback(&Op::CotStepCheck {
+                shared_mem_offset: 0
+            }),
+            OpClass::Opaque
+        );
         assert_eq!(invoke_fallback(&Op::SessionKvRestore), OpClass::Opaque);
-        assert_eq!(invoke_fallback(&Op::MmHiddenInject { hidden_dim: 4096 }), OpClass::Opaque);
-        assert_eq!(invoke_fallback(&Op::MtpDraft { depth: 4, hidden_size: 4096, vocab_size: 32000 }), OpClass::Opaque);
+        assert_eq!(
+            invoke_fallback(&Op::MmHiddenInject { hidden_dim: 4096 }),
+            OpClass::Opaque
+        );
+        assert_eq!(
+            invoke_fallback(&Op::MtpDraft {
+                depth: 4,
+                hidden_size: 4096,
+                vocab_size: 32000
+            }),
+            OpClass::Opaque
+        );
     }
 
     // ── can_register_pass heuristic: single consumer ──
@@ -1920,7 +2360,11 @@ mod tests {
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&graph, &registry);
         // Act
-        let mid_edge = dag.edges.iter().find(|e| e.tensor_id == b).expect("mid edge");
+        let mid_edge = dag
+            .edges
+            .iter()
+            .find(|e| e.tensor_id == b)
+            .expect("mid edge");
         // Assert: single consumer -> register pass eligible
         assert_eq!(mid_edge.num_consumers, 1);
         assert!(mid_edge.can_register_pass);
@@ -1931,11 +2375,7 @@ mod tests {
     #[test]
     fn test_num_nodes_consistent_with_vec_len() {
         // Arrange: build a graph with varying numbers of ops
-        let cases: Vec<Vec<Op>> = vec![
-            vec![],
-            vec![Op::Silu],
-            vec![Op::Silu, Op::Gelu, Op::Tanh],
-        ];
+        let cases: Vec<Vec<Op>> = vec![vec![], vec![Op::Silu], vec![Op::Silu, Op::Gelu, Op::Tanh]];
         for ops in cases {
             let mut graph = CompilerGraph::new();
             let mut prev = None;
@@ -1953,8 +2393,12 @@ mod tests {
             let registry = ScalarOpRegistry::new();
             let dag = SemanticDAG::from_graph(&graph, &registry);
             // Assert
-            assert_eq!(dag.num_nodes(), dag.nodes.len(),
-                "num_nodes() should equal nodes.len() for {} ops", ops.len());
+            assert_eq!(
+                dag.num_nodes(),
+                dag.nodes.len(),
+                "num_nodes() should equal nodes.len() for {} ops",
+                ops.len()
+            );
         }
     }
 }

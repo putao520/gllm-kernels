@@ -3,8 +3,8 @@
 //! 支持 Mega-Kernel 架构的全域热修补机制（§9.2）。
 //! 允许在运行时原子覆写 JIT 生成代码中的 JMP 指令，实现零停机的拓扑重构。
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use crate::types::CompilerError;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 可热修补的跳转点
 #[derive(Debug)]
@@ -92,7 +92,13 @@ impl HotPatchRegistry {
             let page_size = 4096;
             let page_addr = (jmp_addr as usize & !(page_size - 1)) as *mut winapi::ctypes::c_void;
             let mut old_protect = 0u32;
-            if VirtualProtect(page_addr, page_size, PAGE_EXECUTE_READWRITE, &mut old_protect) == 0 {
+            if VirtualProtect(
+                page_addr,
+                page_size,
+                PAGE_EXECUTE_READWRITE,
+                &mut old_protect,
+            ) == 0
+            {
                 return Err("VirtualProtect failed".to_string().into());
             }
         }
@@ -128,12 +134,16 @@ impl HotPatchRegistry {
 
     /// 获取当前跳转目标
     pub fn get_target(&self, patch_id: usize) -> Option<u64> {
-        self.patches.get(patch_id).map(|p| p.target.load(Ordering::Acquire))
+        self.patches
+            .get(patch_id)
+            .map(|p| p.target.load(Ordering::Acquire))
     }
 
     /// 获取可选目标列表
     pub fn get_alternatives(&self, patch_id: usize) -> Option<&[u64]> {
-        self.patches.get(patch_id).map(|p| p.alternatives.as_slice())
+        self.patches
+            .get(patch_id)
+            .map(|p| p.alternatives.as_slice())
     }
 
     /// 获取注册的跳转点数量
@@ -349,7 +359,10 @@ mod tests {
         let result = unsafe { registry.patch(0, 0x2000) };
 
         // Assert
-        assert!(result.is_err(), "should fail: only 1 byte available, need 5");
+        assert!(
+            result.is_err(),
+            "should fail: only 1 byte available, need 5"
+        );
     }
 
     #[test]
@@ -418,8 +431,10 @@ mod tests {
         let debug = format!("{:?}", pj);
         assert!(debug.contains("7"), "should contain offset");
         // alternatives should appear in debug output
-        assert!(debug.contains("DEAD") || debug.contains("dead") || debug.contains("57005"),
-            "debug should reference alternatives");
+        assert!(
+            debug.contains("DEAD") || debug.contains("dead") || debug.contains("57005"),
+            "debug should reference alternatives"
+        );
     }
 
     #[test]

@@ -364,7 +364,10 @@ impl<'a> RegAllocator<'a> {
         // 这确保循环变量不会被分配到和 body 内 VReg 相同的物理寄存器
         let mut loop_stack: Vec<(VRegId, Vec<VRegId>)> = Vec::new(); // (counter, offsets)
         for (i, instr) in program.instrs.iter().enumerate() {
-            if let VmInstr::LoopBegin { counter, offsets, .. } = instr {
+            if let VmInstr::LoopBegin {
+                counter, offsets, ..
+            } = instr
+            {
                 loop_stack.push((*counter, offsets.iter().map(|offset| offset.vreg).collect()));
             }
             if matches!(instr, VmInstr::LoopEnd) {
@@ -1889,15 +1892,17 @@ impl<'a> RegAllocator<'a> {
         //   - If zero violations → root-cause NOT in spill layout; look at const_pool
         //     layout (方案③方向) or native-call clobber instead.
         // @trace REQ-LC-012 [req:post_alloc_verify] diagnostic spill layout verification gate
-        if std::env::var("GLLM_VERIFY_SPILL").map(|v| !v.is_empty() && v != "0").unwrap_or(false) {
+        if std::env::var("GLLM_VERIFY_SPILL")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+        {
             // spill_base_off: callee_save_area is the x86 spill base (after callee-saved
             // pushes). The full rbp_off includes ABI arg slots (48B on x86), but for
             // diagnostic overlap detection the relative offset is what matters.
             let callee_save_area = alloc.callee_saved_used.len() * 8;
             let spill_base_off = -(callee_save_area as i32);
-            let violations = Self::verify_spill_layout_diagnostic(
-                &alloc.spills, &sorted, spill_base_off,
-            );
+            let violations =
+                Self::verify_spill_layout_diagnostic(&alloc.spills, &sorted, spill_base_off);
             eprintln!(
                 "[GLLM_VERIFY_SPILL] Dimension B: {} spill-layout violations (spills={}, intervals={})",
                 violations.len(), alloc.spills.len(), sorted.len(),
@@ -1907,11 +1912,16 @@ impl<'a> RegAllocator<'a> {
             }
             if !violations.is_empty() {
                 if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true).append(true)
+                    .create(true)
+                    .append(true)
                     .open("/tmp/gllm_regalloc.log")
                 {
                     use std::io::Write;
-                    let _ = writeln!(f, "\n=== SPILL-OVERLAP (Dimension B, {} violations) ===", violations.len());
+                    let _ = writeln!(
+                        f,
+                        "\n=== SPILL-OVERLAP (Dimension B, {} violations) ===",
+                        violations.len()
+                    );
                     for v in &violations {
                         let _ = writeln!(f, "  {v}");
                     }
@@ -2524,9 +2534,9 @@ fn validate_spill_is_pure_write_arithb(instr: &VmInstr, vreg: VRegId) -> bool {
 fn validate_spill_is_pure_write_controla(instr: &VmInstr, vreg: VRegId) -> bool {
     // Control cluster a (1 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
     match instr {
-        VmInstr::LoopBegin { counter, offsets, .. } => {
-            *counter == vreg || offsets.iter().any(|offset| offset.vreg == vreg)
-        },
+        VmInstr::LoopBegin {
+            counter, offsets, ..
+        } => *counter == vreg || offsets.iter().any(|offset| offset.vreg == vreg),
         _ => false,
     }
 }
@@ -3544,7 +3554,10 @@ mod tests {
         let vec1 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::LoopBegin {
             counter,
-            offsets: vec![LoopOffset { vreg: byte_off, stride: LoopStride::FixedBytes(4) }],
+            offsets: vec![LoopOffset {
+                vreg: byte_off,
+                stride: LoopStride::FixedBytes(4),
+            }],
             bound: BoundExpr::Const(10),
         });
         prog.emit(VmInstr::VecLoad {

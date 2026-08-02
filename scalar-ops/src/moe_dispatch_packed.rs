@@ -71,8 +71,7 @@ pub unsafe extern "C" fn scalar_moe_dispatch_packed(
 
     // Helper: decode e2m1 nibble
     const E2M1_LUT: [f32; 16] = [
-        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
     ];
 
     // Helper: silu
@@ -82,7 +81,13 @@ pub unsafe extern "C" fn scalar_moe_dispatch_packed(
 
     // Helper: clamp
     fn clamp(x: f32, min: f32, max: f32) -> f32 {
-        if x < min { min } else if x > max { max } else { x }
+        if x < min {
+            min
+        } else if x > max {
+            max
+        } else {
+            x
+        }
     }
 
     // Temp buffers (stack allocation for small sizes, heap for large)
@@ -108,7 +113,8 @@ pub unsafe extern "C" fn scalar_moe_dispatch_packed(
             let weight = *router_weights.add(s * top_k + k);
 
             // === Dequant gate_up ===
-            let gu_blocks_base = gate_up_blocks.add(expert_id * gu_blocks_per_expert * gu_block_bytes);
+            let gu_blocks_base =
+                gate_up_blocks.add(expert_id * gu_blocks_per_expert * gu_block_bytes);
             let gu_scales_base = gate_up_scales.add(expert_id * gu_blocks_per_expert);
             let gu_bias_base = gate_up_bias.add(expert_id * gu_size);
 
@@ -136,7 +142,8 @@ pub unsafe extern "C" fn scalar_moe_dispatch_packed(
             }
 
             // === Dequant down ===
-            let down_blocks_base = down_blocks.add(expert_id * down_blocks_per_expert * down_block_bytes);
+            let down_blocks_base =
+                down_blocks.add(expert_id * down_blocks_per_expert * down_block_bytes);
             let down_scales_base = down_scales.add(expert_id * down_blocks_per_expert);
 
             for blk in 0..down_blocks_per_expert {

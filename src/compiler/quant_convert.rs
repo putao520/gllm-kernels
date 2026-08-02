@@ -2,8 +2,8 @@
 //!
 //! REQ-JIT-QUANT-001: Format conversion via FP32 intermediate + graph-level quantization.
 
-use crate::compiler::quant_ir::{QuantFormat, QuantIR};
 use crate::compiler::graph::{CompilerGraph, Op};
+use crate::compiler::quant_ir::{QuantFormat, QuantIR};
 // QuantCodegen/PtxQuantCodegen 已迁移到 Register VM。
 // 量化 codegen 将通过 VmInstr::Transcendental(Dequant) + IsaLower 实现。
 use crate::types::CompilerError;
@@ -193,7 +193,9 @@ pub fn quantize_from_fp32(input: &[f32], ir: &QuantIR) -> Result<(Vec<u8>, f32),
             let max_val = (1 << (bits - 1)) - 1;
             let scale = compute_scale_rabitq(input, bits);
             for (i, &val) in input.iter().enumerate() {
-                let q = (val / scale).round().clamp(-(max_val as f32) - 1.0, max_val as f32) as i32;
+                let q = (val / scale)
+                    .round()
+                    .clamp(-(max_val as f32) - 1.0, max_val as f32) as i32;
                 pack_bits(&mut output, i, bits, q);
             }
             Ok((output, scale))
@@ -203,7 +205,11 @@ pub fn quantize_from_fp32(input: &[f32], ir: &QuantIR) -> Result<(Vec<u8>, f32),
 }
 
 /// Dequantize to FP32 with explicit scale.
-fn dequantize_to_fp32_with_scale(input: &[u8], ir: &QuantIR, scale: f32) -> Result<Vec<f32>, CompilerError> {
+fn dequantize_to_fp32_with_scale(
+    input: &[u8],
+    ir: &QuantIR,
+    scale: f32,
+) -> Result<Vec<f32>, CompilerError> {
     let num_elements: usize = ir.input_shape.iter().product();
     let mut output = vec![0.0f32; num_elements];
 
@@ -239,21 +245,24 @@ fn dequantize_to_fp32_with_scale(input: &[u8], ir: &QuantIR, scale: f32) -> Resu
     Ok(output)
 }
 
-
 /// Apply quantization to a CompilerGraph.
 pub fn apply_quantization(
     graph: &mut CompilerGraph,
     format: QuantFormat,
 ) -> Result<(), CompilerError> {
     // 收集需要量化的 op id（胖 opcode 自描述，避免借用冲突）
-    let quantize_op_ids: Vec<_> = graph.ops.iter()
-        .filter(|op| op.op_is_gemm_with_bias(graph) || matches!(op.op_resolved(graph), Some(Op::Gemm(_))))
+    let quantize_op_ids: Vec<_> = graph
+        .ops
+        .iter()
+        .filter(|op| {
+            op.op_is_gemm_with_bias(graph) || matches!(op.op_resolved(graph), Some(Op::Gemm(_)))
+        })
         .map(|op| op.id)
         .collect();
     for _op_id in quantize_op_ids {
         let _ir = QuantIR::new(format.clone(), vec![1024]); // Placeholder shape
-        // 量化 kernel 生成已迁移到 Register VM (VmInstr 路径)
-        // Mark op as quantized (would store kernel in real implementation)
+                                                            // 量化 kernel 生成已迁移到 Register VM (VmInstr 路径)
+                                                            // Mark op as quantized (would store kernel in real implementation)
     }
     Ok(())
 }
@@ -341,7 +350,13 @@ mod tests {
 
         // 2-bit has only 4 levels: -2, -1, 0, 1 (signed), so precision is very low
         for (i, (orig, deq)) in input.iter().zip(dequantized.iter()).enumerate() {
-            println!("  [{}] orig={}, deq={}, diff={}", i, orig, deq, (orig - deq).abs());
+            println!(
+                "  [{}] orig={}, deq={}, diff={}",
+                i,
+                orig,
+                deq,
+                (orig - deq).abs()
+            );
         }
     }
 
@@ -409,9 +424,14 @@ mod tests {
 
     #[test]
     fn should_quantize_op_gemm_only() {
-        use crate::compiler::graph::{SymDim, GemmSpec};
+        use crate::compiler::graph::{GemmSpec, SymDim};
         assert!(should_quantize_op(&Op::Gemm(GemmSpec {
-            m: SymDim::Concrete(1), n: 64, k: 64, dtype: crate::types::DType::F32, trans_b: false, has_bias: false
+            m: SymDim::Concrete(1),
+            n: 64,
+            k: 64,
+            dtype: crate::types::DType::F32,
+            trans_b: false,
+            has_bias: false
         })));
         assert!(!should_quantize_op(&Op::Silu));
         assert!(!should_quantize_op(&Op::Add));
@@ -439,7 +459,12 @@ mod tests {
         // Check relative error is reasonable
         for (orig, deq) in input.iter().zip(dequantized.iter()) {
             let rel_err = (orig - deq).abs() / orig.abs().max(1e-6);
-            assert!(rel_err < 0.15, "rel_err too high: orig={}, deq={}", orig, deq);
+            assert!(
+                rel_err < 0.15,
+                "rel_err too high: orig={}, deq={}",
+                orig,
+                deq
+            );
         }
     }
 
@@ -513,10 +538,14 @@ mod tests {
 
     #[test]
     fn should_quantize_op_gemm_bias() {
-        use crate::compiler::graph::{SymDim, GemmSpec};
+        use crate::compiler::graph::{GemmSpec, SymDim};
         assert!(should_quantize_op(&Op::GemmBias(GemmSpec {
-            m: SymDim::Concrete(1), n: 64, k: 64,
-            dtype: crate::types::DType::F32, trans_b: false, has_bias: true,
+            m: SymDim::Concrete(1),
+            n: 64,
+            k: 64,
+            dtype: crate::types::DType::F32,
+            trans_b: false,
+            has_bias: true,
         })));
     }
 
@@ -562,7 +591,7 @@ mod tests {
 
     #[test]
     fn apply_quantization_with_gemm_ops() {
-        use crate::compiler::graph::{SymDim, GemmSpec};
+        use crate::compiler::graph::{GemmSpec, SymDim};
         use crate::types::DType;
 
         // Arrange: create a graph with a Gemm op
@@ -570,7 +599,15 @@ mod tests {
         let input = graph.add_tensor_concrete("input", &[16], DType::F32);
         let weight = graph.add_tensor_concrete("weight", &[16, 16], DType::F32);
         let output = graph.add_tensor_concrete("output", &[16], DType::F32);
-        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }),
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 16,
+                k: 16,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![input, weight],
             vec![output],
             "gemm",

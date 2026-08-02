@@ -14,9 +14,9 @@
 //! Supported formats: Q8_K, Q4_K.
 
 #[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
-#[cfg(target_arch = "x86_64")]
 use std::arch::global_asm;
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
 
 const Q8K_BLOCK_BYTES: usize = 292;
 const Q8K_QS_OFFSET: usize = 4;
@@ -59,9 +59,15 @@ unsafe fn q8k_block_dot_1row(qs: *const i8, input: *const f32) -> f32 {
         let o2 = _mm256_loadu_ps(input.add(i + 16));
         let o3 = _mm256_loadu_ps(input.add(i + 24));
         let q0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(qs.add(i) as *const _)));
-        let q1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(qs.add(i + 8) as *const _)));
-        let q2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(qs.add(i + 16) as *const _)));
-        let q3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(qs.add(i + 24) as *const _)));
+        let q1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+            qs.add(i + 8) as *const _
+        )));
+        let q2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+            qs.add(i + 16) as *const _
+        )));
+        let q3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+            qs.add(i + 24) as *const _
+        )));
         a0 = _mm256_fmadd_ps(q0, o0, a0);
         a1 = _mm256_fmadd_ps(q1, o1, a1);
         a2 = _mm256_fmadd_ps(q2, o2, a2);
@@ -95,25 +101,121 @@ macro_rules! q8k_block_4row_avx2 {
             let o3 = _mm256_loadu_ps($inp.add(i + 24));
 
             // Row 0
-            $a00 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64($qs0.add(i) as *const _))), o0, $a00);
-            $a01 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64($qs0.add(i+8) as *const _))), o1, $a01);
-            $a02 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64($qs0.add(i+16) as *const _))), o2, $a02);
-            $a03 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64($qs0.add(i+24) as *const _))), o3, $a03);
+            $a00 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                    $qs0.add(i) as *const _
+                ))),
+                o0,
+                $a00,
+            );
+            $a01 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                    $qs0.add(i + 8) as *const _
+                ))),
+                o1,
+                $a01,
+            );
+            $a02 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                    $qs0.add(i + 16) as *const _
+                ))),
+                o2,
+                $a02,
+            );
+            $a03 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                    $qs0.add(i + 24) as *const _
+                ))),
+                o3,
+                $a03,
+            );
             // Row 1
-            $a10 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64($qs1.add(i) as *const _))), o0, $a10);
-            $a11 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64($qs1.add(i+8) as *const _))), o1, $a11);
-            $a12 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64($qs1.add(i+16) as *const _))), o2, $a12);
-            $a13 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64($qs1.add(i+24) as *const _))), o3, $a13);
+            $a10 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                    $qs1.add(i) as *const _
+                ))),
+                o0,
+                $a10,
+            );
+            $a11 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                    $qs1.add(i + 8) as *const _
+                ))),
+                o1,
+                $a11,
+            );
+            $a12 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                    $qs1.add(i + 16) as *const _
+                ))),
+                o2,
+                $a12,
+            );
+            $a13 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                    $qs1.add(i + 24) as *const _
+                ))),
+                o3,
+                $a13,
+            );
             // Row 2
-            $a20 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64($qs2.add(i) as *const _))), o0, $a20);
-            $a21 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64($qs2.add(i+8) as *const _))), o1, $a21);
-            $a22 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64($qs2.add(i+16) as *const _))), o2, $a22);
-            $a23 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64($qs2.add(i+24) as *const _))), o3, $a23);
+            $a20 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                    $qs2.add(i) as *const _
+                ))),
+                o0,
+                $a20,
+            );
+            $a21 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                    $qs2.add(i + 8) as *const _
+                ))),
+                o1,
+                $a21,
+            );
+            $a22 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                    $qs2.add(i + 16) as *const _
+                ))),
+                o2,
+                $a22,
+            );
+            $a23 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                    $qs2.add(i + 24) as *const _
+                ))),
+                o3,
+                $a23,
+            );
             // Row 3
-            $a30 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64($qs3.add(i) as *const _))), o0, $a30);
-            $a31 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64($qs3.add(i+8) as *const _))), o1, $a31);
-            $a32 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64($qs3.add(i+16) as *const _))), o2, $a32);
-            $a33 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64($qs3.add(i+24) as *const _))), o3, $a33);
+            $a30 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                    $qs3.add(i) as *const _
+                ))),
+                o0,
+                $a30,
+            );
+            $a31 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                    $qs3.add(i + 8) as *const _
+                ))),
+                o1,
+                $a31,
+            );
+            $a32 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                    $qs3.add(i + 16) as *const _
+                ))),
+                o2,
+                $a32,
+            );
+            $a33 = _mm256_fmadd_ps(
+                _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                    $qs3.add(i + 24) as *const _
+                ))),
+                o3,
+                $a33,
+            );
 
             i += 32;
         }
@@ -124,7 +226,10 @@ macro_rules! q8k_block_4row_avx2 {
 #[cfg(target_arch = "x86_64")]
 macro_rules! reduce4_avx2 {
     ($a0:expr, $a1:expr, $a2:expr, $a3:expr) => {
-        hsum_avx2(_mm256_add_ps(_mm256_add_ps($a0, $a1), _mm256_add_ps($a2, $a3)))
+        hsum_avx2(_mm256_add_ps(
+            _mm256_add_ps($a0, $a1),
+            _mm256_add_ps($a2, $a3),
+        ))
     };
 }
 
@@ -178,7 +283,6 @@ global_asm!(
     ".global _gllm_gemv_q8k_block_4row_avx2",
     ".type _gllm_gemv_q8k_block_4row_avx2, @function",
     "_gllm_gemv_q8k_block_4row_avx2:",
-
     // All YMM registers are caller-saved in SysV AMD64 ABI — no push/pop needed.
 
     // Zero all 8 accumulators (2 per row × 4 rows)
@@ -190,17 +294,13 @@ global_asm!(
     "vxorps ymm5, ymm5, ymm5",
     "vxorps ymm6, ymm6, ymm6",
     "vxorps ymm7, ymm7, ymm7",
-
     // r10 = loop counter: 16 iterations × 16 elements = 256 total
     "mov r10, 16",
-
     ".align 32",
     ".Lq8k_4row_loop:",
-
     // ── Shared input load: 16 f32 = 64 bytes ──
     "vmovups ymm8, [r8]",
     "vmovups ymm9, [r8 + 32]",
-
     // ── Row 0 (qs0 = rdi): low 8 then high 8 ──
     "vmovq    xmm12, [rdi]",
     "vpmovsxbd ymm10, xmm12",
@@ -210,7 +310,6 @@ global_asm!(
     "vpmovsxbd ymm11, xmm12",
     "vcvtdq2ps ymm11, ymm11",
     "vfmadd231ps ymm1, ymm11, ymm9",
-
     // ── Row 1 (qs1 = rsi) ──
     "vmovq    xmm12, [rsi]",
     "vpmovsxbd ymm10, xmm12",
@@ -220,7 +319,6 @@ global_asm!(
     "vpmovsxbd ymm11, xmm12",
     "vcvtdq2ps ymm11, ymm11",
     "vfmadd231ps ymm3, ymm11, ymm9",
-
     // ── Row 2 (qs2 = rdx) ──
     "vmovq    xmm12, [rdx]",
     "vpmovsxbd ymm10, xmm12",
@@ -230,7 +328,6 @@ global_asm!(
     "vpmovsxbd ymm11, xmm12",
     "vcvtdq2ps ymm11, ymm11",
     "vfmadd231ps ymm5, ymm11, ymm9",
-
     // ── Row 3 (qs3 = rcx) ──
     "vmovq    xmm12, [rcx]",
     "vpmovsxbd ymm10, xmm12",
@@ -240,17 +337,14 @@ global_asm!(
     "vpmovsxbd ymm11, xmm12",
     "vcvtdq2ps ymm11, ymm11",
     "vfmadd231ps ymm7, ymm11, ymm9",
-
     // Advance all pointers: qs += 16 bytes (16 i8), input += 64 bytes (16 f32)
     "add rdi, 16",
     "add rsi, 16",
     "add rdx, 16",
     "add rcx, 16",
     "add r8,  64",
-
     "dec r10",
     "jnz .Lq8k_4row_loop",
-
     // ── Horizontal reduce each row pair → scalar ──
     // Pattern: vaddps(acc_lo, acc_hi) → vhaddps×2 → vextractf128 → vaddss
     // This is the same hsum_avx2 pattern used in the intrinsics path.
@@ -262,7 +356,6 @@ global_asm!(
     "vextractf128 xmm1, ymm0, 1",
     "vaddss xmm0, xmm0, xmm1",
     "vmovss [r9],      xmm0",
-
     // Row 1: ymm2 + ymm3 → out[1]
     "vaddps ymm2, ymm2, ymm3",
     "vhaddps ymm2, ymm2, ymm2",
@@ -270,7 +363,6 @@ global_asm!(
     "vextractf128 xmm3, ymm2, 1",
     "vaddss xmm2, xmm2, xmm3",
     "vmovss [r9 + 4],  xmm2",
-
     // Row 2: ymm4 + ymm5 → out[2]
     "vaddps ymm4, ymm4, ymm5",
     "vhaddps ymm4, ymm4, ymm4",
@@ -278,7 +370,6 @@ global_asm!(
     "vextractf128 xmm5, ymm4, 1",
     "vaddss xmm4, xmm4, xmm5",
     "vmovss [r9 + 8],  xmm4",
-
     // Row 3: ymm6 + ymm7 → out[3]
     "vaddps ymm6, ymm6, ymm7",
     "vhaddps ymm6, ymm6, ymm6",
@@ -286,10 +377,8 @@ global_asm!(
     "vextractf128 xmm7, ymm6, 1",
     "vaddss xmm6, xmm6, xmm7",
     "vmovss [r9 + 12], xmm6",
-
     "vzeroupper",
     "ret",
-
     ".size _gllm_gemv_q8k_block_4row_avx2, . - _gllm_gemv_q8k_block_4row_avx2",
 );
 
@@ -437,7 +526,7 @@ pub unsafe fn gemv_q8k_fused_avx2_asm(
             sum3 += d3 * partial[3];
         }
 
-        *output.add(row)     = sum0;
+        *output.add(row) = sum0;
         *output.add(row + 1) = sum1;
         *output.add(row + 2) = sum2;
         *output.add(row + 3) = sum3;
@@ -530,9 +619,10 @@ pub unsafe fn gemv_q8k_fused_avx2_intrinsics(
             let qs2 = base2.add(boff + Q8K_QS_OFFSET) as *const i8;
             let qs3 = base3.add(boff + Q8K_QS_OFFSET) as *const i8;
 
-            q8k_block_4row_avx2!(inp, qs0, qs1, qs2, qs3,
-                a00, a01, a02, a03, a10, a11, a12, a13,
-                a20, a21, a22, a23, a30, a31, a32, a33);
+            q8k_block_4row_avx2!(
+                inp, qs0, qs1, qs2, qs3, a00, a01, a02, a03, a10, a11, a12, a13, a20, a21, a22,
+                a23, a30, a31, a32, a33
+            );
 
             // Reduce block b and apply d
             sum0 += d0_b0 * reduce4_avx2!(a00, a01, a02, a03);
@@ -567,9 +657,10 @@ pub unsafe fn gemv_q8k_fused_avx2_intrinsics(
             let qs2 = base2.add(boff1 + Q8K_QS_OFFSET) as *const i8;
             let qs3 = base3.add(boff1 + Q8K_QS_OFFSET) as *const i8;
 
-            q8k_block_4row_avx2!(inp1, qs0, qs1, qs2, qs3,
-                a00, a01, a02, a03, a10, a11, a12, a13,
-                a20, a21, a22, a23, a30, a31, a32, a33);
+            q8k_block_4row_avx2!(
+                inp1, qs0, qs1, qs2, qs3, a00, a01, a02, a03, a10, a11, a12, a13, a20, a21, a22,
+                a23, a30, a31, a32, a33
+            );
 
             sum0 += d0_b1 * reduce4_avx2!(a00, a01, a02, a03);
             sum1 += d1_b1 * reduce4_avx2!(a10, a11, a12, a13);
@@ -599,9 +690,10 @@ pub unsafe fn gemv_q8k_fused_avx2_intrinsics(
             let qs2 = base2.add(boff + Q8K_QS_OFFSET) as *const i8;
             let qs3 = base3.add(boff + Q8K_QS_OFFSET) as *const i8;
 
-            q8k_block_4row_avx2!(inp, qs0, qs1, qs2, qs3,
-                a00, a01, a02, a03, a10, a11, a12, a13,
-                a20, a21, a22, a23, a30, a31, a32, a33);
+            q8k_block_4row_avx2!(
+                inp, qs0, qs1, qs2, qs3, a00, a01, a02, a03, a10, a11, a12, a13, a20, a21, a22,
+                a23, a30, a31, a32, a33
+            );
 
             sum0 += d0 * reduce4_avx2!(a00, a01, a02, a03);
             sum1 += d1 * reduce4_avx2!(a10, a11, a12, a13);
@@ -639,8 +731,8 @@ pub unsafe fn gemv_q8k_fused_avx2_intrinsics(
 // ============================================================================
 
 const Q4K_BLOCK_BYTES: usize = 144;
-const Q4K_D_OFFSET: usize = 0;     // f16 d at byte 0
-const Q4K_QS_OFFSET: usize = 16;   // qs starts after d(2) + dmin(2) + scales(12)
+const Q4K_D_OFFSET: usize = 0; // f16 d at byte 0
+const Q4K_QS_OFFSET: usize = 16; // qs starts after d(2) + dmin(2) + scales(12)
 
 /// Unpack 16 bytes of Q4K nibbles and FMA against 4 input vectors.
 /// Accumulates into 4 named accumulators for one row.
@@ -695,14 +787,10 @@ macro_rules! q4k_block_4row_avx2 {
             $oa0 = _mm256_add_ps($oa0, _mm256_add_ps(o0, o1));
             $oa1 = _mm256_add_ps($oa1, _mm256_add_ps(o2, o3));
 
-            q4k_row_fma_avx2!($qs0, byte_off, o0, o1, o2, o3, $mask_0f,
-                $na00, $na01, $na02, $na03);
-            q4k_row_fma_avx2!($qs1, byte_off, o0, o1, o2, o3, $mask_0f,
-                $na10, $na11, $na12, $na13);
-            q4k_row_fma_avx2!($qs2, byte_off, o0, o1, o2, o3, $mask_0f,
-                $na20, $na21, $na22, $na23);
-            q4k_row_fma_avx2!($qs3, byte_off, o0, o1, o2, o3, $mask_0f,
-                $na30, $na31, $na32, $na33);
+            q4k_row_fma_avx2!($qs0, byte_off, o0, o1, o2, o3, $mask_0f, $na00, $na01, $na02, $na03);
+            q4k_row_fma_avx2!($qs1, byte_off, o0, o1, o2, o3, $mask_0f, $na10, $na11, $na12, $na13);
+            q4k_row_fma_avx2!($qs2, byte_off, o0, o1, o2, o3, $mask_0f, $na20, $na21, $na22, $na23);
+            q4k_row_fma_avx2!($qs3, byte_off, o0, o1, o2, o3, $mask_0f, $na30, $na31, $na32, $na33);
 
             i += 1;
         }
@@ -778,10 +866,10 @@ pub unsafe fn gemv_q4k_fused_avx2_intrinsics(
             let qs2 = base2.add(boff + Q4K_QS_OFFSET);
             let qs3 = base3.add(boff + Q4K_QS_OFFSET);
 
-            q4k_block_4row_avx2!(inp, qs0, qs1, qs2, qs3, mask_0f,
-                na00, na01, na02, na03, na10, na11, na12, na13,
-                na20, na21, na22, na23, na30, na31, na32, na33,
-                oa0, oa1);
+            q4k_block_4row_avx2!(
+                inp, qs0, qs1, qs2, qs3, mask_0f, na00, na01, na02, na03, na10, na11, na12, na13,
+                na20, na21, na22, na23, na30, na31, na32, na33, oa0, oa1
+            );
 
             let nib0 = reduce4_avx2!(na00, na01, na02, na03);
             let nib1 = reduce4_avx2!(na10, na11, na12, na13);
@@ -803,10 +891,14 @@ pub unsafe fn gemv_q4k_fused_avx2_intrinsics(
 
             let boff1 = noff;
             let inp1 = input.add((b + 1) * QK_K);
-            let d0_b1 = half::f16::from_bits(*(base0.add(boff1 + Q4K_D_OFFSET) as *const u16)).to_f32();
-            let d1_b1 = half::f16::from_bits(*(base1.add(boff1 + Q4K_D_OFFSET) as *const u16)).to_f32();
-            let d2_b1 = half::f16::from_bits(*(base2.add(boff1 + Q4K_D_OFFSET) as *const u16)).to_f32();
-            let d3_b1 = half::f16::from_bits(*(base3.add(boff1 + Q4K_D_OFFSET) as *const u16)).to_f32();
+            let d0_b1 =
+                half::f16::from_bits(*(base0.add(boff1 + Q4K_D_OFFSET) as *const u16)).to_f32();
+            let d1_b1 =
+                half::f16::from_bits(*(base1.add(boff1 + Q4K_D_OFFSET) as *const u16)).to_f32();
+            let d2_b1 =
+                half::f16::from_bits(*(base2.add(boff1 + Q4K_D_OFFSET) as *const u16)).to_f32();
+            let d3_b1 =
+                half::f16::from_bits(*(base3.add(boff1 + Q4K_D_OFFSET) as *const u16)).to_f32();
 
             if b + 2 < bpr {
                 let noff2 = (b + 2) * Q4K_BLOCK_BYTES;
@@ -821,10 +913,10 @@ pub unsafe fn gemv_q4k_fused_avx2_intrinsics(
             let qs2 = base2.add(boff1 + Q4K_QS_OFFSET);
             let qs3 = base3.add(boff1 + Q4K_QS_OFFSET);
 
-            q4k_block_4row_avx2!(inp1, qs0, qs1, qs2, qs3, mask_0f,
-                na00, na01, na02, na03, na10, na11, na12, na13,
-                na20, na21, na22, na23, na30, na31, na32, na33,
-                oa0, oa1);
+            q4k_block_4row_avx2!(
+                inp1, qs0, qs1, qs2, qs3, mask_0f, na00, na01, na02, na03, na10, na11, na12, na13,
+                na20, na21, na22, na23, na30, na31, na32, na33, oa0, oa1
+            );
 
             let nib0 = reduce4_avx2!(na00, na01, na02, na03);
             let nib1 = reduce4_avx2!(na10, na11, na12, na13);
@@ -861,10 +953,10 @@ pub unsafe fn gemv_q4k_fused_avx2_intrinsics(
             let qs2 = base2.add(boff + Q4K_QS_OFFSET);
             let qs3 = base3.add(boff + Q4K_QS_OFFSET);
 
-            q4k_block_4row_avx2!(inp, qs0, qs1, qs2, qs3, mask_0f,
-                na00, na01, na02, na03, na10, na11, na12, na13,
-                na20, na21, na22, na23, na30, na31, na32, na33,
-                oa0, oa1);
+            q4k_block_4row_avx2!(
+                inp, qs0, qs1, qs2, qs3, mask_0f, na00, na01, na02, na03, na10, na11, na12, na13,
+                na20, na21, na22, na23, na30, na31, na32, na33, oa0, oa1
+            );
 
             let nib0 = reduce4_avx2!(na00, na01, na02, na03);
             let nib1 = reduce4_avx2!(na10, na11, na12, na13);
@@ -912,8 +1004,7 @@ pub unsafe fn gemv_q4k_fused_avx2_intrinsics(
                 oa0 = _mm256_add_ps(oa0, _mm256_add_ps(o0, o1));
                 oa1 = _mm256_add_ps(oa1, _mm256_add_ps(o2, o3));
 
-                q4k_row_fma_avx2!(qs, byte_off, o0, o1, o2, o3, mask_0f,
-                    na0, na1, na2, na3);
+                q4k_row_fma_avx2!(qs, byte_off, o0, o1, o2, o3, mask_0f, na0, na1, na2, na3);
 
                 i += 1;
             }
@@ -970,7 +1061,6 @@ global_asm!(
     ".global _gllm_q4k_block_1row_avx2",
     ".type _gllm_q4k_block_1row_avx2, @function",
     "_gllm_q4k_block_1row_avx2:",
-
     // Zero nib accumulators ymm0-ymm3
     "vxorps ymm0, ymm0, ymm0",
     "vxorps ymm1, ymm1, ymm1",
@@ -979,43 +1069,35 @@ global_asm!(
     // Zero oth accumulators ymm4-ymm5
     "vxorps ymm4, ymm4, ymm4",
     "vxorps ymm5, ymm5, ymm5",
-
     // Build nibble mask 0x0F in xmm10 via vpbroadcastd
     "mov eax, 0x0F0F0F0F",
     "vmovd xmm10, eax",
     "vpbroadcastd xmm10, xmm10",
-
     // r8d = loop counter (8 iterations)
     // r9d = byte offset into qs (0, 16, 32, ..., 112)
     // r10d = float element offset into input (0, 32, 64, ..., 224)
     "mov r8d, 8",
     "xor r9d, r9d",
     "xor r10d, r10d",
-
     ".align 32",
     ".Lq4k_1row_loop:",
-
     // Load 4 x 8 f32 input values (32 f32 = 128 bytes)
     "vmovups ymm6, [rsi + r10*4]",
     "vmovups ymm7, [rsi + r10*4 + 32]",
     "vmovups ymm8, [rsi + r10*4 + 64]",
     "vmovups ymm9, [rsi + r10*4 + 96]",
-
     // Accumulate input sum: oth += (o0+o1) + (o2+o3)
     "vaddps ymm14, ymm6, ymm7",
     "vaddps ymm15, ymm8, ymm9",
     "vaddps ymm4, ymm4, ymm14",
     "vaddps ymm5, ymm5, ymm15",
-
     // Load 16 bytes of packed nibbles
     "vmovdqu xmm11, [rdi + r9]",
-
     // lo = xmm11 & 0x0F
     "vpand xmm12, xmm11, xmm10",
     // hi = (xmm11 >> 4) & 0x0F
     "vpsrlw xmm13, xmm11, 4",
     "vpand xmm13, xmm13, xmm10",
-
     // fl0 = cvtepu8_epi32(lo[0..7]) -> f32  (vpmovzxbd uses low 8 bytes of xmm12)
     "vpmovzxbd ymm14, xmm12",
     "vcvtdq2ps ymm14, ymm14",
@@ -1023,7 +1105,6 @@ global_asm!(
     "vpsrldq xmm12, xmm12, 8",
     "vpmovzxbd ymm15, xmm12",
     "vcvtdq2ps ymm15, ymm15",
-
     // Save hi[8..15] into xmm11 before consuming xmm13
     "vpsrldq xmm11, xmm13, 8",
     // fh0 = cvtepu8_epi32(hi[0..7]) -> f32  (into ymm12)
@@ -1032,7 +1113,6 @@ global_asm!(
     // fh1 = cvtepu8_epi32(hi[8..15]) -> f32  (into ymm13)
     "vpmovzxbd ymm13, xmm11",
     "vcvtdq2ps ymm13, ymm13",
-
     // Interleave fl0(ymm14) / fh0(ymm12) -> n0, n1
     // t0 = vunpcklps(fl0, fh0): [fl0[0],fh0[0],fl0[1],fh0[1] | fl0[4],fh0[4],fl0[5],fh0[5]]
     // t1 = vunpckhps(fl0, fh0): [fl0[2],fh0[2],fl0[3],fh0[3] | fl0[6],fh0[6],fl0[7],fh0[7]]
@@ -1042,27 +1122,22 @@ global_asm!(
     "vunpckhps ymm12, ymm14, ymm12",
     "vperm2f128 ymm14, ymm11, ymm12, 0x20",
     "vperm2f128 ymm11, ymm11, ymm12, 0x31",
-
     // FMA: nib_acc[0] += n0 * o0,  nib_acc[1] += n1 * o1
     "vfmadd231ps ymm0, ymm14, ymm6",
     "vfmadd231ps ymm1, ymm11, ymm7",
-
     // Interleave fl1(ymm15) / fh1(ymm13) -> n2, n3
     "vunpcklps ymm11, ymm15, ymm13",
     "vunpckhps ymm12, ymm15, ymm13",
     "vperm2f128 ymm14, ymm11, ymm12, 0x20",
     "vperm2f128 ymm11, ymm11, ymm12, 0x31",
-
     // FMA: nib_acc[2] += n2 * o2,  nib_acc[3] += n3 * o3
     "vfmadd231ps ymm2, ymm14, ymm8",
     "vfmadd231ps ymm3, ymm11, ymm9",
-
     // Advance: r9 += 16 (bytes), r10 += 32 (f32 elements)
     "add r9d, 16",
     "add r10d, 32",
     "dec r8d",
     "jnz .Lq4k_1row_loop",
-
     // Reduce nib accumulators ymm0-ymm3 -> scalar
     "vaddps ymm0, ymm0, ymm1",
     "vaddps ymm2, ymm2, ymm3",
@@ -1072,7 +1147,6 @@ global_asm!(
     "vextractf128 xmm1, ymm0, 1",
     "vaddss xmm0, xmm0, xmm1",
     "vmovss [rdx], xmm0",
-
     // Reduce oth accumulators ymm4-ymm5 -> scalar
     "vaddps ymm4, ymm4, ymm5",
     "vhaddps ymm4, ymm4, ymm4",
@@ -1080,10 +1154,8 @@ global_asm!(
     "vextractf128 xmm5, ymm4, 1",
     "vaddss xmm4, xmm4, xmm5",
     "vmovss [rcx], xmm4",
-
     "vzeroupper",
     "ret",
-
     ".size _gllm_q4k_block_1row_avx2, . - _gllm_q4k_block_1row_avx2",
 );
 
@@ -1195,10 +1267,14 @@ pub unsafe fn gemv_q4k_fused_avx2_asm(
             let boff1 = noff;
             let inp1 = input.add((b + 1) * QK_K);
 
-            let d0_b1 = half::f16::from_bits(*(base0.add(boff1 + Q4K_D_OFFSET) as *const u16)).to_f32();
-            let d1_b1 = half::f16::from_bits(*(base1.add(boff1 + Q4K_D_OFFSET) as *const u16)).to_f32();
-            let d2_b1 = half::f16::from_bits(*(base2.add(boff1 + Q4K_D_OFFSET) as *const u16)).to_f32();
-            let d3_b1 = half::f16::from_bits(*(base3.add(boff1 + Q4K_D_OFFSET) as *const u16)).to_f32();
+            let d0_b1 =
+                half::f16::from_bits(*(base0.add(boff1 + Q4K_D_OFFSET) as *const u16)).to_f32();
+            let d1_b1 =
+                half::f16::from_bits(*(base1.add(boff1 + Q4K_D_OFFSET) as *const u16)).to_f32();
+            let d2_b1 =
+                half::f16::from_bits(*(base2.add(boff1 + Q4K_D_OFFSET) as *const u16)).to_f32();
+            let d3_b1 =
+                half::f16::from_bits(*(base3.add(boff1 + Q4K_D_OFFSET) as *const u16)).to_f32();
 
             if b + 2 < bpr {
                 let noff2 = (b + 2) * Q4K_BLOCK_BYTES;
@@ -1325,7 +1401,10 @@ pub unsafe fn gemv_q4k_fused_avx2(
 #[cfg(target_arch = "x86_64")]
 macro_rules! reduce4_avx512 {
     ($a0:expr, $a1:expr, $a2:expr, $a3:expr) => {
-        hsum_avx512(_mm512_add_ps(_mm512_add_ps($a0, $a1), _mm512_add_ps($a2, $a3)))
+        hsum_avx512(_mm512_add_ps(
+            _mm512_add_ps($a0, $a1),
+            _mm512_add_ps($a2, $a3),
+        ))
     };
 }
 
@@ -1348,25 +1427,121 @@ macro_rules! q8k_block_4row_avx512 {
             let o3 = _mm512_loadu_ps($inp.add(i + 48));
 
             // Row 0: load 16 i8 → 16 i32 → 16 f32, FMA
-            $a00 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128($qs0.add(i) as *const _))), o0, $a00);
-            $a01 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128($qs0.add(i+16) as *const _))), o1, $a01);
-            $a02 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128($qs0.add(i+32) as *const _))), o2, $a02);
-            $a03 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128($qs0.add(i+48) as *const _))), o3, $a03);
+            $a00 = _mm512_fmadd_ps(
+                _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
+                    $qs0.add(i) as *const _
+                ))),
+                o0,
+                $a00,
+            );
+            $a01 = _mm512_fmadd_ps(
+                _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
+                    $qs0.add(i + 16) as *const _
+                ))),
+                o1,
+                $a01,
+            );
+            $a02 = _mm512_fmadd_ps(
+                _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
+                    $qs0.add(i + 32) as *const _
+                ))),
+                o2,
+                $a02,
+            );
+            $a03 = _mm512_fmadd_ps(
+                _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
+                    $qs0.add(i + 48) as *const _
+                ))),
+                o3,
+                $a03,
+            );
             // Row 1
-            $a10 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128($qs1.add(i) as *const _))), o0, $a10);
-            $a11 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128($qs1.add(i+16) as *const _))), o1, $a11);
-            $a12 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128($qs1.add(i+32) as *const _))), o2, $a12);
-            $a13 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128($qs1.add(i+48) as *const _))), o3, $a13);
+            $a10 = _mm512_fmadd_ps(
+                _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
+                    $qs1.add(i) as *const _
+                ))),
+                o0,
+                $a10,
+            );
+            $a11 = _mm512_fmadd_ps(
+                _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
+                    $qs1.add(i + 16) as *const _
+                ))),
+                o1,
+                $a11,
+            );
+            $a12 = _mm512_fmadd_ps(
+                _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
+                    $qs1.add(i + 32) as *const _
+                ))),
+                o2,
+                $a12,
+            );
+            $a13 = _mm512_fmadd_ps(
+                _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
+                    $qs1.add(i + 48) as *const _
+                ))),
+                o3,
+                $a13,
+            );
             // Row 2
-            $a20 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128($qs2.add(i) as *const _))), o0, $a20);
-            $a21 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128($qs2.add(i+16) as *const _))), o1, $a21);
-            $a22 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128($qs2.add(i+32) as *const _))), o2, $a22);
-            $a23 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128($qs2.add(i+48) as *const _))), o3, $a23);
+            $a20 = _mm512_fmadd_ps(
+                _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
+                    $qs2.add(i) as *const _
+                ))),
+                o0,
+                $a20,
+            );
+            $a21 = _mm512_fmadd_ps(
+                _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
+                    $qs2.add(i + 16) as *const _
+                ))),
+                o1,
+                $a21,
+            );
+            $a22 = _mm512_fmadd_ps(
+                _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
+                    $qs2.add(i + 32) as *const _
+                ))),
+                o2,
+                $a22,
+            );
+            $a23 = _mm512_fmadd_ps(
+                _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
+                    $qs2.add(i + 48) as *const _
+                ))),
+                o3,
+                $a23,
+            );
             // Row 3
-            $a30 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128($qs3.add(i) as *const _))), o0, $a30);
-            $a31 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128($qs3.add(i+16) as *const _))), o1, $a31);
-            $a32 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128($qs3.add(i+32) as *const _))), o2, $a32);
-            $a33 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128($qs3.add(i+48) as *const _))), o3, $a33);
+            $a30 = _mm512_fmadd_ps(
+                _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
+                    $qs3.add(i) as *const _
+                ))),
+                o0,
+                $a30,
+            );
+            $a31 = _mm512_fmadd_ps(
+                _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
+                    $qs3.add(i + 16) as *const _
+                ))),
+                o1,
+                $a31,
+            );
+            $a32 = _mm512_fmadd_ps(
+                _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
+                    $qs3.add(i + 32) as *const _
+                ))),
+                o2,
+                $a32,
+            );
+            $a33 = _mm512_fmadd_ps(
+                _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
+                    $qs3.add(i + 48) as *const _
+                ))),
+                o3,
+                $a33,
+            );
 
             i += 64;
         }
@@ -1389,9 +1564,15 @@ unsafe fn q8k_block_dot_1row_avx512(qs: *const i8, input: *const f32) -> f32 {
         let o2 = _mm512_loadu_ps(input.add(i + 32));
         let o3 = _mm512_loadu_ps(input.add(i + 48));
         let q0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(qs.add(i) as *const _)));
-        let q1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(qs.add(i + 16) as *const _)));
-        let q2 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(qs.add(i + 32) as *const _)));
-        let q3 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(qs.add(i + 48) as *const _)));
+        let q1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
+            qs.add(i + 16) as *const _
+        )));
+        let q2 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
+            qs.add(i + 32) as *const _
+        )));
+        let q3 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
+            qs.add(i + 48) as *const _
+        )));
         a0 = _mm512_fmadd_ps(q0, o0, a0);
         a1 = _mm512_fmadd_ps(q1, o1, a1);
         a2 = _mm512_fmadd_ps(q2, o2, a2);
@@ -1463,9 +1644,10 @@ pub unsafe fn gemv_q8k_fused_avx512(
             let qs2 = base2.add(boff + Q8K_QS_OFFSET) as *const i8;
             let qs3 = base3.add(boff + Q8K_QS_OFFSET) as *const i8;
 
-            q8k_block_4row_avx512!(inp, qs0, qs1, qs2, qs3,
-                a00, a01, a02, a03, a10, a11, a12, a13,
-                a20, a21, a22, a23, a30, a31, a32, a33);
+            q8k_block_4row_avx512!(
+                inp, qs0, qs1, qs2, qs3, a00, a01, a02, a03, a10, a11, a12, a13, a20, a21, a22,
+                a23, a30, a31, a32, a33
+            );
 
             sum0 += d0_b0 * reduce4_avx512!(a00, a01, a02, a03);
             sum1 += d1_b0 * reduce4_avx512!(a10, a11, a12, a13);
@@ -1498,9 +1680,10 @@ pub unsafe fn gemv_q8k_fused_avx512(
             let qs2 = base2.add(boff1 + Q8K_QS_OFFSET) as *const i8;
             let qs3 = base3.add(boff1 + Q8K_QS_OFFSET) as *const i8;
 
-            q8k_block_4row_avx512!(inp1, qs0, qs1, qs2, qs3,
-                a00, a01, a02, a03, a10, a11, a12, a13,
-                a20, a21, a22, a23, a30, a31, a32, a33);
+            q8k_block_4row_avx512!(
+                inp1, qs0, qs1, qs2, qs3, a00, a01, a02, a03, a10, a11, a12, a13, a20, a21, a22,
+                a23, a30, a31, a32, a33
+            );
 
             sum0 += d0_b1 * reduce4_avx512!(a00, a01, a02, a03);
             sum1 += d1_b1 * reduce4_avx512!(a10, a11, a12, a13);
@@ -1530,9 +1713,10 @@ pub unsafe fn gemv_q8k_fused_avx512(
             let qs2 = base2.add(boff + Q8K_QS_OFFSET) as *const i8;
             let qs3 = base3.add(boff + Q8K_QS_OFFSET) as *const i8;
 
-            q8k_block_4row_avx512!(inp, qs0, qs1, qs2, qs3,
-                a00, a01, a02, a03, a10, a11, a12, a13,
-                a20, a21, a22, a23, a30, a31, a32, a33);
+            q8k_block_4row_avx512!(
+                inp, qs0, qs1, qs2, qs3, a00, a01, a02, a03, a10, a11, a12, a13, a20, a21, a22,
+                a23, a30, a31, a32, a33
+            );
 
             sum0 += d0 * reduce4_avx512!(a00, a01, a02, a03);
             sum1 += d1 * reduce4_avx512!(a10, a11, a12, a13);
@@ -1639,8 +1823,8 @@ pub unsafe fn gemv_q4k_fused_avx512(
     // Permutation indices for cross-lane interleave fix after unpacklo/unpackhi.
     // n0 picks: il.lane0(0..3), ih.lane0(16..19), il.lane1(4..7), ih.lane1(20..23)
     // n1 picks: il.lane2(8..11), ih.lane2(24..27), il.lane3(12..15), ih.lane3(28..31)
-    let idx_n0 = _mm512_setr_epi32(0,1,2,3, 16,17,18,19, 4,5,6,7, 20,21,22,23);
-    let idx_n1 = _mm512_setr_epi32(8,9,10,11, 24,25,26,27, 12,13,14,15, 28,29,30,31);
+    let idx_n0 = _mm512_setr_epi32(0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23);
+    let idx_n1 = _mm512_setr_epi32(8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31);
 
     let mut row = 0usize;
     while row < m4 {
@@ -1726,10 +1910,14 @@ pub unsafe fn gemv_q4k_fused_avx512(
 
             let boff1 = noff;
             let inp1 = input.add((b + 1) * QK_K);
-            let d0_b1 = half::f16::from_bits(*(base0.add(boff1 + Q4K_D_OFFSET) as *const u16)).to_f32();
-            let d1_b1 = half::f16::from_bits(*(base1.add(boff1 + Q4K_D_OFFSET) as *const u16)).to_f32();
-            let d2_b1 = half::f16::from_bits(*(base2.add(boff1 + Q4K_D_OFFSET) as *const u16)).to_f32();
-            let d3_b1 = half::f16::from_bits(*(base3.add(boff1 + Q4K_D_OFFSET) as *const u16)).to_f32();
+            let d0_b1 =
+                half::f16::from_bits(*(base0.add(boff1 + Q4K_D_OFFSET) as *const u16)).to_f32();
+            let d1_b1 =
+                half::f16::from_bits(*(base1.add(boff1 + Q4K_D_OFFSET) as *const u16)).to_f32();
+            let d2_b1 =
+                half::f16::from_bits(*(base2.add(boff1 + Q4K_D_OFFSET) as *const u16)).to_f32();
+            let d3_b1 =
+                half::f16::from_bits(*(base3.add(boff1 + Q4K_D_OFFSET) as *const u16)).to_f32();
 
             if b + 2 < bpr {
                 let noff2 = (b + 2) * Q4K_BLOCK_BYTES;
@@ -1910,7 +2098,7 @@ pub unsafe extern "C" fn q3k_decode_step_native(
     block: *const u8,
     lane_offset: u64,
     _d_f32: f32,
-    _qs_offset: u64,   // always 32 for Q3_K
+    _qs_offset: u64,    // always 32 for Q3_K
     _hmask_offset: u64, // always 0 for Q3_K
     lanes: u64,
     out: *mut f32,
@@ -1938,15 +2126,20 @@ pub unsafe extern "C" fn q3k_decode_step_native(
     // Store scales into local array
     let mut scales_arr = [0i8; 16];
     for b in 0..4 {
-        let bytes = [aux_0.to_ne_bytes(), aux_1.to_ne_bytes(), aux_2.to_ne_bytes(), aux_3.to_ne_bytes()];
+        let bytes = [
+            aux_0.to_ne_bytes(),
+            aux_1.to_ne_bytes(),
+            aux_2.to_ne_bytes(),
+            aux_3.to_ne_bytes(),
+        ];
         scales_arr[b * 4 + 0] = bytes[b][0] as i8;
         scales_arr[b * 4 + 1] = bytes[b][1] as i8;
         scales_arr[b * 4 + 2] = bytes[b][2] as i8;
         scales_arr[b * 4 + 3] = bytes[b][3] as i8;
     }
 
-    let q = block.add(32);   // qs[64]
-    let hm = block.add(0);   // hmask[32]
+    let q = block.add(32); // qs[64]
+    let hm = block.add(0); // hmask[32]
 
     for i in 0..lanes as usize {
         let global_elem = (lane_offset as usize) + i;
@@ -1988,8 +2181,8 @@ pub unsafe extern "C" fn q6k_decode_step_native(
     block: *const u8,
     lane_offset: u64,
     _d_f32: f32,
-    _qs_offset: u64,   // Q6_K: qs at offset 0 (fixed by descriptor)
-    _qh_offset: u64,   // Q6_K: qh at offset 128 (fixed by descriptor)
+    _qs_offset: u64, // Q6_K: qs at offset 0 (fixed by descriptor)
+    _qh_offset: u64, // Q6_K: qh at offset 128 (fixed by descriptor)
     lanes: u64,
     out: *mut f32,
 ) {
@@ -2002,17 +2195,17 @@ pub unsafe extern "C" fn q6k_decode_step_native(
     let d = half::f16::from_bits(d_bits).to_f32();
 
     // qs[128] at block+0, qh[64] at block+128, scales[16] at block+192
-    let qs = block;            // qs[0..128]
-    let qh = block.add(128);   // qh[0..64]
-    let sc = block.add(192);   // scales[0..16] (i8)
+    let qs = block; // qs[0..128]
+    let qh = block.add(128); // qh[0..64]
+    let sc = block.add(192); // scales[0..16] (i8)
 
     for i in 0..lanes as usize {
         let global_elem = (lane_offset as usize) + i;
-        let n_group = global_elem / 128;          // 0 or 1
+        let n_group = global_elem / 128; // 0 or 1
         let within = global_elem % 128;
-        let quarter = within / 32;                 // 0=q1, 1=q2, 2=q3, 3=q4
+        let quarter = within / 32; // 0=q1, 1=q2, 2=q3, 3=q4
         let l = within % 32;
-        let is = l / 16;                            // 0 or 1 (sub-block within quarter)
+        let is = l / 16; // 0 or 1 (sub-block within quarter)
 
         let ql_off = n_group * 64;
         let qh_off = n_group * 32;
@@ -2070,18 +2263,18 @@ pub unsafe extern "C" fn q5k_decode_step_native(
     let dmin = half::f16::from_bits(dmin_bits).to_f32();
 
     // scales[12] at block+4, qh[32] at block+16, qs[128] at block+48
-    let scales = block.add(4);   // scales[0..12]
-    let qh = block.add(16);      // qh[0..32]
-    let qs = block.add(48);      // qs[0..128]
+    let scales = block.add(4); // scales[0..12]
+    let qh = block.add(16); // qh[0..32]
+    let qs = block.add(48); // qs[0..128]
 
     for i in 0..lanes as usize {
         let global_elem = (lane_offset as usize) + i;
         debug_assert!(global_elem < 256);
 
-        let mini = global_elem / 32;   // 0..7 (8 mini-blocks)
-        let l = global_elem % 32;      // mini-block 内位置
-        let group = mini / 2;          // 0..3 (4 qs groups of 32)
-        let half = mini % 2;           // 0=low nibble, 1=high nibble
+        let mini = global_elem / 32; // 0..7 (8 mini-blocks)
+        let l = global_elem % 32; // mini-block 内位置
+        let group = mini / 2; // 0..3 (4 qs groups of 32)
+        let half = mini % 2; // 0=low nibble, 1=high nibble
 
         // lo4: SPLIT per 64-element group (low nibble → mini even, high nibble → mini odd)
         let packed = *qs.add(group * 32 + l);
@@ -2145,17 +2338,19 @@ pub unsafe extern "C" fn q4k_decode_step_native(
         let group = mini / 2;
         let half = mini % 2;
         let packed = *qs.add(group * 32 + local);
-        let q = if half == 0 { packed & 0x0F } else { packed >> 4 };
+        let q = if half == 0 {
+            packed & 0x0F
+        } else {
+            packed >> 4
+        };
         let (sc, m) = if mini < 4 {
             (
                 (*scales.add(mini) & 0x3F) as f32,
                 (*scales.add(mini + 4) & 0x3F) as f32,
             )
         } else {
-            let sc = ((*scales.add(mini + 4) & 0x0F)
-                | ((*scales.add(mini - 4) >> 6) << 4)) as f32;
-            let m = ((*scales.add(mini + 4) >> 4)
-                | ((*scales.add(mini) >> 6) << 4)) as f32;
+            let sc = ((*scales.add(mini + 4) & 0x0F) | ((*scales.add(mini - 4) >> 6) << 4)) as f32;
+            let m = ((*scales.add(mini + 4) >> 4) | ((*scales.add(mini) >> 6) << 4)) as f32;
             (sc, m)
         };
         *out.add(i) = d * sc * q as f32 - dmin * m;
@@ -2174,12 +2369,14 @@ pub unsafe extern "C" fn q5_0_decode_step_native(
     block: *const u8,
     lane_offset: u64,
     _d_f32: f32,
-    _qs_offset: u64,   // Q5_0: qs at offset 6 (fixed by descriptor)
-    _qh_offset: u64,   // Q5_0: qh at offset 2 (fixed by descriptor)
+    _qs_offset: u64, // Q5_0: qs at offset 6 (fixed by descriptor)
+    _qh_offset: u64, // Q5_0: qh at offset 2 (fixed by descriptor)
     lanes: u64,
     out: *mut f32,
 ) {
-    if block.is_null() { return; }
+    if block.is_null() {
+        return;
+    }
     // d (f16) at block+0
     let d_bits = (*block.add(0) as u16) | ((*block.add(1) as u16) << 8);
     let d = half::f16::from_bits(d_bits).to_f32();
@@ -2211,12 +2408,14 @@ pub unsafe extern "C" fn q5_1_decode_step_native(
     block: *const u8,
     lane_offset: u64,
     _d_f32: f32,
-    _qs_offset: u64,   // Q5_1: qs at offset 8
-    _qh_offset: u64,   // Q5_1: qh at offset 4
+    _qs_offset: u64, // Q5_1: qs at offset 8
+    _qh_offset: u64, // Q5_1: qh at offset 4
     lanes: u64,
     out: *mut f32,
 ) {
-    if block.is_null() { return; }
+    if block.is_null() {
+        return;
+    }
     // d (f16) at block+0, m (f16) at block+2
     let d_bits = (*block.add(0) as u16) | ((*block.add(1) as u16) << 8);
     let d = half::f16::from_bits(d_bits).to_f32();
@@ -2259,10 +2458,8 @@ mod tests {
                 )
             } else {
                 (
-                    ((scales[index + 4] & 0x0f)
-                        | ((scales[index - 4] >> 6) << 4)) as f32,
-                    ((scales[index + 4] >> 4)
-                        | ((scales[index] >> 6) << 4)) as f32,
+                    ((scales[index + 4] & 0x0f) | ((scales[index - 4] >> 6) << 4)) as f32,
+                    ((scales[index + 4] >> 4) | ((scales[index] >> 6) << 4)) as f32,
                 )
             }
         }
@@ -2272,10 +2469,8 @@ mod tests {
             let (sc_hi, m_hi) = scale_min(scales, group * 2 + 1);
             let q = &qs[group * 32..(group + 1) * 32];
             for local in 0..32 {
-                output[group * 64 + local] =
-                    d * sc_lo * (q[local] & 0x0f) as f32 - dmin * m_lo;
-                output[group * 64 + 32 + local] =
-                    d * sc_hi * (q[local] >> 4) as f32 - dmin * m_hi;
+                output[group * 64 + local] = d * sc_lo * (q[local] & 0x0f) as f32 - dmin * m_lo;
+                output[group * 64 + 32 + local] = d * sc_hi * (q[local] >> 4) as f32 - dmin * m_hi;
             }
         }
         output
@@ -2331,6 +2526,9 @@ mod tests {
                 mismatches += 1;
             }
         }
-        assert_eq!(mismatches, 0, "Q4_K native output differs from llama.cpp reference");
+        assert_eq!(
+            mismatches, 0,
+            "Q4_K native output differs from llama.cpp reference"
+        );
     }
 }

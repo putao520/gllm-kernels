@@ -24,8 +24,10 @@ fn bench_gemm(label: &str, m: usize, n: usize, k: usize, warmup: usize, iters: u
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let median = times[iters / 2];
     let gflops = (2.0 * m as f64 * n as f64 * k as f64) / median / 1e9;
-    println!("{label:<45} {median_ms:>8.3}ms {gflops:>9.1}",
-             median_ms = median * 1000.0);
+    println!(
+        "{label:<45} {median_ms:>8.3}ms {gflops:>9.1}",
+        median_ms = median * 1000.0
+    );
 }
 
 fn bench_gemm_prepacked(label: &str, m: usize, n: usize, k: usize, warmup: usize, iters: usize) {
@@ -53,8 +55,10 @@ fn bench_gemm_prepacked(label: &str, m: usize, n: usize, k: usize, warmup: usize
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let median = times[iters / 2];
     let gflops = (2.0 * m as f64 * n as f64 * k as f64) / median / 1e9;
-    println!("{label:<45} {median_ms:>8.3}ms {gflops:>9.1}",
-             median_ms = median * 1000.0);
+    println!(
+        "{label:<45} {median_ms:>8.3}ms {gflops:>9.1}",
+        median_ms = median * 1000.0
+    );
 }
 
 fn main() {
@@ -64,11 +68,32 @@ fn main() {
     println!("Rayon threads: {}", rayon::current_num_threads());
 
     let shapes: &[(&str, usize, usize, usize, usize, usize)] = &[
-        ("M=1 K=4096 N=4096 (decode GEMV)",      1,    4096, 4096, 5, 50),
-        ("M=32 K=4096 N=4096 (small batch)",      32,   4096, 4096, 5, 20),
-        ("M=128 K=4096 N=11008 (FFN prefill)",    128,  4096, 11008, 3, 10),
-        ("M=512 K=4096 N=4096 (medium prefill)",  512,  4096, 4096, 3, 10),
-        ("M=2048 K=4096 N=4096 (large prefill)",  2048, 4096, 4096, 2, 5),
+        ("M=1 K=4096 N=4096 (decode GEMV)", 1, 4096, 4096, 5, 50),
+        ("M=32 K=4096 N=4096 (small batch)", 32, 4096, 4096, 5, 20),
+        (
+            "M=128 K=4096 N=11008 (FFN prefill)",
+            128,
+            4096,
+            11008,
+            3,
+            10,
+        ),
+        (
+            "M=512 K=4096 N=4096 (medium prefill)",
+            512,
+            4096,
+            4096,
+            3,
+            10,
+        ),
+        (
+            "M=2048 K=4096 N=4096 (large prefill)",
+            2048,
+            4096,
+            4096,
+            2,
+            5,
+        ),
     ];
 
     println!("\n{}", "=".repeat(72));

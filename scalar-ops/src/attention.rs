@@ -263,7 +263,9 @@ pub unsafe extern "C" fn scalar_cached_gqa_attention(
             let valid_len = cur_pos + 1;
             let mut max_val = f32::NEG_INFINITY;
             for t in 0..valid_len {
-                if scores[t] > max_val { max_val = scores[t]; }
+                if scores[t] > max_val {
+                    max_val = scores[t];
+                }
             }
             let mut sum = 0.0f32;
             for t in 0..valid_len {
@@ -281,7 +283,9 @@ pub unsafe extern "C" fn scalar_cached_gqa_attention(
             // Sparsity stats
             for t in 0..valid_len {
                 total_weights += 1;
-                if scores[t] < 0.01 { near_zero_count += 1; }
+                if scores[t] < 0.01 {
+                    near_zero_count += 1;
+                }
             }
 
             // Weighted sum: out[s,h] = Σ_t scores[t] * V_cache[t,kv_h]

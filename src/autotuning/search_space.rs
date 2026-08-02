@@ -388,7 +388,13 @@ impl SearchSpace {
     pub fn for_jit_gemm(hw: &HwInfo, shape: &ProblemShape, tm: usize, tn: usize) -> Self {
         let mut base = Self::for_gemm(hw, shape, tm, tn);
 
-        let simd_w = if hw.isa.avx512f { 16usize } else if hw.isa.avx2 { 8 } else { 4 };
+        let simd_w = if hw.isa.avx512f {
+            16usize
+        } else if hw.isa.avx2 {
+            8
+        } else {
+            4
+        };
 
         // NR variant: multiples of SIMD width, from simd_w up to tn (default NR).
         // Capped at 2*tn to avoid excessive register pressure.
@@ -481,7 +487,11 @@ impl SearchSpace {
                 for &nc in ncs {
                     for &t in thr {
                         configs.push(TuningConfig {
-                            kc, mc, nc, num_threads: t, jit: None,
+                            kc,
+                            mc,
+                            nc,
+                            num_threads: t,
+                            jit: None,
                         });
                     }
                 }
@@ -516,7 +526,10 @@ impl SearchSpace {
                                     for &sw in &sw_depths {
                                         for &nr in &nr_variants {
                                             configs.push(TuningConfig {
-                                                kc, mc, nc, num_threads: t,
+                                                kc,
+                                                mc,
+                                                nc,
+                                                num_threads: t,
                                                 jit: Some(JitParams {
                                                     k_unroll: ku,
                                                     prefetch_distance: pf,
@@ -546,7 +559,9 @@ impl SearchSpace {
         let thr = thread_neighborhood(center.num_threads, self.thread_range.max);
 
         if let (Some(jit_ranges), Some(center_jit)) = (&self.jit_ranges, &center.jit) {
-            self.refine_around_jit(center, &kcs, &mcs, &ncs, &thr, jit_ranges, center_jit, radius)
+            self.refine_around_jit(
+                center, &kcs, &mcs, &ncs, &thr, jit_ranges, center_jit, radius,
+            )
         } else {
             self.refine_around_base(center, &kcs, &mcs, &ncs, &thr)
         }
@@ -566,7 +581,11 @@ impl SearchSpace {
                 for &nc in ncs {
                     for &t in thr {
                         let cfg = TuningConfig {
-                            kc, mc, nc, num_threads: t, jit: None,
+                            kc,
+                            mc,
+                            nc,
+                            num_threads: t,
+                            jit: None,
                         };
                         if cfg != *center {
                             configs.push(cfg);
@@ -589,10 +608,19 @@ impl SearchSpace {
         center_jit: &JitParams,
         radius: usize,
     ) -> Vec<TuningConfig> {
-        let k_unrolls = jit_k_unroll_neighborhood(center_jit.k_unroll, jit_ranges.k_unroll_range.max);
-        let prefetches = neighborhood(center_jit.prefetch_distance, &jit_ranges.prefetch_range, radius);
+        let k_unrolls =
+            jit_k_unroll_neighborhood(center_jit.k_unroll, jit_ranges.k_unroll_range.max);
+        let prefetches = neighborhood(
+            center_jit.prefetch_distance,
+            &jit_ranges.prefetch_range,
+            radius,
+        );
         let strategies = &jit_ranges.reg_alloc_strategies;
-        let sw_depths = neighborhood(center_jit.sw_pipeline_depth, &jit_ranges.sw_pipeline_range, radius);
+        let sw_depths = neighborhood(
+            center_jit.sw_pipeline_depth,
+            &jit_ranges.sw_pipeline_range,
+            radius,
+        );
         let nr_variants = neighborhood(center_jit.nr_variant, &jit_ranges.nr_variant_range, radius);
 
         let mut configs = Vec::new();
@@ -606,7 +634,10 @@ impl SearchSpace {
                                     for &sw in &sw_depths {
                                         for &nr in &nr_variants {
                                             let cfg = TuningConfig {
-                                                kc, mc, nc, num_threads: t,
+                                                kc,
+                                                mc,
+                                                nc,
+                                                num_threads: t,
                                                 jit: Some(JitParams {
                                                     k_unroll: ku,
                                                     prefetch_distance: pf,
@@ -658,10 +689,18 @@ fn subsample(values: &[usize], stride: usize) -> Vec<usize> {
     }
     // Always include last
     // SAFETY: result is non-empty (pushed values[0] above), values is non-empty (checked at entry).
-    if *result.last().expect("result non-empty: values[0] pushed above")
-        != *values.last().expect("values non-empty: checked at function entry")
+    if *result
+        .last()
+        .expect("result non-empty: values[0] pushed above")
+        != *values
+            .last()
+            .expect("values non-empty: checked at function entry")
     {
-        result.push(*values.last().expect("values non-empty: checked at function entry"));
+        result.push(
+            *values
+                .last()
+                .expect("values non-empty: checked at function entry"),
+        );
     }
     result
 }
@@ -837,21 +876,36 @@ mod tests {
 
     #[test]
     fn param_range_single_value() {
-        let r = ParamRange { name: "T", min: 64, max: 64, step: 1 };
+        let r = ParamRange {
+            name: "T",
+            min: 64,
+            max: 64,
+            step: 1,
+        };
         assert_eq!(r.count(), 1);
         assert_eq!(r.values(), vec![64]);
     }
 
     #[test]
     fn param_range_inverted_is_empty() {
-        let r = ParamRange { name: "X", min: 100, max: 50, step: 10 };
+        let r = ParamRange {
+            name: "X",
+            min: 100,
+            max: 50,
+            step: 10,
+        };
         assert_eq!(r.count(), 0);
         assert!(r.values().is_empty());
     }
 
     #[test]
     fn param_range_step_1_covers_all() {
-        let r = ParamRange { name: "S", min: 0, max: 4, step: 1 };
+        let r = ParamRange {
+            name: "S",
+            min: 0,
+            max: 4,
+            step: 1,
+        };
         assert_eq!(r.values(), vec![0, 1, 2, 3, 4]);
     }
 
@@ -903,7 +957,13 @@ mod tests {
 
     #[test]
     fn tuning_config_display_no_jit() {
-        let cfg = TuningConfig { kc: 128, mc: 64, nc: 256, num_threads: 4, jit: None };
+        let cfg = TuningConfig {
+            kc: 128,
+            mc: 64,
+            nc: 256,
+            num_threads: 4,
+            jit: None,
+        };
         let s = cfg.to_string();
         assert!(s.contains("KC=128"));
         assert!(s.contains("threads=4"));
@@ -913,7 +973,10 @@ mod tests {
     #[test]
     fn tuning_config_display_with_jit() {
         let cfg = TuningConfig {
-            kc: 64, mc: 32, nc: 128, num_threads: 2,
+            kc: 64,
+            mc: 32,
+            nc: 128,
+            num_threads: 2,
             jit: Some(JitParams::default()),
         };
         let s = cfg.to_string();
@@ -922,8 +985,20 @@ mod tests {
 
     #[test]
     fn tuning_config_equality() {
-        let a = TuningConfig { kc: 64, mc: 32, nc: 128, num_threads: 2, jit: None };
-        let b = TuningConfig { kc: 64, mc: 32, nc: 128, num_threads: 2, jit: None };
+        let a = TuningConfig {
+            kc: 64,
+            mc: 32,
+            nc: 128,
+            num_threads: 2,
+            jit: None,
+        };
+        let b = TuningConfig {
+            kc: 64,
+            mc: 32,
+            nc: 128,
+            num_threads: 2,
+            jit: None,
+        };
         assert_eq!(a, b);
     }
 
@@ -940,7 +1015,13 @@ mod tests {
 
     #[test]
     fn problem_shape_display() {
-        let s = ProblemShape { m: 1, n: 512, k: 4096, elem_bytes: 2, dtype_id: 1 };
+        let s = ProblemShape {
+            m: 1,
+            n: 512,
+            k: 4096,
+            elem_bytes: 2,
+            dtype_id: 1,
+        };
         let display = s.to_string();
         assert!(display.contains("1x512x4096"));
         assert!(display.contains("e2_d1"));
@@ -951,8 +1032,11 @@ mod tests {
     #[test]
     fn gpu_gemm_config_fields() {
         let cfg = GpuGemmConfig {
-            cta_m: 128, cta_n: 64, cta_k: 32,
-            warp_m: 32, warp_n: 16,
+            cta_m: 128,
+            cta_n: 64,
+            cta_k: 32,
+            warp_m: 32,
+            warp_n: 16,
             pipeline_depth: 2,
         };
         assert_eq!(cfg.cta_m, 128);
@@ -967,7 +1051,13 @@ mod tests {
     fn search_space_gemm_small_shape_ranges_aligned() {
         // Arrange
         let hw = HwInfo::detect();
-        let shape = ProblemShape { m: 16, n: 16, k: 16, elem_bytes: 4, dtype_id: 0 };
+        let shape = ProblemShape {
+            m: 16,
+            n: 16,
+            k: 16,
+            elem_bytes: 4,
+            dtype_id: 0,
+        };
 
         // Act
         let space = SearchSpace::for_gemm(&hw, &shape, 6, 8);
@@ -977,19 +1067,37 @@ mod tests {
         // KC range values must be multiples of step (8)
         if space.kc_range.max >= space.kc_range.min {
             for v in space.kc_range.values() {
-                assert_eq!(v % space.kc_range.step, 0, "KC value {} not aligned to step {}", v, space.kc_range.step);
+                assert_eq!(
+                    v % space.kc_range.step,
+                    0,
+                    "KC value {} not aligned to step {}",
+                    v,
+                    space.kc_range.step
+                );
             }
         }
         // MC range values must be multiples of step (tm=6)
         if space.mc_range.max >= space.mc_range.min {
             for v in space.mc_range.values() {
-                assert_eq!(v % space.mc_range.step, 0, "MC value {} not aligned to step {}", v, space.mc_range.step);
+                assert_eq!(
+                    v % space.mc_range.step,
+                    0,
+                    "MC value {} not aligned to step {}",
+                    v,
+                    space.mc_range.step
+                );
             }
         }
         // NC range values must be multiples of step (tn=8)
         if space.nc_range.max >= space.nc_range.min {
             for v in space.nc_range.values() {
-                assert_eq!(v % space.nc_range.step, 0, "NC value {} not aligned to step {}", v, space.nc_range.step);
+                assert_eq!(
+                    v % space.nc_range.step,
+                    0,
+                    "NC value {} not aligned to step {}",
+                    v,
+                    space.nc_range.step
+                );
             }
         }
     }
@@ -1000,7 +1108,13 @@ mod tests {
     fn search_space_gemv_fixed_mc_and_nc() {
         // Arrange
         let hw = HwInfo::detect();
-        let shape = ProblemShape { m: 1, n: 768, k: 4096, elem_bytes: 4, dtype_id: 0 };
+        let shape = ProblemShape {
+            m: 1,
+            n: 768,
+            k: 4096,
+            elem_bytes: 4,
+            dtype_id: 0,
+        };
 
         // Act
         let space = SearchSpace::for_gemv(&hw, &shape, 8);
@@ -1041,7 +1155,12 @@ mod tests {
     #[test]
     fn param_range_step_equals_span_yields_two() {
         // Arrange
-        let r = ParamRange { name: "test", min: 10, max: 30, step: 20 };
+        let r = ParamRange {
+            name: "test",
+            min: 10,
+            max: 30,
+            step: 20,
+        };
 
         // Act
         let count = r.count();
@@ -1057,7 +1176,12 @@ mod tests {
     #[test]
     fn param_range_large_step_yields_min_only() {
         // Arrange
-        let r = ParamRange { name: "big_step", min: 10, max: 15, step: 100 };
+        let r = ParamRange {
+            name: "big_step",
+            min: 10,
+            max: 15,
+            step: 100,
+        };
 
         // Act
         let vals = r.values();
@@ -1088,9 +1212,11 @@ mod tests {
         // Arrange
         use std::collections::HashSet;
         let a = JitParams {
-            k_unroll: 2, prefetch_distance: 4,
+            k_unroll: 2,
+            prefetch_distance: 4,
             reg_alloc_strategy: RegAllocStrategy::MaxAccumulators,
-            sw_pipeline_depth: 1, nr_variant: 8,
+            sw_pipeline_depth: 1,
+            nr_variant: 8,
         };
         let b = a.clone();
 
@@ -1109,7 +1235,13 @@ mod tests {
     fn jit_gemm_grid_size_larger_than_base_gemm() {
         // Arrange
         let hw = HwInfo::detect();
-        let shape = ProblemShape { m: 256, n: 256, k: 256, elem_bytes: 4, dtype_id: 0 };
+        let shape = ProblemShape {
+            m: 256,
+            n: 256,
+            k: 256,
+            elem_bytes: 4,
+            dtype_id: 0,
+        };
 
         // Act
         let base = SearchSpace::for_gemm(&hw, &shape, 6, 8);
@@ -1118,7 +1250,12 @@ mod tests {
         let jit_grid = jit.grid_size();
 
         // Assert
-        assert!(jit_grid >= base_grid, "JIT grid ({}) should be >= base grid ({})", jit_grid, base_grid);
+        assert!(
+            jit_grid >= base_grid,
+            "JIT grid ({}) should be >= base grid ({})",
+            jit_grid,
+            base_grid
+        );
         assert!(jit.jit_ranges.is_some());
     }
 
@@ -1155,7 +1292,13 @@ mod tests {
     fn coarse_grid_stride_one_equals_full_grid() {
         // Arrange
         let hw = HwInfo::detect();
-        let shape = ProblemShape { m: 64, n: 64, k: 64, elem_bytes: 4, dtype_id: 0 };
+        let shape = ProblemShape {
+            m: 64,
+            n: 64,
+            k: 64,
+            elem_bytes: 4,
+            dtype_id: 0,
+        };
         let space = SearchSpace::for_gemm(&hw, &shape, 6, 8);
 
         // Act
@@ -1165,7 +1308,10 @@ mod tests {
         // Assert — coarse_grid uses thread_candidates which deduplicates,
         // so it may differ from the raw product. Just check same order of magnitude.
         assert!(!coarse.is_empty());
-        assert!(coarse.len() <= full, "coarse_grid(1) should not exceed full grid");
+        assert!(
+            coarse.len() <= full,
+            "coarse_grid(1) should not exceed full grid"
+        );
     }
 
     /// Verify that GpuSearchSpace::for_sm produces more tile candidates for
@@ -1177,9 +1323,12 @@ mod tests {
         let sm80 = GpuSearchSpace::for_sm(80, 256 * 1024);
 
         // Assert
-        assert!(sm100.total_candidates() > sm80.total_candidates(),
+        assert!(
+            sm100.total_candidates() > sm80.total_candidates(),
             "SM100 candidates ({}) should exceed SM80 ({})",
-            sm100.total_candidates(), sm80.total_candidates());
+            sm100.total_candidates(),
+            sm80.total_candidates()
+        );
         assert_eq!(sm100.sm_version, 100);
         assert_eq!(sm80.sm_version, 80);
     }
@@ -1191,7 +1340,9 @@ mod tests {
         // Arrange
         let space = GpuSearchSpace::for_sm(90, 200 * 1024);
         let cfg = GpuGemmConfig {
-            cta_m: 128, cta_n: 64, cta_k: 32,
+            cta_m: 128,
+            cta_n: 64,
+            cta_k: 32,
             warp_m: 30, // does NOT divide 128
             warp_n: 16,
             pipeline_depth: 1,
@@ -1201,7 +1352,10 @@ mod tests {
         let valid = space.is_valid(&cfg, 200 * 1024, 4);
 
         // Assert
-        assert!(!valid, "Config with warp_m=30 not dividing cta_m=128 should be invalid");
+        assert!(
+            !valid,
+            "Config with warp_m=30 not dividing cta_m=128 should be invalid"
+        );
     }
 
     /// Verify that GpuGemmConfig Display formats all 6 fields correctly.
@@ -1209,8 +1363,11 @@ mod tests {
     fn gpu_gemm_config_display_format() {
         // Arrange
         let cfg = GpuGemmConfig {
-            cta_m: 128, cta_n: 64, cta_k: 32,
-            warp_m: 32, warp_n: 16,
+            cta_m: 128,
+            cta_n: 64,
+            cta_k: 32,
+            warp_m: 32,
+            warp_n: 16,
             pipeline_depth: 3,
         };
 
@@ -1218,9 +1375,21 @@ mod tests {
         let s = cfg.to_string();
 
         // Assert
-        assert!(s.contains("128\u{00d7}64\u{00d7}32"), "CTA tiles should appear as 128x64x32, got: {}", s);
-        assert!(s.contains("32\u{00d7}16"), "Warp tiles should appear as 32x16, got: {}", s);
-        assert!(s.contains("pipe=3"), "Pipeline depth should appear as pipe=3, got: {}", s);
+        assert!(
+            s.contains("128\u{00d7}64\u{00d7}32"),
+            "CTA tiles should appear as 128x64x32, got: {}",
+            s
+        );
+        assert!(
+            s.contains("32\u{00d7}16"),
+            "Warp tiles should appear as 32x16, got: {}",
+            s
+        );
+        assert!(
+            s.contains("pipe=3"),
+            "Pipeline depth should appear as pipe=3, got: {}",
+            s
+        );
     }
 
     /// Verify that round_down aligns values correctly and handles align=0.
@@ -1317,8 +1486,11 @@ mod tests {
         // Arrange
         let space = GpuSearchSpace::for_sm(90, 128 * 1024); // 128KB shared mem
         let cfg = GpuGemmConfig {
-            cta_m: 256, cta_n: 256, cta_k: 64,
-            warp_m: 64, warp_n: 32,
+            cta_m: 256,
+            cta_n: 256,
+            cta_k: 64,
+            warp_m: 64,
+            warp_n: 32,
             pipeline_depth: 3, // 3 stages of 256*64*4 + 64*256*4 = 128KB per stage -> 384KB total
         };
 
@@ -1337,8 +1509,11 @@ mod tests {
         // 4 warps in M * 2 warps in N = 8 warps * 32 = 256 threads (valid)
         // But cta_m=256/cta_n=128 with warp_m=16/warp_n=16 -> 16*8=128 warps * 32 = 4096 threads
         let cfg = GpuGemmConfig {
-            cta_m: 256, cta_n: 128, cta_k: 32,
-            warp_m: 16, warp_n: 16,
+            cta_m: 256,
+            cta_n: 128,
+            cta_k: 32,
+            warp_m: 16,
+            warp_n: 16,
             pipeline_depth: 1,
         };
 
@@ -1363,8 +1538,11 @@ mod tests {
         // Assert
         assert!(!configs.is_empty(), "should have at least one valid config");
         for cfg in &configs {
-            assert!(space.is_valid(cfg, smem, 4),
-                "enumerate_valid returned invalid config: {}", cfg);
+            assert!(
+                space.is_valid(cfg, smem, 4),
+                "enumerate_valid returned invalid config: {}",
+                cfg
+            );
         }
     }
 
@@ -1373,8 +1551,11 @@ mod tests {
     fn gpu_gemm_config_clone_and_equality() {
         // Arrange
         let a = GpuGemmConfig {
-            cta_m: 64, cta_n: 64, cta_k: 32,
-            warp_m: 32, warp_n: 16,
+            cta_m: 64,
+            cta_n: 64,
+            cta_k: 32,
+            warp_m: 32,
+            warp_n: 16,
             pipeline_depth: 2,
         };
         let b = a.clone();
@@ -1382,7 +1563,10 @@ mod tests {
         // Act & Assert
         assert_eq!(a, b);
         // Modify one field to ensure inequality
-        let c = GpuGemmConfig { pipeline_depth: 1, ..a.clone() };
+        let c = GpuGemmConfig {
+            pipeline_depth: 1,
+            ..a.clone()
+        };
         assert_ne!(a, c);
     }
 
@@ -1393,16 +1577,28 @@ mod tests {
         // Arrange
         let jit = JitParams::default();
         let a = TuningConfig {
-            kc: 64, mc: 32, nc: 128, num_threads: 4,
+            kc: 64,
+            mc: 32,
+            nc: 128,
+            num_threads: 4,
             jit: Some(jit.clone()),
         };
         let b = TuningConfig {
-            kc: 64, mc: 32, nc: 128, num_threads: 4,
+            kc: 64,
+            mc: 32,
+            nc: 128,
+            num_threads: 4,
             jit: Some(jit.clone()),
         };
         let c = TuningConfig {
-            kc: 64, mc: 32, nc: 128, num_threads: 4,
-            jit: Some(JitParams { k_unroll: 8, ..jit.clone() }),
+            kc: 64,
+            mc: 32,
+            nc: 128,
+            num_threads: 4,
+            jit: Some(JitParams {
+                k_unroll: 8,
+                ..jit.clone()
+            }),
         };
 
         // Act & Assert
@@ -1432,7 +1628,12 @@ mod tests {
     #[test]
     fn neighborhood_stays_within_bounds_and_includes_center() {
         // Arrange
-        let range = ParamRange { name: "KC", min: 16, max: 128, step: 16 };
+        let range = ParamRange {
+            name: "KC",
+            min: 16,
+            max: 128,
+            step: 16,
+        };
         let center = 64;
         let radius = 2;
 
@@ -1444,7 +1645,13 @@ mod tests {
         for &v in &vals {
             assert!(v >= range.min, "value {} below min {}", v, range.min);
             assert!(v <= range.max, "value {} above max {}", v, range.max);
-            assert_eq!(v % range.step, 0, "value {} not aligned to step {}", v, range.step);
+            assert_eq!(
+                v % range.step,
+                0,
+                "value {} not aligned to step {}",
+                v,
+                range.step
+            );
         }
     }
 
@@ -1453,7 +1660,12 @@ mod tests {
     #[test]
     fn neighborhood_radius_zero_returns_center_only() {
         // Arrange
-        let range = ParamRange { name: "MC", min: 6, max: 96, step: 6 };
+        let range = ParamRange {
+            name: "MC",
+            min: 6,
+            max: 96,
+            step: 6,
+        };
         let center = 48;
 
         // Act
@@ -1467,7 +1679,12 @@ mod tests {
     #[test]
     fn neighborhood_clamps_at_lower_bound() {
         // Arrange
-        let range = ParamRange { name: "NC", min: 8, max: 512, step: 8 };
+        let range = ParamRange {
+            name: "NC",
+            min: 8,
+            max: 512,
+            step: 8,
+        };
         let center = 8; // at min
 
         // Act
@@ -1523,7 +1740,10 @@ mod tests {
         assert!(vals.contains(&4), "should contain center = 4");
         assert!(vals.contains(&8), "should contain center*2 = 8");
         // Should not contain values far from center
-        assert!(!vals.contains(&16), "should not contain 16 (two steps away)");
+        assert!(
+            !vals.contains(&16),
+            "should not contain 16 (two steps away)"
+        );
     }
 
     /// Verify that jit_k_unroll_neighborhood with center=1 (minimum power)
@@ -1548,7 +1768,12 @@ mod tests {
     #[test]
     fn param_range_non_dividing_step_stops_before_max() {
         // Arrange
-        let r = ParamRange { name: "odd", min: 0, max: 10, step: 3 };
+        let r = ParamRange {
+            name: "odd",
+            min: 0,
+            max: 10,
+            step: 3,
+        };
 
         // Act
         let vals = r.values();
@@ -1581,8 +1806,20 @@ mod tests {
     fn tuning_config_hash_distinguishes_different_configs() {
         // Arrange
         use std::collections::HashSet;
-        let a = TuningConfig { kc: 64, mc: 32, nc: 128, num_threads: 4, jit: None };
-        let b = TuningConfig { kc: 128, mc: 32, nc: 128, num_threads: 4, jit: None };
+        let a = TuningConfig {
+            kc: 64,
+            mc: 32,
+            nc: 128,
+            num_threads: 4,
+            jit: None,
+        };
+        let b = TuningConfig {
+            kc: 128,
+            mc: 32,
+            nc: 128,
+            num_threads: 4,
+            jit: None,
+        };
 
         // Act
         let mut set = HashSet::new();
@@ -1617,7 +1854,9 @@ mod tests {
         // Arrange
         let space = GpuSearchSpace::for_sm(90, 512 * 1024);
         let cfg = GpuGemmConfig {
-            cta_m: 64, cta_n: 64, cta_k: 32,
+            cta_m: 64,
+            cta_n: 64,
+            cta_k: 32,
             warp_m: 128, // larger than cta_m=64
             warp_n: 16,
             pipeline_depth: 1,
@@ -1627,7 +1866,10 @@ mod tests {
         let valid = space.is_valid(&cfg, 512 * 1024, 4);
 
         // Assert
-        assert!(!valid, "Config with warp_m > cta_m should be invalid (zero warps in M)");
+        assert!(
+            !valid,
+            "Config with warp_m > cta_m should be invalid (zero warps in M)"
+        );
     }
 }
 
@@ -1658,9 +1900,7 @@ impl std::fmt::Display for GpuGemmConfig {
         write!(
             f,
             "cta={}×{}×{} warp={}×{} pipe={}",
-            self.cta_m, self.cta_n, self.cta_k,
-            self.warp_m, self.warp_n,
-            self.pipeline_depth
+            self.cta_m, self.cta_n, self.cta_k, self.warp_m, self.warp_n, self.pipeline_depth
         )
     }
 }
@@ -1683,26 +1923,10 @@ impl GpuSearchSpace {
     pub fn for_sm(sm_version: u32, shared_mem_bytes: usize) -> Self {
         // Tile sizes by SM generation
         let (cta_m_cands, cta_n_cands, cta_k_cands) = match sm_version {
-            100.. => (
-                vec![64, 128, 256],
-                vec![64, 128, 256],
-                vec![32, 64, 128],
-            ),
-            90..=99 => (
-                vec![64, 128],
-                vec![64, 128],
-                vec![32, 64],
-            ),
-            80..=89 => (
-                vec![64, 128],
-                vec![64, 128],
-                vec![16, 32, 64],
-            ),
-            _ => (
-                vec![64, 128],
-                vec![64, 128],
-                vec![16, 32],
-            ),
+            100.. => (vec![64, 128, 256], vec![64, 128, 256], vec![32, 64, 128]),
+            90..=99 => (vec![64, 128], vec![64, 128], vec![32, 64]),
+            80..=89 => (vec![64, 128], vec![64, 128], vec![16, 32, 64]),
+            _ => (vec![64, 128], vec![64, 128], vec![16, 32]),
         };
 
         // Warp-level tiles by SM
@@ -1737,7 +1961,12 @@ impl GpuSearchSpace {
     }
 
     /// Validate a config against shared memory constraints.
-    pub fn is_valid(&self, cfg: &GpuGemmConfig, shared_mem_bytes: usize, elem_bytes: usize) -> bool {
+    pub fn is_valid(
+        &self,
+        cfg: &GpuGemmConfig,
+        shared_mem_bytes: usize,
+        elem_bytes: usize,
+    ) -> bool {
         // Warp tiles must divide CTA tiles
         if cfg.cta_m % cfg.warp_m != 0 || cfg.cta_n % cfg.warp_n != 0 {
             return false;
@@ -1762,7 +1991,11 @@ impl GpuSearchSpace {
     }
 
     /// Enumerate all valid configurations.
-    pub fn enumerate_valid(&self, shared_mem_bytes: usize, elem_bytes: usize) -> Vec<GpuGemmConfig> {
+    pub fn enumerate_valid(
+        &self,
+        shared_mem_bytes: usize,
+        elem_bytes: usize,
+    ) -> Vec<GpuGemmConfig> {
         let mut configs = Vec::new();
         for &cta_m in &self.cta_m_values {
             for &cta_n in &self.cta_n_values {
@@ -1771,8 +2004,11 @@ impl GpuSearchSpace {
                         for &warp_n in &self.warp_n_values {
                             for &pipe in &self.pipeline_depth_values {
                                 let cfg = GpuGemmConfig {
-                                    cta_m, cta_n, cta_k,
-                                    warp_m, warp_n,
+                                    cta_m,
+                                    cta_n,
+                                    cta_k,
+                                    warp_m,
+                                    warp_n,
                                     pipeline_depth: pipe,
                                 };
                                 if self.is_valid(&cfg, shared_mem_bytes, elem_bytes) {

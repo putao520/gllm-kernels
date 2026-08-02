@@ -42,10 +42,7 @@ pub enum PackMap {
     /// Tile layout: 固定大小 tile 存储 (AMX 16×16, GPU tensor core 16×16)
     /// 原始: W[m][n]
     /// Tile: tile[m/tile_m][n/tile_n][r][c] = W[m*tile_m+r][n*tile_n+c]
-    TilePack {
-        tile_rows: usize,
-        tile_cols: usize,
-    },
+    TilePack { tile_rows: usize, tile_cols: usize },
 }
 
 impl PackMap {
@@ -60,8 +57,8 @@ impl PackMap {
                 let intra_r = row % nr;
                 let intra_c = col % nr;
                 let panel_id = row / nr; // simplified: panel row
-                // BLIS B-pack: panel[col_block][kc_block][r][c]
-                // For single kc block: offset = panel_j * nr * kc + intra_r * kc + intra_c
+                                         // BLIS B-pack: panel[col_block][kc_block][r][c]
+                                         // For single kc block: offset = panel_j * nr * kc + intra_r * kc + intra_c
                 (panel_j * nr * kc + intra_r * kc + intra_c) * elem_bytes
             }
 
@@ -71,13 +68,19 @@ impl PackMap {
                 (group * orig_ldc * interleave + col * interleave + lane) * elem_bytes
             }
 
-            PackMap::TilePack { tile_rows, tile_cols } => {
+            PackMap::TilePack {
+                tile_rows,
+                tile_cols,
+            } => {
                 let tile_row = row / tile_rows;
                 let tile_col = col / tile_cols;
                 let intra_r = row % tile_rows;
                 let intra_c = col % tile_cols;
-                (tile_row * tile_cols + tile_col * tile_rows * tile_cols
-                    + intra_r * tile_cols + intra_c) * elem_bytes
+                (tile_row * tile_cols
+                    + tile_col * tile_rows * tile_cols
+                    + intra_r * tile_cols
+                    + intra_c)
+                    * elem_bytes
             }
         }
     }
@@ -92,7 +95,10 @@ impl PackMap {
                 num_panels_i * num_panels_j * nr * kc * elem_bytes
             }
             PackMap::VnniPack { interleave } => rows * cols * elem_bytes, // same size, different layout
-            PackMap::TilePack { tile_rows, tile_cols } => {
+            PackMap::TilePack {
+                tile_rows,
+                tile_cols,
+            } => {
                 let aligned_rows = ((rows + tile_rows - 1) / tile_rows) * tile_rows;
                 let aligned_cols = ((cols + tile_cols - 1) / tile_cols) * tile_cols;
                 aligned_rows * aligned_cols * elem_bytes
@@ -115,15 +121,16 @@ impl PackMap {
             PackMap::Identity => orig_n * elem_bytes,
             PackMap::PanelPack { nr, kc: _ } => nr * elem_bytes,
             PackMap::VnniPack { interleave } => orig_n * interleave * elem_bytes,
-            PackMap::TilePack { tile_rows: _, tile_cols } => tile_cols * elem_bytes,
+            PackMap::TilePack {
+                tile_rows: _,
+                tile_cols,
+            } => tile_cols * elem_bytes,
         }
     }
 }
 
 /// 从 LayoutConstraint 推导 PackMap
-pub fn pack_map_from_layout(
-    layout: &crate::compiler::accel_registry::LayoutConstraint,
-) -> PackMap {
+pub fn pack_map_from_layout(layout: &crate::compiler::accel_registry::LayoutConstraint) -> PackMap {
     match layout {
         crate::compiler::accel_registry::LayoutConstraint::PanelPacked { mr: _, nr } => {
             // 默认 kc 从 DeviceProfile 获取，这里用 0 表示 "运行时确定"
@@ -133,7 +140,10 @@ pub fn pack_map_from_layout(
             PackMap::VnniPack { interleave: 4 }
         }
         crate::compiler::accel_registry::LayoutConstraint::AmxTileBF16 { rows, cols } => {
-            PackMap::TilePack { tile_rows: *rows, tile_cols: *cols }
+            PackMap::TilePack {
+                tile_rows: *rows,
+                tile_cols: *cols,
+            }
         }
         _ => PackMap::Identity,
     }
@@ -172,7 +182,10 @@ mod tests {
 
     #[test]
     fn test_tile_pack() {
-        let pm = PackMap::TilePack { tile_rows: 16, tile_cols: 16 };
+        let pm = PackMap::TilePack {
+            tile_rows: 16,
+            tile_cols: 16,
+        };
         assert!(pm.requires_physical_pack());
         // Aligned to tile boundary
         assert_eq!(pm.packed_bytes(17, 17, 2), 32 * 32 * 2);
@@ -229,7 +242,10 @@ mod tests {
 
     #[test]
     fn tile_pack_blis_k_stride() {
-        let pm = PackMap::TilePack { tile_rows: 16, tile_cols: 16 };
+        let pm = PackMap::TilePack {
+            tile_rows: 16,
+            tile_cols: 16,
+        };
         assert_eq!(pm.blis_k_stride_bytes(64, 4), 16 * 4);
     }
 
@@ -239,7 +255,14 @@ mod tests {
     fn pack_map_debug_format() {
         assert!(format!("{:?}", PackMap::Identity).contains("Identity"));
         assert!(format!("{:?}", PackMap::VnniPack { interleave: 4 }).contains("VnniPack"));
-        assert!(format!("{:?}", PackMap::TilePack { tile_rows: 16, tile_cols: 16 }).contains("TilePack"));
+        assert!(format!(
+            "{:?}",
+            PackMap::TilePack {
+                tile_rows: 16,
+                tile_cols: 16
+            }
+        )
+        .contains("TilePack"));
     }
 
     // ── Test 12: PackMap Clone and PartialEq ──
@@ -275,14 +298,23 @@ mod tests {
         use crate::compiler::accel_registry::LayoutConstraint;
 
         let pm = pack_map_from_layout(&LayoutConstraint::AmxTileBF16 { rows: 16, cols: 16 });
-        assert!(matches!(pm, PackMap::TilePack { tile_rows: 16, tile_cols: 16 }));
+        assert!(matches!(
+            pm,
+            PackMap::TilePack {
+                tile_rows: 16,
+                tile_cols: 16
+            }
+        ));
     }
 
     // ── Test 15: TilePack map_offset ──
 
     #[test]
     fn tile_pack_map_offset() {
-        let pm = PackMap::TilePack { tile_rows: 4, tile_cols: 4 };
+        let pm = PackMap::TilePack {
+            tile_rows: 4,
+            tile_cols: 4,
+        };
         // row=0, col=0 → tile_row=0, tile_col=0, intra_r=0, intra_c=0
         assert_eq!(pm.map_offset(0, 0, 8, 4), 0);
         // row=4, col=0 → tile_row=1, tile_col=0, intra_r=0, intra_c=0
@@ -331,7 +363,10 @@ mod tests {
 
     #[test]
     fn tile_pack_map_offset_within_tile() {
-        let pm = PackMap::TilePack { tile_rows: 8, tile_cols: 8 };
+        let pm = PackMap::TilePack {
+            tile_rows: 8,
+            tile_cols: 8,
+        };
         // row=3, col=5: tile_row=0, tile_col=0, intra_r=3, intra_c=5
         // offset = (0*8 + 0*8*8 + 3*8 + 5) * 4 = 29*4 = 116
         assert_eq!(pm.map_offset(3, 5, 16, 4), (3 * 8 + 5) * 4);
@@ -339,7 +374,10 @@ mod tests {
 
     #[test]
     fn tile_pack_packed_bytes_exact_multiple() {
-        let pm = PackMap::TilePack { tile_rows: 16, tile_cols: 16 };
+        let pm = PackMap::TilePack {
+            tile_rows: 16,
+            tile_cols: 16,
+        };
         // 32x32 is exact multiple of 16x16 -> no padding
         assert_eq!(pm.packed_bytes(32, 32, 4), 32 * 32 * 4);
     }

@@ -20,7 +20,7 @@
 //! - `pack_b_asm_f32_neon`:    pack the full B matrix for repeated use
 
 #[cfg(target_arch = "aarch64")]
-use crate::asm::aarch64::{MR, NR, gemm_kernel_8x12_f32};
+use crate::asm::aarch64::{gemm_kernel_8x12_f32, MR, NR};
 #[cfg(target_arch = "aarch64")]
 use crate::cache_params;
 
@@ -33,13 +33,7 @@ use crate::cache_params;
 /// with a single `ldp` instruction pair.
 #[cfg(target_arch = "aarch64")]
 #[inline]
-unsafe fn pack_a_f32(
-    a: *const f32,
-    lda: usize,
-    packed: *mut f32,
-    mc: usize,
-    kc: usize,
-) {
+unsafe fn pack_a_f32(a: *const f32, lda: usize, packed: *mut f32, mc: usize, kc: usize) {
     let mut p = packed;
     let mut i = 0usize;
 
@@ -79,13 +73,7 @@ unsafe fn pack_a_f32(
 /// with `ldp` + `ldr` (48 bytes = 12 floats).
 #[cfg(target_arch = "aarch64")]
 #[inline]
-unsafe fn pack_b_f32(
-    b: *const f32,
-    ldb: usize,
-    packed: *mut f32,
-    kc: usize,
-    nc: usize,
-) {
+unsafe fn pack_b_f32(b: *const f32, ldb: usize, packed: *mut f32, kc: usize, nc: usize) {
     let mut p = packed;
     let mut j = 0usize;
 
@@ -185,14 +173,7 @@ unsafe fn compute_mc_block(
 /// enough M-blocks to fill available cores. B is packed once on the
 /// main thread and shared read-only; each worker packs its own A block.
 #[cfg(target_arch = "aarch64")]
-pub fn gemm_asm_f32(
-    a: &[f32],
-    b: &[f32],
-    c: &mut [f32],
-    m: usize,
-    n: usize,
-    k: usize,
-) {
+pub fn gemm_asm_f32(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
     assert!(a.len() >= m * k);
     assert!(b.len() >= k * n);
     assert!(c.len() >= m * n);
@@ -252,7 +233,9 @@ pub fn gemm_asm_f32(
                     use rayon::prelude::*;
                     (0..num_m_blocks).into_par_iter().for_each(|block_idx| {
                         let ic = block_idx * mc_max;
-                        if ic >= m { return; }
+                        if ic >= m {
+                            return;
+                        }
                         let mc = mc_max.min(m - ic);
 
                         // Thread-local pack_a
@@ -274,8 +257,16 @@ pub fn gemm_asm_f32(
                             unsafe {
                                 pack_a_f32(a_ptr.add(ic * k + pc), k, pa.as_mut_ptr(), mc, kc);
                                 compute_mc_block(
-                                    pa.as_ptr(), pb_ptr, c_ptr,
-                                    ic, jc, mc, nc, kc, n, first_kc,
+                                    pa.as_ptr(),
+                                    pb_ptr,
+                                    c_ptr,
+                                    ic,
+                                    jc,
+                                    mc,
+                                    nc,
+                                    kc,
+                                    n,
+                                    first_kc,
                                 );
                             }
                         });
@@ -301,8 +292,16 @@ pub fn gemm_asm_f32(
                             unsafe {
                                 pack_a_f32(a_ptr.add(ic * k + pc), k, pa.as_mut_ptr(), mc, kc);
                                 compute_mc_block(
-                                    pa.as_ptr(), pb.as_ptr(), c_ptr,
-                                    ic, jc, mc, nc, kc, n, first_kc,
+                                    pa.as_ptr(),
+                                    pb.as_ptr(),
+                                    c_ptr,
+                                    ic,
+                                    jc,
+                                    mc,
+                                    nc,
+                                    kc,
+                                    n,
+                                    first_kc,
                                 );
                             }
 
@@ -405,7 +404,9 @@ pub fn gemm_prepacked_asm_f32(
             use rayon::prelude::*;
             (0..num_m_blocks).into_par_iter().for_each(|block_idx| {
                 let ic = block_idx * mc_max;
-                if ic >= m { return; }
+                if ic >= m {
+                    return;
+                }
                 let mc = mc_max.min(m - ic);
 
                 thread_local! {
@@ -426,8 +427,17 @@ pub fn gemm_prepacked_asm_f32(
                     unsafe {
                         pack_a_f32(a_ptr.add(ic * k + pc), k, pa.as_mut_ptr(), mc, kc);
                         compute_mc_block_prepacked(
-                            pa.as_ptr(), pb_ptr, c_ptr,
-                            ic, mc, n, k, kc, pc, n_nr, first_kc,
+                            pa.as_ptr(),
+                            pb_ptr,
+                            c_ptr,
+                            ic,
+                            mc,
+                            n,
+                            k,
+                            kc,
+                            pc,
+                            n_nr,
+                            first_kc,
                         );
                     }
                 });
@@ -453,8 +463,17 @@ pub fn gemm_prepacked_asm_f32(
                     unsafe {
                         pack_a_f32(a_ptr.add(ic * k + pc), k, pa.as_mut_ptr(), mc, kc);
                         compute_mc_block_prepacked(
-                            pa.as_ptr(), pb_ptr, c_ptr,
-                            ic, mc, n, k, kc, pc, n_nr, first_kc,
+                            pa.as_ptr(),
+                            pb_ptr,
+                            c_ptr,
+                            ic,
+                            mc,
+                            n,
+                            k,
+                            kc,
+                            pc,
+                            n_nr,
+                            first_kc,
                         );
                     }
 
@@ -490,7 +509,9 @@ unsafe fn compute_mc_block_prepacked(
 
     for jr in 0..n_nr {
         let nc_cur = NR.min(n.saturating_sub(jr * NR));
-        if nc_cur == 0 { continue; }
+        if nc_cur == 0 {
+            continue;
+        }
 
         for ir in 0..n_mr {
             let mc_cur = MR.min(mc - ir * MR);
@@ -505,8 +526,7 @@ unsafe fn compute_mc_block_prepacked(
                 if !first_kc {
                     for r in 0..mc_cur {
                         for col in 0..nc_cur {
-                            tmp[r * NR + col] =
-                                *c_ptr.add((ic + ir * MR + r) * n + jr * NR + col);
+                            tmp[r * NR + col] = *c_ptr.add((ic + ir * MR + r) * n + jr * NR + col);
                         }
                     }
                 } else {
@@ -517,8 +537,7 @@ unsafe fn compute_mc_block_prepacked(
 
                 for r in 0..mc_cur {
                     for col in 0..nc_cur {
-                        *c_ptr.add((ic + ir * MR + r) * n + jr * NR + col) =
-                            tmp[r * NR + col];
+                        *c_ptr.add((ic + ir * MR + r) * n + jr * NR + col) = tmp[r * NR + col];
                     }
                 }
             }
@@ -631,8 +650,12 @@ mod tests {
     fn test_asm_gemm_multi_tile() {
         // Multiple tiles: 32x48 with k=64
         let (m, n, k) = (32, 48, 64);
-        let a: Vec<f32> = (0..m * k).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
-        let b: Vec<f32> = (0..k * n).map(|i| ((i % 83) as f32 - 41.0) * 0.02).collect();
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 97) as f32 - 48.0) * 0.01)
+            .collect();
+        let b: Vec<f32> = (0..k * n)
+            .map(|i| ((i % 83) as f32 - 41.0) * 0.02)
+            .collect();
 
         let mut c_asm = vec![0.0f32; m * n];
         let mut c_ref = vec![0.0f32; m * n];
@@ -696,7 +719,8 @@ mod tests {
                 let expected = b[i * n + j]; // since A is identity for first m rows
                 assert!(
                     (c[i * n + j] - expected).abs() < 1e-5,
-                    "identity[{i},{j}]: got={}, expected={expected}", c[i * n + j]
+                    "identity[{i},{j}]: got={}, expected={expected}",
+                    c[i * n + j]
                 );
             }
         }
@@ -737,7 +761,11 @@ mod tests {
         assert_eq!(mr, 8, "MR must be 8 for NEON 8x12 microkernel");
         assert_eq!(nr, 12, "NR must be 12 for NEON 8x12 microkernel");
         // MR * NR = 96 accumulator elements fits in 24 NEON Q registers.
-        assert_eq!(mr * nr, 96, "MR*NR must equal 96 (24 Q-registers x 4 lanes)");
+        assert_eq!(
+            mr * nr,
+            96,
+            "MR*NR must equal 96 (24 Q-registers x 4 lanes)"
+        );
     }
 
     #[test]
@@ -753,9 +781,15 @@ mod tests {
         for k in 0..kc {
             for j in 0..nc {
                 assert_eq!(
-                    packed[k * NR + j], b[k * nc + j],
+                    packed[k * NR + j],
+                    b[k * nc + j],
                     "packed[{}*NR+{}]={}, expected b[{}*nc+{}]={}",
-                    k, j, packed[k * NR + j], k, j, b[k * nc + j]
+                    k,
+                    j,
+                    packed[k * NR + j],
+                    k,
+                    j,
+                    b[k * nc + j]
                 );
             }
         }
@@ -776,14 +810,22 @@ mod tests {
                 assert!(
                     (packed[k * NR + j] - b[k * nc + j]).abs() < 1e-7,
                     "packed[{}*NR+{}]={}, expected b[{}*nc+{}]={}",
-                    k, j, packed[k * NR + j], k, j, b[k * nc + j]
+                    k,
+                    j,
+                    packed[k * NR + j],
+                    k,
+                    j,
+                    b[k * nc + j]
                 );
             }
             // Remaining 5 are zero-padded.
             for j in nc..NR {
                 assert_eq!(
-                    packed[k * NR + j], 0.0,
-                    "zero-pad at packed[{}*NR+{}]", k, j
+                    packed[k * NR + j],
+                    0.0,
+                    "zero-pad at packed[{}*NR+{}]",
+                    k,
+                    j
                 );
             }
         }
@@ -793,8 +835,12 @@ mod tests {
     fn test_gemm_prepacked_matches_standard() {
         // Arrange: compute C = A*B via both standard and prepacked paths.
         let (m, n, k) = (16, 24, 32);
-        let a: Vec<f32> = (0..m * k).map(|i| ((i % 31) as f32 - 15.0) * 0.03).collect();
-        let b: Vec<f32> = (0..k * n).map(|i| ((i % 37) as f32 - 18.0) * 0.04).collect();
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 31) as f32 - 15.0) * 0.03)
+            .collect();
+        let b: Vec<f32> = (0..k * n)
+            .map(|i| ((i % 37) as f32 - 18.0) * 0.04)
+            .collect();
         let mut c_std = vec![0.0f32; m * n];
         let mut c_pp = vec![0.0f32; m * n];
         // Act: standard GEMM.
@@ -856,7 +902,9 @@ mod tests {
         let expected = 3.0f32 * 7.0f32;
         assert!(
             (c[0] - expected).abs() < 1e-5,
-            "unit gemm: got {}, expected {}", c[0], expected
+            "unit gemm: got {}, expected {}",
+            c[0],
+            expected
         );
     }
 
@@ -899,15 +947,18 @@ mod tests {
         // Assert: must contain field names.
         assert!(
             debug_str.contains("kc"),
-            "Debug output must contain 'kc': got {}", debug_str
+            "Debug output must contain 'kc': got {}",
+            debug_str
         );
         assert!(
             debug_str.contains("mc"),
-            "Debug output must contain 'mc': got {}", debug_str
+            "Debug output must contain 'mc': got {}",
+            debug_str
         );
         assert!(
             debug_str.contains("nc"),
-            "Debug output must contain 'nc': got {}", debug_str
+            "Debug output must contain 'nc': got {}",
+            debug_str
         );
     }
 
@@ -933,10 +984,7 @@ mod tests {
         // Arrange.
         let bp = crate::cache_params::blocking_params(MR, 3, 4, 4);
         // Act: use struct update syntax to override one field.
-        let bp_custom = crate::cache_params::BlockingParams {
-            kc: 128,
-            ..bp
-        };
+        let bp_custom = crate::cache_params::BlockingParams { kc: 128, ..bp };
         // Assert: overridden field is 128, others inherited.
         assert_eq!(bp_custom.kc, 128, "overridden kc must be 128");
         assert_eq!(bp_custom.mc, bp.mc, "mc must be inherited from bp");
@@ -1035,10 +1083,7 @@ mod tests {
         // First strip: rows 0-11, exact NR.
         for k in 0..kc {
             for j in 0..NR {
-                assert_eq!(
-                    packed[k * NR + j], b[k * nc + j],
-                    "strip0[k={},j={}]", k, j
-                );
+                assert_eq!(packed[k * NR + j], b[k * nc + j], "strip0[k={},j={}]", k, j);
             }
         }
     }
@@ -1058,7 +1103,10 @@ mod tests {
                 assert!(
                     (packed[col_start + j] - b[k * nc + j]).abs() < 1e-7,
                     "layout[k={},j={}]: packed={}, b={}",
-                    k, j, packed[col_start + j], b[k * nc + j]
+                    k,
+                    j,
+                    packed[col_start + j],
+                    b[k * nc + j]
                 );
             }
         }
@@ -1086,7 +1134,9 @@ mod tests {
         // Arrange: large k to force multiple KC blocks in the KC loop.
         let (m, n, k) = (8, 12, 512);
         let a: Vec<f32> = (0..m * k).map(|i| ((i % 19) as f32 - 9.0) * 0.01).collect();
-        let b: Vec<f32> = (0..k * n).map(|i| ((i % 23) as f32 - 11.0) * 0.01).collect();
+        let b: Vec<f32> = (0..k * n)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.01)
+            .collect();
         let mut c_asm = vec![0.0f32; m * n];
         let mut c_ref = vec![0.0f32; m * n];
         // Act.
@@ -1112,7 +1162,10 @@ mod tests {
         let scale = c_asm[0].abs().max(c_ref[0].abs()).max(1.0);
         assert!(
             diff / scale < 1e-4,
-            "1x1_k24: asm={}, ref={}, diff={}", c_asm[0], c_ref[0], diff
+            "1x1_k24: asm={}, ref={}, diff={}",
+            c_asm[0],
+            c_ref[0],
+            diff
         );
     }
 

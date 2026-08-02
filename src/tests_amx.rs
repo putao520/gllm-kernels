@@ -20,8 +20,14 @@ mod tests_amx_bf16 {
     }
 
     /// Reference scalar bf16 matmul with bias: C[m,n] = A[m,k] * B[k,n] + bias[n]
-    fn ref_matmul_bias_bf16(a: &[bf16], b: &[bf16], bias: &[bf16],
-                            m: usize, n: usize, k: usize) -> Vec<bf16> {
+    fn ref_matmul_bias_bf16(
+        a: &[bf16],
+        b: &[bf16],
+        bias: &[bf16],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Vec<bf16> {
         let mut c = vec![bf16::ZERO; m * n];
         for i in 0..m {
             for j in 0..n {
@@ -36,13 +42,15 @@ mod tests_amx_bf16 {
     }
 
     fn max_abs_diff_bf16(a: &[bf16], b: &[bf16]) -> f32 {
-        a.iter().zip(b.iter())
+        a.iter()
+            .zip(b.iter())
             .map(|(x, y)| (x.to_f32() - y.to_f32()).abs())
             .fold(0.0f32, f32::max)
     }
 
     fn max_rel_diff_bf16(a: &[bf16], b: &[bf16]) -> f32 {
-        a.iter().zip(b.iter())
+        a.iter()
+            .zip(b.iter())
             .map(|(x, y)| {
                 let xf = x.to_f32();
                 let yf = y.to_f32();
@@ -68,15 +76,22 @@ mod tests_amx_bf16 {
             return;
         }
         let (m, n, k) = (4, 8, 16);
-        let a: Vec<bf16> = (0..m * k).map(|i| bf16::from_f32((i % 10) as f32 * 0.1)).collect();
-        let b: Vec<bf16> = (0..k * n).map(|i| bf16::from_f32((i % 7) as f32 * 0.2 - 0.5)).collect();
+        let a: Vec<bf16> = (0..m * k)
+            .map(|i| bf16::from_f32((i % 10) as f32 * 0.1))
+            .collect();
+        let b: Vec<bf16> = (0..k * n)
+            .map(|i| bf16::from_f32((i % 7) as f32 * 0.2 - 0.5))
+            .collect();
         let expected = ref_matmul_bf16(&a, &b, m, n, k);
 
         let mut c = vec![bf16::ZERO; m * n];
         amx_bf16::matmul(&a, &b, &mut c, m, n, k);
 
         let max_diff = max_abs_diff_bf16(&c, &expected);
-        assert!(max_diff < 0.5, "small matmul max_abs_diff={max_diff} (expected < 0.5)");
+        assert!(
+            max_diff < 0.5,
+            "small matmul max_abs_diff={max_diff} (expected < 0.5)"
+        );
     }
 
     #[test]
@@ -87,15 +102,22 @@ mod tests_amx_bf16 {
         }
         // Exact 16x32 tile, K=32 (matches TILE_M x TILE_N x TILE_K)
         let (m, n, k) = (16, 32, 32);
-        let a: Vec<bf16> = (0..m * k).map(|i| bf16::from_f32((i % 13) as f32 * 0.05)).collect();
-        let b: Vec<bf16> = (0..k * n).map(|i| bf16::from_f32((i % 11) as f32 * 0.1 - 0.5)).collect();
+        let a: Vec<bf16> = (0..m * k)
+            .map(|i| bf16::from_f32((i % 13) as f32 * 0.05))
+            .collect();
+        let b: Vec<bf16> = (0..k * n)
+            .map(|i| bf16::from_f32((i % 11) as f32 * 0.1 - 0.5))
+            .collect();
         let expected = ref_matmul_bf16(&a, &b, m, n, k);
 
         let mut c = vec![bf16::ZERO; m * n];
         amx_bf16::matmul(&a, &b, &mut c, m, n, k);
 
         let max_diff = max_abs_diff_bf16(&c, &expected);
-        assert!(max_diff < 1.0, "exact tile matmul max_abs_diff={max_diff} (expected < 1.0)");
+        assert!(
+            max_diff < 1.0,
+            "exact tile matmul max_abs_diff={max_diff} (expected < 1.0)"
+        );
     }
 
     #[test]
@@ -106,15 +128,22 @@ mod tests_amx_bf16 {
         }
         // M not multiple of 16, N not multiple of 32, K not multiple of 32
         let (m, n, k) = (19, 37, 50);
-        let a: Vec<bf16> = (0..m * k).map(|i| bf16::from_f32((i % 17) as f32 * 0.03)).collect();
-        let b: Vec<bf16> = (0..k * n).map(|i| bf16::from_f32((i % 19) as f32 * 0.04 - 0.3)).collect();
+        let a: Vec<bf16> = (0..m * k)
+            .map(|i| bf16::from_f32((i % 17) as f32 * 0.03))
+            .collect();
+        let b: Vec<bf16> = (0..k * n)
+            .map(|i| bf16::from_f32((i % 19) as f32 * 0.04 - 0.3))
+            .collect();
         let expected = ref_matmul_bf16(&a, &b, m, n, k);
 
         let mut c = vec![bf16::ZERO; m * n];
         amx_bf16::matmul(&a, &b, &mut c, m, n, k);
 
         let max_diff = max_abs_diff_bf16(&c, &expected);
-        assert!(max_diff < 1.5, "remainder matmul max_abs_diff={max_diff} (expected < 1.5)");
+        assert!(
+            max_diff < 1.5,
+            "remainder matmul max_abs_diff={max_diff} (expected < 1.5)"
+        );
     }
 
     #[test]
@@ -125,15 +154,22 @@ mod tests_amx_bf16 {
         }
         // Large enough to trigger multi-chunk K blocking
         let (m, n, k) = (64, 128, 256);
-        let a: Vec<bf16> = (0..m * k).map(|i| bf16::from_f32(((i * 7 + 3) % 100) as f32 * 0.01)).collect();
-        let b: Vec<bf16> = (0..k * n).map(|i| bf16::from_f32(((i * 11 + 5) % 100) as f32 * 0.01 - 0.5)).collect();
+        let a: Vec<bf16> = (0..m * k)
+            .map(|i| bf16::from_f32(((i * 7 + 3) % 100) as f32 * 0.01))
+            .collect();
+        let b: Vec<bf16> = (0..k * n)
+            .map(|i| bf16::from_f32(((i * 11 + 5) % 100) as f32 * 0.01 - 0.5))
+            .collect();
         let expected = ref_matmul_bf16(&a, &b, m, n, k);
 
         let mut c = vec![bf16::ZERO; m * n];
         amx_bf16::matmul(&a, &b, &mut c, m, n, k);
 
         let max_rel = max_rel_diff_bf16(&c, &expected);
-        assert!(max_rel < 0.05, "large matmul max_rel_diff={max_rel} (expected < 0.05)");
+        assert!(
+            max_rel < 0.05,
+            "large matmul max_rel_diff={max_rel} (expected < 0.05)"
+        );
     }
 
     #[test]
@@ -143,8 +179,12 @@ mod tests_amx_bf16 {
             return;
         }
         let (m, n, k) = (16, 32, 64);
-        let a: Vec<bf16> = (0..m * k).map(|i| bf16::from_f32((i % 10) as f32 * 0.1)).collect();
-        let b: Vec<bf16> = (0..k * n).map(|i| bf16::from_f32((i % 7) as f32 * 0.1 - 0.3)).collect();
+        let a: Vec<bf16> = (0..m * k)
+            .map(|i| bf16::from_f32((i % 10) as f32 * 0.1))
+            .collect();
+        let b: Vec<bf16> = (0..k * n)
+            .map(|i| bf16::from_f32((i % 7) as f32 * 0.1 - 0.3))
+            .collect();
         let bias: Vec<bf16> = (0..n).map(|i| bf16::from_f32(i as f32 * 0.01)).collect();
         let expected = ref_matmul_bias_bf16(&a, &b, &bias, m, n, k);
 
@@ -152,7 +192,10 @@ mod tests_amx_bf16 {
         amx_bf16::matmul_bias(&a, &b, &bias, &mut c, m, n, k);
 
         let max_diff = max_abs_diff_bf16(&c, &expected);
-        assert!(max_diff < 1.0, "matmul_bias max_abs_diff={max_diff} (expected < 1.0)");
+        assert!(
+            max_diff < 1.0,
+            "matmul_bias max_abs_diff={max_diff} (expected < 1.0)"
+        );
     }
 
     #[test]
@@ -162,16 +205,26 @@ mod tests_amx_bf16 {
             return;
         }
         let (m, n, k) = (16, 32, 64);
-        let a: Vec<bf16> = (0..m * k).map(|i| bf16::from_f32((i % 10) as f32 * 0.1)).collect();
-        let b: Vec<bf16> = (0..k * n).map(|i| bf16::from_f32((i % 7) as f32 * 0.1 - 0.3)).collect();
-        let bias: Vec<bf16> = (0..n).map(|i| bf16::from_f32(i as f32 * 0.01 - 0.2)).collect();
+        let a: Vec<bf16> = (0..m * k)
+            .map(|i| bf16::from_f32((i % 10) as f32 * 0.1))
+            .collect();
+        let b: Vec<bf16> = (0..k * n)
+            .map(|i| bf16::from_f32((i % 7) as f32 * 0.1 - 0.3))
+            .collect();
+        let bias: Vec<bf16> = (0..n)
+            .map(|i| bf16::from_f32(i as f32 * 0.01 - 0.2))
+            .collect();
 
         let mut c = vec![bf16::ZERO; m * n];
         amx_bf16::matmul_bias_act(&a, &b, &bias, &mut c, m, n, k, crate::Activation::Relu);
 
         // Verify all outputs are >= 0 (ReLU property)
         for i in 0..m * n {
-            assert!(c[i].to_f32() >= 0.0, "ReLU output negative at index {i}: {}", c[i].to_f32());
+            assert!(
+                c[i].to_f32() >= 0.0,
+                "ReLU output negative at index {i}: {}",
+                c[i].to_f32()
+            );
         }
     }
 
@@ -183,8 +236,12 @@ mod tests_amx_bf16 {
         }
         // Verify pack_b + matmul_prepacked matches matmul
         let (m, n, k) = (16, 32, 64);
-        let a: Vec<bf16> = (0..m * k).map(|i| bf16::from_f32((i % 10) as f32 * 0.1)).collect();
-        let b: Vec<bf16> = (0..k * n).map(|i| bf16::from_f32((i % 7) as f32 * 0.1 - 0.3)).collect();
+        let a: Vec<bf16> = (0..m * k)
+            .map(|i| bf16::from_f32((i % 10) as f32 * 0.1))
+            .collect();
+        let b: Vec<bf16> = (0..k * n)
+            .map(|i| bf16::from_f32((i % 7) as f32 * 0.1 - 0.3))
+            .collect();
 
         let mut c_direct = vec![bf16::ZERO; m * n];
         amx_bf16::matmul(&a, &b, &mut c_direct, m, n, k);
@@ -194,7 +251,10 @@ mod tests_amx_bf16 {
         amx_bf16::matmul_prepacked(&a, &packed_b, &mut c_prepacked, m, n, k);
 
         let max_diff = max_abs_diff_bf16(&c_direct, &c_prepacked);
-        assert!(max_diff < 0.01, "prepacked vs direct max_abs_diff={max_diff} (expected < 0.01)");
+        assert!(
+            max_diff < 0.01,
+            "prepacked vs direct max_abs_diff={max_diff} (expected < 0.01)"
+        );
     }
 
     #[test]
@@ -217,7 +277,9 @@ mod tests_amx_bf16 {
         }
         // A * I = A (for square matrices)
         let n = 32;
-        let a: Vec<bf16> = (0..n * n).map(|i| bf16::from_f32((i % 10) as f32 * 0.1)).collect();
+        let a: Vec<bf16> = (0..n * n)
+            .map(|i| bf16::from_f32((i % 10) as f32 * 0.1))
+            .collect();
         let mut identity = vec![bf16::ZERO; n * n];
         for i in 0..n {
             identity[i * n + i] = bf16::ONE;
@@ -227,7 +289,10 @@ mod tests_amx_bf16 {
         amx_bf16::matmul(&a, &identity, &mut c, n, n, n);
 
         let max_diff = max_abs_diff_bf16(&c, &a);
-        assert!(max_diff < 0.1, "identity matmul max_abs_diff={max_diff} (expected < 0.1)");
+        assert!(
+            max_diff < 0.1,
+            "identity matmul max_abs_diff={max_diff} (expected < 0.1)"
+        );
     }
 }
 
@@ -352,8 +417,14 @@ mod tests_amx_int8 {
 
         unsafe {
             amx_int8::dequantize_i32_to_f32(
-                &c_i32, &mut c_f32, 1, n,
-                scale_a, scale_b, None, crate::Activation::None,
+                &c_i32,
+                &mut c_f32,
+                1,
+                n,
+                scale_a,
+                scale_b,
+                None,
+                crate::Activation::None,
             );
         }
 
@@ -361,7 +432,8 @@ mod tests_amx_int8 {
             let expected = c_i32[i] as f32 * scale_a * scale_b;
             assert!(
                 (c_f32[i] - expected).abs() < 1e-5,
-                "AMX INT8 dequant mismatch at {i}: got {} expected {expected}", c_f32[i]
+                "AMX INT8 dequant mismatch at {i}: got {} expected {expected}",
+                c_f32[i]
             );
         }
     }
@@ -381,8 +453,14 @@ mod tests_amx_int8 {
 
         unsafe {
             amx_int8::dequantize_i32_to_f32(
-                &c_i32, &mut c_f32, m, n,
-                scale_a, scale_b, Some(&bias), crate::Activation::Relu,
+                &c_i32,
+                &mut c_f32,
+                m,
+                n,
+                scale_a,
+                scale_b,
+                Some(&bias),
+                crate::Activation::Relu,
             );
         }
 

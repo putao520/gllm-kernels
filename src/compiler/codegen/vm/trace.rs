@@ -114,8 +114,11 @@ fn zero_offset_from_desc(desc: &QuantFormatDescriptor) -> usize {
 
 /// 判断 format 是否有有效的 zero-point（BlockScalar, BlockMin, 或 Hierarchical）。
 fn has_dynamic_zero_point(desc: &QuantFormatDescriptor) -> bool {
-    matches!(desc.zero_layout,
-        ZeroLayout::BlockScalar { .. } | ZeroLayout::BlockMin { .. } | ZeroLayout::Hierarchical { .. }
+    matches!(
+        desc.zero_layout,
+        ZeroLayout::BlockScalar { .. }
+            | ZeroLayout::BlockMin { .. }
+            | ZeroLayout::Hierarchical { .. }
     )
 }
 
@@ -550,10 +553,7 @@ pub fn build_kv_cache_trace_simple(
 }
 
 /// 便捷构造器: 从 block_size (head_dim) 创建 Rope 分族 trace。
-pub fn build_rope_trace_simple(
-    block_size: usize,
-    dtype: QuantOutputDtype,
-) -> Vec<TraceOp> {
+pub fn build_rope_trace_simple(block_size: usize, dtype: QuantOutputDtype) -> Vec<TraceOp> {
     build_data_kind_trace(&TraceTemplateParams {
         data_kind: DataKind::Rope,
         quant_type: QuantType::F32,
@@ -570,19 +570,33 @@ mod tests {
     #[test]
     fn weight_trace_has_valid_ssa() {
         let body = build_weight_trace_simple(QuantType::Q4_0, 32, QuantOutputDtype::F32);
-        assert!(body.len() > 4, "weight trace should have multiple ops, got {}", body.len());
+        assert!(
+            body.len() > 4,
+            "weight trace should have multiple ops, got {}",
+            body.len()
+        );
         // Verify all value references are within bounds
         for (i, op) in body.iter().enumerate() {
             match op {
                 TraceOp::Input(_) | TraceOp::Const(_) => {}
-                TraceOp::QuantScaleLoad { .. } | TraceOp::QuantZeroLoad { .. }
+                TraceOp::QuantScaleLoad { .. }
+                | TraceOp::QuantZeroLoad { .. }
                 | TraceOp::QuantDataLoad { .. } => {}
                 TraceOp::Neg(a) | TraceOp::Exp(a) | TraceOp::Sqrt(a) => {
                     assert!((a.0 as usize) < i, "SSA violation at {i}: operand {a:?}");
                 }
-                TraceOp::Add(a, b) | TraceOp::Sub(a, b) | TraceOp::Mul(a, b) | TraceOp::Div(a, b) => {
-                    assert!((a.0 as usize) < i, "SSA violation at {i}: left operand {a:?}");
-                    assert!((b.0 as usize) < i, "SSA violation at {i}: right operand {b:?}");
+                TraceOp::Add(a, b)
+                | TraceOp::Sub(a, b)
+                | TraceOp::Mul(a, b)
+                | TraceOp::Div(a, b) => {
+                    assert!(
+                        (a.0 as usize) < i,
+                        "SSA violation at {i}: left operand {a:?}"
+                    );
+                    assert!(
+                        (b.0 as usize) < i,
+                        "SSA violation at {i}: right operand {b:?}"
+                    );
                 }
                 _ => {}
             }
@@ -592,16 +606,31 @@ mod tests {
     #[test]
     fn activation_trace_has_valid_ssa() {
         let body = build_activation_trace_simple(QuantType::Q8_0, 32, QuantOutputDtype::F32);
-        assert!(body.len() > 4, "activation trace should have multiple ops, got {}", body.len());
+        assert!(
+            body.len() > 4,
+            "activation trace should have multiple ops, got {}",
+            body.len()
+        );
         for (i, op) in body.iter().enumerate() {
             match op {
                 TraceOp::Input(_) | TraceOp::Const(_) => {}
-                TraceOp::QuantScaleLoad { .. } | TraceOp::QuantZeroLoad { .. }
+                TraceOp::QuantScaleLoad { .. }
+                | TraceOp::QuantZeroLoad { .. }
                 | TraceOp::QuantDataLoad { .. } => {}
-                TraceOp::VecStoreIndexed { base, offset, value } => {
+                TraceOp::VecStoreIndexed {
+                    base,
+                    offset,
+                    value,
+                } => {
                     assert!((base.0 as usize) < i, "SSA violation at {i}: base {base:?}");
-                    assert!((offset.0 as usize) < i, "SSA violation at {i}: offset {offset:?}");
-                    assert!((value.0 as usize) < i, "SSA violation at {i}: value {value:?}");
+                    assert!(
+                        (offset.0 as usize) < i,
+                        "SSA violation at {i}: offset {offset:?}"
+                    );
+                    assert!(
+                        (value.0 as usize) < i,
+                        "SSA violation at {i}: value {value:?}"
+                    );
                 }
                 TraceOp::Add(a, b) | TraceOp::Sub(a, b) | TraceOp::Mul(a, b) => {
                     assert!((a.0 as usize) < i, "SSA violation at {i}");
@@ -615,7 +644,11 @@ mod tests {
     #[test]
     fn kv_cache_trace_has_valid_ssa() {
         let body = build_kv_cache_trace_simple(QuantType::Q4_0, 32, QuantOutputDtype::F32);
-        assert!(body.len() > 4, "kv_cache trace should have multiple ops, got {}", body.len());
+        assert!(
+            body.len() > 4,
+            "kv_cache trace should have multiple ops, got {}",
+            body.len()
+        );
         for (i, op) in body.iter().enumerate() {
             match op {
                 TraceOp::Input(_) | TraceOp::Const(_) => {}
@@ -623,7 +656,11 @@ mod tests {
                     assert!((base.0 as usize) < i, "SSA violation at {i}");
                     assert!((offset.0 as usize) < i, "SSA violation at {i}");
                 }
-                TraceOp::VecStoreIndexed { base, offset, value } => {
+                TraceOp::VecStoreIndexed {
+                    base,
+                    offset,
+                    value,
+                } => {
                     assert!((base.0 as usize) < i, "SSA violation at {i}");
                     assert!((offset.0 as usize) < i, "SSA violation at {i}");
                     assert!((value.0 as usize) < i, "SSA violation at {i}");
@@ -636,7 +673,11 @@ mod tests {
     #[test]
     fn rope_trace_has_valid_ssa() {
         let body = build_rope_trace_simple(64, QuantOutputDtype::F32);
-        assert!(body.len() > 10, "rope trace should have many ops, got {}", body.len());
+        assert!(
+            body.len() > 10,
+            "rope trace should have many ops, got {}",
+            body.len()
+        );
         // Verify all binary ops have valid SSA refs
         for (i, op) in body.iter().enumerate() {
             match op {
@@ -649,7 +690,11 @@ mod tests {
                     assert!((base.0 as usize) < i, "SSA violation at {i}: base");
                     assert!((offset.0 as usize) < i, "SSA violation at {i}: offset");
                 }
-                TraceOp::VecStoreIndexed { base, offset, value } => {
+                TraceOp::VecStoreIndexed {
+                    base,
+                    offset,
+                    value,
+                } => {
                     assert!((base.0 as usize) < i, "SSA violation at {i}: base");
                     assert!((offset.0 as usize) < i, "SSA violation at {i}: offset");
                     assert!((value.0 as usize) < i, "SSA violation at {i}: value");
@@ -671,19 +716,29 @@ mod tests {
         };
         let dispatched = build_data_kind_trace(&params);
         let direct = build_weight_trace(&params);
-        assert_eq!(dispatched.len(), direct.len(),
-            "dispatch should match direct call for Weight");
+        assert_eq!(
+            dispatched.len(),
+            direct.len(),
+            "dispatch should match direct call for Weight"
+        );
     }
 
     // ── 13 new tests below ──
 
     #[test]
     fn data_kind_all_variants_are_distinct() {
-        let kinds = [DataKind::Weight, DataKind::Activation, DataKind::KvCache, DataKind::Rope];
+        let kinds = [
+            DataKind::Weight,
+            DataKind::Activation,
+            DataKind::KvCache,
+            DataKind::Rope,
+        ];
         for i in 0..kinds.len() {
             for j in (i + 1)..kinds.len() {
-                assert_ne!(kinds[i], kinds[j],
-                    "DataKind variants at index {i} and {j} must be distinct");
+                assert_ne!(
+                    kinds[i], kinds[j],
+                    "DataKind variants at index {i} and {j} must be distinct"
+                );
             }
         }
     }
@@ -692,7 +747,11 @@ mod tests {
     fn quant_output_dtype_elem_bytes_covers_all_variants() {
         assert_eq!(QuantOutputDtype::F32.elem_bytes(), 4, "F32 must be 4 bytes");
         assert_eq!(QuantOutputDtype::F16.elem_bytes(), 2, "F16 must be 2 bytes");
-        assert_eq!(QuantOutputDtype::BF16.elem_bytes(), 2, "BF16 must be 2 bytes");
+        assert_eq!(
+            QuantOutputDtype::BF16.elem_bytes(),
+            2,
+            "BF16 must be 2 bytes"
+        );
     }
 
     #[test]
@@ -711,7 +770,10 @@ mod tests {
         assert_eq!(cloned.block_size, original.block_size);
         assert_eq!(cloned.dtype, original.dtype);
         assert!(cloned.format_desc.is_some());
-        assert_eq!(cloned.format_desc.as_ref().unwrap().name, original.format_desc.as_ref().unwrap().name);
+        assert_eq!(
+            cloned.format_desc.as_ref().unwrap().name,
+            original.format_desc.as_ref().unwrap().name
+        );
     }
 
     #[test]
@@ -745,13 +807,24 @@ mod tests {
             format_desc: None,
         };
         let body = build_weight_trace(&params);
-        assert!(!body.is_empty(), "trace body must not be empty even without format_desc");
-        assert!(matches!(body[0], TraceOp::Input(0)), "first op must be Input(0)");
+        assert!(
+            !body.is_empty(),
+            "trace body must not be empty even without format_desc"
+        );
+        assert!(
+            matches!(body[0], TraceOp::Input(0)),
+            "first op must be Input(0)"
+        );
     }
 
     #[test]
     fn build_data_kind_trace_dispatches_all_four_kinds() {
-        let kinds = [DataKind::Weight, DataKind::Activation, DataKind::KvCache, DataKind::Rope];
+        let kinds = [
+            DataKind::Weight,
+            DataKind::Activation,
+            DataKind::KvCache,
+            DataKind::Rope,
+        ];
         let mut lengths = Vec::new();
         for kind in kinds {
             let params = TraceTemplateParams {
@@ -766,13 +839,19 @@ mod tests {
             lengths.push(body.len());
         }
         // Rope has the most ops; all should differ or at least not be empty
-        assert!(lengths.iter().all(|&l| l > 0), "all dispatch results must be non-empty");
+        assert!(
+            lengths.iter().all(|&l| l > 0),
+            "all dispatch results must be non-empty"
+        );
     }
 
     #[test]
     fn weight_trace_starts_with_three_inputs() {
         let body = build_weight_trace_simple(QuantType::Q5_0, 32, QuantOutputDtype::F32);
-        assert!(body.len() >= 3, "weight trace must have at least 3 input ops");
+        assert!(
+            body.len() >= 3,
+            "weight trace must have at least 3 input ops"
+        );
         assert!(matches!(body[0], TraceOp::Input(0)));
         assert!(matches!(body[1], TraceOp::Input(1)));
         assert!(matches!(body[2], TraceOp::Input(2)));
@@ -781,7 +860,10 @@ mod tests {
     #[test]
     fn activation_trace_starts_with_two_inputs() {
         let body = build_activation_trace_simple(QuantType::Q4_0, 32, QuantOutputDtype::F16);
-        assert!(body.len() >= 2, "activation trace must have at least 2 input ops");
+        assert!(
+            body.len() >= 2,
+            "activation trace must have at least 2 input ops"
+        );
         assert!(matches!(body[0], TraceOp::Input(0)));
         assert!(matches!(body[1], TraceOp::Input(1)));
     }
@@ -789,7 +871,10 @@ mod tests {
     #[test]
     fn kv_cache_trace_starts_with_three_inputs() {
         let body = build_kv_cache_trace_simple(QuantType::Q8_0, 32, QuantOutputDtype::BF16);
-        assert!(body.len() >= 3, "kv_cache trace must have at least 3 input ops");
+        assert!(
+            body.len() >= 3,
+            "kv_cache trace must have at least 3 input ops"
+        );
         assert!(matches!(body[0], TraceOp::Input(0)));
         assert!(matches!(body[1], TraceOp::Input(1)));
         assert!(matches!(body[2], TraceOp::Input(2)));
@@ -821,8 +906,10 @@ mod tests {
                 }
             }
         }
-        assert!(found_half_offset,
-            "rope trace must contain Const({expected_half_byte_offset}) for half-dim byte offset");
+        assert!(
+            found_half_offset,
+            "rope trace must contain Const({expected_half_byte_offset}) for half-dim byte offset"
+        );
     }
 
     #[test]
@@ -843,9 +930,15 @@ mod tests {
     #[test]
     fn data_kind_debug_format_contains_variant_name() {
         let debug_str = format!("{:?}", DataKind::KvCache);
-        assert!(debug_str.contains("KvCache"), "Debug output must contain variant name: got {debug_str}");
+        assert!(
+            debug_str.contains("KvCache"),
+            "Debug output must contain variant name: got {debug_str}"
+        );
         let debug_str = format!("{:?}", DataKind::Rope);
-        assert!(debug_str.contains("Rope"), "Debug output must contain variant name: got {debug_str}");
+        assert!(
+            debug_str.contains("Rope"),
+            "Debug output must contain variant name: got {debug_str}"
+        );
     }
 
     // ── 10 additional tests ──
@@ -865,7 +958,9 @@ mod tests {
         let body = build_weight_trace(&params);
 
         // Assert: body must contain a QuantScaleLoad op
-        let has_scale_load = body.iter().any(|op| matches!(op, TraceOp::QuantScaleLoad { .. }));
+        let has_scale_load = body
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantScaleLoad { .. }));
         assert!(has_scale_load, "weight trace must contain QuantScaleLoad");
     }
 
@@ -885,13 +980,19 @@ mod tests {
 
         // Assert: body must contain a QuantDataLoad with matching quant_type and block_size
         let found = body.iter().any(|op| {
-            matches!(op, TraceOp::QuantDataLoad {
-                quant_type: QuantType::Q8_0,
-                block_size: 32,
-                ..
-            })
+            matches!(
+                op,
+                TraceOp::QuantDataLoad {
+                    quant_type: QuantType::Q8_0,
+                    block_size: 32,
+                    ..
+                }
+            )
         });
-        assert!(found, "weight trace must contain QuantDataLoad with Q8_0 block_size=32");
+        assert!(
+            found,
+            "weight trace must contain QuantDataLoad with Q8_0 block_size=32"
+        );
     }
 
     #[test]
@@ -910,8 +1011,13 @@ mod tests {
         let body = build_weight_trace(&params);
 
         // Assert: body must contain QuantZeroLoad because AWQ4 has BlockScalar zero-point
-        let has_zero_load = body.iter().any(|op| matches!(op, TraceOp::QuantZeroLoad { .. }));
-        assert!(has_zero_load, "AWQ4 weight trace must contain QuantZeroLoad for dynamic zero-point");
+        let has_zero_load = body
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantZeroLoad { .. }));
+        assert!(
+            has_zero_load,
+            "AWQ4 weight trace must contain QuantZeroLoad for dynamic zero-point"
+        );
     }
 
     #[test]
@@ -931,11 +1037,13 @@ mod tests {
         let body = build_kv_cache_trace(&params);
 
         // Assert: body must contain Const(block_bytes) as the slot stride
-        let has_stride_const = body.iter().any(|op| {
-            matches!(op, TraceOp::Const(v) if (*v - block_bytes as f64).abs() < f64::EPSILON)
-        });
-        assert!(has_stride_const,
-            "kv_cache trace with format_desc must contain Const({block_bytes}) as slot stride");
+        let has_stride_const = body.iter().any(
+            |op| matches!(op, TraceOp::Const(v) if (*v - block_bytes as f64).abs() < f64::EPSILON),
+        );
+        assert!(
+            has_stride_const,
+            "kv_cache trace with format_desc must contain Const({block_bytes}) as slot stride"
+        );
     }
 
     #[test]
@@ -944,14 +1052,32 @@ mod tests {
         let body = build_rope_trace_simple(64, QuantOutputDtype::F32);
 
         // Act: count Mul, Sub, Add ops — RoPE uses 4 Mul + 1 Sub + 1 Add for rotate_half
-        let mul_count = body.iter().filter(|op| matches!(op, TraceOp::Mul(_, _))).count();
-        let sub_count = body.iter().filter(|op| matches!(op, TraceOp::Sub(_, _))).count();
-        let add_count = body.iter().filter(|op| matches!(op, TraceOp::Add(_, _))).count();
+        let mul_count = body
+            .iter()
+            .filter(|op| matches!(op, TraceOp::Mul(_, _)))
+            .count();
+        let sub_count = body
+            .iter()
+            .filter(|op| matches!(op, TraceOp::Sub(_, _)))
+            .count();
+        let add_count = body
+            .iter()
+            .filter(|op| matches!(op, TraceOp::Add(_, _)))
+            .count();
 
         // Assert: 4 Mul (x*cos, y*sin, x*sin, y*cos), 1 Sub (x*cos - y*sin), 1 Add (x*sin + y*cos)
-        assert_eq!(mul_count, 4, "rope trace must have exactly 4 Mul ops for rotate_half, got {mul_count}");
-        assert_eq!(sub_count, 1, "rope trace must have exactly 1 Sub op for out_first_half, got {sub_count}");
-        assert_eq!(add_count, 1, "rope trace must have exactly 1 Add op for out_second_half, got {add_count}");
+        assert_eq!(
+            mul_count, 4,
+            "rope trace must have exactly 4 Mul ops for rotate_half, got {mul_count}"
+        );
+        assert_eq!(
+            sub_count, 1,
+            "rope trace must have exactly 1 Sub op for out_first_half, got {sub_count}"
+        );
+        assert_eq!(
+            add_count, 1,
+            "rope trace must have exactly 1 Add op for out_second_half, got {add_count}"
+        );
     }
 
     #[test]
@@ -960,10 +1086,16 @@ mod tests {
         let body = build_rope_trace_simple(128, QuantOutputDtype::F32);
 
         // Act
-        let store_count = body.iter().filter(|op| matches!(op, TraceOp::VecStoreIndexed { .. })).count();
+        let store_count = body
+            .iter()
+            .filter(|op| matches!(op, TraceOp::VecStoreIndexed { .. }))
+            .count();
 
         // Assert: RoPE stores two halves (first half and second half)
-        assert_eq!(store_count, 2, "rope trace must store first and second half, got {store_count}");
+        assert_eq!(
+            store_count, 2,
+            "rope trace must store first and second half, got {store_count}"
+        );
     }
 
     #[test]
@@ -1000,7 +1132,10 @@ mod tests {
         let result = id.saturating_sub(5);
 
         // Assert: saturating_sub must not underflow below 0
-        assert_eq!(result.0, 0, "ValueId(0).saturating_sub(5) must be ValueId(0), not underflow");
+        assert_eq!(
+            result.0, 0,
+            "ValueId(0).saturating_sub(5) must be ValueId(0), not underflow"
+        );
     }
 
     #[test]
@@ -1018,27 +1153,39 @@ mod tests {
     #[test]
     fn build_data_kind_trace_produces_different_lengths_per_kind() {
         // Arrange: use the same quant_type/block_size for all kinds
-        let kinds = [DataKind::Weight, DataKind::Activation, DataKind::KvCache, DataKind::Rope];
+        let kinds = [
+            DataKind::Weight,
+            DataKind::Activation,
+            DataKind::KvCache,
+            DataKind::Rope,
+        ];
 
         // Act
-        let lengths: Vec<usize> = kinds.iter().map(|kind| {
-            let params = TraceTemplateParams {
-                data_kind: *kind,
-                quant_type: QuantType::Q4_0,
-                block_size: 32,
-                dtype: QuantOutputDtype::F32,
-                format_desc: None,
-            };
-            build_data_kind_trace(&params).len()
-        }).collect();
+        let lengths: Vec<usize> = kinds
+            .iter()
+            .map(|kind| {
+                let params = TraceTemplateParams {
+                    data_kind: *kind,
+                    quant_type: QuantType::Q4_0,
+                    block_size: 32,
+                    dtype: QuantOutputDtype::F32,
+                    format_desc: None,
+                };
+                build_data_kind_trace(&params).len()
+            })
+            .collect();
 
         // Assert: Rope should have the most ops due to 5 inputs + 4 loads + 4 mul + sub + add + 2 stores
         let rope_idx = kinds.iter().position(|k| *k == DataKind::Rope).unwrap();
         for (i, &len) in lengths.iter().enumerate() {
             if i != rope_idx {
-                assert!(lengths[rope_idx] > len,
+                assert!(
+                    lengths[rope_idx] > len,
                     "Rope trace ({} ops) should be longer than {:?} trace ({} ops)",
-                    lengths[rope_idx], kinds[i], len);
+                    lengths[rope_idx],
+                    kinds[i],
+                    len
+                );
             }
         }
     }
@@ -1058,8 +1205,13 @@ mod tests {
         let body = build_activation_trace(&params);
 
         // Assert: activation trace must write result via VecStoreIndexed
-        let has_store = body.iter().any(|op| matches!(op, TraceOp::VecStoreIndexed { .. }));
-        assert!(has_store, "activation trace must contain VecStoreIndexed for output write");
+        let has_store = body
+            .iter()
+            .any(|op| matches!(op, TraceOp::VecStoreIndexed { .. }));
+        assert!(
+            has_store,
+            "activation trace must contain VecStoreIndexed for output write"
+        );
     }
 
     // ── 10 more tests (total 40) ──
@@ -1099,8 +1251,10 @@ mod tests {
         let last = body.last().expect("weight trace must not be empty");
 
         // Assert: the trace must end with Add (product + acc_ptr)
-        assert!(matches!(last, TraceOp::Add(_, _)),
-            "weight trace must end with Add for accumulation, got {last:?}");
+        assert!(
+            matches!(last, TraceOp::Add(_, _)),
+            "weight trace must end with Add for accumulation, got {last:?}"
+        );
     }
 
     #[test]
@@ -1118,9 +1272,13 @@ mod tests {
         let body = build_weight_trace(&params);
 
         // Assert: without format_desc, no QuantZeroLoad should be emitted
-        let has_zero = body.iter().any(|op| matches!(op, TraceOp::QuantZeroLoad { .. }));
-        assert!(!has_zero,
-            "weight trace without format_desc must not contain QuantZeroLoad");
+        let has_zero = body
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantZeroLoad { .. }));
+        assert!(
+            !has_zero,
+            "weight trace without format_desc must not contain QuantZeroLoad"
+        );
     }
 
     #[test]
@@ -1139,9 +1297,13 @@ mod tests {
         let body = build_activation_trace(&params);
 
         // Assert: GPTQ4 activation trace must contain QuantZeroLoad
-        let has_zero_load = body.iter().any(|op| matches!(op, TraceOp::QuantZeroLoad { .. }));
-        assert!(has_zero_load,
-            "GPTQ4 activation trace with format_desc must contain QuantZeroLoad");
+        let has_zero_load = body
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantZeroLoad { .. }));
+        assert!(
+            has_zero_load,
+            "GPTQ4 activation trace with format_desc must contain QuantZeroLoad"
+        );
     }
 
     #[test]
@@ -1160,9 +1322,13 @@ mod tests {
         let body = build_kv_cache_trace(&params);
 
         // Assert: Q4K KV cache trace must contain QuantZeroLoad
-        let has_zero_load = body.iter().any(|op| matches!(op, TraceOp::QuantZeroLoad { .. }));
-        assert!(has_zero_load,
-            "Q4K kv_cache trace with format_desc must contain QuantZeroLoad");
+        let has_zero_load = body
+            .iter()
+            .any(|op| matches!(op, TraceOp::QuantZeroLoad { .. }));
+        assert!(
+            has_zero_load,
+            "Q4K kv_cache trace with format_desc must contain QuantZeroLoad"
+        );
     }
 
     #[test]
@@ -1181,9 +1347,9 @@ mod tests {
 
         // Assert: stride must be block_size / 2 = 32
         let expected_stride = 32.0_f64;
-        let has_stride = body.iter().any(|op| {
-            matches!(op, TraceOp::Const(v) if (*v - expected_stride).abs() < f64::EPSILON)
-        });
+        let has_stride = body.iter().any(
+            |op| matches!(op, TraceOp::Const(v) if (*v - expected_stride).abs() < f64::EPSILON),
+        );
         assert!(has_stride,
             "kv_cache trace without format_desc must use block_size/2 = {expected_stride} as stride");
     }
@@ -1197,8 +1363,10 @@ mod tests {
         let last = body.last().expect("kv_cache trace must not be empty");
 
         // Assert: KV cache trace must end with VecStoreIndexed writing dequantized output
-        assert!(matches!(last, TraceOp::VecStoreIndexed { .. }),
-            "kv_cache trace must end with VecStoreIndexed, got {last:?}");
+        assert!(
+            matches!(last, TraceOp::VecStoreIndexed { .. }),
+            "kv_cache trace must end with VecStoreIndexed, got {last:?}"
+        );
     }
 
     #[test]
@@ -1209,15 +1377,29 @@ mod tests {
 
         // Act: extract QuantScaleLoad dtype fields
         let scale_q4 = body_q4.iter().find_map(|op| {
-            if let TraceOp::QuantScaleLoad { dtype, .. } = op { Some(*dtype) } else { None }
+            if let TraceOp::QuantScaleLoad { dtype, .. } = op {
+                Some(*dtype)
+            } else {
+                None
+            }
         });
         let scale_q8 = body_q8.iter().find_map(|op| {
-            if let TraceOp::QuantScaleLoad { dtype, .. } = op { Some(*dtype) } else { None }
+            if let TraceOp::QuantScaleLoad { dtype, .. } = op {
+                Some(*dtype)
+            } else {
+                None
+            }
         });
 
         // Assert: both must have QuantScaleLoad with their respective quant_type
-        assert!(scale_q4.is_some(), "Q4_0 weight trace must have QuantScaleLoad");
-        assert!(scale_q8.is_some(), "Q8_0 weight trace must have QuantScaleLoad");
+        assert!(
+            scale_q4.is_some(),
+            "Q4_0 weight trace must have QuantScaleLoad"
+        );
+        assert!(
+            scale_q8.is_some(),
+            "Q8_0 weight trace must have QuantScaleLoad"
+        );
         assert_eq!(scale_q4.unwrap(), QuantType::Q4_0);
         assert_eq!(scale_q8.unwrap(), QuantType::Q8_0);
     }
@@ -1245,10 +1427,19 @@ mod tests {
         let offset_128 = find_half_offset(&body_128);
 
         // Assert: larger block_size must produce larger half offset
-        assert!(offset_64.is_some(), "rope trace block_size=64 must have half-dim offset");
-        assert!(offset_128.is_some(), "rope trace block_size=128 must have half-dim offset");
-        assert!(offset_128.unwrap() > offset_64.unwrap(),
+        assert!(
+            offset_64.is_some(),
+            "rope trace block_size=64 must have half-dim offset"
+        );
+        assert!(
+            offset_128.is_some(),
+            "rope trace block_size=128 must have half-dim offset"
+        );
+        assert!(
+            offset_128.unwrap() > offset_64.unwrap(),
             "block_size=128 half offset ({}) must be > block_size=64 half offset ({})",
-            offset_128.unwrap(), offset_64.unwrap());
+            offset_128.unwrap(),
+            offset_64.unwrap()
+        );
     }
 }

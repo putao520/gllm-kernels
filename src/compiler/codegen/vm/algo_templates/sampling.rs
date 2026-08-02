@@ -21,13 +21,14 @@ pub static SAMPLING_ARGMAX: AlgoTemplate = AlgoTemplate {
         // Argmax: HReduce(Max) over logits to find max value.
         AlgoStep::TraceBody(&[
             AlgoTraceStep::LoadInput { name: "logits" },
-            AlgoTraceStep::HReduce { src: "logits", op: ReduceKind::Max },
+            AlgoTraceStep::HReduce {
+                src: "logits",
+                op: ReduceKind::Max,
+            },
         ]),
         AlgoStep::Reduce { op: ReduceOp::Max },
     ],
-    params: &[
-        ("vocab_size", AlgoParam::FromGraph("vocab_size")),
-    ],
+    params: &[("vocab_size", AlgoParam::FromGraph("vocab_size"))],
     micro_kernel: None,
 };
 
@@ -39,13 +40,18 @@ pub static SAMPLING_TEMPERATURE: AlgoTemplate = AlgoTemplate {
         // Temperature scaling: logits / temperature
         AlgoStep::TraceBody(&[
             AlgoTraceStep::LoadInput { name: "logits" },
-            AlgoTraceStep::LoadInput { name: "temperature" },
-            AlgoTraceStep::BinOp { op: TraceBinOp::Div, dst: "scaled", a: "logits", b: "temperature" },
+            AlgoTraceStep::LoadInput {
+                name: "temperature",
+            },
+            AlgoTraceStep::BinOp {
+                op: TraceBinOp::Div,
+                dst: "scaled",
+                a: "logits",
+                b: "temperature",
+            },
         ]),
     ],
-    params: &[
-        ("vocab_size", AlgoParam::FromGraph("vocab_size")),
-    ],
+    params: &[("vocab_size", AlgoParam::FromGraph("vocab_size"))],
     micro_kernel: None,
 };
 
@@ -55,14 +61,10 @@ pub static SAMPLING_SOFTMAX: AlgoTemplate = AlgoTemplate {
     device_req: DeviceReq::CpuAny,
     steps: &[
         // Softmax over logits: exp(logits) / sum(exp(logits))
-        AlgoStep::TraceBody(&[
-            AlgoTraceStep::LoadInput { name: "logits" },
-        ]),
+        AlgoStep::TraceBody(&[AlgoTraceStep::LoadInput { name: "logits" }]),
         AlgoStep::Softmax,
     ],
-    params: &[
-        ("vocab_size", AlgoParam::FromGraph("vocab_size")),
-    ],
+    params: &[("vocab_size", AlgoParam::FromGraph("vocab_size"))],
     micro_kernel: None,
 };
 
@@ -74,12 +76,20 @@ pub static SAMPLING_TOP_K: AlgoTemplate = AlgoTemplate {
         // Top-K: find K-th largest value via HReduce(Max), then mask.
         AlgoStep::TraceBody(&[
             AlgoTraceStep::LoadInput { name: "logits" },
-            AlgoTraceStep::HReduce { src: "logits", op: ReduceKind::Max },
+            AlgoTraceStep::HReduce {
+                src: "logits",
+                op: ReduceKind::Max,
+            },
         ]),
         AlgoStep::Reduce { op: ReduceOp::Max },
         AlgoStep::TraceBody(&[
             AlgoTraceStep::LoadInput { name: "threshold" },
-            AlgoTraceStep::BinOp { op: TraceBinOp::Sub, dst: "diff", a: "logits", b: "threshold" },
+            AlgoTraceStep::BinOp {
+                op: TraceBinOp::Sub,
+                dst: "diff",
+                a: "logits",
+                b: "threshold",
+            },
         ]),
     ],
     params: &[
@@ -95,19 +105,22 @@ pub static SAMPLING_TOP_P: AlgoTemplate = AlgoTemplate {
     device_req: DeviceReq::CpuAny,
     steps: &[
         // Top-P: softmax → cumulative distribution → threshold mask.
-        AlgoStep::TraceBody(&[
-            AlgoTraceStep::LoadInput { name: "logits" },
-        ]),
+        AlgoStep::TraceBody(&[AlgoTraceStep::LoadInput { name: "logits" }]),
         AlgoStep::Softmax,
         AlgoStep::TraceBody(&[
             AlgoTraceStep::LoadInput { name: "probs" },
-            AlgoTraceStep::LoadInput { name: "top_p_threshold" },
-            AlgoTraceStep::BinOp { op: TraceBinOp::Sub, dst: "remaining", a: "probs", b: "top_p_threshold" },
+            AlgoTraceStep::LoadInput {
+                name: "top_p_threshold",
+            },
+            AlgoTraceStep::BinOp {
+                op: TraceBinOp::Sub,
+                dst: "remaining",
+                a: "probs",
+                b: "top_p_threshold",
+            },
         ]),
     ],
-    params: &[
-        ("vocab_size", AlgoParam::FromGraph("vocab_size")),
-    ],
+    params: &[("vocab_size", AlgoParam::FromGraph("vocab_size"))],
     micro_kernel: None,
 };
 
@@ -120,13 +133,14 @@ pub static SAMPLING_MULTINOMIAL: AlgoTemplate = AlgoTemplate {
         AlgoStep::TraceBody(&[
             AlgoTraceStep::LoadInput { name: "probs" },
             AlgoTraceStep::LoadInput { name: "random_val" },
-            AlgoTraceStep::HReduce { src: "probs", op: ReduceKind::Sum },
+            AlgoTraceStep::HReduce {
+                src: "probs",
+                op: ReduceKind::Sum,
+            },
         ]),
         AlgoStep::Reduce { op: ReduceOp::Sum },
     ],
-    params: &[
-        ("vocab_size", AlgoParam::FromGraph("vocab_size")),
-    ],
+    params: &[("vocab_size", AlgoParam::FromGraph("vocab_size"))],
     micro_kernel: None,
 };
 
@@ -155,11 +169,18 @@ mod tests {
         // Act & Assert: all pairwise distinct
         for i in 0..strategies.len() {
             for j in (i + 1)..strategies.len() {
-                assert_ne!(strategies[i], strategies[j],
-                    "sampling strategies at indices {} and {} must differ", i, j);
+                assert_ne!(
+                    strategies[i], strategies[j],
+                    "sampling strategies at indices {} and {} must differ",
+                    i, j
+                );
             }
         }
-        assert_eq!(strategies.len(), 6, "must have exactly 6 sampling templates");
+        assert_eq!(
+            strategies.len(),
+            6,
+            "must have exactly 6 sampling templates"
+        );
     }
 
     // ── Test 2: All sampling templates belong to the Sampling family ─────
@@ -178,8 +199,12 @@ mod tests {
 
         // Act & Assert
         for (name, strategy) in templates {
-            assert_eq!(strategy.family(), StrategyFamily::Sampling,
-                "{} must belong to Sampling family", name);
+            assert_eq!(
+                strategy.family(),
+                StrategyFamily::Sampling,
+                "{} must belong to Sampling family",
+                name
+            );
         }
     }
 
@@ -199,8 +224,7 @@ mod tests {
 
         // Act & Assert
         for (name, req) in templates {
-            assert_eq!(*req, DeviceReq::CpuAny,
-                "{} must target CpuAny", name);
+            assert_eq!(*req, DeviceReq::CpuAny, "{} must target CpuAny", name);
         }
     }
 
@@ -244,8 +268,11 @@ mod tests {
             assert!(vocab_entry.is_some(), "{} must have vocab_size param", name);
 
             let (_, param) = vocab_entry.unwrap();
-            assert!(matches!(param, AlgoParam::FromGraph("vocab_size")),
-                "{} vocab_size must be FromGraph(\"vocab_size\")", name);
+            assert!(
+                matches!(param, AlgoParam::FromGraph("vocab_size")),
+                "{} vocab_size must be FromGraph(\"vocab_size\")",
+                name
+            );
         }
     }
 
@@ -266,8 +293,10 @@ mod tests {
 
         // top_k must come from graph
         let top_k_param = params.iter().find(|(n, _)| *n == "top_k").unwrap().1;
-        assert!(matches!(top_k_param, AlgoParam::FromGraph("top_k")),
-            "top_k must be FromGraph(\"top_k\")");
+        assert!(
+            matches!(top_k_param, AlgoParam::FromGraph("top_k")),
+            "top_k must be FromGraph(\"top_k\")"
+        );
     }
 
     // ── Test 7: SAMPLING_ARGMAX steps contain TraceBody + Reduce(Max) ────
@@ -281,12 +310,16 @@ mod tests {
         assert_eq!(steps.len(), 2, "ARGMAX must have 2 steps");
 
         // Step 0: TraceBody with LoadInput + HReduce(Max)
-        assert!(matches!(&steps[0], AlgoStep::TraceBody(body) if body.len() == 2),
-            "first step must be TraceBody with 2 trace steps");
+        assert!(
+            matches!(&steps[0], AlgoStep::TraceBody(body) if body.len() == 2),
+            "first step must be TraceBody with 2 trace steps"
+        );
 
         // Step 1: Reduce(Max)
-        assert!(matches!(&steps[1], AlgoStep::Reduce { op } if matches!(op, ReduceOp::Max)),
-            "second step must be Reduce(Max)");
+        assert!(
+            matches!(&steps[1], AlgoStep::Reduce { op } if matches!(op, ReduceOp::Max)),
+            "second step must be Reduce(Max)"
+        );
     }
 
     // ── Test 8: SAMPLING_TEMPERATURE steps contain BinOp(Div) ────────────
@@ -303,20 +336,26 @@ mod tests {
             assert_eq!(body.len(), 3, "TraceBody must have 3 trace steps");
 
             // Step 0: LoadInput("logits")
-            assert!(matches!(&body[0], AlgoTraceStep::LoadInput { name } if *name == "logits"),
-                "first trace step must load logits");
+            assert!(
+                matches!(&body[0], AlgoTraceStep::LoadInput { name } if *name == "logits"),
+                "first trace step must load logits"
+            );
 
             // Step 1: LoadInput("temperature")
-            assert!(matches!(&body[1], AlgoTraceStep::LoadInput { name } if *name == "temperature"),
-                "second trace step must load temperature");
+            assert!(
+                matches!(&body[1], AlgoTraceStep::LoadInput { name } if *name == "temperature"),
+                "second trace step must load temperature"
+            );
 
             // Step 2: BinOp(Div, "scaled", "logits", "temperature")
-            assert!(matches!(&body[2],
+            assert!(
+                matches!(&body[2],
                 AlgoTraceStep::BinOp {
                     op: TraceBinOp::Div,
                     dst, a, b,
                 } if *dst == "scaled" && *a == "logits" && *b == "temperature"),
-                "third trace step must be Div producing 'scaled'");
+                "third trace step must be Div producing 'scaled'"
+            );
         } else {
             panic!("first step must be TraceBody");
         }
@@ -335,15 +374,19 @@ mod tests {
         // Step 0: TraceBody loading logits
         if let AlgoStep::TraceBody(body) = &steps[0] {
             assert_eq!(body.len(), 1, "TraceBody must have 1 trace step");
-            assert!(matches!(&body[0], AlgoTraceStep::LoadInput { name } if *name == "logits"),
-                "must load logits");
+            assert!(
+                matches!(&body[0], AlgoTraceStep::LoadInput { name } if *name == "logits"),
+                "must load logits"
+            );
         } else {
             panic!("step 0 must be TraceBody");
         }
 
         // Step 1: Softmax
-        assert!(matches!(&steps[1], AlgoStep::Softmax),
-            "step 1 must be Softmax");
+        assert!(
+            matches!(&steps[1], AlgoStep::Softmax),
+            "step 1 must be Softmax"
+        );
     }
 
     // ── Test 10: SAMPLING_MULTINOMIAL steps structure ────────────────────
@@ -358,14 +401,22 @@ mod tests {
             assert_eq!(body.len(), 3, "TraceBody must have 3 trace steps");
             assert!(matches!(&body[0], AlgoTraceStep::LoadInput { name } if *name == "probs"));
             assert!(matches!(&body[1], AlgoTraceStep::LoadInput { name } if *name == "random_val"));
-            assert!(matches!(&body[2], AlgoTraceStep::HReduce { op: ReduceKind::Sum, .. }));
+            assert!(matches!(
+                &body[2],
+                AlgoTraceStep::HReduce {
+                    op: ReduceKind::Sum,
+                    ..
+                }
+            ));
         } else {
             panic!("step 0 must be TraceBody");
         }
 
         // Step 1: Reduce(Sum)
-        assert!(matches!(&steps[1], AlgoStep::Reduce { op } if matches!(op, ReduceOp::Sum)),
-            "step 1 must be Reduce(Sum)");
+        assert!(
+            matches!(&steps[1], AlgoStep::Reduce { op } if matches!(op, ReduceOp::Sum)),
+            "step 1 must be Reduce(Sum)"
+        );
     }
 
     // ── Test 11: SAMPLING_TOP_K steps contain 3 steps ────────────────────
@@ -406,7 +457,11 @@ mod tests {
             ("SAMPLING_MULTINOMIAL", &SAMPLING_MULTINOMIAL),
         ] {
             assert_eq!(tmpl.name, name, "template name mismatch");
-            assert!(name.starts_with("SAMPLING_"), "{} must start with SAMPLING_", name);
+            assert!(
+                name.starts_with("SAMPLING_"),
+                "{} must start with SAMPLING_",
+                name
+            );
         }
     }
 
@@ -415,9 +470,11 @@ mod tests {
     #[test]
     fn sampling_argmax_trace_body_has_hreduce_max() {
         if let AlgoStep::TraceBody(body) = &SAMPLING_ARGMAX.steps[0] {
-            assert!(matches!(&body[1], AlgoTraceStep::HReduce { src, op }
+            assert!(
+                matches!(&body[1], AlgoTraceStep::HReduce { src, op }
                 if *src == "logits" && matches!(op, ReduceKind::Max)),
-                "second trace step must be HReduce(Max) on logits");
+                "second trace step must be HReduce(Max) on logits"
+            );
         }
     }
 
@@ -447,30 +504,40 @@ mod tests {
         assert_eq!(steps.len(), 3, "TOP_P must have 3 steps");
 
         // Step 0: TraceBody loading logits
-        assert!(matches!(&steps[0], AlgoStep::TraceBody(_)),
-            "step 0 must be TraceBody");
+        assert!(
+            matches!(&steps[0], AlgoStep::TraceBody(_)),
+            "step 0 must be TraceBody"
+        );
 
         // Step 1: Softmax
-        assert!(matches!(&steps[1], AlgoStep::Softmax),
-            "step 1 must be Softmax");
+        assert!(
+            matches!(&steps[1], AlgoStep::Softmax),
+            "step 1 must be Softmax"
+        );
 
         // Step 2: TraceBody with BinOp(Sub) for threshold comparison
         if let AlgoStep::TraceBody(body) = &steps[2] {
             assert_eq!(body.len(), 3, "final TraceBody must have 3 steps");
 
             // First two: LoadInput("probs") and LoadInput("top_p_threshold")
-            assert!(matches!(&body[0], AlgoTraceStep::LoadInput { name } if *name == "probs"),
-                "must load probs");
-            assert!(matches!(&body[1], AlgoTraceStep::LoadInput { name } if *name == "top_p_threshold"),
-                "must load top_p_threshold");
+            assert!(
+                matches!(&body[0], AlgoTraceStep::LoadInput { name } if *name == "probs"),
+                "must load probs"
+            );
+            assert!(
+                matches!(&body[1], AlgoTraceStep::LoadInput { name } if *name == "top_p_threshold"),
+                "must load top_p_threshold"
+            );
 
             // Third: BinOp(Sub) producing "remaining"
-            assert!(matches!(&body[2],
+            assert!(
+                matches!(&body[2],
                 AlgoTraceStep::BinOp {
                     op: TraceBinOp::Sub,
                     dst, a, b,
                 } if *dst == "remaining" && *a == "probs" && *b == "top_p_threshold"),
-                "last trace step must be Sub producing 'remaining'");
+                "last trace step must be Sub producing 'remaining'"
+            );
         } else {
             panic!("step 2 must be TraceBody");
         }
@@ -481,8 +548,10 @@ mod tests {
     #[test]
     fn sampling_argmax_loads_logits_input() {
         if let AlgoStep::TraceBody(body) = &SAMPLING_ARGMAX.steps[0] {
-            assert!(matches!(&body[0], AlgoTraceStep::LoadInput { name } if *name == "logits"),
-                "first trace step must load logits");
+            assert!(
+                matches!(&body[0], AlgoTraceStep::LoadInput { name } if *name == "logits"),
+                "first trace step must load logits"
+            );
         }
     }
 
@@ -508,10 +577,13 @@ mod tests {
     #[test]
     fn sampling_multinomial_loads_correct_inputs() {
         if let AlgoStep::TraceBody(body) = &SAMPLING_MULTINOMIAL.steps[0] {
-            let names: Vec<&str> = body.iter().filter_map(|t| match t {
-                AlgoTraceStep::LoadInput { name } => Some(*name),
-                _ => None,
-            }).collect();
+            let names: Vec<&str> = body
+                .iter()
+                .filter_map(|t| match t {
+                    AlgoTraceStep::LoadInput { name } => Some(*name),
+                    _ => None,
+                })
+                .collect();
             assert!(names.contains(&"probs"), "must load probs");
             assert!(names.contains(&"random_val"), "must load random_val");
         }
@@ -522,9 +594,11 @@ mod tests {
     #[test]
     fn sampling_top_k_first_trace_body_has_hreduce_max() {
         if let AlgoStep::TraceBody(body) = &SAMPLING_TOP_K.steps[0] {
-            assert!(body.iter().any(|t| matches!(t,
+            assert!(
+                body.iter().any(|t| matches!(t,
                 AlgoTraceStep::HReduce { src, op: ReduceKind::Max } if *src == "logits")),
-                "first TraceBody must have HReduce(Max) on logits");
+                "first TraceBody must have HReduce(Max) on logits"
+            );
         }
     }
 
@@ -540,7 +614,11 @@ mod tests {
             ("SAMPLING_TOP_P", &SAMPLING_TOP_P),
             ("SAMPLING_MULTINOMIAL", &SAMPLING_MULTINOMIAL),
         ] {
-            assert!(!tmpl.steps.is_empty(), "{} must have at least one step", name);
+            assert!(
+                !tmpl.steps.is_empty(),
+                "{} must have at least one step",
+                name
+            );
         }
     }
 
@@ -548,7 +626,10 @@ mod tests {
 
     #[test]
     fn sampling_temperature_first_step_is_trace_body() {
-        assert!(matches!(&SAMPLING_TEMPERATURE.steps[0], AlgoStep::TraceBody(_)));
+        assert!(matches!(
+            &SAMPLING_TEMPERATURE.steps[0],
+            AlgoStep::TraceBody(_)
+        ));
     }
 
     // ── Test 22: SAMPLING_TOP_P loads logits in first step ───────────────
@@ -556,8 +637,10 @@ mod tests {
     #[test]
     fn sampling_top_p_first_step_loads_logits() {
         if let AlgoStep::TraceBody(body) = &SAMPLING_TOP_P.steps[0] {
-            assert!(matches!(&body[0], AlgoTraceStep::LoadInput { name } if *name == "logits"),
-                "first trace step must load logits");
+            assert!(
+                matches!(&body[0], AlgoTraceStep::LoadInput { name } if *name == "logits"),
+                "first trace step must load logits"
+            );
         }
     }
 
@@ -566,9 +649,16 @@ mod tests {
     #[test]
     fn sampling_top_k_second_trace_body_has_sub() {
         if let AlgoStep::TraceBody(body) = &SAMPLING_TOP_K.steps[2] {
-            assert!(body.iter().any(|t| matches!(t,
-                AlgoTraceStep::BinOp { op: TraceBinOp::Sub, .. })),
-                "second TraceBody must have a Sub BinOp");
+            assert!(
+                body.iter().any(|t| matches!(
+                    t,
+                    AlgoTraceStep::BinOp {
+                        op: TraceBinOp::Sub,
+                        ..
+                    }
+                )),
+                "second TraceBody must have a Sub BinOp"
+            );
         }
     }
 }

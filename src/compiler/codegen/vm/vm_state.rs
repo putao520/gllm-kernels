@@ -7,10 +7,10 @@
 //! §7: HeteroPhase + EmitState — plan_lower 跨迭代状态追踪
 //! §7.3: HeteroPhasePlan — 异构层模板阶段预计算
 
-use std::collections::HashMap;
 use super::instr::PtrExpr;
 use super::isa_profile::PhysGpr;
 use crate::types::CompilerError;
+use std::collections::HashMap;
 
 /// Whether the compilation plan requires a scratchpad buffer.
 /// Single computation replacing duplicated logic in pipeline.inc.rs and mega_kernel_emit.rs.
@@ -20,15 +20,21 @@ pub fn needs_scratch_for_plan(
     has_dwc: bool,
     plan: &crate::compiler::fusion::FusionPlan,
 ) -> bool {
-    alloc_total_bytes > 0 || has_ple || has_dwc || plan.groups.iter().any(|g| matches!(&g.mode,
-        crate::compiler::fusion::FusionMode::NormIntoGemm
-        | crate::compiler::fusion::FusionMode::QkvSharedInput
-        | crate::compiler::fusion::FusionMode::FFNBlock { .. }
-        | crate::compiler::fusion::FusionMode::TileLevelFusion { .. }
-        | crate::compiler::fusion::FusionMode::ComputeRoot { .. }
-        | crate::compiler::fusion::FusionMode::CrossLayerResidual { .. }
-        | crate::compiler::fusion::FusionMode::FusedQkvNormRope { .. }
-    ))
+    alloc_total_bytes > 0
+        || has_ple
+        || has_dwc
+        || plan.groups.iter().any(|g| {
+            matches!(
+                &g.mode,
+                crate::compiler::fusion::FusionMode::NormIntoGemm
+                    | crate::compiler::fusion::FusionMode::QkvSharedInput
+                    | crate::compiler::fusion::FusionMode::FFNBlock { .. }
+                    | crate::compiler::fusion::FusionMode::TileLevelFusion { .. }
+                    | crate::compiler::fusion::FusionMode::ComputeRoot { .. }
+                    | crate::compiler::fusion::FusionMode::CrossLayerResidual { .. }
+                    | crate::compiler::fusion::FusionMode::FusedQkvNormRope { .. }
+            )
+        })
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -39,7 +45,7 @@ pub fn needs_scratch_for_plan(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArgLocation {
     /// 在寄存器中 (x86 SysV: 前 6 个整数/指针参数)
-    Register(u8),  // 寄存器 ABI 编号 (0=rdi, 1=rsi, ...)
+    Register(u8), // 寄存器 ABI 编号 (0=rdi, 1=rsi, ...)
     /// 在栈上 (第 7+ 个参数)
     /// offset 是相对 rbp 的正偏移 (prologue 后)
     Stack(i32),
@@ -106,9 +112,9 @@ impl VmState {
     pub fn init_gpu_kernel() -> Self {
         let mut arg_locations = HashMap::new();
         // 与 GpuLower::emit_prologue 声明的 .param 顺序严格一致
-        arg_locations.insert("input".into(), ArgLocation::Register(0));    // input_ptr
-        arg_locations.insert("weights".into(), ArgLocation::Register(1));  // weight_ptr
-        arg_locations.insert("output".into(), ArgLocation::Register(2));   // output_ptr
+        arg_locations.insert("input".into(), ArgLocation::Register(0)); // input_ptr
+        arg_locations.insert("weights".into(), ArgLocation::Register(1)); // weight_ptr
+        arg_locations.insert("output".into(), ArgLocation::Register(2)); // output_ptr
         arg_locations.insert("seq_len".into(), ArgLocation::Register(3));
         arg_locations.insert("telemetry".into(), ArgLocation::Register(4));
         // ARCH-GPU-SHARED-SCRATCH: GPU scratchpad = 片上 shared memory,
@@ -129,29 +135,29 @@ impl VmState {
     /// f32 已改为 u32 传递 (避免 SSE 寄存器传参导致 JIT 无法从栈读取)。
     pub fn init_mega_kernel_x86() -> Self {
         let param_names: &[&str] = &[
-            "input_ids_ptr",        // arg 0 → AbiArg(0)
-            "weight_blob_ptr",      // arg 1 → AbiArg(1)
-            "kv_cache_ptr",         // arg 2 → AbiArg(2)
-            "positions_ptr",        // arg 3 → AbiArg(3)
-            "aux_ptr",              // arg 4 → AbiArg(4)
-            "batch_size",           // arg 5 → AbiArg(5)
-            "prompt_len",           // arg 6 → StackArg(16)
-            "scratchpad_ptr",       // arg 7 → StackArg(24)
-            "output_tokens_ptr",    // arg 8 → StackArg(32)
-            "temperature_u32",      // arg 9 → StackArg(40)
-            "top_k",                // arg 10 → StackArg(48)
-            "top_p_u32",            // arg 11 → StackArg(56)
-            "max_new_tokens",       // arg 12 → StackArg(64)
-            "eos_token_id",         // arg 13 → StackArg(72)
-            "hook_ctx_ptr",         // arg 14 → StackArg(80)
-            "telemetry_ptr",        // arg 15 → StackArg(88)
-            "session_position",     // arg 16 → StackArg(96)
-            "fused_hidden_ptr",     // arg 17 → StackArg(104)
-            "num_mm_tokens",        // arg 18 → StackArg(112)
-            "callback_table_ptr",   // arg 19 → StackArg(120)
-            "page_table_ptr",       // arg 20 → StackArg(128)
-            "batch_ctx_ptr",        // arg 21 → StackArg(136) (NULL = single-seq legacy, non-NULL = batch mode)
-            "kv_page_header_ptr",   // arg 22 → StackArg(144) (NULL = no page headers)
+            "input_ids_ptr",      // arg 0 → AbiArg(0)
+            "weight_blob_ptr",    // arg 1 → AbiArg(1)
+            "kv_cache_ptr",       // arg 2 → AbiArg(2)
+            "positions_ptr",      // arg 3 → AbiArg(3)
+            "aux_ptr",            // arg 4 → AbiArg(4)
+            "batch_size",         // arg 5 → AbiArg(5)
+            "prompt_len",         // arg 6 → StackArg(16)
+            "scratchpad_ptr",     // arg 7 → StackArg(24)
+            "output_tokens_ptr",  // arg 8 → StackArg(32)
+            "temperature_u32",    // arg 9 → StackArg(40)
+            "top_k",              // arg 10 → StackArg(48)
+            "top_p_u32",          // arg 11 → StackArg(56)
+            "max_new_tokens",     // arg 12 → StackArg(64)
+            "eos_token_id",       // arg 13 → StackArg(72)
+            "hook_ctx_ptr",       // arg 14 → StackArg(80)
+            "telemetry_ptr",      // arg 15 → StackArg(88)
+            "session_position",   // arg 16 → StackArg(96)
+            "fused_hidden_ptr",   // arg 17 → StackArg(104)
+            "num_mm_tokens",      // arg 18 → StackArg(112)
+            "callback_table_ptr", // arg 19 → StackArg(120)
+            "page_table_ptr",     // arg 20 → StackArg(128)
+            "batch_ctx_ptr", // arg 21 → StackArg(136) (NULL = single-seq legacy, non-NULL = batch mode)
+            "kv_page_header_ptr", // arg 22 → StackArg(144) (NULL = no page headers)
         ];
 
         let num_reg_args: usize = 6;
@@ -187,29 +193,29 @@ impl VmState {
     /// `arg_ptr_expr()` 返回 `AbiArg(N)`, GPU LoadPtr 降低为 `ld.param.u64 dst,[param_name];`.
     pub fn init_mega_kernel_gpu() -> Self {
         let param_names: &[&str] = &[
-            "input_ids_ptr",        // .param 0  → AbiArg(0)
-            "weight_blob_ptr",      // .param 1  → AbiArg(1)
-            "kv_cache_ptr",         // .param 2  → AbiArg(2)
-            "positions_ptr",        // .param 3  → AbiArg(3)
-            "aux_ptr",              // .param 4  → AbiArg(4)
-            "batch_size",           // .param 5  → AbiArg(5)
-            "prompt_len",           // .param 6  → AbiArg(6)
-            "scratchpad_ptr",       // .param 7  → AbiArg(7)
-            "output_tokens_ptr",    // .param 8  → AbiArg(8)
-            "temperature_u32",      // .param 9  → AbiArg(9)
-            "top_k",                // .param 10 → AbiArg(10)
-            "top_p_u32",            // .param 11 → AbiArg(11)
-            "max_new_tokens",       // .param 12 → AbiArg(12)
-            "eos_token_id",         // .param 13 → AbiArg(13)
-            "hook_ctx_ptr",         // .param 14 → AbiArg(14)
-            "telemetry_ptr",        // .param 15 → AbiArg(15)
-            "session_position",     // .param 16 → AbiArg(16)
-            "fused_hidden_ptr",     // .param 17 → AbiArg(17)
-            "num_mm_tokens",        // .param 18 → AbiArg(18)
-            "callback_table_ptr",   // .param 19 → AbiArg(19)
-            "page_table_ptr",       // .param 20 → AbiArg(20)
-            "batch_ctx_ptr",        // .param 21 → AbiArg(21)
-            "kv_page_header_ptr",   // .param 22 → AbiArg(22)
+            "input_ids_ptr",      // .param 0  → AbiArg(0)
+            "weight_blob_ptr",    // .param 1  → AbiArg(1)
+            "kv_cache_ptr",       // .param 2  → AbiArg(2)
+            "positions_ptr",      // .param 3  → AbiArg(3)
+            "aux_ptr",            // .param 4  → AbiArg(4)
+            "batch_size",         // .param 5  → AbiArg(5)
+            "prompt_len",         // .param 6  → AbiArg(6)
+            "scratchpad_ptr",     // .param 7  → AbiArg(7)
+            "output_tokens_ptr",  // .param 8  → AbiArg(8)
+            "temperature_u32",    // .param 9  → AbiArg(9)
+            "top_k",              // .param 10 → AbiArg(10)
+            "top_p_u32",          // .param 11 → AbiArg(11)
+            "max_new_tokens",     // .param 12 → AbiArg(12)
+            "eos_token_id",       // .param 13 → AbiArg(13)
+            "hook_ctx_ptr",       // .param 14 → AbiArg(14)
+            "telemetry_ptr",      // .param 15 → AbiArg(15)
+            "session_position",   // .param 16 → AbiArg(16)
+            "fused_hidden_ptr",   // .param 17 → AbiArg(17)
+            "num_mm_tokens",      // .param 18 → AbiArg(18)
+            "callback_table_ptr", // .param 19 → AbiArg(19)
+            "page_table_ptr",     // .param 20 → AbiArg(20)
+            "batch_ctx_ptr",      // .param 21 → AbiArg(21)
+            "kv_page_header_ptr", // .param 22 → AbiArg(22)
         ];
 
         let mut arg_locations = HashMap::new();
@@ -231,11 +237,13 @@ impl VmState {
     /// 返回 PtrExpr 供 VmInstr::LoadPtr 使用。
     /// 查询失败返回 Err——禁止 fallback 到默认值。
     pub fn arg_ptr_expr(&self, name: &str) -> Result<PtrExpr, CompilerError> {
-        let loc = self.arg_locations.get(name)
-            .ok_or_else(|| CompilerError::CodegenViolation(
-                format!("VmState: unknown parameter '{}'. Available: {:?}",
-                    name, self.arg_locations.keys().collect::<Vec<_>>())
-            ))?;
+        let loc = self.arg_locations.get(name).ok_or_else(|| {
+            CompilerError::CodegenViolation(format!(
+                "VmState: unknown parameter '{}'. Available: {:?}",
+                name,
+                self.arg_locations.keys().collect::<Vec<_>>()
+            ))
+        })?;
         Ok(loc.to_ptr_expr())
     }
 
@@ -271,9 +279,7 @@ impl VmState {
     /// 符号维度名称的别名映射。
     /// "total_seq" 复用 "seq_len" 的位置（生成循环模式）。
     pub fn sym_dim_aliases() -> Vec<(&'static str, &'static str)> {
-        vec![
-            ("total_seq", "seq_len"),
-        ]
+        vec![("total_seq", "seq_len")]
     }
 }
 
@@ -307,7 +313,9 @@ pub struct HeteroPhasePlan {
 impl HeteroPhasePlan {
     /// 空计划 (同构模型)
     pub fn empty() -> Self {
-        HeteroPhasePlan { transitions: Vec::new() }
+        HeteroPhasePlan {
+            transitions: Vec::new(),
+        }
     }
 
     /// 是否为空 (同构模型)
@@ -412,12 +420,27 @@ mod tests {
     fn test_init_mega_kernel_x86_register_args() {
         let state = VmState::init_mega_kernel_x86();
         // 前 6 个参数在寄存器
-        assert_eq!(state.arg_ptr_expr("input_ids_ptr").unwrap(), PtrExpr::AbiArg(0));
-        assert_eq!(state.arg_ptr_expr("weight_blob_ptr").unwrap(), PtrExpr::AbiArg(1));
-        assert_eq!(state.arg_ptr_expr("kv_cache_ptr").unwrap(), PtrExpr::AbiArg(2));
-        assert_eq!(state.arg_ptr_expr("positions_ptr").unwrap(), PtrExpr::AbiArg(3));
+        assert_eq!(
+            state.arg_ptr_expr("input_ids_ptr").unwrap(),
+            PtrExpr::AbiArg(0)
+        );
+        assert_eq!(
+            state.arg_ptr_expr("weight_blob_ptr").unwrap(),
+            PtrExpr::AbiArg(1)
+        );
+        assert_eq!(
+            state.arg_ptr_expr("kv_cache_ptr").unwrap(),
+            PtrExpr::AbiArg(2)
+        );
+        assert_eq!(
+            state.arg_ptr_expr("positions_ptr").unwrap(),
+            PtrExpr::AbiArg(3)
+        );
         assert_eq!(state.arg_ptr_expr("aux_ptr").unwrap(), PtrExpr::AbiArg(4));
-        assert_eq!(state.arg_ptr_expr("batch_size").unwrap(), PtrExpr::AbiArg(5));
+        assert_eq!(
+            state.arg_ptr_expr("batch_size").unwrap(),
+            PtrExpr::AbiArg(5)
+        );
     }
 
     #[test]
@@ -442,7 +465,10 @@ mod tests {
         assert_eq!(state.rsp_offset, -80);
 
         // 参数位置不受 prologue 操作影响（相对 rbp）
-        assert_eq!(state.arg_ptr_expr("scratchpad_ptr").unwrap(), PtrExpr::StackArg(24));
+        assert_eq!(
+            state.arg_ptr_expr("scratchpad_ptr").unwrap(),
+            PtrExpr::StackArg(24)
+        );
     }
 
     // ── New tests (TEST-VMS-06 .. TEST-VMS-18) ──
@@ -478,7 +504,10 @@ mod tests {
         assert_eq!(state.arg_ptr_expr("telemetry").unwrap(), PtrExpr::AbiArg(4));
 
         // SharedMem scratchpad
-        assert_eq!(state.arg_ptr_expr("scratchpad").unwrap(), PtrExpr::SharedMem);
+        assert_eq!(
+            state.arg_ptr_expr("scratchpad").unwrap(),
+            PtrExpr::SharedMem
+        );
 
         // CPU-only params absent
         assert!(state.arg_ptr_expr("kv_cache").is_err());
@@ -500,17 +529,41 @@ mod tests {
         let state = VmState::init_mega_kernel_x86();
 
         // Act & Assert — first 6 in registers
-        assert_eq!(state.arg_ptr_expr("input_ids_ptr").unwrap(), PtrExpr::AbiArg(0));
-        assert_eq!(state.arg_ptr_expr("weight_blob_ptr").unwrap(), PtrExpr::AbiArg(1));
-        assert_eq!(state.arg_ptr_expr("kv_cache_ptr").unwrap(), PtrExpr::AbiArg(2));
-        assert_eq!(state.arg_ptr_expr("positions_ptr").unwrap(), PtrExpr::AbiArg(3));
+        assert_eq!(
+            state.arg_ptr_expr("input_ids_ptr").unwrap(),
+            PtrExpr::AbiArg(0)
+        );
+        assert_eq!(
+            state.arg_ptr_expr("weight_blob_ptr").unwrap(),
+            PtrExpr::AbiArg(1)
+        );
+        assert_eq!(
+            state.arg_ptr_expr("kv_cache_ptr").unwrap(),
+            PtrExpr::AbiArg(2)
+        );
+        assert_eq!(
+            state.arg_ptr_expr("positions_ptr").unwrap(),
+            PtrExpr::AbiArg(3)
+        );
         assert_eq!(state.arg_ptr_expr("aux_ptr").unwrap(), PtrExpr::AbiArg(4));
-        assert_eq!(state.arg_ptr_expr("batch_size").unwrap(), PtrExpr::AbiArg(5));
+        assert_eq!(
+            state.arg_ptr_expr("batch_size").unwrap(),
+            PtrExpr::AbiArg(5)
+        );
 
         // First stack args — stack_arg_base=16, stride=8
-        assert_eq!(state.arg_ptr_expr("prompt_len").unwrap(), PtrExpr::StackArg(16));
-        assert_eq!(state.arg_ptr_expr("scratchpad_ptr").unwrap(), PtrExpr::StackArg(24));
-        assert_eq!(state.arg_ptr_expr("output_tokens_ptr").unwrap(), PtrExpr::StackArg(32));
+        assert_eq!(
+            state.arg_ptr_expr("prompt_len").unwrap(),
+            PtrExpr::StackArg(16)
+        );
+        assert_eq!(
+            state.arg_ptr_expr("scratchpad_ptr").unwrap(),
+            PtrExpr::StackArg(24)
+        );
+        assert_eq!(
+            state.arg_ptr_expr("output_tokens_ptr").unwrap(),
+            PtrExpr::StackArg(32)
+        );
     }
 
     /// @trace TEST-VMS-09 [req:REQ-VR] [level:unit]
@@ -523,20 +576,59 @@ mod tests {
         let state = VmState::init_mega_kernel_x86();
 
         // Act & Assert — later stack args
-        assert_eq!(state.arg_ptr_expr("temperature_u32").unwrap(), PtrExpr::StackArg(40));
+        assert_eq!(
+            state.arg_ptr_expr("temperature_u32").unwrap(),
+            PtrExpr::StackArg(40)
+        );
         assert_eq!(state.arg_ptr_expr("top_k").unwrap(), PtrExpr::StackArg(48));
-        assert_eq!(state.arg_ptr_expr("top_p_u32").unwrap(), PtrExpr::StackArg(56));
-        assert_eq!(state.arg_ptr_expr("max_new_tokens").unwrap(), PtrExpr::StackArg(64));
-        assert_eq!(state.arg_ptr_expr("eos_token_id").unwrap(), PtrExpr::StackArg(72));
-        assert_eq!(state.arg_ptr_expr("hook_ctx_ptr").unwrap(), PtrExpr::StackArg(80));
-        assert_eq!(state.arg_ptr_expr("telemetry_ptr").unwrap(), PtrExpr::StackArg(88));
-        assert_eq!(state.arg_ptr_expr("session_position").unwrap(), PtrExpr::StackArg(96));
-        assert_eq!(state.arg_ptr_expr("fused_hidden_ptr").unwrap(), PtrExpr::StackArg(104));
-        assert_eq!(state.arg_ptr_expr("num_mm_tokens").unwrap(), PtrExpr::StackArg(112));
-        assert_eq!(state.arg_ptr_expr("callback_table_ptr").unwrap(), PtrExpr::StackArg(120));
-        assert_eq!(state.arg_ptr_expr("page_table_ptr").unwrap(), PtrExpr::StackArg(128));
-        assert_eq!(state.arg_ptr_expr("batch_ctx_ptr").unwrap(), PtrExpr::StackArg(136));
-        assert_eq!(state.arg_ptr_expr("kv_page_header_ptr").unwrap(), PtrExpr::StackArg(144));
+        assert_eq!(
+            state.arg_ptr_expr("top_p_u32").unwrap(),
+            PtrExpr::StackArg(56)
+        );
+        assert_eq!(
+            state.arg_ptr_expr("max_new_tokens").unwrap(),
+            PtrExpr::StackArg(64)
+        );
+        assert_eq!(
+            state.arg_ptr_expr("eos_token_id").unwrap(),
+            PtrExpr::StackArg(72)
+        );
+        assert_eq!(
+            state.arg_ptr_expr("hook_ctx_ptr").unwrap(),
+            PtrExpr::StackArg(80)
+        );
+        assert_eq!(
+            state.arg_ptr_expr("telemetry_ptr").unwrap(),
+            PtrExpr::StackArg(88)
+        );
+        assert_eq!(
+            state.arg_ptr_expr("session_position").unwrap(),
+            PtrExpr::StackArg(96)
+        );
+        assert_eq!(
+            state.arg_ptr_expr("fused_hidden_ptr").unwrap(),
+            PtrExpr::StackArg(104)
+        );
+        assert_eq!(
+            state.arg_ptr_expr("num_mm_tokens").unwrap(),
+            PtrExpr::StackArg(112)
+        );
+        assert_eq!(
+            state.arg_ptr_expr("callback_table_ptr").unwrap(),
+            PtrExpr::StackArg(120)
+        );
+        assert_eq!(
+            state.arg_ptr_expr("page_table_ptr").unwrap(),
+            PtrExpr::StackArg(128)
+        );
+        assert_eq!(
+            state.arg_ptr_expr("batch_ctx_ptr").unwrap(),
+            PtrExpr::StackArg(136)
+        );
+        assert_eq!(
+            state.arg_ptr_expr("kv_page_header_ptr").unwrap(),
+            PtrExpr::StackArg(144)
+        );
     }
 
     /// @trace TEST-VMS-GPU-MEGA-KERNEL-ABI [req:REQ-UMK-27] [level:unit]
@@ -550,20 +642,37 @@ mod tests {
 
         // 全部 23 个参数必须解析为 AbiArg(N), 顺序与 GPU prologue abi_param_names 一致
         let expected: &[(&str, u8)] = &[
-            ("input_ids_ptr", 0), ("weight_blob_ptr", 1), ("kv_cache_ptr", 2),
-            ("positions_ptr", 3), ("aux_ptr", 4), ("batch_size", 5),
-            ("prompt_len", 6), ("scratchpad_ptr", 7), ("output_tokens_ptr", 8),
-            ("temperature_u32", 9), ("top_k", 10), ("top_p_u32", 11),
-            ("max_new_tokens", 12), ("eos_token_id", 13), ("hook_ctx_ptr", 14),
-            ("telemetry_ptr", 15), ("session_position", 16), ("fused_hidden_ptr", 17),
-            ("num_mm_tokens", 18), ("callback_table_ptr", 19),
-            ("page_table_ptr", 20), ("batch_ctx_ptr", 21),
+            ("input_ids_ptr", 0),
+            ("weight_blob_ptr", 1),
+            ("kv_cache_ptr", 2),
+            ("positions_ptr", 3),
+            ("aux_ptr", 4),
+            ("batch_size", 5),
+            ("prompt_len", 6),
+            ("scratchpad_ptr", 7),
+            ("output_tokens_ptr", 8),
+            ("temperature_u32", 9),
+            ("top_k", 10),
+            ("top_p_u32", 11),
+            ("max_new_tokens", 12),
+            ("eos_token_id", 13),
+            ("hook_ctx_ptr", 14),
+            ("telemetry_ptr", 15),
+            ("session_position", 16),
+            ("fused_hidden_ptr", 17),
+            ("num_mm_tokens", 18),
+            ("callback_table_ptr", 19),
+            ("page_table_ptr", 20),
+            ("batch_ctx_ptr", 21),
             ("kv_page_header_ptr", 22),
         ];
         for &(name, idx) in expected {
             match state.arg_ptr_expr(name).unwrap() {
-                PtrExpr::AbiArg(n) => assert_eq!(n, idx,
-                    "GPU ABI param '{}' expected AbiArg({}) got AbiArg({})", name, idx, n),
+                PtrExpr::AbiArg(n) => assert_eq!(
+                    n, idx,
+                    "GPU ABI param '{}' expected AbiArg({}) got AbiArg({})",
+                    name, idx, n
+                ),
                 other => panic!("GPU ABI param '{}' must be AbiArg, got {:?}", name, other),
             }
         }
@@ -610,7 +719,7 @@ mod tests {
         let mut state = VmState::init_mega_kernel_x86();
 
         // Act — push rbx, r12, r13
-        state.track_push(PhysGpr(3));  // rbx
+        state.track_push(PhysGpr(3)); // rbx
         state.track_push(PhysGpr(12)); // r12
         state.track_push(PhysGpr(13)); // r13
 
@@ -645,7 +754,7 @@ mod tests {
     fn test_track_sub_rsp_combined_with_push() {
         // Arrange
         let mut state = VmState::init_mega_kernel_x86();
-        state.track_push(PhysGpr(3));  // rsp = -8
+        state.track_push(PhysGpr(3)); // rsp = -8
         state.track_push(PhysGpr(12)); // rsp = -16
 
         // Act
@@ -655,8 +764,14 @@ mod tests {
         assert_eq!(state.rsp_offset, -272);
 
         // Arg locations are still relative to rbp, unaffected
-        assert_eq!(state.arg_ptr_expr("input_ids_ptr").unwrap(), PtrExpr::AbiArg(0));
-        assert_eq!(state.arg_ptr_expr("telemetry_ptr").unwrap(), PtrExpr::StackArg(88));
+        assert_eq!(
+            state.arg_ptr_expr("input_ids_ptr").unwrap(),
+            PtrExpr::AbiArg(0)
+        );
+        assert_eq!(
+            state.arg_ptr_expr("telemetry_ptr").unwrap(),
+            PtrExpr::StackArg(88)
+        );
     }
 
     /// @trace TEST-VMS-15 [req:REQ-VR] [level:unit]
@@ -768,7 +883,10 @@ mod tests {
 
         // Assert — unchanged
         assert_eq!(state.rsp_offset, 0);
-        assert_eq!(state.arg_ptr_expr("input_ids_ptr").unwrap(), PtrExpr::AbiArg(0));
+        assert_eq!(
+            state.arg_ptr_expr("input_ids_ptr").unwrap(),
+            PtrExpr::AbiArg(0)
+        );
     }
 
     /// @trace TEST-VMS-20 [req:REQ-VR] [level:unit]
@@ -853,10 +971,10 @@ mod tests {
         let mut state = VmState::init_mega_kernel_x86();
 
         // Act — push, sub, push, sub
-        state.track_push(PhysGpr(3));   // rsp = -8
-        state.track_sub_rsp(32);         // rsp = -40
-        state.track_push(PhysGpr(12));   // rsp = -48
-        state.track_sub_rsp(64);         // rsp = -112
+        state.track_push(PhysGpr(3)); // rsp = -8
+        state.track_sub_rsp(32); // rsp = -40
+        state.track_push(PhysGpr(12)); // rsp = -48
+        state.track_sub_rsp(64); // rsp = -112
 
         // Assert
         assert_eq!(state.rsp_offset, -112);

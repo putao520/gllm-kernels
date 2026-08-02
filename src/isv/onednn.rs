@@ -4,8 +4,8 @@
 //! oneDNN's `dnnl_sgemm` uses row-major layout natively, so no transpose trick is needed.
 
 use super::IsvGemm;
-use std::sync::OnceLock;
 use crate::types::CompilerError;
+use std::sync::OnceLock;
 
 /// Signature: `dnnl_sgemm(transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc) -> i32`
 type DnnlSgemmFn = unsafe extern "C" fn(
@@ -35,10 +35,7 @@ unsafe impl Sync for OneDnnFfi {}
 static FFI: OnceLock<Option<OneDnnFfi>> = OnceLock::new();
 
 fn load_ffi() -> Option<OneDnnFfi> {
-    const LIB_NAMES: &[&[u8]] = &[
-        b"libdnnl.so\0",
-        b"libmkl_rt.so\0",
-    ];
+    const LIB_NAMES: &[&[u8]] = &[b"libdnnl.so\0", b"libmkl_rt.so\0"];
 
     for name in LIB_NAMES {
         unsafe {
@@ -79,28 +76,42 @@ impl IsvGemm for OneDnnBackend {
     }
 
     unsafe fn sgemm(
-        m: usize, n: usize, k: usize,
+        m: usize,
+        n: usize,
+        k: usize,
         alpha: f32,
-        a: *const f32, lda: usize,
-        b: *const f32, ldb: usize,
+        a: *const f32,
+        lda: usize,
+        b: *const f32,
+        ldb: usize,
         beta: f32,
-        c: *mut f32, ldc: usize,
+        c: *mut f32,
+        ldc: usize,
     ) -> Result<(), CompilerError> {
-        let ffi = get_ffi().ok_or_else(|| CompilerError::Internal("oneDNN library not loaded".to_string()))?;
+        let ffi = get_ffi()
+            .ok_or_else(|| CompilerError::Internal("oneDNN library not loaded".to_string()))?;
         let ret = (ffi.sgemm)(
             b'N' as std::ffi::c_char,
             b'N' as std::ffi::c_char,
-            m as i64, n as i64, k as i64,
+            m as i64,
+            n as i64,
+            k as i64,
             alpha,
-            a, lda as i64,
-            b, ldb as i64,
+            a,
+            lda as i64,
+            b,
+            ldb as i64,
             beta,
-            c, ldc as i64,
+            c,
+            ldc as i64,
         );
         if ret == 0 {
             Ok(())
         } else {
-            Err(CompilerError::Internal(format!("dnnl_sgemm returned error code {}", ret)))
+            Err(CompilerError::Internal(format!(
+                "dnnl_sgemm returned error code {}",
+                ret
+            )))
         }
     }
 }
@@ -128,7 +139,10 @@ mod tests {
         // Act
         let available = OneDnnBackend::is_available();
         // Assert: without the oneDNN shared library, it must report unavailable
-        assert!(!available, "oneDNN should not be available without libdnnl.so");
+        assert!(
+            !available,
+            "oneDNN should not be available without libdnnl.so"
+        );
     }
 
     // ── Test 3: sgemm returns error when library is not loaded ──
@@ -142,15 +156,24 @@ mod tests {
         // Act
         let result = unsafe {
             OneDnnBackend::sgemm(
-                2, 2, 2, 1.0,
-                a.as_ptr(), 2,
-                b.as_ptr(), 2,
+                2,
+                2,
+                2,
+                1.0,
+                a.as_ptr(),
+                2,
+                b.as_ptr(),
+                2,
                 0.0,
-                c.as_mut_ptr(), 2,
+                c.as_mut_ptr(),
+                2,
             )
         };
         // Assert: without the library, must be an error
-        assert!(result.is_err(), "sgemm should fail when oneDNN is not loaded");
+        assert!(
+            result.is_err(),
+            "sgemm should fail when oneDNN is not loaded"
+        );
     }
 
     // ── Test 4: sgemm error message mentions oneDNN ──
@@ -164,11 +187,17 @@ mod tests {
         // Act
         let result = unsafe {
             OneDnnBackend::sgemm(
-                1, 1, 1, 1.0,
-                a.as_ptr(), 1,
-                b.as_ptr(), 1,
+                1,
+                1,
+                1,
+                1.0,
+                a.as_ptr(),
+                1,
+                b.as_ptr(),
+                1,
                 0.0,
-                c.as_mut_ptr(), 1,
+                c.as_mut_ptr(),
+                1,
             )
         };
         // Assert: error message should contain "oneDNN"
@@ -191,18 +220,27 @@ mod tests {
         // Act
         let result = unsafe {
             OneDnnBackend::sgemm(
-                1, 1, 1, 1.0,
-                a.as_ptr(), 1,
-                b.as_ptr(), 1,
+                1,
+                1,
+                1,
+                1.0,
+                a.as_ptr(),
+                1,
+                b.as_ptr(),
+                1,
                 0.0,
-                c.as_mut_ptr(), 1,
+                c.as_mut_ptr(),
+                1,
             )
         };
         // Assert: error must be the Internal variant
         let err = result.expect_err("should be error");
         match &err {
             CompilerError::Internal(msg) => {
-                assert!(msg.contains("oneDNN"), "Internal message should mention oneDNN");
+                assert!(
+                    msg.contains("oneDNN"),
+                    "Internal message should mention oneDNN"
+                );
             }
             other => panic!("expected CompilerError::Internal, got: {other:?}"),
         }
@@ -219,11 +257,17 @@ mod tests {
         // Act
         let result = unsafe {
             OneDnnBackend::sgemm(
-                0, 0, 0, 0.0,
-                a.as_ptr(), 0,
-                b.as_ptr(), 0,
+                0,
+                0,
+                0,
                 0.0,
-                c.as_mut_ptr(), 0,
+                a.as_ptr(),
+                0,
+                b.as_ptr(),
+                0,
+                0.0,
+                c.as_mut_ptr(),
+                0,
             )
         };
         // Assert: still errors because library is not loaded (not because of dimensions)
@@ -252,11 +296,17 @@ mod tests {
         // Act
         let result = unsafe {
             OneDnnBackend::hgemm(
-                1, 1, 1, 1.0,
-                std::ptr::null(), 1,
-                std::ptr::null(), 1,
+                1,
+                1,
+                1,
+                1.0,
+                std::ptr::null(),
+                1,
+                std::ptr::null(),
+                1,
                 0.0,
-                std::ptr::null_mut(), 1,
+                std::ptr::null_mut(),
+                1,
             )
         };
         // Assert: default hgemm should return error
@@ -271,11 +321,17 @@ mod tests {
         // Act
         let result = unsafe {
             OneDnnBackend::hgemm(
-                2, 2, 2, 1.0,
-                std::ptr::null(), 2,
-                std::ptr::null(), 2,
+                2,
+                2,
+                2,
+                1.0,
+                std::ptr::null(),
+                2,
+                std::ptr::null(),
+                2,
                 0.0,
-                std::ptr::null_mut(), 2,
+                std::ptr::null_mut(),
+                2,
             )
         };
         // Assert: error message from the trait default impl

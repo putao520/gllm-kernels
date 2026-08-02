@@ -170,28 +170,25 @@ where
     let search_time_ns = t0.elapsed().as_nanos() as u64;
     let configs_evaluated = all_results.len();
 
-    let (best_config, best_result) = all_results
-        .first()
-        .cloned()
-        .unwrap_or({
-            (
-                TuningConfig {
-                    kc: 256,
-                    mc: 72,
-                    nc: 1024,
-                    num_threads: 1,
-                    jit: None,
-                },
-                BenchResult {
-                    median_ns: f64::MAX,
-                    iqr_ns: 0.0,
-                    min_ns: f64::MAX,
-                    samples: 0,
-                    gflops: None,
-                    bandwidth_gbs: None,
-                },
-            )
-        });
+    let (best_config, best_result) = all_results.first().cloned().unwrap_or({
+        (
+            TuningConfig {
+                kc: 256,
+                mc: 72,
+                nc: 1024,
+                num_threads: 1,
+                jit: None,
+            },
+            BenchResult {
+                median_ns: f64::MAX,
+                iqr_ns: 0.0,
+                min_ns: f64::MAX,
+                samples: 0,
+                gflops: None,
+                bandwidth_gbs: None,
+            },
+        )
+    });
 
     SearchResult {
         best_config,
@@ -252,9 +249,9 @@ pub fn format_report(result: &SearchResult, op_name: &str, shape_desc: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::autotuning::hw_info::HwInfo;
     use crate::autotuning::measure;
     use crate::autotuning::search_space::*;
-    use crate::autotuning::hw_info::HwInfo;
 
     #[test]
     fn test_search_synthetic() {
@@ -286,7 +283,10 @@ mod tests {
 
         assert!(result.configs_evaluated > 0);
         assert!(result.best_result.median_ns > 0.0);
-        eprintln!("{}", format_report(&result, "synthetic_gemm", "256x256x256"));
+        eprintln!(
+            "{}",
+            format_report(&result, "synthetic_gemm", "256x256x256")
+        );
     }
 
     // ── SearchConfig presets ──
@@ -323,7 +323,13 @@ mod tests {
     #[test]
     fn search_result_display_contains_key_info() {
         let hw = HwInfo::detect();
-        let shape = ProblemShape { m: 64, n: 64, k: 64, elem_bytes: 4, dtype_id: 0 };
+        let shape = ProblemShape {
+            m: 64,
+            n: 64,
+            k: 64,
+            elem_bytes: 4,
+            dtype_id: 0,
+        };
         let space = SearchSpace::for_gemm(&hw, &shape, 4, 8);
         let result = run_search(&space, &SearchConfig::fast(), |cfg, bench_cfg| {
             measure::bench_fn(bench_cfg, |_| {
@@ -331,8 +337,14 @@ mod tests {
             })
         });
         let display = format!("{}", result);
-        assert!(display.contains("evaluated"), "Display should contain 'evaluated'");
-        assert!(display.contains("configs"), "Display should contain 'configs'");
+        assert!(
+            display.contains("evaluated"),
+            "Display should contain 'evaluated'"
+        );
+        assert!(
+            display.contains("configs"),
+            "Display should contain 'configs'"
+        );
     }
 
     // ── 13 Additional Tests ──
@@ -545,7 +557,8 @@ mod tests {
 
         // Assert
         assert_eq!(
-            result.configs_evaluated, result.all_results.len(),
+            result.configs_evaluated,
+            result.all_results.len(),
             "configs_evaluated must equal all_results.len()"
         );
     }
@@ -599,12 +612,24 @@ mod tests {
         let report = format_report(&result, "test_gemm", "64x64x64");
 
         // Assert
-        assert!(report.contains("Autotuning Report"), "report should contain header");
-        assert!(report.contains("test_gemm"), "report should contain op_name");
-        assert!(report.contains("64x64x64"), "report should contain shape_desc");
+        assert!(
+            report.contains("Autotuning Report"),
+            "report should contain header"
+        );
+        assert!(
+            report.contains("test_gemm"),
+            "report should contain op_name"
+        );
+        assert!(
+            report.contains("64x64x64"),
+            "report should contain shape_desc"
+        );
         assert!(report.contains("Best:"), "report should contain 'Best:'");
         assert!(report.contains("Perf:"), "report should contain 'Perf:'");
-        assert!(report.contains("Search:"), "report should contain 'Search:'");
+        assert!(
+            report.contains("Search:"),
+            "report should contain 'Search:'"
+        );
     }
 
     #[test]
@@ -633,8 +658,14 @@ mod tests {
         });
 
         // Assert: search still completes and returns valid result
-        assert!(result.configs_evaluated > 0, "should evaluate at least one config");
-        assert!(result.best_result.median_ns > 0.0, "best_result should have nonzero median");
+        assert!(
+            result.configs_evaluated > 0,
+            "should evaluate at least one config"
+        );
+        assert!(
+            result.best_result.median_ns > 0.0,
+            "best_result should have nonzero median"
+        );
     }
 
     // ── 10 Additional Tests ──
@@ -651,10 +682,22 @@ mod tests {
         assert_eq!(cloned.coarse_stride, original.coarse_stride);
         assert_eq!(cloned.refine_radius, original.refine_radius);
         assert_eq!(cloned.refine_iters, original.refine_iters);
-        assert_eq!(cloned.coarse_bench.warmup_iters, original.coarse_bench.warmup_iters);
-        assert_eq!(cloned.coarse_bench.min_iters, original.coarse_bench.min_iters);
-        assert_eq!(cloned.refine_bench.warmup_iters, original.refine_bench.warmup_iters);
-        assert_eq!(cloned.refine_bench.min_iters, original.refine_bench.min_iters);
+        assert_eq!(
+            cloned.coarse_bench.warmup_iters,
+            original.coarse_bench.warmup_iters
+        );
+        assert_eq!(
+            cloned.coarse_bench.min_iters,
+            original.coarse_bench.min_iters
+        );
+        assert_eq!(
+            cloned.refine_bench.warmup_iters,
+            original.refine_bench.warmup_iters
+        );
+        assert_eq!(
+            cloned.refine_bench.min_iters,
+            original.refine_bench.min_iters
+        );
         assert!((cloned.early_reject_ratio - original.early_reject_ratio).abs() < 1e-6);
     }
 
@@ -737,7 +780,10 @@ mod tests {
         let display = format!("{}", result);
 
         // Assert
-        assert!(display.contains("0.0ms"), "zero search_time_ns should display as 0.0ms");
+        assert!(
+            display.contains("0.0ms"),
+            "zero search_time_ns should display as 0.0ms"
+        );
         assert!(display.contains("1"), "should contain configs_evaluated=1");
     }
 
@@ -813,8 +859,14 @@ mod tests {
         let display = format!("{}", result);
 
         // Assert
-        assert!(display.contains("12345.7ms"), "large search_time should format as ms with 1 decimal");
-        assert!(display.contains("100"), "should contain configs_evaluated=100");
+        assert!(
+            display.contains("12345.7ms"),
+            "large search_time should format as ms with 1 decimal"
+        );
+        assert!(
+            display.contains("100"),
+            "should contain configs_evaluated=100"
+        );
     }
 
     #[test]
@@ -840,7 +892,10 @@ mod tests {
 
         // Assert: best_config should match the first entry in all_results
         if let Some((first_config, first_result)) = result.all_results.first() {
-            assert_eq!(*first_config, result.best_config, "best_config should match first entry in all_results");
+            assert_eq!(
+                *first_config, result.best_config,
+                "best_config should match first entry in all_results"
+            );
             assert!(
                 (first_result.median_ns - result.best_result.median_ns).abs() < 1e-6,
                 "best_result.median_ns should match first entry in all_results"
@@ -872,8 +927,14 @@ mod tests {
         });
 
         // Assert: still completes coarse phase and returns valid result
-        assert!(result.configs_evaluated > 0, "should evaluate coarse configs even with 0 refine_iters");
-        assert!(result.best_result.median_ns > 0.0, "best_result should have nonzero median");
+        assert!(
+            result.configs_evaluated > 0,
+            "should evaluate coarse configs even with 0 refine_iters"
+        );
+        assert!(
+            result.best_result.median_ns > 0.0,
+            "best_result should have nonzero median"
+        );
     }
 
     #[test]
@@ -920,9 +981,18 @@ mod tests {
         let report = format_report(&result, "single_gemm", "128x128x128");
 
         // Assert
-        assert!(report.contains("Autotuning Report"), "should contain header");
+        assert!(
+            report.contains("Autotuning Report"),
+            "should contain header"
+        );
         assert!(report.contains("single_gemm"), "should contain op_name");
-        assert!(!report.contains("Top configurations"), "single result should not show Top section");
-        assert!(report.contains("Parameter sensitivity"), "should still show sensitivity with single result");
+        assert!(
+            !report.contains("Top configurations"),
+            "single result should not show Top section"
+        );
+        assert!(
+            report.contains("Parameter sensitivity"),
+            "should still show sensitivity with single result"
+        );
     }
 }

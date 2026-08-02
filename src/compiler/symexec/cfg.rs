@@ -4,8 +4,8 @@
 //! a compiled `extern "C"` function's machine code, then identifies natural
 //! loops via dominator-tree analysis.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use crate::types::CompilerError;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 // ---------------------------------------------------------------------------
 // Data structures
@@ -134,7 +134,10 @@ use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register}
 /// `fn_ptr` must point to valid executable memory containing a compiled
 /// function. `max_bytes` limits how far the disassembler reads.
 #[cfg(target_arch = "x86_64")]
-pub unsafe fn build_cfg_from_fn(fn_ptr: *const u8, max_bytes: usize) -> Result<ControlFlowGraph, CompilerError> {
+pub unsafe fn build_cfg_from_fn(
+    fn_ptr: *const u8,
+    max_bytes: usize,
+) -> Result<ControlFlowGraph, CompilerError> {
     if fn_ptr.is_null() {
         return Err("null function pointer".into());
     }
@@ -198,9 +201,7 @@ pub unsafe fn build_cfg_from_fn(fn_ptr: *const u8, max_bytes: usize) -> Result<C
     }
 
     // Helper: find which block an address belongs to.
-    let find_block = |addr: u64| -> Option<BlockId> {
-        addr_to_block.get(&addr).copied()
-    };
+    let find_block = |addr: u64| -> Option<BlockId> { addr_to_block.get(&addr).copied() };
 
     // Build basic blocks.
     let block_start_vec: Vec<u64> = block_starts.iter().copied().collect();
@@ -265,7 +266,9 @@ pub unsafe fn build_cfg_from_fn(fn_ptr: *const u8, max_bytes: usize) -> Result<C
         let succs = match &terminator {
             Terminator::Fallthrough(next) => vec![*next],
             Terminator::Jump(target) => vec![*target],
-            Terminator::CondBranch { taken, fallthrough, .. } => vec![*taken, *fallthrough],
+            Terminator::CondBranch {
+                taken, fallthrough, ..
+            } => vec![*taken, *fallthrough],
             Terminator::Return => vec![],
         };
 
@@ -280,13 +283,16 @@ pub unsafe fn build_cfg_from_fn(fn_ptr: *const u8, max_bytes: usize) -> Result<C
             blk_end
         };
 
-        blocks.insert(blk_id, BasicBlock {
-            id: blk_id,
-            start_addr: blk_start,
-            end_addr: block_end_addr,
-            instructions: insns,
-            terminator,
-        });
+        blocks.insert(
+            blk_id,
+            BasicBlock {
+                id: blk_id,
+                start_addr: blk_start,
+                end_addr: block_end_addr,
+                instructions: insns,
+                terminator,
+            },
+        );
     }
 
     // Ensure all blocks have entries in predecessor/successor maps.
@@ -304,12 +310,18 @@ pub unsafe fn build_cfg_from_fn(fn_ptr: *const u8, max_bytes: usize) -> Result<C
 }
 
 #[cfg(target_arch = "aarch64")]
-pub unsafe fn build_cfg_from_fn(fn_ptr: *const u8, max_bytes: usize) -> Result<ControlFlowGraph, CompilerError> {
+pub unsafe fn build_cfg_from_fn(
+    fn_ptr: *const u8,
+    max_bytes: usize,
+) -> Result<ControlFlowGraph, CompilerError> {
     super::decoder_aarch64::build_cfg_from_fn_aarch64(fn_ptr, max_bytes)
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub unsafe fn build_cfg_from_fn(_fn_ptr: *const u8, _max_bytes: usize) -> Result<ControlFlowGraph, CompilerError> {
+pub unsafe fn build_cfg_from_fn(
+    _fn_ptr: *const u8,
+    _max_bytes: usize,
+) -> Result<ControlFlowGraph, CompilerError> {
     Err("CFG construction only supported on x86_64 and aarch64".into())
 }
 
@@ -375,9 +387,7 @@ pub fn find_loops(cfg: &ControlFlowGraph) -> LoopForest {
     }
 
     // Sort by header address for deterministic ordinals.
-    loops.sort_by_key(|l| {
-        cfg.blocks.get(&l.header).map(|b| b.start_addr).unwrap_or(0)
-    });
+    loops.sort_by_key(|l| cfg.blocks.get(&l.header).map(|b| b.start_addr).unwrap_or(0));
     for (i, l) in loops.iter_mut().enumerate() {
         l.ordinal = i;
     }
@@ -400,7 +410,10 @@ pub fn find_loops(cfg: &ControlFlowGraph) -> LoopForest {
                     Some(&current_parent) => {
                         if loops[i].body_blocks.len() < loops[current_parent].body_blocks.len() {
                             // i is a tighter parent than current_parent.
-                            children.entry(current_parent).or_default().retain(|&x| x != j);
+                            children
+                                .entry(current_parent)
+                                .or_default()
+                                .retain(|&x| x != j);
                             children.entry(i).or_default().push(j);
                             parent.insert(j, i);
                         }
@@ -447,10 +460,7 @@ pub fn find_loops(cfg: &ControlFlowGraph) -> LoopForest {
 /// Compute immediate dominators for all blocks using the iterative algorithm.
 /// Returns a map: BlockId → immediate dominator BlockId.
 /// The entry block dominates itself.
-fn compute_dominators(
-    cfg: &ControlFlowGraph,
-    block_ids: &[BlockId],
-) -> HashMap<BlockId, BlockId> {
+fn compute_dominators(cfg: &ControlFlowGraph, block_ids: &[BlockId]) -> HashMap<BlockId, BlockId> {
     // Use the classic iterative dominator algorithm.
     // dom[n] = {n} ∪ (∩ dom[p] for p in preds[n])
     // We store dom sets as BTreeSets for determinism.
@@ -489,7 +499,9 @@ fn compute_dominators(
                     // Intersect dom sets of all predecessors.
                     let mut iter = preds.iter();
                     // SAFETY: this else branch is only reached when preds is non-empty
-                    let first = iter.next().expect("SAFETY: preds is non-empty in else branch");
+                    let first = iter
+                        .next()
+                        .expect("SAFETY: preds is non-empty in else branch");
                     let mut intersection = dom_sets.get(first).cloned().unwrap_or_default();
                     for pred in iter {
                         let pred_dom = dom_sets.get(pred).cloned().unwrap_or_default();
@@ -560,11 +572,7 @@ fn dominates(idom: &HashMap<BlockId, BlockId>, a: BlockId, b: BlockId) -> bool {
 
 /// Compute the natural loop body for a back-edge (latch → header).
 /// Uses reverse BFS from latch to header, collecting all blocks on the path.
-fn compute_loop_body(
-    cfg: &ControlFlowGraph,
-    header: BlockId,
-    latch: BlockId,
-) -> BTreeSet<BlockId> {
+fn compute_loop_body(cfg: &ControlFlowGraph, header: BlockId, latch: BlockId) -> BTreeSet<BlockId> {
     let mut body = BTreeSet::new();
     body.insert(header);
 
@@ -624,9 +632,14 @@ fn decode_insn(instr: &Instruction) -> DecodedInsn {
                 }
                 operands.push(format!("[{}]", parts.join("+")));
             }
-            OpKind::Immediate8 | OpKind::Immediate8to16 | OpKind::Immediate8to32
-            | OpKind::Immediate8to64 | OpKind::Immediate16 | OpKind::Immediate32
-            | OpKind::Immediate32to64 | OpKind::Immediate64 => {
+            OpKind::Immediate8
+            | OpKind::Immediate8to16
+            | OpKind::Immediate8to32
+            | OpKind::Immediate8to64
+            | OpKind::Immediate16
+            | OpKind::Immediate32
+            | OpKind::Immediate32to64
+            | OpKind::Immediate64 => {
                 operands.push(format!("0x{:x}", instr.immediate(i)));
             }
             OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
@@ -648,10 +661,21 @@ fn decode_insn(instr: &Instruction) -> DecodedInsn {
 fn is_branch_mnemonic(m: Mnemonic) -> bool {
     matches!(
         m,
-        Mnemonic::Je | Mnemonic::Jne | Mnemonic::Jb | Mnemonic::Jbe
-            | Mnemonic::Ja | Mnemonic::Jae | Mnemonic::Jl | Mnemonic::Jle
-            | Mnemonic::Jg | Mnemonic::Jge | Mnemonic::Jmp
-            | Mnemonic::Js | Mnemonic::Jns | Mnemonic::Jp | Mnemonic::Jnp
+        Mnemonic::Je
+            | Mnemonic::Jne
+            | Mnemonic::Jb
+            | Mnemonic::Jbe
+            | Mnemonic::Ja
+            | Mnemonic::Jae
+            | Mnemonic::Jl
+            | Mnemonic::Jle
+            | Mnemonic::Jg
+            | Mnemonic::Jge
+            | Mnemonic::Jmp
+            | Mnemonic::Js
+            | Mnemonic::Jns
+            | Mnemonic::Jp
+            | Mnemonic::Jnp
     )
 }
 
@@ -709,7 +733,8 @@ mod tests {
             x + 1.0
         }
 
-        let cfg = unsafe { build_cfg_from_fn(add_one as *const u8, 256) }.expect("CFG build failed");
+        let cfg =
+            unsafe { build_cfg_from_fn(add_one as *const u8, 256) }.expect("CFG build failed");
 
         // Should have at least 1 block.
         assert!(!cfg.blocks.is_empty(), "CFG should have at least one block");
@@ -739,7 +764,8 @@ mod tests {
             acc
         }
 
-        let cfg = unsafe { build_cfg_from_fn(sum_array as *const u8, 512) }.expect("CFG build failed");
+        let cfg =
+            unsafe { build_cfg_from_fn(sum_array as *const u8, 512) }.expect("CFG build failed");
 
         // Should have multiple blocks (at least entry, loop header, loop body, exit).
         assert!(
@@ -778,7 +804,8 @@ mod tests {
             x
         }
 
-        let cfg = unsafe { build_cfg_from_fn(identity as *const u8, 256) }.expect("CFG build failed");
+        let cfg =
+            unsafe { build_cfg_from_fn(identity as *const u8, 256) }.expect("CFG build failed");
         let forest = find_loops(&cfg);
         assert!(
             forest.loops.is_empty(),
@@ -907,7 +934,11 @@ mod data_structure_tests {
         let cloned = original.clone();
 
         match cloned {
-            Terminator::CondBranch { kind, taken, fallthrough } => {
+            Terminator::CondBranch {
+                kind,
+                taken,
+                fallthrough,
+            } => {
                 assert_eq!(kind, BranchKind::NotEqual);
                 assert_eq!(taken, BlockId(7));
                 assert_eq!(fallthrough, BlockId(8));
@@ -1060,7 +1091,7 @@ mod data_structure_tests {
             instructions: vec![],
             terminator: Terminator::CondBranch {
                 kind: BranchKind::NotEqual,
-                taken: BlockId(3), // exit
+                taken: BlockId(3),       // exit
                 fallthrough: BlockId(2), // loop body
             },
         };
@@ -1189,7 +1220,9 @@ mod data_structure_tests {
 
     #[test]
     fn loop_forest_with_nested_loops() {
-        let outer_body: BTreeSet<BlockId> = vec![BlockId(1), BlockId(2), BlockId(3)].into_iter().collect();
+        let outer_body: BTreeSet<BlockId> = vec![BlockId(1), BlockId(2), BlockId(3)]
+            .into_iter()
+            .collect();
         let inner_body: BTreeSet<BlockId> = vec![BlockId(2), BlockId(3)].into_iter().collect();
 
         let outer = NaturalLoop {
@@ -1262,7 +1295,10 @@ mod data_structure_tests {
         assert_eq!(block.id, BlockId(5));
         assert_eq!(block.start_addr, 0x5000);
         assert_eq!(block.end_addr, 0x5000);
-        assert!(block.instructions.is_empty(), "empty block should have zero instructions");
+        assert!(
+            block.instructions.is_empty(),
+            "empty block should have zero instructions"
+        );
         assert!(matches!(block.terminator, Terminator::Jump(BlockId(0))));
     }
 
@@ -1285,7 +1321,10 @@ mod data_structure_tests {
         };
 
         // Act & Assert: same targets but different condition kind → not equal.
-        assert_ne!(cb_less, cb_greater, "CondBranch with different BranchKind must not be equal");
+        assert_ne!(
+            cb_less, cb_greater,
+            "CondBranch with different BranchKind must not be equal"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1313,7 +1352,7 @@ mod data_structure_tests {
             instructions: vec![],
             terminator: Terminator::CondBranch {
                 kind: BranchKind::NotEqual,
-                taken: BlockId(1), // self-loop back-edge
+                taken: BlockId(1),       // self-loop back-edge
                 fallthrough: BlockId(2), // exit
             },
         };
@@ -1351,11 +1390,18 @@ mod data_structure_tests {
         let forest = find_loops(&cfg);
 
         // Assert: one self-loop with header == latch.
-        assert_eq!(forest.loops.len(), 1, "self-loop CFG should have exactly one loop");
+        assert_eq!(
+            forest.loops.len(),
+            1,
+            "self-loop CFG should have exactly one loop"
+        );
         let lp = &forest.loops[0];
         assert_eq!(lp.header, BlockId(1), "self-loop header is B1");
         assert_eq!(lp.latch, BlockId(1), "self-loop latch is also B1");
-        assert!(lp.body_blocks.contains(&BlockId(1)), "self-loop body must contain its header");
+        assert!(
+            lp.body_blocks.contains(&BlockId(1)),
+            "self-loop body must contain its header"
+        );
         assert_eq!(lp.body_blocks.len(), 1, "self-loop body is just B1");
         assert_eq!(lp.exits, vec![BlockId(2)], "self-loop exit is B2");
     }
@@ -1415,8 +1461,15 @@ mod data_structure_tests {
         let forest = find_loops(&cfg);
 
         // Assert: no loops, unreachable block does not create false positives.
-        assert!(forest.loops.is_empty(), "unreachable block should not create loops");
-        assert_eq!(cfg.blocks.len(), 3, "CFG should still contain all blocks including unreachable");
+        assert!(
+            forest.loops.is_empty(),
+            "unreachable block should not create loops"
+        );
+        assert_eq!(
+            cfg.blocks.len(),
+            3,
+            "CFG should still contain all blocks including unreachable"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1454,8 +1507,16 @@ mod data_structure_tests {
         // Assert: B0 dominates everything; B1 idom = B0; B2 idom = B1; B3 idom = B1.
         assert_eq!(idom[&BlockId(0)], BlockId(0), "entry idom is itself");
         assert_eq!(idom[&BlockId(1)], BlockId(0), "B1 idom is B0");
-        assert_eq!(idom[&BlockId(2)], BlockId(1), "B2 idom is B1 (only predecessor in loop)");
-        assert_eq!(idom[&BlockId(3)], BlockId(1), "B3 idom is B1 (exit from loop header)");
+        assert_eq!(
+            idom[&BlockId(2)],
+            BlockId(1),
+            "B2 idom is B1 (only predecessor in loop)"
+        );
+        assert_eq!(
+            idom[&BlockId(3)],
+            BlockId(1),
+            "B3 idom is B1 (exit from loop header)"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1504,7 +1565,10 @@ mod data_structure_tests {
 
         // Assert: only the header is in the body.
         assert_eq!(body.len(), 1);
-        assert!(body.contains(&BlockId(1)), "self-loop body must contain header");
+        assert!(
+            body.contains(&BlockId(1)),
+            "self-loop body must contain header"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1528,7 +1592,7 @@ mod data_structure_tests {
             instructions: vec![],
             terminator: Terminator::CondBranch {
                 kind: BranchKind::NotEqual,
-                taken: BlockId(3),     // exit loop1 → loop2 header
+                taken: BlockId(3),       // exit loop1 → loop2 header
                 fallthrough: BlockId(2), // loop1 body
             },
         };
@@ -1546,7 +1610,7 @@ mod data_structure_tests {
             instructions: vec![],
             terminator: Terminator::CondBranch {
                 kind: BranchKind::Less,
-                taken: BlockId(5),     // exit loop2 → return
+                taken: BlockId(5),       // exit loop2 → return
                 fallthrough: BlockId(4), // loop2 body
             },
         };
@@ -1604,9 +1668,17 @@ mod data_structure_tests {
 
         // Assert: exactly 2 loops, both top-level (not nested), depth 0.
         assert_eq!(forest.loops.len(), 2, "should find exactly two loops");
-        assert_eq!(forest.loops[0].header, BlockId(1), "first loop header is B1");
+        assert_eq!(
+            forest.loops[0].header,
+            BlockId(1),
+            "first loop header is B1"
+        );
         assert_eq!(forest.loops[0].latch, BlockId(2), "first loop latch is B2");
-        assert_eq!(forest.loops[1].header, BlockId(3), "second loop header is B3");
+        assert_eq!(
+            forest.loops[1].header,
+            BlockId(3),
+            "second loop header is B3"
+        );
         assert_eq!(forest.loops[1].latch, BlockId(4), "second loop latch is B4");
 
         assert_eq!(forest.loops[0].depth, 0, "both loops are top-level");
@@ -1622,17 +1694,30 @@ mod data_structure_tests {
     fn branch_kind_debug_format_smoke_test() {
         // Arrange: exercise Debug formatting for all 14 variants.
         let kinds = [
-            BranchKind::Above, BranchKind::AboveEqual, BranchKind::Below,
-            BranchKind::BelowEqual, BranchKind::Greater, BranchKind::GreaterEqual,
-            BranchKind::Less, BranchKind::LessEqual, BranchKind::Equal,
-            BranchKind::NotEqual, BranchKind::Sign, BranchKind::NotSign,
-            BranchKind::Parity, BranchKind::NotParity,
+            BranchKind::Above,
+            BranchKind::AboveEqual,
+            BranchKind::Below,
+            BranchKind::BelowEqual,
+            BranchKind::Greater,
+            BranchKind::GreaterEqual,
+            BranchKind::Less,
+            BranchKind::LessEqual,
+            BranchKind::Equal,
+            BranchKind::NotEqual,
+            BranchKind::Sign,
+            BranchKind::NotSign,
+            BranchKind::Parity,
+            BranchKind::NotParity,
         ];
 
         // Act & Assert: every variant formats to a non-empty string.
         for kind in &kinds {
             let s = format!("{:?}", kind);
-            assert!(!s.is_empty(), "BranchKind {:?} Debug output must not be empty", kind);
+            assert!(
+                !s.is_empty(),
+                "BranchKind {:?} Debug output must not be empty",
+                kind
+            );
         }
     }
 
@@ -1647,7 +1732,10 @@ mod data_structure_tests {
         let jmp = Terminator::Jump(BlockId(3));
 
         // Act & Assert: different variants are not equal even with same target.
-        assert_ne!(ft, jmp, "Fallthrough and Jump must not be equal even with same BlockId target");
+        assert_ne!(
+            ft, jmp,
+            "Fallthrough and Jump must not be equal even with same BlockId target"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1672,7 +1760,7 @@ mod data_structure_tests {
             instructions: vec![],
             terminator: Terminator::CondBranch {
                 kind: BranchKind::Equal,
-                taken: BlockId(6),     // exit outer loop
+                taken: BlockId(6),       // exit outer loop
                 fallthrough: BlockId(2), // outer body
             },
         };
@@ -1690,7 +1778,7 @@ mod data_structure_tests {
             instructions: vec![],
             terminator: Terminator::CondBranch {
                 kind: BranchKind::NotEqual,
-                taken: BlockId(5),     // exit inner loop → outer latch
+                taken: BlockId(5),       // exit inner loop → outer latch
                 fallthrough: BlockId(4), // inner body
             },
         };
@@ -1756,14 +1844,19 @@ mod data_structure_tests {
         let forest = find_loops(&cfg);
 
         // Assert: 2 loops found, outer at depth 0, inner at depth 1.
-        assert_eq!(forest.loops.len(), 2, "nested loop CFG should have exactly two loops");
+        assert_eq!(
+            forest.loops.len(),
+            2,
+            "nested loop CFG should have exactly two loops"
+        );
 
         // Identify outer and inner by body size.
-        let (outer_idx, inner_idx) = if forest.loops[0].body_blocks.len() > forest.loops[1].body_blocks.len() {
-            (0, 1)
-        } else {
-            (1, 0)
-        };
+        let (outer_idx, inner_idx) =
+            if forest.loops[0].body_blocks.len() > forest.loops[1].body_blocks.len() {
+                (0, 1)
+            } else {
+                (1, 0)
+            };
 
         let outer = &forest.loops[outer_idx];
         let inner = &forest.loops[inner_idx];
@@ -1780,10 +1873,16 @@ mod data_structure_tests {
         );
 
         // Outer loop is top-level.
-        assert!(forest.top_level.contains(&outer_idx), "outer loop must be in top_level");
+        assert!(
+            forest.top_level.contains(&outer_idx),
+            "outer loop must be in top_level"
+        );
         // Inner loop is a child of outer.
         assert!(
-            forest.children.get(&outer_idx).map_or(false, |kids| kids.contains(&inner_idx)),
+            forest
+                .children
+                .get(&outer_idx)
+                .map_or(false, |kids| kids.contains(&inner_idx)),
             "inner loop must be a child of outer loop"
         );
     }
@@ -1806,7 +1905,11 @@ mod data_structure_tests {
         let debug_str = format!("{:?}", id);
 
         // Assert: Debug output must contain "99".
-        assert!(debug_str.contains("99"), "BlockId Debug output must contain the inner u32 value, got: {}", debug_str);
+        assert!(
+            debug_str.contains("99"),
+            "BlockId Debug output must contain the inner u32 value, got: {}",
+            debug_str
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1914,7 +2017,10 @@ mod data_structure_tests {
         let ft = Terminator::Fallthrough(BlockId(0));
 
         // Act & Assert
-        assert_ne!(ret, ft, "Return and Fallthrough(BlockId(0)) must not be equal");
+        assert_ne!(
+            ret, ft,
+            "Return and Fallthrough(BlockId(0)) must not be equal"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1937,7 +2043,10 @@ mod data_structure_tests {
         };
 
         // Act & Assert
-        assert_ne!(cb_a, cb_b, "CondBranch with different taken must not be equal");
+        assert_ne!(
+            cb_a, cb_b,
+            "CondBranch with different taken must not be equal"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1982,13 +2091,16 @@ mod data_structure_tests {
     fn find_loops_single_block_cfg() {
         // Arrange: CFG with a single block that returns immediately.
         let mut blocks = BTreeMap::new();
-        blocks.insert(BlockId(0), BasicBlock {
-            id: BlockId(0),
-            start_addr: 0x0,
-            end_addr: 0x10,
-            instructions: vec![],
-            terminator: Terminator::Return,
-        });
+        blocks.insert(
+            BlockId(0),
+            BasicBlock {
+                id: BlockId(0),
+                start_addr: 0x0,
+                end_addr: 0x10,
+                instructions: vec![],
+                terminator: Terminator::Return,
+            },
+        );
 
         let mut successors = BTreeMap::new();
         successors.insert(BlockId(0), vec![]);
@@ -2007,7 +2119,10 @@ mod data_structure_tests {
         let forest = find_loops(&cfg);
 
         // Assert: single block with Return cannot form a loop.
-        assert!(forest.loops.is_empty(), "single Return block should not produce loops");
+        assert!(
+            forest.loops.is_empty(),
+            "single Return block should not produce loops"
+        );
         assert!(forest.top_level.is_empty());
         assert!(forest.children.is_empty());
     }
@@ -2024,13 +2139,16 @@ mod data_structure_tests {
         // Predecessors: B1←[B0,B3], B2←[B1], B3←[B2]
         let mut blocks = BTreeMap::new();
         for i in 0..4u32 {
-            blocks.insert(BlockId(i), BasicBlock {
-                id: BlockId(i),
-                start_addr: (i as u64) * 0x10,
-                end_addr: (i as u64 + 1) * 0x10,
-                instructions: vec![],
-                terminator: Terminator::Return,
-            });
+            blocks.insert(
+                BlockId(i),
+                BasicBlock {
+                    id: BlockId(i),
+                    start_addr: (i as u64) * 0x10,
+                    end_addr: (i as u64 + 1) * 0x10,
+                    instructions: vec![],
+                    terminator: Terminator::Return,
+                },
+            );
         }
 
         let mut successors = BTreeMap::new();
@@ -2057,9 +2175,15 @@ mod data_structure_tests {
 
         // Assert: reverse BFS from B3 visits B3→(pred B2)→(pred B1, already in body, stop)
         assert!(body.contains(&BlockId(1)), "body must contain header B1");
-        assert!(body.contains(&BlockId(2)), "body must contain intermediate B2");
+        assert!(
+            body.contains(&BlockId(2)),
+            "body must contain intermediate B2"
+        );
         assert!(body.contains(&BlockId(3)), "body must contain latch B3");
-        assert!(!body.contains(&BlockId(0)), "body must NOT contain B0 (outside loop)");
+        assert!(
+            !body.contains(&BlockId(0)),
+            "body must NOT contain B0 (outside loop)"
+        );
         assert_eq!(body.len(), 3, "loop body should have exactly 3 blocks");
     }
 
@@ -2132,7 +2256,10 @@ mod data_structure_tests {
 
         // Assert: diamond has no back-edges, so no loops.
         assert!(forest.loops.is_empty(), "diamond CFG has no loops");
-        assert!(forest.top_level.is_empty(), "diamond CFG has no top-level loops");
+        assert!(
+            forest.top_level.is_empty(),
+            "diamond CFG has no top-level loops"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2209,7 +2336,11 @@ mod data_structure_tests {
         assert_eq!(idom[&BlockId(0)], BlockId(0), "entry idom is itself");
         assert_eq!(idom[&BlockId(1)], BlockId(0), "B1 idom is B0");
         assert_eq!(idom[&BlockId(2)], BlockId(0), "B2 idom is B0");
-        assert_eq!(idom[&BlockId(3)], BlockId(0), "B3 idom is B0 (convergence of diamond)");
+        assert_eq!(
+            idom[&BlockId(3)],
+            BlockId(0),
+            "B3 idom is B0 (convergence of diamond)"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2226,13 +2357,25 @@ mod data_structure_tests {
 
         // Act & Assert
         // B0 dominates B0 (reflexive).
-        assert!(dominates(&idom, BlockId(0), BlockId(0)), "block dominates itself");
+        assert!(
+            dominates(&idom, BlockId(0), BlockId(0)),
+            "block dominates itself"
+        );
         // B1 does NOT dominate B0.
-        assert!(!dominates(&idom, BlockId(1), BlockId(0)), "B1 does not dominate B0");
+        assert!(
+            !dominates(&idom, BlockId(1), BlockId(0)),
+            "B1 does not dominate B0"
+        );
         // B0 dominates B3 (transitively through B1).
-        assert!(dominates(&idom, BlockId(0), BlockId(3)), "B0 dominates B3 transitively");
+        assert!(
+            dominates(&idom, BlockId(0), BlockId(3)),
+            "B0 dominates B3 transitively"
+        );
         // B2 does not dominate B3.
-        assert!(!dominates(&idom, BlockId(2), BlockId(3)), "B2 does not dominate B3");
+        assert!(
+            !dominates(&idom, BlockId(2), BlockId(3)),
+            "B2 does not dominate B3"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2273,7 +2416,7 @@ mod data_structure_tests {
             instructions: vec![],
             terminator: Terminator::CondBranch {
                 kind: BranchKind::Less,
-                taken: BlockId(1),     // back-edge
+                taken: BlockId(1),       // back-edge
                 fallthrough: BlockId(4), // second exit
             },
         };
@@ -2324,7 +2467,11 @@ mod data_structure_tests {
         // Assert: one loop with two exit blocks B3 and B4.
         assert_eq!(forest.loops.len(), 1, "should find exactly one loop");
         let lp = &forest.loops[0];
-        assert_eq!(lp.exits.len(), 2, "loop should have exactly two exit blocks");
+        assert_eq!(
+            lp.exits.len(),
+            2,
+            "loop should have exactly two exit blocks"
+        );
 
         let mut exit_set: BTreeSet<BlockId> = lp.exits.iter().copied().collect();
         assert!(exit_set.remove(&BlockId(3)), "B3 must be an exit");
@@ -2352,7 +2499,10 @@ mod data_structure_tests {
         };
 
         // Act & Assert
-        assert_ne!(cb_a, cb_b, "CondBranch with different fallthrough must not be equal");
+        assert_ne!(
+            cb_a, cb_b,
+            "CondBranch with different fallthrough must not be equal"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2374,7 +2524,11 @@ mod data_structure_tests {
         let ordered: Vec<u32> = set.iter().map(|b| b.0).collect();
 
         // Assert: BTreeSet iterates in ascending order.
-        assert_eq!(ordered, vec![1, 2, 3, 4, 5], "BlockId BTreeSet must iterate in ascending order");
+        assert_eq!(
+            ordered,
+            vec![1, 2, 3, 4, 5],
+            "BlockId BTreeSet must iterate in ascending order"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2392,13 +2546,22 @@ mod data_structure_tests {
 
         // Assert: ordinals are assigned sequentially starting from 0.
         assert_eq!(forest.loops.len(), 2);
-        assert_eq!(forest.loops[0].ordinal, 0, "first loop (lower address header) gets ordinal 0");
-        assert_eq!(forest.loops[1].ordinal, 1, "second loop (higher address header) gets ordinal 1");
+        assert_eq!(
+            forest.loops[0].ordinal, 0,
+            "first loop (lower address header) gets ordinal 0"
+        );
+        assert_eq!(
+            forest.loops[1].ordinal, 1,
+            "second loop (higher address header) gets ordinal 1"
+        );
 
         // Verify address ordering.
         let addr0 = cfg.blocks[&forest.loops[0].header].start_addr;
         let addr1 = cfg.blocks[&forest.loops[1].header].start_addr;
-        assert!(addr0 < addr1, "first loop header address must be less than second");
+        assert!(
+            addr0 < addr1,
+            "first loop header address must be less than second"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2415,7 +2578,11 @@ mod data_structure_tests {
         let forest = find_loops(&cfg);
 
         // Assert: two top-level loops, no parent-child relationships.
-        assert_eq!(forest.top_level.len(), 2, "both disjoint loops are top-level");
+        assert_eq!(
+            forest.top_level.len(),
+            2,
+            "both disjoint loops are top-level"
+        );
         assert!(
             forest.children.is_empty(),
             "disjoint loops should have no parent-child relationships"
@@ -2445,7 +2612,11 @@ mod data_structure_tests {
         // Verify by inserting all elements into a Vec and checking against the set.
         let body_vec: Vec<BlockId> = body.iter().copied().collect();
         let body_unique: BTreeSet<BlockId> = body_vec.iter().copied().collect();
-        assert_eq!(body.len(), body_unique.len(), "body_blocks must have no duplicates");
+        assert_eq!(
+            body.len(),
+            body_unique.len(),
+            "body_blocks must have no duplicates"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2459,13 +2630,16 @@ mod data_structure_tests {
         // Predecessors: B1←[B0, B2], B2←[B1].
         let mut blocks = BTreeMap::new();
         for i in 0..3u32 {
-            blocks.insert(BlockId(i), BasicBlock {
-                id: BlockId(i),
-                start_addr: (i as u64) * 0x10,
-                end_addr: (i as u64 + 1) * 0x10,
-                instructions: vec![],
-                terminator: Terminator::Return,
-            });
+            blocks.insert(
+                BlockId(i),
+                BasicBlock {
+                    id: BlockId(i),
+                    start_addr: (i as u64) * 0x10,
+                    end_addr: (i as u64 + 1) * 0x10,
+                    instructions: vec![],
+                    terminator: Terminator::Return,
+                },
+            );
         }
 
         let mut successors = BTreeMap::new();
@@ -2489,7 +2663,11 @@ mod data_structure_tests {
         let body = compute_loop_body(&cfg, BlockId(1), BlockId(2));
 
         // Assert: body should be exactly {B1, B2}, not including B0.
-        assert_eq!(body.len(), 2, "direct latch→header body should have exactly 2 blocks");
+        assert_eq!(
+            body.len(),
+            2,
+            "direct latch→header body should have exactly 2 blocks"
+        );
         assert!(body.contains(&BlockId(1)), "body must contain header B1");
         assert!(body.contains(&BlockId(2)), "body must contain latch B2");
         assert!(!body.contains(&BlockId(0)), "body must NOT contain B0");
@@ -2515,7 +2693,11 @@ mod data_structure_tests {
 
         // Act & Assert: each pair's members must differ.
         for (a, b) in &pairs {
-            assert_ne!(a, b, "complementary pair {:?} and {:?} must not be equal", a, b);
+            assert_ne!(
+                a, b,
+                "complementary pair {:?} and {:?} must not be equal",
+                a, b
+            );
         }
     }
 
@@ -2539,7 +2721,10 @@ mod data_structure_tests {
         };
 
         // Act & Assert
-        assert_ne!(a, b, "DecodedInsn with different operands must not be equal");
+        assert_ne!(
+            a, b,
+            "DecodedInsn with different operands must not be equal"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2554,8 +2739,15 @@ mod data_structure_tests {
         let j2 = Terminator::Jump(BlockId(2));
 
         // Act & Assert
-        assert_eq!(j1, Terminator::Jump(BlockId(1)), "same target must be equal");
-        assert_ne!(j1, j2, "Jump with different BlockId targets must not be equal");
+        assert_eq!(
+            j1,
+            Terminator::Jump(BlockId(1)),
+            "same target must be equal"
+        );
+        assert_ne!(
+            j1, j2,
+            "Jump with different BlockId targets must not be equal"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2593,9 +2785,21 @@ mod data_structure_tests {
     fn basic_block_multiple_instructions_preserves_order() {
         // Arrange: block with 3 instructions in sequence.
         let insns = vec![
-            DecodedInsn { mnemonic: "push".to_string(), operands: vec!["rbp".to_string()], addr: 0x1000 },
-            DecodedInsn { mnemonic: "mov".to_string(), operands: vec!["rbp".to_string(), "rsp".to_string()], addr: 0x1001 },
-            DecodedInsn { mnemonic: "sub".to_string(), operands: vec!["rsp".to_string(), "0x20".to_string()], addr: 0x1004 },
+            DecodedInsn {
+                mnemonic: "push".to_string(),
+                operands: vec!["rbp".to_string()],
+                addr: 0x1000,
+            },
+            DecodedInsn {
+                mnemonic: "mov".to_string(),
+                operands: vec!["rbp".to_string(), "rsp".to_string()],
+                addr: 0x1001,
+            },
+            DecodedInsn {
+                mnemonic: "sub".to_string(),
+                operands: vec!["rsp".to_string(), "0x20".to_string()],
+                addr: 0x1004,
+            },
         ];
         let block = BasicBlock {
             id: BlockId(0),
@@ -2627,13 +2831,16 @@ mod data_structure_tests {
         // Predecessors: B1←[B0,B4], B2←[B1], B3←[B1], B4←[B2,B3]
         let mut blocks = BTreeMap::new();
         for i in 0..5u32 {
-            blocks.insert(BlockId(i), BasicBlock {
-                id: BlockId(i),
-                start_addr: (i as u64) * 0x10,
-                end_addr: (i as u64 + 1) * 0x10,
-                instructions: vec![],
-                terminator: Terminator::Return,
-            });
+            blocks.insert(
+                BlockId(i),
+                BasicBlock {
+                    id: BlockId(i),
+                    start_addr: (i as u64) * 0x10,
+                    end_addr: (i as u64 + 1) * 0x10,
+                    instructions: vec![],
+                    terminator: Terminator::Return,
+                },
+            );
         }
 
         let mut successors = BTreeMap::new();
@@ -2650,7 +2857,12 @@ mod data_structure_tests {
         predecessors.insert(BlockId(3), vec![BlockId(1)]);
         predecessors.insert(BlockId(4), vec![BlockId(2), BlockId(3)]);
 
-        let cfg = ControlFlowGraph { blocks, entry: BlockId(0), successors, predecessors };
+        let cfg = ControlFlowGraph {
+            blocks,
+            entry: BlockId(0),
+            successors,
+            predecessors,
+        };
 
         // Act: header=B1, latch=B4
         let body = compute_loop_body(&cfg, BlockId(1), BlockId(4));
@@ -2658,10 +2870,19 @@ mod data_structure_tests {
         // Assert: reverse BFS from B4 reaches B2 and B3 (both are predecessors of B4),
         // and B1 (predecessor of both B2 and B3, but already in body). B0 is excluded.
         assert!(body.contains(&BlockId(1)), "body must contain header B1");
-        assert!(body.contains(&BlockId(2)), "body must contain branch path B2");
-        assert!(body.contains(&BlockId(3)), "body must contain branch path B3");
+        assert!(
+            body.contains(&BlockId(2)),
+            "body must contain branch path B2"
+        );
+        assert!(
+            body.contains(&BlockId(3)),
+            "body must contain branch path B3"
+        );
         assert!(body.contains(&BlockId(4)), "body must contain latch B4");
-        assert!(!body.contains(&BlockId(0)), "body must NOT contain B0 (outside loop)");
+        assert!(
+            !body.contains(&BlockId(0)),
+            "body must NOT contain B0 (outside loop)"
+        );
         assert_eq!(body.len(), 4, "body should have exactly 4 blocks");
     }
 
@@ -2680,11 +2901,12 @@ mod data_structure_tests {
 
         // Assert: find the inner loop (smaller body) and verify its exits.
         assert_eq!(forest.loops.len(), 2);
-        let (outer_idx, inner_idx) = if forest.loops[0].body_blocks.len() > forest.loops[1].body_blocks.len() {
-            (0, 1)
-        } else {
-            (1, 0)
-        };
+        let (outer_idx, inner_idx) =
+            if forest.loops[0].body_blocks.len() > forest.loops[1].body_blocks.len() {
+                (0, 1)
+            } else {
+                (1, 0)
+            };
 
         let inner = &forest.loops[inner_idx];
         // Inner loop exits should include the outer latch (B5), which is outside the inner body.
@@ -2720,10 +2942,26 @@ mod data_structure_tests {
         // Assert
         assert_eq!(idom[&BlockId(0)], BlockId(0), "entry idom is itself");
         assert_eq!(idom[&BlockId(1)], BlockId(0), "B1 idom is B0");
-        assert_eq!(idom[&BlockId(2)], BlockId(1), "B2 idom is B1 (only predecessor is B1)");
-        assert_eq!(idom[&BlockId(3)], BlockId(1), "B3 idom is B1 (loop1 header dominates loop2 header)");
-        assert_eq!(idom[&BlockId(4)], BlockId(3), "B4 idom is B3 (only predecessor is B3)");
-        assert_eq!(idom[&BlockId(5)], BlockId(3), "B5 idom is B3 (exit from loop2 header)");
+        assert_eq!(
+            idom[&BlockId(2)],
+            BlockId(1),
+            "B2 idom is B1 (only predecessor is B1)"
+        );
+        assert_eq!(
+            idom[&BlockId(3)],
+            BlockId(1),
+            "B3 idom is B1 (loop1 header dominates loop2 header)"
+        );
+        assert_eq!(
+            idom[&BlockId(4)],
+            BlockId(3),
+            "B4 idom is B3 (only predecessor is B3)"
+        );
+        assert_eq!(
+            idom[&BlockId(5)],
+            BlockId(3),
+            "B5 idom is B3 (exit from loop2 header)"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2760,7 +2998,7 @@ mod data_structure_tests {
             instructions: vec![],
             terminator: Terminator::CondBranch {
                 kind: BranchKind::Less,
-                taken: BlockId(1),     // back-edge 1
+                taken: BlockId(1), // back-edge 1
                 fallthrough: BlockId(3),
             },
         };
@@ -2798,18 +3036,35 @@ mod data_structure_tests {
         predecessors.insert(BlockId(3), vec![BlockId(2)]);
         predecessors.insert(BlockId(4), vec![BlockId(1)]);
 
-        let cfg = ControlFlowGraph { blocks, entry: BlockId(0), successors, predecessors };
+        let cfg = ControlFlowGraph {
+            blocks,
+            entry: BlockId(0),
+            successors,
+            predecessors,
+        };
 
         // Act
         let forest = find_loops(&cfg);
 
         // Assert: two back-edges (B2→B1 and B3→B1) produce two distinct loops
         // that share the same header B1. Both have body {B1, B2, B3}.
-        assert_eq!(forest.loops.len(), 2, "two back-edges should produce two loops");
+        assert_eq!(
+            forest.loops.len(),
+            2,
+            "two back-edges should produce two loops"
+        );
 
         // Both loops should share the same header.
-        assert_eq!(forest.loops[0].header, BlockId(1), "first loop header is B1");
-        assert_eq!(forest.loops[1].header, BlockId(1), "second loop header is also B1");
+        assert_eq!(
+            forest.loops[0].header,
+            BlockId(1),
+            "first loop header is B1"
+        );
+        assert_eq!(
+            forest.loops[1].header,
+            BlockId(1),
+            "second loop header is also B1"
+        );
 
         // Latches differ: one is B2, the other is B3.
         let latches: BTreeSet<BlockId> = forest.loops.iter().map(|l| l.latch).collect();
@@ -2829,7 +3084,11 @@ mod data_structure_tests {
         let cfg = build_loop_cfg();
 
         // Act & Assert: entry block (B0) should have empty predecessor list.
-        let entry_preds = cfg.predecessors.get(&cfg.entry).map(|p| p.len()).unwrap_or(0);
+        let entry_preds = cfg
+            .predecessors
+            .get(&cfg.entry)
+            .map(|p| p.len())
+            .unwrap_or(0);
         assert_eq!(entry_preds, 0, "entry block should have zero predecessors");
     }
 
@@ -2848,11 +3107,12 @@ mod data_structure_tests {
 
         // Assert
         assert_eq!(forest.loops.len(), 2);
-        let (outer_idx, inner_idx) = if forest.loops[0].body_blocks.len() > forest.loops[1].body_blocks.len() {
-            (0, 1)
-        } else {
-            (1, 0)
-        };
+        let (outer_idx, inner_idx) =
+            if forest.loops[0].body_blocks.len() > forest.loops[1].body_blocks.len() {
+                (0, 1)
+            } else {
+                (1, 0)
+            };
 
         let outer = &forest.loops[outer_idx];
         let inner = &forest.loops[inner_idx];
@@ -2895,7 +3155,10 @@ mod data_structure_tests {
         };
 
         // Act & Assert
-        assert_ne!(a, b, "DecodedInsn with different mnemonic must not be equal");
+        assert_ne!(
+            a, b,
+            "DecodedInsn with different mnemonic must not be equal"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2910,7 +3173,10 @@ mod data_structure_tests {
 
         // Act & Assert
         assert_eq!(ft1, Terminator::Fallthrough(BlockId(1)));
-        assert_ne!(ft1, ft2, "Fallthrough with different targets must not be equal");
+        assert_ne!(
+            ft1, ft2,
+            "Fallthrough with different targets must not be equal"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2931,7 +3197,10 @@ mod data_structure_tests {
 
         // Act & Assert
         assert!(body1.is_superset(&body2), "body1 is a superset of body2");
-        assert!(!body2.is_superset(&body1), "body2 is not a superset of body1");
+        assert!(
+            !body2.is_superset(&body1),
+            "body2 is not a superset of body1"
+        );
         assert!(body1.is_disjoint(&{
             let mut s = BTreeSet::new();
             s.insert(BlockId(0));
@@ -2952,7 +3221,9 @@ mod data_structure_tests {
         for (&src, succs) in &cfg.successors {
             for &dst in succs {
                 assert!(
-                    cfg.predecessors.get(&dst).map_or(false, |preds| preds.contains(&src)),
+                    cfg.predecessors
+                        .get(&dst)
+                        .map_or(false, |preds| preds.contains(&src)),
                     "successor edge {:?}→{:?} must have matching predecessor",
                     src,
                     dst
@@ -2964,7 +3235,9 @@ mod data_structure_tests {
         for (&dst, preds) in &cfg.predecessors {
             for &src in preds {
                 assert!(
-                    cfg.successors.get(&src).map_or(false, |succs| succs.contains(&dst)),
+                    cfg.successors
+                        .get(&src)
+                        .map_or(false, |succs| succs.contains(&dst)),
                     "predecessor edge {:?}→{:?} must have matching successor",
                     src,
                     dst
@@ -2988,7 +3261,10 @@ mod data_structure_tests {
         // Assert: single loop at index 0, top_level contains 0, no children.
         assert_eq!(forest.loops.len(), 1);
         assert_eq!(forest.top_level, vec![0]);
-        assert!(!forest.children.contains_key(&0), "single loop has no children");
+        assert!(
+            !forest.children.contains_key(&0),
+            "single loop has no children"
+        );
         assert_eq!(forest.loops[0].ordinal, 0);
         assert_eq!(forest.loops[0].depth, 0);
     }
@@ -3025,8 +3301,16 @@ mod data_structure_tests {
             start_addr: 0x500,
             end_addr: 0x510,
             instructions: vec![
-                DecodedInsn { mnemonic: "mov".to_string(), operands: vec!["rax".to_string(), "0x1".to_string()], addr: 0x500 },
-                DecodedInsn { mnemonic: "ret".to_string(), operands: vec![], addr: 0x505 },
+                DecodedInsn {
+                    mnemonic: "mov".to_string(),
+                    operands: vec!["rax".to_string(), "0x1".to_string()],
+                    addr: 0x500,
+                },
+                DecodedInsn {
+                    mnemonic: "ret".to_string(),
+                    operands: vec![],
+                    addr: 0x505,
+                },
             ],
             terminator: Terminator::Return,
         };
@@ -3079,7 +3363,10 @@ mod data_structure_tests {
 
         // Assert: Debug output must contain key field names.
         assert!(!debug.is_empty(), "LoopForest Debug must not be empty");
-        assert!(debug.contains("loops") || debug.contains("LoopForest"), "Debug must mention loops or LoopForest");
+        assert!(
+            debug.contains("loops") || debug.contains("LoopForest"),
+            "Debug must mention loops or LoopForest"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3096,11 +3383,12 @@ mod data_structure_tests {
 
         // Assert
         assert_eq!(forest.loops.len(), 2);
-        let (outer_idx, inner_idx) = if forest.loops[0].body_blocks.len() > forest.loops[1].body_blocks.len() {
-            (0, 1)
-        } else {
-            (1, 0)
-        };
+        let (outer_idx, inner_idx) =
+            if forest.loops[0].body_blocks.len() > forest.loops[1].body_blocks.len() {
+                (0, 1)
+            } else {
+                (1, 0)
+            };
 
         let outer = &forest.loops[outer_idx];
         let inner = &forest.loops[inner_idx];
@@ -3131,22 +3419,37 @@ mod data_structure_tests {
     fn dominators_empty_cfg_entry_only() {
         // Arrange: single-block CFG where entry returns.
         let mut blocks = BTreeMap::new();
-        blocks.insert(BlockId(0), BasicBlock {
-            id: BlockId(0), start_addr: 0x0, end_addr: 0x10,
-            instructions: vec![], terminator: Terminator::Return,
-        });
+        blocks.insert(
+            BlockId(0),
+            BasicBlock {
+                id: BlockId(0),
+                start_addr: 0x0,
+                end_addr: 0x10,
+                instructions: vec![],
+                terminator: Terminator::Return,
+            },
+        );
         let mut successors = BTreeMap::new();
         successors.insert(BlockId(0), vec![]);
         let mut predecessors = BTreeMap::new();
         predecessors.insert(BlockId(0), vec![]);
-        let cfg = ControlFlowGraph { blocks, entry: BlockId(0), successors, predecessors };
+        let cfg = ControlFlowGraph {
+            blocks,
+            entry: BlockId(0),
+            successors,
+            predecessors,
+        };
         let block_ids: Vec<BlockId> = cfg.blocks.keys().copied().collect();
 
         // Act
         let idom = compute_dominators(&cfg, &block_ids);
 
         // Assert: only entry block, it dominates itself.
-        assert_eq!(idom.len(), 1, "single-block CFG should have exactly one idom entry");
+        assert_eq!(
+            idom.len(),
+            1,
+            "single-block CFG should have exactly one idom entry"
+        );
         assert_eq!(idom[&BlockId(0)], BlockId(0), "entry idom is itself");
     }
 
@@ -3159,15 +3462,22 @@ mod data_structure_tests {
         // Arrange: single block B0 with CondBranch taken=B0, fallthrough=B1,
         // plus B1 (Return). B0 is both header and latch.
         let b0 = BasicBlock {
-            id: BlockId(0), start_addr: 0x0, end_addr: 0x10,
+            id: BlockId(0),
+            start_addr: 0x0,
+            end_addr: 0x10,
             instructions: vec![],
             terminator: Terminator::CondBranch {
-                kind: BranchKind::NotEqual, taken: BlockId(0), fallthrough: BlockId(1),
+                kind: BranchKind::NotEqual,
+                taken: BlockId(0),
+                fallthrough: BlockId(1),
             },
         };
         let b1 = BasicBlock {
-            id: BlockId(1), start_addr: 0x10, end_addr: 0x20,
-            instructions: vec![], terminator: Terminator::Return,
+            id: BlockId(1),
+            start_addr: 0x10,
+            end_addr: 0x20,
+            instructions: vec![],
+            terminator: Terminator::Return,
         };
         let mut blocks = BTreeMap::new();
         blocks.insert(BlockId(0), b0);
@@ -3178,7 +3488,12 @@ mod data_structure_tests {
         let mut predecessors = BTreeMap::new();
         predecessors.insert(BlockId(0), vec![BlockId(0)]);
         predecessors.insert(BlockId(1), vec![BlockId(0)]);
-        let cfg = ControlFlowGraph { blocks, entry: BlockId(0), successors, predecessors };
+        let cfg = ControlFlowGraph {
+            blocks,
+            entry: BlockId(0),
+            successors,
+            predecessors,
+        };
 
         // Act
         let forest = find_loops(&cfg);
@@ -3198,19 +3513,30 @@ mod data_structure_tests {
     fn find_loops_unreachable_self_loop_no_false_positive() {
         // Arrange: B0 → B1 (Return). B2 is unreachable but has a self-loop.
         let b0 = BasicBlock {
-            id: BlockId(0), start_addr: 0x0, end_addr: 0x10,
-            instructions: vec![], terminator: Terminator::Fallthrough(BlockId(1)),
+            id: BlockId(0),
+            start_addr: 0x0,
+            end_addr: 0x10,
+            instructions: vec![],
+            terminator: Terminator::Fallthrough(BlockId(1)),
         };
         let b1 = BasicBlock {
-            id: BlockId(1), start_addr: 0x10, end_addr: 0x20,
-            instructions: vec![], terminator: Terminator::Return,
+            id: BlockId(1),
+            start_addr: 0x10,
+            end_addr: 0x20,
+            instructions: vec![],
+            terminator: Terminator::Return,
         };
         let b2 = BasicBlock {
-            id: BlockId(2), start_addr: 0x20, end_addr: 0x30,
-            instructions: vec![], terminator: Terminator::Jump(BlockId(2)), // self-loop
+            id: BlockId(2),
+            start_addr: 0x20,
+            end_addr: 0x30,
+            instructions: vec![],
+            terminator: Terminator::Jump(BlockId(2)), // self-loop
         };
         let mut blocks = BTreeMap::new();
-        for b in [b0, b1, b2] { blocks.insert(b.id, b); }
+        for b in [b0, b1, b2] {
+            blocks.insert(b.id, b);
+        }
         let mut successors = BTreeMap::new();
         successors.insert(BlockId(0), vec![BlockId(1)]);
         successors.insert(BlockId(1), vec![]);
@@ -3219,15 +3545,28 @@ mod data_structure_tests {
         predecessors.insert(BlockId(0), vec![]);
         predecessors.insert(BlockId(1), vec![BlockId(0)]);
         predecessors.insert(BlockId(2), vec![BlockId(2)]); // unreachable self-loop
-        let cfg = ControlFlowGraph { blocks, entry: BlockId(0), successors, predecessors };
+        let cfg = ControlFlowGraph {
+            blocks,
+            entry: BlockId(0),
+            successors,
+            predecessors,
+        };
 
         // Act
         let forest = find_loops(&cfg);
 
         // Assert: B2's self-loop is still detected (back-edge exists), but it
         // is separate from the reachable CFG. The loop count is 1.
-        assert_eq!(forest.loops.len(), 1, "unreachable self-loop is still detected as a back-edge");
-        assert_eq!(forest.loops[0].header, BlockId(2), "unreachable loop header is B2");
+        assert_eq!(
+            forest.loops.len(),
+            1,
+            "unreachable self-loop is still detected as a back-edge"
+        );
+        assert_eq!(
+            forest.loops[0].header,
+            BlockId(2),
+            "unreachable loop header is B2"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3238,19 +3577,30 @@ mod data_structure_tests {
     fn dominators_unreachable_block_idom_is_self() {
         // Arrange: B0 → B1 (Return), B2 unreachable.
         let b0 = BasicBlock {
-            id: BlockId(0), start_addr: 0x0, end_addr: 0x10,
-            instructions: vec![], terminator: Terminator::Fallthrough(BlockId(1)),
+            id: BlockId(0),
+            start_addr: 0x0,
+            end_addr: 0x10,
+            instructions: vec![],
+            terminator: Terminator::Fallthrough(BlockId(1)),
         };
         let b1 = BasicBlock {
-            id: BlockId(1), start_addr: 0x10, end_addr: 0x20,
-            instructions: vec![], terminator: Terminator::Return,
+            id: BlockId(1),
+            start_addr: 0x10,
+            end_addr: 0x20,
+            instructions: vec![],
+            terminator: Terminator::Return,
         };
         let b2 = BasicBlock {
-            id: BlockId(2), start_addr: 0x20, end_addr: 0x30,
-            instructions: vec![], terminator: Terminator::Return,
+            id: BlockId(2),
+            start_addr: 0x20,
+            end_addr: 0x30,
+            instructions: vec![],
+            terminator: Terminator::Return,
         };
         let mut blocks = BTreeMap::new();
-        for b in [b0, b1, b2] { blocks.insert(b.id, b); }
+        for b in [b0, b1, b2] {
+            blocks.insert(b.id, b);
+        }
         let mut successors = BTreeMap::new();
         successors.insert(BlockId(0), vec![BlockId(1)]);
         successors.insert(BlockId(1), vec![]);
@@ -3259,7 +3609,12 @@ mod data_structure_tests {
         predecessors.insert(BlockId(0), vec![]);
         predecessors.insert(BlockId(1), vec![BlockId(0)]);
         predecessors.insert(BlockId(2), vec![]);
-        let cfg = ControlFlowGraph { blocks, entry: BlockId(0), successors, predecessors };
+        let cfg = ControlFlowGraph {
+            blocks,
+            entry: BlockId(0),
+            successors,
+            predecessors,
+        };
         let block_ids: Vec<BlockId> = cfg.blocks.keys().copied().collect();
 
         // Act
@@ -3267,7 +3622,11 @@ mod data_structure_tests {
 
         // Assert: unreachable B2 has no predecessors, so its dom set = {B2},
         // making idom(B2) = B2.
-        assert_eq!(idom[&BlockId(2)], BlockId(2), "unreachable block idom is itself");
+        assert_eq!(
+            idom[&BlockId(2)],
+            BlockId(2),
+            "unreachable block idom is itself"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3284,11 +3643,12 @@ mod data_structure_tests {
         // Act
         let forest = find_loops(&cfg);
         assert_eq!(forest.loops.len(), 2);
-        let (outer_idx, inner_idx) = if forest.loops[0].body_blocks.len() > forest.loops[1].body_blocks.len() {
-            (0, 1)
-        } else {
-            (1, 0)
-        };
+        let (outer_idx, inner_idx) =
+            if forest.loops[0].body_blocks.len() > forest.loops[1].body_blocks.len() {
+                (0, 1)
+            } else {
+                (1, 0)
+            };
         let outer_header = forest.loops[outer_idx].header;
         let inner_header = forest.loops[inner_idx].header;
 
@@ -3296,7 +3656,8 @@ mod data_structure_tests {
         assert!(
             dominates(&idom, outer_header, inner_header),
             "outer header {:?} must dominate inner header {:?}",
-            outer_header, inner_header
+            outer_header,
+            inner_header
         );
     }
 
@@ -3308,23 +3669,37 @@ mod data_structure_tests {
     fn find_loops_multiple_unreachable_blocks_no_false_loops() {
         // Arrange: B0 → B1 (Return). B2 and B3 are unreachable, no edges between them.
         let b0 = BasicBlock {
-            id: BlockId(0), start_addr: 0x0, end_addr: 0x10,
-            instructions: vec![], terminator: Terminator::Fallthrough(BlockId(1)),
+            id: BlockId(0),
+            start_addr: 0x0,
+            end_addr: 0x10,
+            instructions: vec![],
+            terminator: Terminator::Fallthrough(BlockId(1)),
         };
         let b1 = BasicBlock {
-            id: BlockId(1), start_addr: 0x10, end_addr: 0x20,
-            instructions: vec![], terminator: Terminator::Return,
+            id: BlockId(1),
+            start_addr: 0x10,
+            end_addr: 0x20,
+            instructions: vec![],
+            terminator: Terminator::Return,
         };
         let b2 = BasicBlock {
-            id: BlockId(2), start_addr: 0x20, end_addr: 0x30,
-            instructions: vec![], terminator: Terminator::Return,
+            id: BlockId(2),
+            start_addr: 0x20,
+            end_addr: 0x30,
+            instructions: vec![],
+            terminator: Terminator::Return,
         };
         let b3 = BasicBlock {
-            id: BlockId(3), start_addr: 0x30, end_addr: 0x40,
-            instructions: vec![], terminator: Terminator::Return,
+            id: BlockId(3),
+            start_addr: 0x30,
+            end_addr: 0x40,
+            instructions: vec![],
+            terminator: Terminator::Return,
         };
         let mut blocks = BTreeMap::new();
-        for b in [b0, b1, b2, b3] { blocks.insert(b.id, b); }
+        for b in [b0, b1, b2, b3] {
+            blocks.insert(b.id, b);
+        }
         let mut successors = BTreeMap::new();
         successors.insert(BlockId(0), vec![BlockId(1)]);
         successors.insert(BlockId(1), vec![]);
@@ -3335,7 +3710,12 @@ mod data_structure_tests {
         predecessors.insert(BlockId(1), vec![BlockId(0)]);
         predecessors.insert(BlockId(2), vec![]);
         predecessors.insert(BlockId(3), vec![]);
-        let cfg = ControlFlowGraph { blocks, entry: BlockId(0), successors, predecessors };
+        let cfg = ControlFlowGraph {
+            blocks,
+            entry: BlockId(0),
+            successors,
+            predecessors,
+        };
 
         // Act
         let forest = find_loops(&cfg);
@@ -3376,19 +3756,30 @@ mod data_structure_tests {
         // Arrange: B0 → B1 (self-loop via Jump to B1) with separate exit B2.
         // B1 has two successors: B1 (back-edge) and B2 (exit).
         let b0 = BasicBlock {
-            id: BlockId(0), start_addr: 0x0, end_addr: 0x10,
-            instructions: vec![], terminator: Terminator::Fallthrough(BlockId(1)),
+            id: BlockId(0),
+            start_addr: 0x0,
+            end_addr: 0x10,
+            instructions: vec![],
+            terminator: Terminator::Fallthrough(BlockId(1)),
         };
         let b1 = BasicBlock {
-            id: BlockId(1), start_addr: 0x10, end_addr: 0x20,
-            instructions: vec![], terminator: Terminator::Jump(BlockId(1)), // self-loop
+            id: BlockId(1),
+            start_addr: 0x10,
+            end_addr: 0x20,
+            instructions: vec![],
+            terminator: Terminator::Jump(BlockId(1)), // self-loop
         };
         let b2 = BasicBlock {
-            id: BlockId(2), start_addr: 0x20, end_addr: 0x30,
-            instructions: vec![], terminator: Terminator::Return,
+            id: BlockId(2),
+            start_addr: 0x20,
+            end_addr: 0x30,
+            instructions: vec![],
+            terminator: Terminator::Return,
         };
         let mut blocks = BTreeMap::new();
-        for b in [b0, b1, b2] { blocks.insert(b.id, b); }
+        for b in [b0, b1, b2] {
+            blocks.insert(b.id, b);
+        }
         let mut successors = BTreeMap::new();
         successors.insert(BlockId(0), vec![BlockId(1)]);
         successors.insert(BlockId(1), vec![BlockId(1)]); // only self-loop, no exit edge
@@ -3397,7 +3788,12 @@ mod data_structure_tests {
         predecessors.insert(BlockId(0), vec![]);
         predecessors.insert(BlockId(1), vec![BlockId(0), BlockId(1)]);
         predecessors.insert(BlockId(2), vec![]);
-        let cfg = ControlFlowGraph { blocks, entry: BlockId(0), successors, predecessors };
+        let cfg = ControlFlowGraph {
+            blocks,
+            entry: BlockId(0),
+            successors,
+            predecessors,
+        };
 
         // Act
         let forest = find_loops(&cfg);
@@ -3407,7 +3803,11 @@ mod data_structure_tests {
         let lp = &forest.loops[0];
         assert_eq!(lp.header, BlockId(1));
         assert_eq!(lp.latch, BlockId(1));
-        assert_eq!(lp.body_blocks.len(), 1, "trivial loop body is just the header");
+        assert_eq!(
+            lp.body_blocks.len(),
+            1,
+            "trivial loop body is just the header"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3419,29 +3819,48 @@ mod data_structure_tests {
         // Arrange: diamond B0 → B1/B2 → B3 → B4 (Return).
         // B3 is the convergence point. Its idom should be B0 (the branch point).
         let b0 = BasicBlock {
-            id: BlockId(0), start_addr: 0x0, end_addr: 0x10,
-            instructions: vec![], terminator: Terminator::CondBranch {
-                kind: BranchKind::Less, taken: BlockId(1), fallthrough: BlockId(2),
+            id: BlockId(0),
+            start_addr: 0x0,
+            end_addr: 0x10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Less,
+                taken: BlockId(1),
+                fallthrough: BlockId(2),
             },
         };
         let b1 = BasicBlock {
-            id: BlockId(1), start_addr: 0x10, end_addr: 0x20,
-            instructions: vec![], terminator: Terminator::Jump(BlockId(3)),
+            id: BlockId(1),
+            start_addr: 0x10,
+            end_addr: 0x20,
+            instructions: vec![],
+            terminator: Terminator::Jump(BlockId(3)),
         };
         let b2 = BasicBlock {
-            id: BlockId(2), start_addr: 0x20, end_addr: 0x30,
-            instructions: vec![], terminator: Terminator::Fallthrough(BlockId(3)),
+            id: BlockId(2),
+            start_addr: 0x20,
+            end_addr: 0x30,
+            instructions: vec![],
+            terminator: Terminator::Fallthrough(BlockId(3)),
         };
         let b3 = BasicBlock {
-            id: BlockId(3), start_addr: 0x30, end_addr: 0x40,
-            instructions: vec![], terminator: Terminator::Fallthrough(BlockId(4)),
+            id: BlockId(3),
+            start_addr: 0x30,
+            end_addr: 0x40,
+            instructions: vec![],
+            terminator: Terminator::Fallthrough(BlockId(4)),
         };
         let b4 = BasicBlock {
-            id: BlockId(4), start_addr: 0x40, end_addr: 0x50,
-            instructions: vec![], terminator: Terminator::Return,
+            id: BlockId(4),
+            start_addr: 0x40,
+            end_addr: 0x50,
+            instructions: vec![],
+            terminator: Terminator::Return,
         };
         let mut blocks = BTreeMap::new();
-        for b in [b0, b1, b2, b3, b4] { blocks.insert(b.id, b); }
+        for b in [b0, b1, b2, b3, b4] {
+            blocks.insert(b.id, b);
+        }
         let mut successors = BTreeMap::new();
         successors.insert(BlockId(0), vec![BlockId(1), BlockId(2)]);
         successors.insert(BlockId(1), vec![BlockId(3)]);
@@ -3454,14 +3873,23 @@ mod data_structure_tests {
         predecessors.insert(BlockId(2), vec![BlockId(0)]);
         predecessors.insert(BlockId(3), vec![BlockId(1), BlockId(2)]);
         predecessors.insert(BlockId(4), vec![BlockId(3)]);
-        let cfg = ControlFlowGraph { blocks, entry: BlockId(0), successors, predecessors };
+        let cfg = ControlFlowGraph {
+            blocks,
+            entry: BlockId(0),
+            successors,
+            predecessors,
+        };
         let block_ids: Vec<BlockId> = cfg.blocks.keys().copied().collect();
 
         // Act
         let idom = compute_dominators(&cfg, &block_ids);
 
         // Assert: B3's idom is B0 (the branch point), not B1 or B2.
-        assert_eq!(idom[&BlockId(3)], BlockId(0), "diamond convergence B3 idom is branch point B0");
+        assert_eq!(
+            idom[&BlockId(3)],
+            BlockId(0),
+            "diamond convergence B3 idom is branch point B0"
+        );
         // B4's idom is B3 (single predecessor path after convergence).
         assert_eq!(idom[&BlockId(4)], BlockId(3), "B4 idom is B3");
     }
@@ -3474,15 +3902,26 @@ mod data_structure_tests {
     fn compute_loop_body_header_no_predecessors() {
         // Arrange: minimal CFG where header B1 has no predecessors recorded.
         let mut blocks = BTreeMap::new();
-        blocks.insert(BlockId(0), BasicBlock {
-            id: BlockId(0), start_addr: 0x0, end_addr: 0x10,
-            instructions: vec![], terminator: Terminator::Return,
-        });
+        blocks.insert(
+            BlockId(0),
+            BasicBlock {
+                id: BlockId(0),
+                start_addr: 0x0,
+                end_addr: 0x10,
+                instructions: vec![],
+                terminator: Terminator::Return,
+            },
+        );
         let mut successors = BTreeMap::new();
         successors.insert(BlockId(0), vec![]);
         let mut predecessors = BTreeMap::new();
         predecessors.insert(BlockId(0), vec![]);
-        let cfg = ControlFlowGraph { blocks, entry: BlockId(0), successors, predecessors };
+        let cfg = ControlFlowGraph {
+            blocks,
+            entry: BlockId(0),
+            successors,
+            predecessors,
+        };
 
         // Act: header == latch == B0 (self-loop on entry).
         let body = compute_loop_body(&cfg, BlockId(0), BlockId(0));
@@ -3508,13 +3947,16 @@ mod data_structure_tests {
             } else {
                 Terminator::Return
             };
-            blocks.insert(BlockId(i), BasicBlock {
-                id: BlockId(i),
-                start_addr: (i as u64) * 0x10,
-                end_addr: (i as u64 + 1) * 0x10,
-                instructions: vec![],
-                terminator: term,
-            });
+            blocks.insert(
+                BlockId(i),
+                BasicBlock {
+                    id: BlockId(i),
+                    start_addr: (i as u64) * 0x10,
+                    end_addr: (i as u64 + 1) * 0x10,
+                    instructions: vec![],
+                    terminator: term,
+                },
+            );
         }
         let mut successors = BTreeMap::new();
         successors.insert(BlockId(0), vec![BlockId(1)]);
@@ -3524,17 +3966,34 @@ mod data_structure_tests {
         predecessors.insert(BlockId(0), vec![]);
         predecessors.insert(BlockId(1), vec![BlockId(0)]);
         predecessors.insert(BlockId(2), vec![BlockId(1)]);
-        let cfg = ControlFlowGraph { blocks, entry: BlockId(0), successors, predecessors };
+        let cfg = ControlFlowGraph {
+            blocks,
+            entry: BlockId(0),
+            successors,
+            predecessors,
+        };
 
         // Act
         let forest = find_loops(&cfg);
 
         // Assert: pure Jump chain has no back-edges, hence no loops.
-        assert!(forest.loops.is_empty(), "Jump chain with no back-edges must have no loops");
+        assert!(
+            forest.loops.is_empty(),
+            "Jump chain with no back-edges must have no loops"
+        );
         // Verify terminator types are preserved.
-        assert!(matches!(cfg.blocks[&BlockId(0)].terminator, Terminator::Jump(BlockId(1))));
-        assert!(matches!(cfg.blocks[&BlockId(1)].terminator, Terminator::Jump(BlockId(2))));
-        assert!(matches!(cfg.blocks[&BlockId(2)].terminator, Terminator::Return));
+        assert!(matches!(
+            cfg.blocks[&BlockId(0)].terminator,
+            Terminator::Jump(BlockId(1))
+        ));
+        assert!(matches!(
+            cfg.blocks[&BlockId(1)].terminator,
+            Terminator::Jump(BlockId(2))
+        ));
+        assert!(matches!(
+            cfg.blocks[&BlockId(2)].terminator,
+            Terminator::Return
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -3551,9 +4010,12 @@ mod data_structure_tests {
         for (&src, succs) in &cfg.successors {
             for &dst in succs {
                 assert!(
-                    cfg.predecessors.get(&dst).map_or(false, |preds| preds.contains(&src)),
+                    cfg.predecessors
+                        .get(&dst)
+                        .map_or(false, |preds| preds.contains(&src)),
                     "successor edge {:?} -> {:?} must have matching predecessor in loop CFG",
-                    src, dst
+                    src,
+                    dst
                 );
             }
         }
@@ -3562,9 +4024,12 @@ mod data_structure_tests {
         for (&dst, preds) in &cfg.predecessors {
             for &src in preds {
                 assert!(
-                    cfg.successors.get(&src).map_or(false, |succs| succs.contains(&dst)),
+                    cfg.successors
+                        .get(&src)
+                        .map_or(false, |succs| succs.contains(&dst)),
                     "predecessor edge {:?} -> {:?} must have matching successor in loop CFG",
-                    src, dst
+                    src,
+                    dst
                 );
             }
         }
@@ -3616,13 +4081,16 @@ mod data_structure_tests {
         //   B4 jumps back to B1 (back-edge).
         let mut blocks = BTreeMap::new();
         for i in 0..5u32 {
-            blocks.insert(BlockId(i), BasicBlock {
-                id: BlockId(i),
-                start_addr: (i as u64) * 0x10,
-                end_addr: (i as u64 + 1) * 0x10,
-                instructions: vec![],
-                terminator: Terminator::Return,
-            });
+            blocks.insert(
+                BlockId(i),
+                BasicBlock {
+                    id: BlockId(i),
+                    start_addr: (i as u64) * 0x10,
+                    end_addr: (i as u64 + 1) * 0x10,
+                    instructions: vec![],
+                    terminator: Terminator::Return,
+                },
+            );
         }
         let mut successors = BTreeMap::new();
         successors.insert(BlockId(0), vec![BlockId(1)]);
@@ -3636,7 +4104,12 @@ mod data_structure_tests {
         predecessors.insert(BlockId(2), vec![BlockId(1)]);
         predecessors.insert(BlockId(3), vec![BlockId(1)]);
         predecessors.insert(BlockId(4), vec![BlockId(2), BlockId(3)]);
-        let cfg = ControlFlowGraph { blocks, entry: BlockId(0), successors, predecessors };
+        let cfg = ControlFlowGraph {
+            blocks,
+            entry: BlockId(0),
+            successors,
+            predecessors,
+        };
 
         // Act
         let forest = find_loops(&cfg);
@@ -3646,10 +4119,23 @@ mod data_structure_tests {
         let lp = &forest.loops[0];
         assert_eq!(lp.header, BlockId(1), "header is B1");
         assert_eq!(lp.latch, BlockId(4), "latch is B4");
-        assert!(lp.body_blocks.contains(&BlockId(2)), "body must contain branch path B2");
-        assert!(lp.body_blocks.contains(&BlockId(3)), "body must contain branch path B3");
-        assert!(!lp.body_blocks.contains(&BlockId(0)), "body must NOT contain B0");
-        assert_eq!(lp.body_blocks.len(), 4, "body should have exactly 4 blocks: B1, B2, B3, B4");
+        assert!(
+            lp.body_blocks.contains(&BlockId(2)),
+            "body must contain branch path B2"
+        );
+        assert!(
+            lp.body_blocks.contains(&BlockId(3)),
+            "body must contain branch path B3"
+        );
+        assert!(
+            !lp.body_blocks.contains(&BlockId(0)),
+            "body must NOT contain B0"
+        );
+        assert_eq!(
+            lp.body_blocks.len(),
+            4,
+            "body should have exactly 4 blocks: B1, B2, B3, B4"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3662,25 +4148,41 @@ mod data_structure_tests {
         // Arrange: B0 → B1 (taken) / B2 (fallthrough) → B3 (Return).
         // B1 jumps directly to B3. This is a triangle, not a full diamond.
         let b0 = BasicBlock {
-            id: BlockId(0), start_addr: 0x0, end_addr: 0x10,
-            instructions: vec![], terminator: Terminator::CondBranch {
-                kind: BranchKind::NotEqual, taken: BlockId(1), fallthrough: BlockId(2),
+            id: BlockId(0),
+            start_addr: 0x0,
+            end_addr: 0x10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::NotEqual,
+                taken: BlockId(1),
+                fallthrough: BlockId(2),
             },
         };
         let b1 = BasicBlock {
-            id: BlockId(1), start_addr: 0x10, end_addr: 0x20,
-            instructions: vec![], terminator: Terminator::Jump(BlockId(3)),
+            id: BlockId(1),
+            start_addr: 0x10,
+            end_addr: 0x20,
+            instructions: vec![],
+            terminator: Terminator::Jump(BlockId(3)),
         };
         let b2 = BasicBlock {
-            id: BlockId(2), start_addr: 0x20, end_addr: 0x30,
-            instructions: vec![], terminator: Terminator::Fallthrough(BlockId(3)),
+            id: BlockId(2),
+            start_addr: 0x20,
+            end_addr: 0x30,
+            instructions: vec![],
+            terminator: Terminator::Fallthrough(BlockId(3)),
         };
         let b3 = BasicBlock {
-            id: BlockId(3), start_addr: 0x30, end_addr: 0x40,
-            instructions: vec![], terminator: Terminator::Return,
+            id: BlockId(3),
+            start_addr: 0x30,
+            end_addr: 0x40,
+            instructions: vec![],
+            terminator: Terminator::Return,
         };
         let mut blocks = BTreeMap::new();
-        for b in [b0, b1, b2, b3] { blocks.insert(b.id, b); }
+        for b in [b0, b1, b2, b3] {
+            blocks.insert(b.id, b);
+        }
         let mut successors = BTreeMap::new();
         successors.insert(BlockId(0), vec![BlockId(1), BlockId(2)]);
         successors.insert(BlockId(1), vec![BlockId(3)]);
@@ -3691,13 +4193,21 @@ mod data_structure_tests {
         predecessors.insert(BlockId(1), vec![BlockId(0)]);
         predecessors.insert(BlockId(2), vec![BlockId(0)]);
         predecessors.insert(BlockId(3), vec![BlockId(1), BlockId(2)]);
-        let cfg = ControlFlowGraph { blocks, entry: BlockId(0), successors, predecessors };
+        let cfg = ControlFlowGraph {
+            blocks,
+            entry: BlockId(0),
+            successors,
+            predecessors,
+        };
 
         // Act
         let forest = find_loops(&cfg);
 
         // Assert: triangle has no back-edges, so no loops.
-        assert!(forest.loops.is_empty(), "triangle branch-merge has no loops");
+        assert!(
+            forest.loops.is_empty(),
+            "triangle branch-merge has no loops"
+        );
         assert!(forest.top_level.is_empty());
     }
 
@@ -3719,7 +4229,9 @@ mod data_structure_tests {
         // Assert: every exit must be a successor of some body block.
         for exit in &lp.exits {
             let is_successor_of_body = lp.body_blocks.iter().any(|blk| {
-                cfg.successors.get(blk).map_or(false, |succs| succs.contains(exit))
+                cfg.successors
+                    .get(blk)
+                    .map_or(false, |succs| succs.contains(exit))
             });
             assert!(
                 is_successor_of_body,
@@ -3747,13 +4259,16 @@ mod data_structure_tests {
         // B3 is unreachable from entry but has a predecessor edge to B2.
         let mut blocks = BTreeMap::new();
         for i in 0..4u32 {
-            blocks.insert(BlockId(i), BasicBlock {
-                id: BlockId(i),
-                start_addr: (i as u64) * 0x10,
-                end_addr: (i as u64 + 1) * 0x10,
-                instructions: vec![],
-                terminator: Terminator::Return,
-            });
+            blocks.insert(
+                BlockId(i),
+                BasicBlock {
+                    id: BlockId(i),
+                    start_addr: (i as u64) * 0x10,
+                    end_addr: (i as u64 + 1) * 0x10,
+                    instructions: vec![],
+                    terminator: Terminator::Return,
+                },
+            );
         }
         let mut successors = BTreeMap::new();
         successors.insert(BlockId(0), vec![BlockId(1)]);
@@ -3765,7 +4280,12 @@ mod data_structure_tests {
         predecessors.insert(BlockId(1), vec![BlockId(0), BlockId(2)]);
         predecessors.insert(BlockId(2), vec![BlockId(1), BlockId(3)]);
         predecessors.insert(BlockId(3), vec![]);
-        let cfg = ControlFlowGraph { blocks, entry: BlockId(0), successors, predecessors };
+        let cfg = ControlFlowGraph {
+            blocks,
+            entry: BlockId(0),
+            successors,
+            predecessors,
+        };
 
         // Act: header=B1, latch=B2
         let body = compute_loop_body(&cfg, BlockId(1), BlockId(2));
@@ -3776,8 +4296,14 @@ mod data_structure_tests {
         assert!(body.contains(&BlockId(1)), "body must contain header B1");
         assert!(body.contains(&BlockId(2)), "body must contain latch B2");
         // B3 is a predecessor of latch, so reverse BFS includes it.
-        assert!(body.contains(&BlockId(3)), "body must contain B3 (predecessor of latch)");
-        assert!(!body.contains(&BlockId(0)), "body must NOT contain B0 (predecessor of header, not latch)");
+        assert!(
+            body.contains(&BlockId(3)),
+            "body must contain B3 (predecessor of latch)"
+        );
+        assert!(
+            !body.contains(&BlockId(0)),
+            "body must NOT contain B0 (predecessor of header, not latch)"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3795,13 +4321,16 @@ mod data_structure_tests {
             } else {
                 Terminator::Return
             };
-            blocks.insert(BlockId(i), BasicBlock {
-                id: BlockId(i),
-                start_addr: (i as u64) * 0x10,
-                end_addr: (i as u64 + 1) * 0x10,
-                instructions: vec![],
-                terminator: term,
-            });
+            blocks.insert(
+                BlockId(i),
+                BasicBlock {
+                    id: BlockId(i),
+                    start_addr: (i as u64) * 0x10,
+                    end_addr: (i as u64 + 1) * 0x10,
+                    instructions: vec![],
+                    terminator: term,
+                },
+            );
         }
         let mut successors = BTreeMap::new();
         let mut predecessors = BTreeMap::new();
@@ -3814,7 +4343,12 @@ mod data_structure_tests {
             }
         }
         predecessors.insert(BlockId(0), vec![]);
-        let cfg = ControlFlowGraph { blocks, entry: BlockId(0), successors, predecessors };
+        let cfg = ControlFlowGraph {
+            blocks,
+            entry: BlockId(0),
+            successors,
+            predecessors,
+        };
         let block_ids: Vec<BlockId> = cfg.blocks.keys().copied().collect();
 
         // Act
@@ -3824,9 +4358,11 @@ mod data_structure_tests {
         assert_eq!(idom[&BlockId(0)], BlockId(0), "entry idom is itself");
         for i in 1..6u32 {
             assert_eq!(
-                idom[&BlockId(i)], BlockId(i - 1),
+                idom[&BlockId(i)],
+                BlockId(i - 1),
                 "B{} idom should be B{}",
-                i, i - 1
+                i,
+                i - 1
             );
         }
 
@@ -3839,7 +4375,10 @@ mod data_structure_tests {
             );
         }
         assert!(dominates(&idom, BlockId(3), BlockId(5)), "B3 dominates B5");
-        assert!(!dominates(&idom, BlockId(3), BlockId(2)), "B3 does not dominate B2");
+        assert!(
+            !dominates(&idom, BlockId(3), BlockId(2)),
+            "B3 does not dominate B2"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3853,33 +4392,55 @@ mod data_structure_tests {
         // The back-edge B4→B1 skips over B2 and B3.
         // B1 conditionally exits to B5.
         let b0 = BasicBlock {
-            id: BlockId(0), start_addr: 0x0, end_addr: 0x10,
-            instructions: vec![], terminator: Terminator::Fallthrough(BlockId(1)),
+            id: BlockId(0),
+            start_addr: 0x0,
+            end_addr: 0x10,
+            instructions: vec![],
+            terminator: Terminator::Fallthrough(BlockId(1)),
         };
         let b1 = BasicBlock {
-            id: BlockId(1), start_addr: 0x10, end_addr: 0x20,
-            instructions: vec![], terminator: Terminator::CondBranch {
-                kind: BranchKind::NotEqual, taken: BlockId(5), fallthrough: BlockId(2),
+            id: BlockId(1),
+            start_addr: 0x10,
+            end_addr: 0x20,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::NotEqual,
+                taken: BlockId(5),
+                fallthrough: BlockId(2),
             },
         };
         let b2 = BasicBlock {
-            id: BlockId(2), start_addr: 0x20, end_addr: 0x30,
-            instructions: vec![], terminator: Terminator::Fallthrough(BlockId(3)),
+            id: BlockId(2),
+            start_addr: 0x20,
+            end_addr: 0x30,
+            instructions: vec![],
+            terminator: Terminator::Fallthrough(BlockId(3)),
         };
         let b3 = BasicBlock {
-            id: BlockId(3), start_addr: 0x30, end_addr: 0x40,
-            instructions: vec![], terminator: Terminator::Fallthrough(BlockId(4)),
+            id: BlockId(3),
+            start_addr: 0x30,
+            end_addr: 0x40,
+            instructions: vec![],
+            terminator: Terminator::Fallthrough(BlockId(4)),
         };
         let b4 = BasicBlock {
-            id: BlockId(4), start_addr: 0x40, end_addr: 0x50,
-            instructions: vec![], terminator: Terminator::Jump(BlockId(1)),
+            id: BlockId(4),
+            start_addr: 0x40,
+            end_addr: 0x50,
+            instructions: vec![],
+            terminator: Terminator::Jump(BlockId(1)),
         };
         let b5 = BasicBlock {
-            id: BlockId(5), start_addr: 0x50, end_addr: 0x60,
-            instructions: vec![], terminator: Terminator::Return,
+            id: BlockId(5),
+            start_addr: 0x50,
+            end_addr: 0x60,
+            instructions: vec![],
+            terminator: Terminator::Return,
         };
         let mut blocks = BTreeMap::new();
-        for b in [b0, b1, b2, b3, b4, b5] { blocks.insert(b.id, b); }
+        for b in [b0, b1, b2, b3, b4, b5] {
+            blocks.insert(b.id, b);
+        }
         let mut successors = BTreeMap::new();
         successors.insert(BlockId(0), vec![BlockId(1)]);
         successors.insert(BlockId(1), vec![BlockId(5), BlockId(2)]);
@@ -3894,7 +4455,12 @@ mod data_structure_tests {
         predecessors.insert(BlockId(3), vec![BlockId(2)]);
         predecessors.insert(BlockId(4), vec![BlockId(3)]);
         predecessors.insert(BlockId(5), vec![BlockId(1)]);
-        let cfg = ControlFlowGraph { blocks, entry: BlockId(0), successors, predecessors };
+        let cfg = ControlFlowGraph {
+            blocks,
+            entry: BlockId(0),
+            successors,
+            predecessors,
+        };
 
         // Act
         let forest = find_loops(&cfg);
@@ -3906,8 +4472,14 @@ mod data_structure_tests {
         assert_eq!(lp.latch, BlockId(4), "latch is B4");
         assert!(lp.body_blocks.contains(&BlockId(2)), "body must contain B2");
         assert!(lp.body_blocks.contains(&BlockId(3)), "body must contain B3");
-        assert!(!lp.body_blocks.contains(&BlockId(0)), "body must NOT contain B0");
-        assert!(!lp.body_blocks.contains(&BlockId(5)), "body must NOT contain B5 (exit)");
+        assert!(
+            !lp.body_blocks.contains(&BlockId(0)),
+            "body must NOT contain B0"
+        );
+        assert!(
+            !lp.body_blocks.contains(&BlockId(5)),
+            "body must NOT contain B5 (exit)"
+        );
         assert_eq!(lp.exits, vec![BlockId(5)], "exit should be B5");
     }
 
@@ -3921,14 +4493,22 @@ mod data_structure_tests {
         // Arrange: B0 CondBranch where both taken and fallthrough go to B1.
         // This is degenerate (equivalent to unconditional jump) but must be handled.
         let b0 = BasicBlock {
-            id: BlockId(0), start_addr: 0x0, end_addr: 0x10,
-            instructions: vec![], terminator: Terminator::CondBranch {
-                kind: BranchKind::Equal, taken: BlockId(1), fallthrough: BlockId(1),
+            id: BlockId(0),
+            start_addr: 0x0,
+            end_addr: 0x10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Equal,
+                taken: BlockId(1),
+                fallthrough: BlockId(1),
             },
         };
         let b1 = BasicBlock {
-            id: BlockId(1), start_addr: 0x10, end_addr: 0x20,
-            instructions: vec![], terminator: Terminator::Return,
+            id: BlockId(1),
+            start_addr: 0x10,
+            end_addr: 0x20,
+            instructions: vec![],
+            terminator: Terminator::Return,
         };
         let mut blocks = BTreeMap::new();
         blocks.insert(BlockId(0), b0);
@@ -3939,7 +4519,12 @@ mod data_structure_tests {
         let mut predecessors = BTreeMap::new();
         predecessors.insert(BlockId(0), vec![]);
         predecessors.insert(BlockId(1), vec![BlockId(0), BlockId(0)]);
-        let cfg = ControlFlowGraph { blocks, entry: BlockId(0), successors, predecessors };
+        let cfg = ControlFlowGraph {
+            blocks,
+            entry: BlockId(0),
+            successors,
+            predecessors,
+        };
 
         // Act
         let forest = find_loops(&cfg);
@@ -3947,10 +4532,16 @@ mod data_structure_tests {
         let idom = compute_dominators(&cfg, &block_ids);
 
         // Assert: no loops (no back-edges).
-        assert!(forest.loops.is_empty(), "degenerate CondBranch with same targets has no loops");
+        assert!(
+            forest.loops.is_empty(),
+            "degenerate CondBranch with same targets has no loops"
+        );
         // B0 dominates B1.
         assert!(dominates(&idom, BlockId(0), BlockId(1)), "B0 dominates B1");
         // B1 does not dominate B0.
-        assert!(!dominates(&idom, BlockId(1), BlockId(0)), "B1 does not dominate B0");
+        assert!(
+            !dominates(&idom, BlockId(1), BlockId(0)),
+            "B1 does not dominate B0"
+        );
     }
 }

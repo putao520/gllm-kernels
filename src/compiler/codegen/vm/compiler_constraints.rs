@@ -7,11 +7,11 @@
 //!
 //! REQ-LC-012: JIT 生命周期集成到 compiler_constraints.rs
 
-use std::collections::HashMap;
-use super::instr::{VmProgram, VRegId, VmInstr};
-use super::reg_alloc::{RegAllocation, LiveInterval, LifecycleTag};
+use super::instr::{VRegId, VmInstr, VmProgram};
+use super::reg_alloc::{LifecycleTag, LiveInterval, RegAllocation};
 use super::stack_frame::ScopedSpillAllocator;
-use super::verify::{VerifyReport, post_hoc_verify};
+use super::verify::{post_hoc_verify, VerifyReport};
+use std::collections::HashMap;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // §1 编译约束定义 (REQ-LC-012)
@@ -179,7 +179,10 @@ impl<'a> ConstraintChecker<'a> {
     }
 
     /// 检查生命周期标签传播
-    pub fn check_lifecycle_propagation(&mut self, intervals: &[LiveInterval]) -> Result<(), ConstraintViolation> {
+    pub fn check_lifecycle_propagation(
+        &mut self,
+        intervals: &[LiveInterval],
+    ) -> Result<(), ConstraintViolation> {
         for iv in intervals {
             if !self.ctx.lifecycle_tags.contains_key(&iv.vreg) {
                 return Err(ConstraintViolation::MissingLifecycleTag { vreg: iv.vreg });
@@ -233,19 +236,11 @@ impl<'a> ConstraintChecker<'a> {
 #[derive(Debug, Clone)]
 pub enum ConstraintViolation {
     /// Spill 槽数量超过限制
-    TooManySpills {
-        actual: usize,
-        limit: usize,
-    },
+    TooManySpills { actual: usize, limit: usize },
     /// Spill 字节数超过限制
-    SpillBytesExceeded {
-        actual: usize,
-        limit: usize,
-    },
+    SpillBytesExceeded { actual: usize, limit: usize },
     /// 缺少生命周期标签
-    MissingLifecycleTag {
-        vreg: VRegId,
-    },
+    MissingLifecycleTag { vreg: VRegId },
     /// 生命周期标签不匹配
     LifecycleTagMismatch {
         vreg: VRegId,
@@ -258,17 +253,36 @@ impl std::fmt::Display for ConstraintViolation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TooManySpills { actual, limit } => {
-                write!(f, "Too many spill slots: {} (limit: {}) (REQ-LC-012)", actual, limit)
+                write!(
+                    f,
+                    "Too many spill slots: {} (limit: {}) (REQ-LC-012)",
+                    actual, limit
+                )
             }
             Self::SpillBytesExceeded { actual, limit } => {
-                write!(f, "Spill bytes exceeded: {} (limit: {}) (REQ-LC-012)", actual, limit)
+                write!(
+                    f,
+                    "Spill bytes exceeded: {} (limit: {}) (REQ-LC-012)",
+                    actual, limit
+                )
             }
             Self::MissingLifecycleTag { vreg } => {
-                write!(f, "Missing lifecycle tag for VRegId({}) (REQ-LC-012)", vreg.0)
+                write!(
+                    f,
+                    "Missing lifecycle tag for VRegId({}) (REQ-LC-012)",
+                    vreg.0
+                )
             }
-            Self::LifecycleTagMismatch { vreg, expected, actual } => {
-                write!(f, "Lifecycle tag mismatch for VRegId({}): expected {:?}, got {:?} (REQ-LC-012)",
-                    vreg.0, expected, actual)
+            Self::LifecycleTagMismatch {
+                vreg,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "Lifecycle tag mismatch for VRegId({}): expected {:?}, got {:?} (REQ-LC-012)",
+                    vreg.0, expected, actual
+                )
             }
         }
     }
@@ -346,10 +360,15 @@ pub fn compile_with_constraints(
     // 3. 运行约束检查
     let spill_bytes: usize = alloc.spills.iter().map(|s| s.size).sum();
     let mut checker = ConstraintChecker::new(&ctx);
-    checker.run_all_checks(alloc.spills.len(), spill_bytes, intervals)
+    checker
+        .run_all_checks(alloc.spills.len(), spill_bytes, intervals)
         .map_err(|violations| CompilationError::ConstraintViolations {
             count: violations.len(),
-            details: violations.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("; "),
+            details: violations
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join("; "),
         })?;
 
     // 4. 运行 post_hoc_verify
@@ -374,10 +393,7 @@ pub fn compile_with_constraints(
 #[derive(Debug, Clone)]
 pub enum CompilationError {
     /// 约束违规
-    ConstraintViolations {
-        count: usize,
-        details: String,
-    },
+    ConstraintViolations { count: usize, details: String },
     /// 验证失败
     VerificationFailed(String),
 }
@@ -386,11 +402,18 @@ impl std::fmt::Display for CompilationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ConstraintViolations { count, details } => {
-                write!(f, "Compilation failed: {} constraint violations: {} (REQ-LC-012)",
-                    count, details)
+                write!(
+                    f,
+                    "Compilation failed: {} constraint violations: {} (REQ-LC-012)",
+                    count, details
+                )
             }
             Self::VerificationFailed(msg) => {
-                write!(f, "Compilation failed: verification error: {} (REQ-LC-012)", msg)
+                write!(
+                    f,
+                    "Compilation failed: verification error: {} (REQ-LC-012)",
+                    msg
+                )
             }
         }
     }
@@ -400,8 +423,8 @@ impl std::error::Error for CompilationError {}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::instr::{SimdWidth, VRegKind};
+    use super::*;
 
     #[test]
     fn test_compiler_constraints_default() {
@@ -445,7 +468,10 @@ mod tests {
 
     #[test]
     fn test_constraint_violation_display() {
-        let violation = ConstraintViolation::TooManySpills { actual: 300, limit: 256 };
+        let violation = ConstraintViolation::TooManySpills {
+            actual: 300,
+            limit: 256,
+        };
         let msg = format!("{}", violation);
         assert!(msg.contains("Too many spill slots"));
         assert!(msg.contains("300"));
@@ -500,11 +526,26 @@ mod tests {
         let default_constraints = CompilerConstraints::default();
 
         // Assert: new() should produce identical values to default()
-        assert_eq!(new_constraints.lifecycle_aware_alloc, default_constraints.lifecycle_aware_alloc);
-        assert_eq!(new_constraints.scoped_spill_alloc, default_constraints.scoped_spill_alloc);
-        assert_eq!(new_constraints.enable_post_hoc_verify, default_constraints.enable_post_hoc_verify);
-        assert_eq!(new_constraints.max_spill_slots, default_constraints.max_spill_slots);
-        assert_eq!(new_constraints.max_spill_bytes, default_constraints.max_spill_bytes);
+        assert_eq!(
+            new_constraints.lifecycle_aware_alloc,
+            default_constraints.lifecycle_aware_alloc
+        );
+        assert_eq!(
+            new_constraints.scoped_spill_alloc,
+            default_constraints.scoped_spill_alloc
+        );
+        assert_eq!(
+            new_constraints.enable_post_hoc_verify,
+            default_constraints.enable_post_hoc_verify
+        );
+        assert_eq!(
+            new_constraints.max_spill_slots,
+            default_constraints.max_spill_slots
+        );
+        assert_eq!(
+            new_constraints.max_spill_bytes,
+            default_constraints.max_spill_bytes
+        );
     }
 
     // @trace TEST-CC-09 [req:REQ-LC-012] [level:unit]
@@ -582,7 +623,8 @@ mod tests {
     fn test_constraint_checker_lifecycle_tag_mismatch() {
         // Arrange: context has LoopInvariant but interval says BodyLocal
         let mut ctx = CompilationContext::new(CompilerConstraints::default());
-        ctx.lifecycle_tags.insert(VRegId(7), LifecycleTag::LoopInvariant);
+        ctx.lifecycle_tags
+            .insert(VRegId(7), LifecycleTag::LoopInvariant);
         let mut checker = ConstraintChecker::new(&ctx);
         let interval = LiveInterval {
             vreg: VRegId(7),
@@ -599,7 +641,11 @@ mod tests {
         // Assert
         let err = result.expect_err("should fail for tag mismatch");
         match err {
-            ConstraintViolation::LifecycleTagMismatch { vreg, expected, actual } => {
+            ConstraintViolation::LifecycleTagMismatch {
+                vreg,
+                expected,
+                actual,
+            } => {
                 assert_eq!(vreg, VRegId(7));
                 assert_eq!(expected, LifecycleTag::LoopInvariant);
                 assert_eq!(actual, LifecycleTag::BodyLocal);
@@ -614,7 +660,8 @@ mod tests {
         // Arrange: context tags match interval tags
         let mut ctx = CompilationContext::new(CompilerConstraints::default());
         ctx.lifecycle_tags.insert(VRegId(1), LifecycleTag::Global);
-        ctx.lifecycle_tags.insert(VRegId(2), LifecycleTag::LoopCarried);
+        ctx.lifecycle_tags
+            .insert(VRegId(2), LifecycleTag::LoopCarried);
         let mut checker = ConstraintChecker::new(&ctx);
         let intervals = vec![
             LiveInterval {
@@ -646,16 +693,14 @@ mod tests {
         let mut ctx = CompilationContext::new(CompilerConstraints::relaxed());
         // Intentionally do NOT insert lifecycle tags for VRegId(99)
         let mut checker = ConstraintChecker::new(&ctx);
-        let intervals = vec![
-            LiveInterval {
-                vreg: VRegId(99),
-                kind: VRegKind::Scalar,
-                width: SimdWidth::Scalar,
-                def_point: 0,
-                last_use: 10,
-                lifecycle: LifecycleTag::BodyLocal,
-            },
-        ];
+        let intervals = vec![LiveInterval {
+            vreg: VRegId(99),
+            kind: VRegKind::Scalar,
+            width: SimdWidth::Scalar,
+            def_point: 0,
+            last_use: 10,
+            lifecycle: LifecycleTag::BodyLocal,
+        }];
 
         // Act: should NOT fail on lifecycle since it's disabled
         let result = checker.run_all_checks(10, 1024, &intervals);
@@ -702,9 +747,7 @@ mod tests {
     #[test]
     fn test_violation_display_missing_lifecycle_tag() {
         // Arrange
-        let violation = ConstraintViolation::MissingLifecycleTag {
-            vreg: VRegId(55),
-        };
+        let violation = ConstraintViolation::MissingLifecycleTag { vreg: VRegId(55) };
 
         // Act
         let msg = format!("{}", violation);
@@ -791,12 +834,16 @@ mod tests {
     #[test]
     fn test_scope_at_position_boundary_inclusive() {
         // Arrange: scope spans positions [1, 3]
-        let filler = VmInstr::DeclareVReg { id: VRegId(0), kind: VRegKind::Scalar, width: SimdWidth::Scalar };
+        let filler = VmInstr::DeclareVReg {
+            id: VRegId(0),
+            kind: VRegKind::Scalar,
+            width: SimdWidth::Scalar,
+        };
         let mut prog = VmProgram::new();
-        prog.emit(filler.clone());                          // pos 0
+        prog.emit(filler.clone()); // pos 0
         prog.emit(VmInstr::ScopeBegin { scope_id: 5 }); // pos 1
-        prog.emit(filler.clone());                          // pos 2
-        prog.emit(VmInstr::ScopeEnd { scope_id: 5 });   // pos 3
+        prog.emit(filler.clone()); // pos 2
+        prog.emit(VmInstr::ScopeEnd { scope_id: 5 }); // pos 3
 
         let mut ctx = CompilationContext::new(CompilerConstraints::default());
         ctx.build_scope_positions(&prog);
@@ -869,9 +916,9 @@ mod tests {
         prog.emit(VmInstr::ScopeBegin { scope_id: 0 }); // pos 0
         prog.emit(VmInstr::ScopeBegin { scope_id: 1 }); // pos 1
         prog.emit(VmInstr::ScopeBegin { scope_id: 2 }); // pos 2
-        prog.emit(VmInstr::ScopeEnd { scope_id: 2 });   // pos 3
-        prog.emit(VmInstr::ScopeEnd { scope_id: 1 });   // pos 4
-        prog.emit(VmInstr::ScopeEnd { scope_id: 0 });   // pos 5
+        prog.emit(VmInstr::ScopeEnd { scope_id: 2 }); // pos 3
+        prog.emit(VmInstr::ScopeEnd { scope_id: 1 }); // pos 4
+        prog.emit(VmInstr::ScopeEnd { scope_id: 0 }); // pos 5
 
         let mut ctx = CompilationContext::new(CompilerConstraints::default());
 
@@ -892,16 +939,14 @@ mod tests {
         let mut ctx = CompilationContext::new(CompilerConstraints::default());
         ctx.lifecycle_tags.insert(VRegId(0), LifecycleTag::Global);
         let mut checker = ConstraintChecker::new(&ctx);
-        let intervals = vec![
-            LiveInterval {
-                vreg: VRegId(0),
-                kind: VRegKind::Ptr,
-                width: SimdWidth::Scalar,
-                def_point: 0,
-                last_use: 100,
-                lifecycle: LifecycleTag::Global,
-            },
-        ];
+        let intervals = vec![LiveInterval {
+            vreg: VRegId(0),
+            kind: VRegKind::Ptr,
+            width: SimdWidth::Scalar,
+            def_point: 0,
+            last_use: 100,
+            lifecycle: LifecycleTag::Global,
+        }];
 
         // Act: well within limits
         let result = checker.run_all_checks(50, 16 * 1024, &intervals);
@@ -969,7 +1014,11 @@ mod tests {
     #[test]
     fn test_build_scope_positions_unclosed_scope_ignored() {
         // Arrange: ScopeBegin with no ScopeEnd
-        let filler = VmInstr::DeclareVReg { id: VRegId(0), kind: VRegKind::Scalar, width: SimdWidth::Scalar };
+        let filler = VmInstr::DeclareVReg {
+            id: VRegId(0),
+            kind: VRegKind::Scalar,
+            width: SimdWidth::Scalar,
+        };
         let mut prog = VmProgram::new();
         prog.emit(VmInstr::ScopeBegin { scope_id: 42 });
         prog.emit(filler);
@@ -1010,13 +1059,17 @@ mod tests {
     #[test]
     fn test_scope_at_position_with_overlapping_scopes_returns_first_match() {
         // Arrange: two scopes where one is wider
-        let filler = VmInstr::DeclareVReg { id: VRegId(0), kind: VRegKind::Scalar, width: SimdWidth::Scalar };
+        let filler = VmInstr::DeclareVReg {
+            id: VRegId(0),
+            kind: VRegKind::Scalar,
+            width: SimdWidth::Scalar,
+        };
         let mut prog = VmProgram::new();
         prog.emit(VmInstr::ScopeBegin { scope_id: 10 }); // pos 0
         prog.emit(VmInstr::ScopeBegin { scope_id: 20 }); // pos 1
-        prog.emit(VmInstr::ScopeEnd { scope_id: 20 });   // pos 2
-        prog.emit(filler);                                // pos 3
-        prog.emit(VmInstr::ScopeEnd { scope_id: 10 });   // pos 4
+        prog.emit(VmInstr::ScopeEnd { scope_id: 20 }); // pos 2
+        prog.emit(filler); // pos 3
+        prog.emit(VmInstr::ScopeEnd { scope_id: 10 }); // pos 4
 
         let mut ctx = CompilationContext::new(CompilerConstraints::default());
         ctx.build_scope_positions(&prog);
@@ -1062,7 +1115,10 @@ mod tests {
         // Assert: clone produces identical values
         assert_eq!(original.lifecycle_aware_alloc, cloned.lifecycle_aware_alloc);
         assert_eq!(original.scoped_spill_alloc, cloned.scoped_spill_alloc);
-        assert_eq!(original.enable_post_hoc_verify, cloned.enable_post_hoc_verify);
+        assert_eq!(
+            original.enable_post_hoc_verify,
+            cloned.enable_post_hoc_verify
+        );
         assert_eq!(original.max_spill_slots, cloned.max_spill_slots);
         assert_eq!(original.max_spill_bytes, cloned.max_spill_bytes);
     }
@@ -1073,16 +1129,14 @@ mod tests {
         // Arrange: default constraints (lifecycle_aware=true), missing tag
         let ctx = CompilationContext::new(CompilerConstraints::default());
         let mut checker = ConstraintChecker::new(&ctx);
-        let intervals = vec![
-            LiveInterval {
-                vreg: VRegId(33),
-                kind: VRegKind::Vec,
-                width: SimdWidth::W256,
-                def_point: 5,
-                last_use: 20,
-                lifecycle: LifecycleTag::BodyLocal,
-            },
-        ];
+        let intervals = vec![LiveInterval {
+            vreg: VRegId(33),
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+            def_point: 5,
+            last_use: 20,
+            lifecycle: LifecycleTag::BodyLocal,
+        }];
 
         // Act: VRegId(33) not in lifecycle_tags
         let result = checker.run_all_checks(10, 1024, &intervals);
@@ -1113,7 +1167,11 @@ mod tests {
 
         // Assert
         match cloned {
-            ConstraintViolation::LifecycleTagMismatch { vreg, expected, actual } => {
+            ConstraintViolation::LifecycleTagMismatch {
+                vreg,
+                expected,
+                actual,
+            } => {
                 assert_eq!(vreg, VRegId(5));
                 assert_eq!(expected, LifecycleTag::Global);
                 assert_eq!(actual, LifecycleTag::CrossScope);

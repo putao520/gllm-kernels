@@ -279,7 +279,10 @@ mod tests {
 
         let sum: f32 = out.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5, "softmax sum = {sum}");
-        assert!(out.iter().all(|v| v.is_finite()), "softmax produced non-finite");
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "softmax produced non-finite"
+        );
     }
 
     #[test]
@@ -353,7 +356,15 @@ mod tests {
         let b = vec![5.0_f32, 6.0, 7.0, 8.0];
         let bias = vec![10.0_f32, 20.0];
         let mut c = vec![0.0_f32; 4];
-        scalar_gemm_bias(a.as_ptr(), b.as_ptr(), bias.as_ptr(), c.as_mut_ptr(), 2, 2, 2);
+        scalar_gemm_bias(
+            a.as_ptr(),
+            b.as_ptr(),
+            bias.as_ptr(),
+            c.as_mut_ptr(),
+            2,
+            2,
+            2,
+        );
         // C = A*B + bias = [19+10, 22+20; 43+10, 50+20] = [29, 42, 53, 70]
         assert_eq!(c, vec![29.0, 42.0, 53.0, 70.0]);
     }
@@ -373,5 +384,4 @@ mod tests {
         scalar_reshape(input.as_ptr(), out.as_mut_ptr(), 4);
         assert_eq!(out, input);
     }
-
 }

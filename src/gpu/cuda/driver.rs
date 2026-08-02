@@ -4,7 +4,7 @@
 //! all function pointers through `dlsym`. If the driver is not installed,
 //! `CudaDriver::load()` returns `Err` instead of panicking.
 
-use std::ffi::{c_void, c_char, c_int, c_uint};
+use std::ffi::{c_char, c_int, c_uint, c_void};
 
 use crate::gpu::GpuError;
 
@@ -59,15 +59,20 @@ pub struct CudaDriver {
     // ── Module / kernel ──
     pub cuModuleLoadData: unsafe extern "C" fn(*mut CUmodule, *const c_void) -> CUresult,
     pub cuModuleUnload: unsafe extern "C" fn(CUmodule) -> CUresult,
-    pub cuModuleGetFunction: unsafe extern "C" fn(*mut CUfunction, CUmodule, *const c_char) -> CUresult,
+    pub cuModuleGetFunction:
+        unsafe extern "C" fn(*mut CUfunction, CUmodule, *const c_char) -> CUresult,
     pub cuLaunchKernel: unsafe extern "C" fn(
         CUfunction,
-        c_uint, c_uint, c_uint, // grid dim x, y, z
-        c_uint, c_uint, c_uint, // block dim x, y, z
-        c_uint,                 // shared mem bytes
-        CUstream,               // stream
-        *mut *mut c_void,       // kernel params
-        *mut *mut c_void,       // extra
+        c_uint,
+        c_uint,
+        c_uint, // grid dim x, y, z
+        c_uint,
+        c_uint,
+        c_uint,           // block dim x, y, z
+        c_uint,           // shared mem bytes
+        CUstream,         // stream
+        *mut *mut c_void, // kernel params
+        *mut *mut c_void, // extra
     ) -> CUresult,
 
     // ── Memory management ──
@@ -254,8 +259,10 @@ impl CudaDriver {
 
         let device = self.device_handle(0)?;
         let sm_version = {
-            let maj = self.device_attribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device)?;
-            let min = self.device_attribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device)?;
+            let maj =
+                self.device_attribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device)?;
+            let min =
+                self.device_attribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device)?;
             (maj as u32) * 10 + (min as u32)
         };
 
@@ -263,15 +270,18 @@ impl CudaDriver {
             self.device_attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device)? as u32;
         let shared_mem_per_block =
             self.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK, device)? as u32;
-        let max_regs_per_mp =
-            self.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR, device)?
-                as u32;
+        let max_regs_per_mp = self
+            .device_attribute(CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR, device)?
+            as u32;
         let max_threads_per_block =
             self.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, device)? as u32;
         let warp_size = self.device_attribute(CU_DEVICE_ATTRIBUTE_WARP_SIZE, device)? as u32;
-        let max_block_x = self.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X, device)? as u32;
-        let max_block_y = self.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Y, device)? as u32;
-        let max_block_z = self.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Z, device)? as u32;
+        let max_block_x =
+            self.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X, device)? as u32;
+        let max_block_y =
+            self.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Y, device)? as u32;
+        let max_block_z =
+            self.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Z, device)? as u32;
         let max_grid_x = self.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X, device)? as u32;
         let max_grid_y = self.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y, device)? as u32;
         let max_grid_z = self.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z, device)? as u32;
@@ -283,22 +293,21 @@ impl CudaDriver {
 
         // CUDA cores per SM by architecture (NVIDIA hardware spec)
         let cores_per_sm: u32 = match sm_version {
-            30..=37 => 192, // Kepler
-            50..=53 => 128, // Maxwell
-            60 => 64,       // GP100
-            61 | 62 => 128, // GP102/104/106/107/108
-            70 | 72 => 64,  // Volta
-            75 => 64,       // Turing
-            80 => 64,       // GA100
+            30..=37 => 192,      // Kepler
+            50..=53 => 128,      // Maxwell
+            60 => 64,            // GP100
+            61 | 62 => 128,      // GP102/104/106/107/108
+            70 | 72 => 64,       // Volta
+            75 => 64,            // Turing
+            80 => 64,            // GA100
             86 | 87 | 89 => 128, // GA10x / Ada
-            90 => 128,      // Hopper
-            100..=129 => 128, // Blackwell family estimate
-            _ => 64,        // unknown → conservative
+            90 => 128,           // Hopper
+            100..=129 => 128,    // Blackwell family estimate
+            _ => 64,             // unknown → conservative
         };
 
         let clock_ghz = (clock_khz as f64) / 1_000_000.0;
-        let peak_gflops_f32 =
-            (compute_units as f64) * (cores_per_sm as f64) * 2.0 * clock_ghz;
+        let peak_gflops_f32 = (compute_units as f64) * (cores_per_sm as f64) * 2.0 * clock_ghz;
 
         // Tensor Core generation and relative f16 throughput multiplier.
         let (tensor_core_gen, f16_mul) = match sm_version {
@@ -358,7 +367,9 @@ impl CudaDriver {
 impl Drop for CudaDriver {
     fn drop(&mut self) {
         if !self._lib.is_null() {
-            unsafe { dlclose(self._lib); }
+            unsafe {
+                dlclose(self._lib);
+            }
         }
     }
 }
@@ -532,7 +543,11 @@ mod tests {
         assert!(display.contains("1073741824"), "must show available bytes");
 
         // Pattern match to verify field access.
-        if let GpuError::OutOfMemory { requested, available } = err {
+        if let GpuError::OutOfMemory {
+            requested,
+            available,
+        } = err
+        {
             assert_eq!(requested, 4_294_967_296);
             assert_eq!(available, 1_073_741_824);
             assert!(requested > available);
@@ -546,10 +561,25 @@ mod tests {
         // Each GpuError variant must produce a non-empty display string
         // with a recognizable prefix.
         let cases: Vec<(GpuError, &str)> = vec![
-            (GpuError::DeviceNotFound("no GPU".into()), "device not found:"),
-            (GpuError::OutOfMemory { requested: 0, available: 0 }, "out of memory:"),
-            (GpuError::KernelLaunch("bad params".into()), "kernel launch failed:"),
-            (GpuError::ShaderCompilation("compile err".into()), "shader compilation failed:"),
+            (
+                GpuError::DeviceNotFound("no GPU".into()),
+                "device not found:",
+            ),
+            (
+                GpuError::OutOfMemory {
+                    requested: 0,
+                    available: 0,
+                },
+                "out of memory:",
+            ),
+            (
+                GpuError::KernelLaunch("bad params".into()),
+                "kernel launch failed:",
+            ),
+            (
+                GpuError::ShaderCompilation("compile err".into()),
+                "shader compilation failed:",
+            ),
             (GpuError::Transfer("DMA fail".into()), "transfer failed:"),
             (GpuError::Driver("segfault".into()), "driver error:"),
         ];
@@ -576,7 +606,10 @@ mod tests {
     #[test]
     fn test_gpu_isv_capabilities_default() {
         let isv = GpuIsvCapabilities::default();
-        assert_eq!(isv.tensor_core_gen, 0, "Default tensor_core_gen must be 0 (no tensor cores)");
+        assert_eq!(
+            isv.tensor_core_gen, 0,
+            "Default tensor_core_gen must be 0 (no tensor cores)"
+        );
     }
 
     #[test]
@@ -593,7 +626,9 @@ mod tests {
         assert_eq!(hopper.tensor_core_gen, 3);
 
         // Verify u8 boundary fits in the field type.
-        let max_gen = GpuIsvCapabilities { tensor_core_gen: u8::MAX };
+        let max_gen = GpuIsvCapabilities {
+            tensor_core_gen: u8::MAX,
+        };
         assert_eq!(max_gen.tensor_core_gen, 255);
     }
 
@@ -702,7 +737,10 @@ mod tests {
         let mut clone = original.clone();
         // Mutating the clone must not affect the original.
         clone.tensor_core_gen = 3;
-        assert_eq!(original.tensor_core_gen, 2, "original must remain unchanged");
+        assert_eq!(
+            original.tensor_core_gen, 2,
+            "original must remain unchanged"
+        );
         assert_eq!(clone.tensor_core_gen, 3, "clone must reflect the mutation");
     }
 
@@ -791,25 +829,36 @@ mod tests {
         // This mirrors the match in CudaDriver::device_profile().
         let table: Vec<(u32, u32)> = vec![
             // Kepler
-            (30, 192), (35, 192), (37, 192),
+            (30, 192),
+            (35, 192),
+            (37, 192),
             // Maxwell
-            (50, 128), (52, 128), (53, 128),
+            (50, 128),
+            (52, 128),
+            (53, 128),
             // Pascal GP100
             (60, 64),
             // Pascal GP102/104/106/107/108
-            (61, 128), (62, 128),
+            (61, 128),
+            (62, 128),
             // Volta
-            (70, 64), (72, 64),
+            (70, 64),
+            (72, 64),
             // Turing
             (75, 64),
             // GA100
             (80, 64),
             // GA10x / Ada
-            (86, 128), (87, 128), (89, 128),
+            (86, 128),
+            (87, 128),
+            (89, 128),
             // Hopper
             (90, 128),
             // Blackwell
-            (100, 128), (110, 128), (120, 128), (129, 128),
+            (100, 128),
+            (110, 128),
+            (120, 128),
+            (129, 128),
         ];
         for (sm_version, expected_cores) in table {
             let cores: u32 = match sm_version {

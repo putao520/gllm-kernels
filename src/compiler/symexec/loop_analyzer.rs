@@ -213,7 +213,9 @@ pub fn combine_passes_with_sig(
     for trace in traces {
         let dominated = !logical.is_empty() && {
             // SAFETY: guarded by !logical.is_empty() above
-            let prev = logical.last().expect("SAFETY: logical is non-empty: checked above");
+            let prev = logical
+                .last()
+                .expect("SAFETY: logical is non-empty: checked above");
             // Both are transform-only (no reductions) → tail cleanup.
             trace.reductions.is_empty() && prev.reductions.is_empty()
         };
@@ -270,11 +272,17 @@ fn combine_two_loops(
     loop2: &LoopTrace,
 ) -> Result<ComputePattern, CompilerError> {
     // Loop 1 must have a Sum reduction.
-    let r1 = loop1.reductions.first()
+    let r1 = loop1
+        .reductions
+        .first()
         .ok_or("loop 1 has no reductions (expected sum for NormLike)")?;
 
     if r1.kind != ReductionKind::Sum {
-        return Err(format!("loop 1 reduction is {:?}, expected Sum for NormLike", r1.kind).into());
+        return Err(format!(
+            "loop 1 reduction is {:?}, expected Sum for NormLike",
+            r1.kind
+        )
+        .into());
     }
 
     // Build reduce body from the reduction's body_expr.
@@ -284,15 +292,15 @@ fn combine_two_loops(
     // from binary analysis alone. Use a generic placeholder that the codegen
     // can specialize based on OpKind.
     let finalize = vec![
-        TraceOp::Input(0),    // [0] reduction result
-        TraceOp::Input(1),    // [1] n (dimension as float)
+        TraceOp::Input(0), // [0] reduction result
+        TraceOp::Input(1), // [1] n (dimension as float)
     ];
 
     // Transform: generic x * scale pattern (most common for norms).
     // Loop 2 typically does out[i] = x[i] * scale or x[i] * scale * weight[i].
     let transform = vec![
-        TraceOp::Input(0),  // [0] x
-        TraceOp::Input(1),  // [1] scale (from finalize)
+        TraceOp::Input(0),                    // [0] x
+        TraceOp::Input(1),                    // [1] scale (from finalize)
         TraceOp::Mul(ValueId(0), ValueId(1)), // [2] x * scale
     ];
 
@@ -320,10 +328,8 @@ fn combine_three_loops(
     loop3: &LoopTrace,
     fn_sig: Option<&ScalarFnSignature>,
 ) -> Result<ComputePattern, CompilerError> {
-    let r1 = loop1.reductions.first()
-        .ok_or("loop 1 has no reductions")?;
-    let r2 = loop2.reductions.first()
-        .ok_or("loop 2 has no reductions")?;
+    let r1 = loop1.reductions.first().ok_or("loop 1 has no reductions")?;
+    let r2 = loop2.reductions.first().ok_or("loop 2 has no reductions")?;
 
     // Softmax pattern: Max → Sum → normalize
     if r1.kind == ReductionKind::Max && r2.kind == ReductionKind::Sum {
@@ -338,7 +344,8 @@ fn combine_three_loops(
     Err(format!(
         "unrecognized 3-loop pattern: {:?} → {:?} → transform",
         r1.kind, r2.kind
-    ).into())
+    )
+    .into())
 }
 
 /// Build Softmax ComputePattern from 3 loop traces.
@@ -351,15 +358,15 @@ fn combine_softmax(
 
     // Second pass: exp(x - max) → sum
     let element_transform = vec![
-        TraceOp::Input(0),  // [0] x (current element)
-        TraceOp::Input(1),  // [1] max (broadcast from first pass)
+        TraceOp::Input(0),                    // [0] x (current element)
+        TraceOp::Input(1),                    // [1] max (broadcast from first pass)
         TraceOp::Sub(ValueId(0), ValueId(1)), // [2] x - max
-        TraceOp::Exp(ValueId(2)),    // [3] exp(x - max)
+        TraceOp::Exp(ValueId(2)),             // [3] exp(x - max)
     ];
 
     let sum_combine = vec![
-        TraceOp::Input(0),  // [0] acc (running sum)
-        TraceOp::Input(1),  // [1] exp_val
+        TraceOp::Input(0),                    // [0] acc (running sum)
+        TraceOp::Input(1),                    // [1] exp_val
         TraceOp::Add(ValueId(0), ValueId(1)), // [2] acc + exp_val
     ];
 
@@ -370,8 +377,8 @@ fn combine_softmax(
 
     // Normalize: out[i] = exp_val * inv_sum
     let normalize = vec![
-        TraceOp::Input(0),  // [0] exp_val
-        TraceOp::Input(1),  // [1] inv_sum (broadcast)
+        TraceOp::Input(0),                    // [0] exp_val
+        TraceOp::Input(1),                    // [1] inv_sum (broadcast)
         TraceOp::Mul(ValueId(0), ValueId(1)), // [2] exp_val * inv_sum
     ];
 
@@ -409,7 +416,9 @@ fn combine_layer_norm(
     fn_sig: Option<&ScalarFnSignature>,
 ) -> Result<ComputePattern, CompilerError> {
     if let Some(sig) = fn_sig {
-        let n_weight = sig.params.iter()
+        let n_weight = sig
+            .params
+            .iter()
             .filter(|p| matches!(p, ScalarParam::WeightPtr))
             .count();
         if n_weight < 2 {
@@ -418,7 +427,8 @@ fn combine_layer_norm(
                  but a true LayerNorm requires weight + bias (≥2 WeightPtr); \
                  rejecting misclassification of a bias-less NormLike",
                 n_weight
-            ).into());
+            )
+            .into());
         }
     }
 
@@ -430,20 +440,20 @@ fn combine_layer_norm(
     // Finalize: compute scale from mean and variance.
     // Input(0) = mean, Input(1) = var
     let finalize = vec![
-        TraceOp::Input(0),    // [0] mean
-        TraceOp::Input(1),    // [1] var
+        TraceOp::Input(0),                    // [0] mean
+        TraceOp::Input(1),                    // [1] var
         TraceOp::Const(1e-5), // [2] eps (placeholder — codegen reads actual from OpKind)
-        TraceOp::Add(ValueId(1), ValueId(2)),   // [3] var + eps
-        TraceOp::Rsqrt(ValueId(3)),    // [4] rsqrt(var + eps)
+        TraceOp::Add(ValueId(1), ValueId(2)), // [3] var + eps
+        TraceOp::Rsqrt(ValueId(3)), // [4] rsqrt(var + eps)
     ];
 
     // Transform: (x - mean) * scale * weight + bias
     let transform = vec![
-        TraceOp::Input(0),  // [0] x
-        TraceOp::Input(1),  // [1] mean
-        TraceOp::Input(2),  // [2] scale (from finalize)
-        TraceOp::Input(3),  // [3] weight
-        TraceOp::Input(4),  // [4] bias
+        TraceOp::Input(0),                    // [0] x
+        TraceOp::Input(1),                    // [1] mean
+        TraceOp::Input(2),                    // [2] scale (from finalize)
+        TraceOp::Input(3),                    // [3] weight
+        TraceOp::Input(4),                    // [4] bias
         TraceOp::Sub(ValueId(0), ValueId(1)), // [5] x - mean
         TraceOp::Mul(ValueId(5), ValueId(2)), // [6] (x - mean) * scale
         TraceOp::Mul(ValueId(6), ValueId(3)), // [7] normed * weight
@@ -474,18 +484,18 @@ fn reduction_to_trace_ops(r: &ReductionDetected) -> (f64, Vec<TraceOp>) {
 
     let combine = match r.kind {
         ReductionKind::Sum => vec![
-            TraceOp::Input(0),  // [0] acc
-            TraceOp::Input(1),  // [1] element
+            TraceOp::Input(0),                    // [0] acc
+            TraceOp::Input(1),                    // [1] element
             TraceOp::Add(ValueId(0), ValueId(1)), // [2] acc + element
         ],
         ReductionKind::Max => vec![
-            TraceOp::Input(0),  // [0] acc
-            TraceOp::Input(1),  // [1] element
+            TraceOp::Input(0),                    // [0] acc
+            TraceOp::Input(1),                    // [1] element
             TraceOp::Max(ValueId(0), ValueId(1)), // [2] max(acc, element)
         ],
         ReductionKind::Min => vec![
-            TraceOp::Input(0),  // [0] acc
-            TraceOp::Input(1),  // [1] element
+            TraceOp::Input(0),                    // [0] acc
+            TraceOp::Input(1),                    // [1] element
             TraceOp::Min(ValueId(0), ValueId(1)), // [2] min(acc, element)
         ],
     };
@@ -509,14 +519,14 @@ fn symvalue_to_reduce_body(expr: &SymValue) -> Vec<TraceOp> {
             let b_str = format!("{b}");
             if a_str == b_str {
                 vec![
-                    TraceOp::Input(0),  // [0] x
+                    TraceOp::Input(0),                    // [0] x
                     TraceOp::Mul(ValueId(0), ValueId(0)), // [1] x^2
                 ]
             } else {
                 // General multiply — two inputs.
                 vec![
-                    TraceOp::Input(0),  // [0] a
-                    TraceOp::Input(1),  // [1] b
+                    TraceOp::Input(0),                    // [0] a
+                    TraceOp::Input(1),                    // [1] b
                     TraceOp::Mul(ValueId(0), ValueId(1)), // [2] a * b
                 ]
             }
@@ -585,7 +595,9 @@ pub fn analyze_nested_loops(
     // elementwise functions (SiLU, GELU) should fall through to Level 2
     // (linear symexec).
     for try_depth in (1..=max_depth).rev() {
-        let candidates: Vec<&NaturalLoop> = forest.loops.iter()
+        let candidates: Vec<&NaturalLoop> = forest
+            .loops
+            .iter()
             .filter(|l| l.depth == try_depth)
             .collect();
 
@@ -646,7 +658,9 @@ fn classify_nested_pattern(nesting_levels: usize, inner_trace: &LoopTrace) -> Co
 
             // Otherwise it's an injective pattern (Transpose, RoPE, etc.)
             // Determine num_inputs from the inner trace's mutations.
-            let num_stores = inner_trace.unknown_mutations.len()
+            let num_stores = inner_trace
+                .unknown_mutations
+                .len()
                 .max(inner_trace.reductions.len())
                 .max(1);
 
@@ -699,9 +713,15 @@ fn count_distinct_params_in_trace(trace: &LoopTrace) -> usize {
 /// Recursively collect Param indices from a SymValue tree.
 fn collect_params(val: &SymValue, out: &mut std::collections::BTreeSet<usize>) {
     match val {
-        SymValue::Param(n) => { out.insert(*n); }
-        SymValue::Add(a, b) | SymValue::Sub(a, b) | SymValue::Mul(a, b)
-        | SymValue::Div(a, b) | SymValue::Max(a, b) | SymValue::Min(a, b) => {
+        SymValue::Param(n) => {
+            out.insert(*n);
+        }
+        SymValue::Add(a, b)
+        | SymValue::Sub(a, b)
+        | SymValue::Mul(a, b)
+        | SymValue::Div(a, b)
+        | SymValue::Max(a, b)
+        | SymValue::Min(a, b) => {
             collect_params(a, out);
             collect_params(b, out);
         }
@@ -710,8 +730,11 @@ fn collect_params(val: &SymValue, out: &mut std::collections::BTreeSet<usize>) {
             collect_params(b, out);
             collect_params(c, out);
         }
-        SymValue::Neg(a) | SymValue::Abs(a) | SymValue::Sqrt(a)
-        | SymValue::Rsqrt(a) | SymValue::Recip(a) => {
+        SymValue::Neg(a)
+        | SymValue::Abs(a)
+        | SymValue::Sqrt(a)
+        | SymValue::Rsqrt(a)
+        | SymValue::Recip(a) => {
             collect_params(a, out);
         }
         SymValue::Call(_, args) => {
@@ -719,7 +742,13 @@ fn collect_params(val: &SymValue, out: &mut std::collections::BTreeSet<usize>) {
                 collect_params(a, out);
             }
         }
-        SymValue::Select { cond_lhs, cond_rhs, true_val, false_val, .. } => {
+        SymValue::Select {
+            cond_lhs,
+            cond_rhs,
+            true_val,
+            false_val,
+            ..
+        } => {
             collect_params(cond_lhs, out);
             collect_params(cond_rhs, out);
             collect_params(true_val, out);
@@ -796,15 +825,14 @@ fn detect_reduction_pattern(
                 });
             }
         }
-        if b_str == pre_str
-            && is_const_one(a) {
-                return Some(ReductionDetected {
-                    register: reg.to_string(),
-                    kind: ReductionKind::Sum,
-                    init,
-                    body_expr: c.simplify(),
-                });
-            }
+        if b_str == pre_str && is_const_one(a) {
+            return Some(ReductionDetected {
+                register: reg.to_string(),
+                kind: ReductionKind::Sum,
+                init,
+                body_expr: c.simplify(),
+            });
+        }
     }
 
     // Check for Max pattern: post = Max(pre, expr) or Max(expr, pre)
@@ -854,7 +882,14 @@ fn detect_reduction_pattern(
     // Check for Select pattern: conditional max/min from branches.
     // Select(Gt, acc, elem, elem, acc) == Max(acc, elem)
     // Select(Lt, acc, elem, elem, acc) == Max(acc, elem)
-    if let SymValue::Select { kind, cond_lhs, cond_rhs, true_val, false_val } = post_val {
+    if let SymValue::Select {
+        kind,
+        cond_lhs,
+        cond_rhs,
+        true_val,
+        false_val,
+    } = post_val
+    {
         let lhs_str = format!("{cond_lhs}");
         let rhs_str = format!("{cond_rhs}");
         let tv_str = format!("{true_val}");
@@ -866,24 +901,24 @@ fn detect_reduction_pattern(
                     if lhs_str == pre_str && tv_str == pre_str && fv_str != pre_str {
                         (false, false_val.simplify()) // acc > elem → acc : elem → Min
                     } else if lhs_str == pre_str && fv_str == pre_str && tv_str != pre_str {
-                        (true, true_val.simplify())   // acc > elem → elem : acc → Max
+                        (true, true_val.simplify()) // acc > elem → elem : acc → Max
                     } else if rhs_str == pre_str && tv_str == pre_str && fv_str != pre_str {
-                        (true, false_val.simplify())  // elem > acc → acc : elem → Max
+                        (true, false_val.simplify()) // elem > acc → acc : elem → Max
                     } else if rhs_str == pre_str && fv_str == pre_str && tv_str != pre_str {
-                        (false, true_val.simplify())  // elem > acc → elem : acc → Min
+                        (false, true_val.simplify()) // elem > acc → elem : acc → Min
                     } else {
                         return None;
                     }
                 }
                 super::sym_value::SelectKind::Lt | super::sym_value::SelectKind::Le => {
                     if lhs_str == pre_str && tv_str == pre_str && fv_str != pre_str {
-                        (true, false_val.simplify())  // acc < elem → acc : elem → Max
+                        (true, false_val.simplify()) // acc < elem → acc : elem → Max
                     } else if lhs_str == pre_str && fv_str == pre_str && tv_str != pre_str {
-                        (false, true_val.simplify())  // acc < elem → elem : acc → Min
+                        (false, true_val.simplify()) // acc < elem → elem : acc → Min
                     } else if rhs_str == pre_str && tv_str == pre_str && fv_str != pre_str {
                         (false, false_val.simplify()) // elem < acc → acc : elem → Min
                     } else if rhs_str == pre_str && fv_str == pre_str && tv_str != pre_str {
-                        (true, true_val.simplify())   // elem < acc → elem : acc → Max
+                        (true, true_val.simplify()) // elem < acc → elem : acc → Max
                     } else {
                         return None;
                     }
@@ -893,7 +928,11 @@ fn detect_reduction_pattern(
 
             return Some(ReductionDetected {
                 register: reg.to_string(),
-                kind: if is_max { ReductionKind::Max } else { ReductionKind::Min },
+                kind: if is_max {
+                    ReductionKind::Max
+                } else {
+                    ReductionKind::Min
+                },
                 init,
                 body_expr: body,
             });
@@ -1037,11 +1076,17 @@ mod tests {
         // We may or may not detect the reduction depending on how the compiler
         // lays out the accumulator. The key test is that analysis completes
         // without error and produces a LoopTrace.
-        println!("sum_array loop trace: {} reductions, {} unknown mutations",
-            trace.reductions.len(), trace.unknown_mutations.len());
+        println!(
+            "sum_array loop trace: {} reductions, {} unknown mutations",
+            trace.reductions.len(),
+            trace.unknown_mutations.len()
+        );
 
         for r in &trace.reductions {
-            println!("  reduction: {:?} on {} (init: {:?})", r.kind, r.register, r.init);
+            println!(
+                "  reduction: {:?} on {} (init: {:?})",
+                r.kind, r.register, r.init
+            );
         }
     }
 
@@ -1065,12 +1110,17 @@ mod tests {
         let exec = SymbolicExecutor::new(0, 2);
         let trace = analyze_single_loop(&loops[0], &cfg, &exec).expect("analysis failed");
 
-        println!("sum_sq loop trace: {} reductions, {} unknown mutations",
-            trace.reductions.len(), trace.unknown_mutations.len());
+        println!(
+            "sum_sq loop trace: {} reductions, {} unknown mutations",
+            trace.reductions.len(),
+            trace.unknown_mutations.len()
+        );
 
         for r in &trace.reductions {
-            println!("  reduction: {:?} on {} (init: {:?}, body: {})",
-                r.kind, r.register, r.init, r.body_expr);
+            println!(
+                "  reduction: {:?} on {} (init: {:?}, body: {})",
+                r.kind, r.register, r.init, r.body_expr
+            );
         }
     }
 
@@ -1096,11 +1146,17 @@ mod tests {
         let exec = SymbolicExecutor::new(0, 2);
         let trace = analyze_single_loop(&loops[0], &cfg, &exec).expect("analysis failed");
 
-        println!("max_array loop trace: {} reductions, {} unknown mutations",
-            trace.reductions.len(), trace.unknown_mutations.len());
+        println!(
+            "max_array loop trace: {} reductions, {} unknown mutations",
+            trace.reductions.len(),
+            trace.unknown_mutations.len()
+        );
 
         for r in &trace.reductions {
-            println!("  reduction: {:?} on {} (init: {:?})", r.kind, r.register, r.init);
+            println!(
+                "  reduction: {:?} on {} (init: {:?})",
+                r.kind, r.register, r.init
+            );
         }
     }
 
@@ -1111,7 +1167,8 @@ mod tests {
             x
         }
 
-        let cfg = unsafe { build_cfg_from_fn(identity as *const u8, 256) }.expect("CFG build failed");
+        let cfg =
+            unsafe { build_cfg_from_fn(identity as *const u8, 256) }.expect("CFG build failed");
         let forest = find_loops(&cfg);
         assert!(forest.loops.is_empty(), "identity should have no loops");
     }
@@ -1122,10 +1179,7 @@ mod tests {
         let pre = SymValue::Const(0.0);
 
         // Sum: post = Add(pre, Param(0))
-        let post_sum = SymValue::Add(
-            Box::new(SymValue::Const(0.0)),
-            Box::new(SymValue::Param(0)),
-        );
+        let post_sum = SymValue::Add(Box::new(SymValue::Const(0.0)), Box::new(SymValue::Param(0)));
         let r = detect_reduction_pattern("xmm0", &pre, &post_sum);
         assert!(r.is_some(), "should detect sum reduction");
         let r = r.unwrap();
@@ -1133,19 +1187,13 @@ mod tests {
 
         // Max: post = Max(pre, Param(0))
         let pre_max = SymValue::Param(1);
-        let post_max = SymValue::Max(
-            Box::new(SymValue::Param(1)),
-            Box::new(SymValue::Param(0)),
-        );
+        let post_max = SymValue::Max(Box::new(SymValue::Param(1)), Box::new(SymValue::Param(0)));
         let r = detect_reduction_pattern("xmm1", &pre_max, &post_max);
         assert!(r.is_some(), "should detect max reduction");
         assert_eq!(r.unwrap().kind, ReductionKind::Max);
 
         // Min: post = Min(Param(0), pre)
-        let post_min = SymValue::Min(
-            Box::new(SymValue::Param(0)),
-            Box::new(SymValue::Param(1)),
-        );
+        let post_min = SymValue::Min(Box::new(SymValue::Param(0)), Box::new(SymValue::Param(1)));
         let r = detect_reduction_pattern("xmm1", &pre_max, &post_min);
         assert!(r.is_some(), "should detect min reduction");
         assert_eq!(r.unwrap().kind, ReductionKind::Min);
@@ -1168,7 +1216,10 @@ mod tests {
         let pre = SymValue::Const(0.0);
         let post = SymValue::Param(0); // Just a load, not an accumulation.
         let r = detect_reduction_pattern("xmm0", &pre, &post);
-        assert!(r.is_none(), "should not detect reduction for plain assignment");
+        assert!(
+            r.is_none(),
+            "should not detect reduction for plain assignment"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1191,7 +1242,12 @@ mod tests {
 
         let pattern = combine_passes(&[trace]).expect("combine failed");
         match &pattern {
-            ComputePattern::Reduction { identity, combine, second_pass, normalize } => {
+            ComputePattern::Reduction {
+                identity,
+                combine,
+                second_pass,
+                normalize,
+            } => {
                 assert_eq!(*identity, 0.0);
                 assert!(second_pass.is_none());
                 assert!(normalize.is_none());
@@ -1219,7 +1275,9 @@ mod tests {
 
         let pattern = combine_passes(&[trace]).expect("combine failed");
         match &pattern {
-            ComputePattern::Reduction { identity, combine, .. } => {
+            ComputePattern::Reduction {
+                identity, combine, ..
+            } => {
                 assert_eq!(*identity, f64::NEG_INFINITY);
                 assert_eq!(combine[2], TraceOp::Max(ValueId(0), ValueId(1)));
             }
@@ -1296,7 +1354,12 @@ mod tests {
 
         let pattern = combine_passes(&[loop1, loop2, loop3]).expect("combine failed");
         match &pattern {
-            ComputePattern::Reduction { identity, second_pass, normalize, .. } => {
+            ComputePattern::Reduction {
+                identity,
+                second_pass,
+                normalize,
+                ..
+            } => {
                 assert_eq!(*identity, f64::NEG_INFINITY);
                 assert!(second_pass.is_some(), "softmax should have second_pass");
                 assert!(normalize.is_some(), "softmax should have normalize");
@@ -1304,7 +1367,10 @@ mod tests {
                 let sp = second_pass.as_ref().unwrap();
                 assert_eq!(sp.identity, 0.0);
                 // element_transform should contain Sub + Exp
-                let has_exp = sp.element_transform.iter().any(|op| matches!(op, TraceOp::Exp(_)));
+                let has_exp = sp
+                    .element_transform
+                    .iter()
+                    .any(|op| matches!(op, TraceOp::Exp(_)));
                 assert!(has_exp, "second_pass should have Exp");
             }
             other => panic!("expected Reduction (softmax), got {other:?}"),
@@ -1345,7 +1411,11 @@ mod tests {
 
         let pattern = combine_passes(&[loop1, loop2, loop3]).expect("combine failed");
         match &pattern {
-            ComputePattern::NormLike { finalize, transform, .. } => {
+            ComputePattern::NormLike {
+                finalize,
+                transform,
+                ..
+            } => {
                 // finalize should have Rsqrt
                 let has_rsqrt = finalize.iter().any(|op| matches!(op, TraceOp::Rsqrt(_)));
                 assert!(has_rsqrt, "LayerNorm finalize should have Rsqrt");
@@ -1390,24 +1460,39 @@ mod tests {
         let cfg = unsafe { build_cfg_from_fn(fn_ptr, 4096) }.expect("CFG build failed");
         println!("RmsNorm CFG: {} blocks", cfg.blocks.len());
         for (id, blk) in &cfg.blocks {
-            println!("  Block {:?}: addr 0x{:x}..0x{:x}, {} insns, term={:?}",
-                id, blk.start_addr, blk.end_addr, blk.instructions.len(), blk.terminator);
+            println!(
+                "  Block {:?}: addr 0x{:x}..0x{:x}, {} insns, term={:?}",
+                id,
+                blk.start_addr,
+                blk.end_addr,
+                blk.instructions.len(),
+                blk.terminator
+            );
         }
         let forest = find_loops(&cfg);
         println!("RmsNorm loops: {}", forest.loops.len());
         for lp in &forest.loops {
-            println!("  Loop: header={:?}, latch={:?}, body={:?}",
-                lp.header, lp.latch, lp.body_blocks);
+            println!(
+                "  Loop: header={:?}, latch={:?}, body={:?}",
+                lp.header, lp.latch, lp.body_blocks
+            );
         }
 
         let result = unsafe { analyze_scalar_fn_structured(fn_ptr, &sig) };
         match result {
             Ok(Some(analysis)) => {
-                println!("RmsNorm: {} loops, pattern: {:?}", analysis.num_loops, analysis.pattern);
-                assert!(analysis.num_loops >= 2, "RmsNorm should have at least 2 loops");
+                println!(
+                    "RmsNorm: {} loops, pattern: {:?}",
+                    analysis.num_loops, analysis.pattern
+                );
+                assert!(
+                    analysis.num_loops >= 2,
+                    "RmsNorm should have at least 2 loops"
+                );
                 assert!(
                     matches!(analysis.pattern, ComputePattern::NormLike { .. }),
-                    "RmsNorm should be NormLike, got {:?}", analysis.pattern
+                    "RmsNorm should be NormLike, got {:?}",
+                    analysis.pattern
                 );
             }
             Ok(None) => {
@@ -1440,20 +1525,35 @@ mod tests {
         let cfg = unsafe { build_cfg_from_fn(fn_ptr, 4096) }.expect("CFG build failed");
         println!("Softmax CFG: {} blocks", cfg.blocks.len());
         for (id, blk) in &cfg.blocks {
-            println!("  Block {:?}: addr 0x{:x}..0x{:x}, {} insns, term={:?}",
-                id, blk.start_addr, blk.end_addr, blk.instructions.len(), blk.terminator);
+            println!(
+                "  Block {:?}: addr 0x{:x}..0x{:x}, {} insns, term={:?}",
+                id,
+                blk.start_addr,
+                blk.end_addr,
+                blk.instructions.len(),
+                blk.terminator
+            );
         }
         let forest = find_loops(&cfg);
-        println!("Softmax loops: {} total, top_level: {:?}", forest.loops.len(), forest.top_level);
+        println!(
+            "Softmax loops: {} total, top_level: {:?}",
+            forest.loops.len(),
+            forest.top_level
+        );
         for (i, lp) in forest.loops.iter().enumerate() {
-            println!("  Loop[{}]: header={:?}, latch={:?}, body={:?}, depth={}",
-                i, lp.header, lp.latch, lp.body_blocks, lp.depth);
+            println!(
+                "  Loop[{}]: header={:?}, latch={:?}, body={:?}, depth={}",
+                i, lp.header, lp.latch, lp.body_blocks, lp.depth
+            );
         }
 
         let result = unsafe { analyze_scalar_fn_structured(fn_ptr, &sig) };
         match result {
             Ok(Some(analysis)) => {
-                println!("Softmax: {} loops, pattern: {:?}", analysis.num_loops, analysis.pattern);
+                println!(
+                    "Softmax: {} loops, pattern: {:?}",
+                    analysis.num_loops, analysis.pattern
+                );
             }
             Ok(None) => {
                 println!("Softmax: structured analysis returned None");
@@ -1485,11 +1585,18 @@ mod tests {
         let result = unsafe { analyze_scalar_fn_structured(sig.fn_ptr, &sig) };
         match result {
             Ok(Some(analysis)) => {
-                println!("LayerNorm: {} loops, pattern: {:?}", analysis.num_loops, analysis.pattern);
-                assert!(analysis.num_loops >= 2, "LayerNorm should have at least 2 loops");
+                println!(
+                    "LayerNorm: {} loops, pattern: {:?}",
+                    analysis.num_loops, analysis.pattern
+                );
+                assert!(
+                    analysis.num_loops >= 2,
+                    "LayerNorm should have at least 2 loops"
+                );
                 assert!(
                     matches!(analysis.pattern, ComputePattern::NormLike { .. }),
-                    "LayerNorm should be NormLike, got {:?}", analysis.pattern
+                    "LayerNorm should be NormLike, got {:?}",
+                    analysis.pattern
                 );
             }
             Ok(None) => {
@@ -1517,8 +1624,13 @@ mod tests {
         println!("GEMM CFG: {} blocks", cfg.blocks.len());
         println!("GEMM loops: {} total", forest.loops.len());
         for (i, lp) in forest.loops.iter().enumerate() {
-            println!("  Loop[{}]: header={:?}, depth={}, body_blocks={}",
-                i, lp.header, lp.depth, lp.body_blocks.len());
+            println!(
+                "  Loop[{}]: header={:?}, depth={}, body_blocks={}",
+                i,
+                lp.header,
+                lp.depth,
+                lp.body_blocks.len()
+            );
         }
         println!("  top_level: {:?}", forest.top_level);
         println!("  children: {:?}", forest.children);
@@ -1526,7 +1638,11 @@ mod tests {
         // GEMM should have nested loops (depth > 0).
         let max_depth = forest.loops.iter().map(|l| l.depth).max().unwrap_or(0);
         println!("  max_depth: {}", max_depth);
-        assert!(max_depth >= 1, "GEMM should have nested loops (max_depth >= 1), got {}", max_depth);
+        assert!(
+            max_depth >= 1,
+            "GEMM should have nested loops (max_depth >= 1), got {}",
+            max_depth
+        );
 
         // Run nested analysis.
         let exec = SymbolicExecutor::new(0, 6); // a, b, c, m, n, k
@@ -1534,12 +1650,15 @@ mod tests {
         assert!(result.is_some(), "GEMM should produce a NestedLoopAnalysis");
 
         let analysis = result.unwrap();
-        println!("GEMM nested analysis: nesting_levels={}, pattern={:?}",
-            analysis.nesting_levels, analysis.pattern);
+        println!(
+            "GEMM nested analysis: nesting_levels={}, pattern={:?}",
+            analysis.nesting_levels, analysis.pattern
+        );
 
         assert!(
             matches!(analysis.pattern, ComputePattern::Gemm),
-            "GEMM should be classified as Gemm, got {:?}", analysis.pattern
+            "GEMM should be classified as Gemm, got {:?}",
+            analysis.pattern
         );
     }
 
@@ -1552,23 +1671,26 @@ mod tests {
         let sig = ScalarFnSignature {
             fn_ptr: scalar_gemm as *const u8,
             params: vec![
-                ScalarParam::InputPtr,   // a
-                ScalarParam::WeightPtr,  // b
-                ScalarParam::OutputPtr,  // c
-                ScalarParam::Dim(0),     // m
-                ScalarParam::Dim(1),     // n
-                ScalarParam::Dim(2),     // k
+                ScalarParam::InputPtr,  // a
+                ScalarParam::WeightPtr, // b
+                ScalarParam::OutputPtr, // c
+                ScalarParam::Dim(0),    // m
+                ScalarParam::Dim(1),    // n
+                ScalarParam::Dim(2),    // k
             ],
         };
 
         let result = unsafe { analyze_scalar_fn_structured(sig.fn_ptr, &sig) };
         match result {
             Ok(Some(analysis)) => {
-                println!("GEMM structured: {} loops, pattern: {:?}",
-                    analysis.num_loops, analysis.pattern);
+                println!(
+                    "GEMM structured: {} loops, pattern: {:?}",
+                    analysis.num_loops, analysis.pattern
+                );
                 assert!(
                     matches!(analysis.pattern, ComputePattern::Gemm),
-                    "GEMM should be Gemm, got {:?}", analysis.pattern
+                    "GEMM should be Gemm, got {:?}",
+                    analysis.pattern
                 );
             }
             Ok(None) => {
@@ -1592,24 +1714,35 @@ mod tests {
         println!("RoPE CFG: {} blocks", cfg.blocks.len());
         println!("RoPE loops: {} total", forest.loops.len());
         for (i, lp) in forest.loops.iter().enumerate() {
-            println!("  Loop[{}]: header={:?}, depth={}, body_blocks={}",
-                i, lp.header, lp.depth, lp.body_blocks.len());
+            println!(
+                "  Loop[{}]: header={:?}, depth={}, body_blocks={}",
+                i,
+                lp.header,
+                lp.depth,
+                lp.body_blocks.len()
+            );
         }
 
         let max_depth = forest.loops.iter().map(|l| l.depth).max().unwrap_or(0);
         println!("  max_depth: {}", max_depth);
 
         // RoPE has 2-deep nesting (outer: heads, inner: dim pairs).
-        assert!(max_depth >= 1, "RoPE should have nested loops, got max_depth={}", max_depth);
+        assert!(
+            max_depth >= 1,
+            "RoPE should have nested loops, got max_depth={}",
+            max_depth
+        );
 
         // Run nested analysis — RoPE is Injective (no reduction, no GEMM),
         // so analyze_nested_loops returns None. In the full pipeline, RoPE
         // is handled by its manual Injective trace in the registry.
         let exec = SymbolicExecutor::new(0, 6); // x, cos, sin, out, head_dim, n_heads
         let result = analyze_nested_loops(&forest, &cfg, &exec);
-        assert!(result.is_none(),
+        assert!(
+            result.is_none(),
             "RoPE has no GEMM reduction; expected None, got {:?}",
-            result.as_ref().map(|a| &a.pattern));
+            result.as_ref().map(|a| &a.pattern)
+        );
     }
 
     #[test]
@@ -1624,15 +1757,24 @@ mod tests {
         println!("Transpose CFG: {} blocks", cfg.blocks.len());
         println!("Transpose loops: {} total", forest.loops.len());
         for (i, lp) in forest.loops.iter().enumerate() {
-            println!("  Loop[{}]: header={:?}, depth={}, body_blocks={}",
-                i, lp.header, lp.depth, lp.body_blocks.len());
+            println!(
+                "  Loop[{}]: header={:?}, depth={}, body_blocks={}",
+                i,
+                lp.header,
+                lp.depth,
+                lp.body_blocks.len()
+            );
         }
 
         let max_depth = forest.loops.iter().map(|l| l.depth).max().unwrap_or(0);
         println!("  max_depth: {}", max_depth);
 
         // Transpose has 2-deep nesting (outer: rows, inner: cols).
-        assert!(max_depth >= 1, "Transpose should have nested loops, got max_depth={}", max_depth);
+        assert!(
+            max_depth >= 1,
+            "Transpose should have nested loops, got max_depth={}",
+            max_depth
+        );
 
         let exec = SymbolicExecutor::new(0, 4); // input, out, rows, cols
         let result = analyze_nested_loops(&forest, &cfg, &exec);
@@ -1641,9 +1783,11 @@ mod tests {
         // detectable by the symbolic executor). analyze_nested_loops correctly
         // returns None here; in the full pipeline the manual Injective fallback
         // in the registry handles classification.
-        assert!(result.is_none(),
+        assert!(
+            result.is_none(),
             "Transpose inner loops are all empty; expected None, got {:?}",
-            result.as_ref().map(|a| &a.pattern));
+            result.as_ref().map(|a| &a.pattern)
+        );
     }
 
     #[test]
@@ -1667,7 +1811,8 @@ mod tests {
         let pattern = classify_nested_pattern(3, &trace);
         assert!(
             matches!(pattern, ComputePattern::Gemm),
-            "3-deep + Sum(Mul) should be Gemm, got {:?}", pattern
+            "3-deep + Sum(Mul) should be Gemm, got {:?}",
+            pattern
         );
     }
 
@@ -1677,16 +1822,15 @@ mod tests {
         let trace = LoopTrace {
             loop_header: BlockId(0),
             reductions: vec![],
-            unknown_mutations: vec![
-                ("xmm0".into(), SymValue::Param(0)),
-            ],
+            unknown_mutations: vec![("xmm0".into(), SymValue::Param(0))],
             body_block_count: 1,
         };
 
         let pattern = classify_nested_pattern(2, &trace);
         assert!(
             matches!(pattern, ComputePattern::Injective { .. }),
-            "2-deep + no reduction should be Injective, got {:?}", pattern
+            "2-deep + no reduction should be Injective, got {:?}",
+            pattern
         );
     }
 
@@ -1709,14 +1853,20 @@ mod tests {
     fn test_accumulator_init_debug_output_const() {
         let init = AccumulatorInit::Const(0.0);
         let debug = format!("{init:?}");
-        assert!(debug.contains("Const"), "expected Const in debug output, got: {debug}");
+        assert!(
+            debug.contains("Const"),
+            "expected Const in debug output, got: {debug}"
+        );
     }
 
     #[test]
     fn test_accumulator_init_debug_output_symbolic() {
         let init = AccumulatorInit::Symbolic(SymValue::Param(3));
         let debug = format!("{init:?}");
-        assert!(debug.contains("Symbolic"), "expected Symbolic in debug output, got: {debug}");
+        assert!(
+            debug.contains("Symbolic"),
+            "expected Symbolic in debug output, got: {debug}"
+        );
     }
 
     #[test]
@@ -1762,7 +1912,10 @@ mod tests {
             Box::new(SymValue::Const(0.0)),
         );
         let result = detect_reduction_pattern("xmm0", &pre, &post);
-        assert!(result.is_some(), "Fma(1.0, x, acc) should be detected as Sum reduction");
+        assert!(
+            result.is_some(),
+            "Fma(1.0, x, acc) should be detected as Sum reduction"
+        );
         let r = result.unwrap();
         assert_eq!(r.kind, ReductionKind::Sum);
     }
@@ -1778,7 +1931,10 @@ mod tests {
             )),
         );
         let result = detect_reduction_pattern("xmm0", &pre, &post);
-        assert!(result.is_some(), "nested Max tree containing acc should be detected");
+        assert!(
+            result.is_some(),
+            "nested Max tree containing acc should be detected"
+        );
         let r = result.unwrap();
         assert_eq!(r.kind, ReductionKind::Max);
     }
@@ -1794,7 +1950,10 @@ mod tests {
             Box::new(SymValue::Param(1)),
         );
         let result = detect_reduction_pattern("xmm0", &pre, &post);
-        assert!(result.is_some(), "nested Add tree containing acc should be detected");
+        assert!(
+            result.is_some(),
+            "nested Add tree containing acc should be detected"
+        );
         let r = result.unwrap();
         assert_eq!(r.kind, ReductionKind::Sum);
     }
@@ -1808,7 +1967,10 @@ mod tests {
             body_block_count: 1,
         };
         let result = combine_passes(&[trace]);
-        assert!(result.is_err(), "single loop with no reductions should error");
+        assert!(
+            result.is_err(),
+            "single loop with no reductions should error"
+        );
     }
 
     #[test]
@@ -1825,22 +1987,27 @@ mod tests {
             body_block_count: 2,
         };
         let result = combine_passes(&[trace]);
-        assert!(result.is_err(), "single loop with unknown mutations should error");
+        assert!(
+            result.is_err(),
+            "single loop with unknown mutations should error"
+        );
     }
 
     #[test]
     fn test_combine_four_logical_loops_error() {
-        let traces: Vec<LoopTrace> = (0..4).map(|i| LoopTrace {
-            loop_header: BlockId(i),
-            reductions: vec![ReductionDetected {
-                register: format!("xmm{i}"),
-                kind: ReductionKind::Sum,
-                init: AccumulatorInit::Const(0.0),
-                body_expr: SymValue::Param(i as usize),
-            }],
-            unknown_mutations: vec![],
-            body_block_count: 1,
-        }).collect();
+        let traces: Vec<LoopTrace> = (0..4)
+            .map(|i| LoopTrace {
+                loop_header: BlockId(i),
+                reductions: vec![ReductionDetected {
+                    register: format!("xmm{i}"),
+                    kind: ReductionKind::Sum,
+                    init: AccumulatorInit::Const(0.0),
+                    body_expr: SymValue::Param(i as usize),
+                }],
+                unknown_mutations: vec![],
+                body_block_count: 1,
+            })
+            .collect();
         let result = combine_passes(&traces);
         assert!(result.is_err(), "4 logical passes should error");
     }
@@ -1876,16 +2043,15 @@ mod tests {
                 assert_eq!(reduce.len(), 1);
                 assert_eq!(reduce[0], TraceOp::Input(0));
             }
-            other => panic!("expected NormLike (loop2+loop3 coalesced into one transform pass), got {other:?}"),
+            other => panic!(
+                "expected NormLike (loop2+loop3 coalesced into one transform pass), got {other:?}"
+            ),
         }
     }
 
     #[test]
     fn test_symvalue_to_reduce_body_patterns() {
-        let square = SymValue::Mul(
-            Box::new(SymValue::Param(0)),
-            Box::new(SymValue::Param(0)),
-        );
+        let square = SymValue::Mul(Box::new(SymValue::Param(0)), Box::new(SymValue::Param(0)));
         let body = symvalue_to_reduce_body(&square);
         assert_eq!(body.len(), 2);
         assert_eq!(body[1], TraceOp::Mul(ValueId(0), ValueId(0)));
@@ -1903,10 +2069,7 @@ mod tests {
     #[test]
     fn test_symvalue_to_reduce_body_different_factors() {
         // Arrange: Mul(Param(0), Param(1)) — different operands → general 2-input pattern
-        let mul_ab = SymValue::Mul(
-            Box::new(SymValue::Param(0)),
-            Box::new(SymValue::Param(1)),
-        );
+        let mul_ab = SymValue::Mul(Box::new(SymValue::Param(0)), Box::new(SymValue::Param(1)));
 
         // Act
         let body = symvalue_to_reduce_body(&mul_ab);
@@ -1921,16 +2084,17 @@ mod tests {
     #[test]
     fn test_symvalue_to_reduce_body_fallback_for_add() {
         // Arrange: Add is not handled by symvalue_to_reduce_body → fallback to [Input(0)]
-        let add_expr = SymValue::Add(
-            Box::new(SymValue::Param(0)),
-            Box::new(SymValue::Const(1.0)),
-        );
+        let add_expr = SymValue::Add(Box::new(SymValue::Param(0)), Box::new(SymValue::Const(1.0)));
 
         // Act
         let body = symvalue_to_reduce_body(&add_expr);
 
         // Assert
-        assert_eq!(body.len(), 1, "unhandled SymValue should fallback to single Input");
+        assert_eq!(
+            body.len(),
+            1,
+            "unhandled SymValue should fallback to single Input"
+        );
         assert_eq!(body[0], TraceOp::Input(0));
     }
 
@@ -2033,7 +2197,11 @@ mod tests {
         let (identity, combine) = reduction_to_trace_ops(&det);
 
         // Assert
-        assert_eq!(identity, f64::INFINITY, "Symbolic Min init should fallback to +inf");
+        assert_eq!(
+            identity,
+            f64::INFINITY,
+            "Symbolic Min init should fallback to +inf"
+        );
         assert_eq!(combine.len(), 3);
         assert_eq!(combine[2], TraceOp::Min(ValueId(0), ValueId(1)));
     }
@@ -2076,8 +2244,10 @@ mod tests {
         };
 
         // Act & Assert
-        assert!(!has_fma_or_mul_add_reduction(&trace),
-            "Sum reduction with Const body should not be detected as FMA/Mul-add");
+        assert!(
+            !has_fma_or_mul_add_reduction(&trace),
+            "Sum reduction with Const body should not be detected as FMA/Mul-add"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2092,9 +2262,18 @@ mod tests {
         let min_debug = format!("{:?}", ReductionKind::Min);
 
         // Assert: Debug trait should produce readable names
-        assert!(sum_debug.contains("Sum"), "Sum debug should contain 'Sum': {sum_debug}");
-        assert!(max_debug.contains("Max"), "Max debug should contain 'Max': {max_debug}");
-        assert!(min_debug.contains("Min"), "Min debug should contain 'Min': {min_debug}");
+        assert!(
+            sum_debug.contains("Sum"),
+            "Sum debug should contain 'Sum': {sum_debug}"
+        );
+        assert!(
+            max_debug.contains("Max"),
+            "Max debug should contain 'Max': {max_debug}"
+        );
+        assert!(
+            min_debug.contains("Min"),
+            "Min debug should contain 'Min': {min_debug}"
+        );
     }
 
     #[test]
@@ -2111,7 +2290,11 @@ mod tests {
         // Assert: cloned Symbolic should match original's inner SymValue
         match (&init, &cloned) {
             (AccumulatorInit::Symbolic(a), AccumulatorInit::Symbolic(b)) => {
-                assert_eq!(format!("{a}"), format!("{b}"), "cloned Symbolic inner value should match");
+                assert_eq!(
+                    format!("{a}"),
+                    format!("{b}"),
+                    "cloned Symbolic inner value should match"
+                );
             }
             _ => panic!("both should be Symbolic variant"),
         }
@@ -2140,7 +2323,10 @@ mod tests {
         // Assert
         assert_eq!(analysis.num_loops, 1);
         assert_eq!(analysis.loop_traces.len(), 1);
-        assert!(matches!(analysis.pattern, ComputePattern::Elementwise { .. }));
+        assert!(matches!(
+            analysis.pattern,
+            ComputePattern::Elementwise { .. }
+        ));
     }
 
     #[test]
@@ -2191,9 +2377,9 @@ mod tests {
         let pre = SymValue::Param(0); // acc
         let post = SymValue::Select {
             kind: SelectKind::Ge,
-            cond_lhs: Box::new(SymValue::Param(0)), // acc
-            cond_rhs: Box::new(SymValue::Param(1)), // elem
-            true_val: Box::new(SymValue::Param(0)), // acc
+            cond_lhs: Box::new(SymValue::Param(0)),  // acc
+            cond_rhs: Box::new(SymValue::Param(1)),  // elem
+            true_val: Box::new(SymValue::Param(0)),  // acc
             false_val: Box::new(SymValue::Param(1)), // elem
         };
 
@@ -2201,10 +2387,16 @@ mod tests {
         let result = detect_reduction_pattern("xmm0", &pre, &post);
 
         // Assert
-        assert!(result.is_some(), "Select(Ge) pattern should detect a reduction");
+        assert!(
+            result.is_some(),
+            "Select(Ge) pattern should detect a reduction"
+        );
         let r = result.unwrap();
-        assert_eq!(r.kind, ReductionKind::Min,
-            "Select(Ge, acc, elem, acc, elem) is classified as Min");
+        assert_eq!(
+            r.kind,
+            ReductionKind::Min,
+            "Select(Ge, acc, elem, acc, elem) is classified as Min"
+        );
     }
 
     #[test]
@@ -2216,9 +2408,9 @@ mod tests {
         let pre = SymValue::Param(1); // acc
         let post = SymValue::Select {
             kind: SelectKind::Lt,
-            cond_lhs: Box::new(SymValue::Param(0)), // elem
-            cond_rhs: Box::new(SymValue::Param(1)), // acc
-            true_val: Box::new(SymValue::Param(0)), // elem
+            cond_lhs: Box::new(SymValue::Param(0)),  // elem
+            cond_rhs: Box::new(SymValue::Param(1)),  // acc
+            true_val: Box::new(SymValue::Param(0)),  // elem
             false_val: Box::new(SymValue::Param(1)), // acc
         };
 
@@ -2226,10 +2418,16 @@ mod tests {
         let result = detect_reduction_pattern("xmm1", &pre, &post);
 
         // Assert
-        assert!(result.is_some(), "Select(Lt) pattern should detect a reduction");
+        assert!(
+            result.is_some(),
+            "Select(Lt) pattern should detect a reduction"
+        );
         let r = result.unwrap();
-        assert_eq!(r.kind, ReductionKind::Max,
-            "Select(Lt, elem, acc, elem, acc) classified as Max by code");
+        assert_eq!(
+            r.kind,
+            ReductionKind::Max,
+            "Select(Lt, elem, acc, elem, acc) classified as Max by code"
+        );
     }
 
     #[test]
@@ -2253,7 +2451,10 @@ mod tests {
         let found = contains_as_reduction(&deep, &target_str);
 
         // Assert
-        assert!(found, "Const(0.0) buried in 3-deep Add chain should be found");
+        assert!(
+            found,
+            "Const(0.0) buried in 3-deep Add chain should be found"
+        );
     }
 
     #[test]
@@ -2261,10 +2462,7 @@ mod tests {
         // Arrange: searching for a string that doesn't exist in the tree
         let target = SymValue::Const(0.0);
         let target_str = format!("{target}");
-        let unrelated = SymValue::Add(
-            Box::new(SymValue::Param(1)),
-            Box::new(SymValue::Param(2)),
-        );
+        let unrelated = SymValue::Add(Box::new(SymValue::Param(1)), Box::new(SymValue::Param(2)));
 
         // Act
         let found = contains_as_reduction(&unrelated, &target_str);
@@ -2323,9 +2521,15 @@ mod tests {
         let result = combine_passes(&[loop1, loop2]);
 
         // Assert
-        assert!(result.is_err(), "2-loop with Max as first reduction should error");
+        assert!(
+            result.is_err(),
+            "2-loop with Max as first reduction should error"
+        );
         let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("Max"), "error message should mention Max, got: {err_msg}");
+        assert!(
+            err_msg.contains("Max"),
+            "error message should mention Max, got: {err_msg}"
+        );
     }
 
     #[test]
@@ -2348,8 +2552,10 @@ mod tests {
         };
 
         // Act & Assert
-        assert!(has_fma_or_mul_add_reduction(&trace),
-            "Sum reduction with Fma body should be detected");
+        assert!(
+            has_fma_or_mul_add_reduction(&trace),
+            "Sum reduction with Fma body should be detected"
+        );
     }
 
     #[test]
@@ -2368,8 +2574,10 @@ mod tests {
         };
 
         // Act & Assert
-        assert!(has_fma_or_mul_add_reduction(&trace),
-            "Sum reduction with Unknown(unrolled) body should be detected");
+        assert!(
+            has_fma_or_mul_add_reduction(&trace),
+            "Sum reduction with Unknown(unrolled) body should be detected"
+        );
     }
 
     #[test]
@@ -2386,11 +2594,19 @@ mod tests {
         let pattern = classify_nested_pattern(5, &trace);
 
         // Assert
-        if let ComputePattern::Injective { num_inputs, num_outputs, .. } = &pattern {
+        if let ComputePattern::Injective {
+            num_inputs,
+            num_outputs,
+            ..
+        } = &pattern
+        {
             assert_eq!(*num_inputs, 1, "expected num_inputs=1");
             assert_eq!(*num_outputs, 1, "expected num_outputs=1");
         } else {
-            panic!("5-deep nesting should fall back to Injective, got {:?}", pattern);
+            panic!(
+                "5-deep nesting should fall back to Injective, got {:?}",
+                pattern
+            );
         }
     }
 
@@ -2430,9 +2646,15 @@ mod tests {
         let result = combine_passes(&[loop1, loop2, loop3]);
 
         // Assert
-        assert!(result.is_err(), "Max → Max → transform is unrecognized pattern");
+        assert!(
+            result.is_err(),
+            "Max → Max → transform is unrecognized pattern"
+        );
         let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("unrecognized"), "error should mention unrecognized, got: {err_msg}");
+        assert!(
+            err_msg.contains("unrecognized"),
+            "error should mention unrecognized, got: {err_msg}"
+        );
     }
 
     #[test]
@@ -2449,8 +2671,11 @@ mod tests {
         let (identity, combine) = reduction_to_trace_ops(&det);
 
         // Assert
-        assert_eq!(identity, f64::NEG_INFINITY,
-            "Symbolic Max init should fallback to -inf");
+        assert_eq!(
+            identity,
+            f64::NEG_INFINITY,
+            "Symbolic Max init should fallback to -inf"
+        );
         assert_eq!(combine[2], TraceOp::Max(ValueId(0), ValueId(1)));
     }
 
@@ -2464,17 +2689,19 @@ mod tests {
         // standard reduction because the multiplier on acc is not 1.0.
         let pre = SymValue::Param(0);
         let post = SymValue::Fma(
-            Box::new(SymValue::Param(0)),       // a = acc
-            Box::new(SymValue::Const(2.0)),      // b = 2.0 (not 1.0)
-            Box::new(SymValue::Param(1)),        // c = element
+            Box::new(SymValue::Param(0)),   // a = acc
+            Box::new(SymValue::Const(2.0)), // b = 2.0 (not 1.0)
+            Box::new(SymValue::Param(1)),   // c = element
         );
 
         // Act
         let result = detect_reduction_pattern("xmm0", &pre, &post);
 
         // Assert
-        assert!(result.is_none(),
-            "Fma(acc, 2.0, x) should not be detected as reduction (multiplier != 1.0)");
+        assert!(
+            result.is_none(),
+            "Fma(acc, 2.0, x) should not be detected as reduction (multiplier != 1.0)"
+        );
     }
 
     #[test]
@@ -2483,16 +2710,19 @@ mod tests {
         // This hits the b_str == pre_str && is_const_one(a) branch.
         let pre = SymValue::Param(0);
         let post = SymValue::Fma(
-            Box::new(SymValue::Const(1.0)),      // a = 1.0
-            Box::new(SymValue::Param(0)),        // b = acc (pre)
-            Box::new(SymValue::Param(1)),        // c = element
+            Box::new(SymValue::Const(1.0)), // a = 1.0
+            Box::new(SymValue::Param(0)),   // b = acc (pre)
+            Box::new(SymValue::Param(1)),   // c = element
         );
 
         // Act
         let result = detect_reduction_pattern("xmm0", &pre, &post);
 
         // Assert
-        assert!(result.is_some(), "Fma(1.0, acc, x) should be detected as Sum reduction");
+        assert!(
+            result.is_some(),
+            "Fma(1.0, acc, x) should be detected as Sum reduction"
+        );
         let r = result.unwrap();
         assert_eq!(r.kind, ReductionKind::Sum);
     }
@@ -2554,7 +2784,11 @@ mod tests {
         collect_params(&expr, &mut params);
 
         // Assert
-        assert_eq!(params.len(), 3, "should find 3 distinct params from Fma+unary");
+        assert_eq!(
+            params.len(),
+            3,
+            "should find 3 distinct params from Fma+unary"
+        );
         assert!(params.contains(&0));
         assert!(params.contains(&2));
         assert!(params.contains(&5));
@@ -2565,8 +2799,8 @@ mod tests {
         // Arrange: Select with Call in both branches
         // Select { kind: Gt, cond_lhs: Param(0), cond_rhs: Param(1),
         //          true_val: Call(Expf, [Param(2)]), false_val: Abs(Param(3)) }
-        use super::super::sym_value::SelectKind;
         use super::super::sym_value::LibmFn;
+        use super::super::sym_value::SelectKind;
         let expr = SymValue::Select {
             kind: SelectKind::Gt,
             cond_lhs: Box::new(SymValue::Param(0)),
@@ -2580,7 +2814,11 @@ mod tests {
         collect_params(&expr, &mut params);
 
         // Assert
-        assert_eq!(params.len(), 4, "should find params 0,1,2,3 from Select+Call+Abs");
+        assert_eq!(
+            params.len(),
+            4,
+            "should find params 0,1,2,3 from Select+Call+Abs"
+        );
         assert!(params.contains(&0));
         assert!(params.contains(&1));
         assert!(params.contains(&2));
@@ -2610,7 +2848,10 @@ mod tests {
 
         // Assert: both are transform-only, so they coalesce into 1 logical pass,
         // which then fails because the single logical loop has no reductions.
-        assert!(result.is_err(), "all-transform-only loops should error after coalescing");
+        assert!(
+            result.is_err(),
+            "all-transform-only loops should error after coalescing"
+        );
     }
 
     #[test]
@@ -2650,10 +2891,15 @@ mod tests {
         let result = combine_passes(&[loop1, loop2, loop3]);
 
         // Assert
-        assert!(result.is_err(), "Min → Sum → transform should be unrecognized");
+        assert!(
+            result.is_err(),
+            "Min → Sum → transform should be unrecognized"
+        );
         let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("unrecognized"),
-            "error should mention 'unrecognized', got: {err_msg}");
+        assert!(
+            err_msg.contains("unrecognized"),
+            "error should mention 'unrecognized', got: {err_msg}"
+        );
     }
 
     #[test]
@@ -2686,8 +2932,10 @@ mod tests {
         let result = detect_reduction_pattern("xmm0", &pre, &post);
 
         // Assert
-        assert!(result.is_none(),
-            "Select(Eq, ...) should not be detected as reduction (unhandled SelectKind)");
+        assert!(
+            result.is_none(),
+            "Select(Eq, ...) should not be detected as reduction (unhandled SelectKind)"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2702,9 +2950,9 @@ mod tests {
         let pre = SymValue::Param(1); // acc
         let post = SymValue::Select {
             kind: SelectKind::Gt,
-            cond_lhs: Box::new(SymValue::Param(0)), // elem
-            cond_rhs: Box::new(SymValue::Param(1)), // acc (pre)
-            true_val: Box::new(SymValue::Param(1)), // acc (pre)
+            cond_lhs: Box::new(SymValue::Param(0)),  // elem
+            cond_rhs: Box::new(SymValue::Param(1)),  // acc (pre)
+            true_val: Box::new(SymValue::Param(1)),  // acc (pre)
             false_val: Box::new(SymValue::Param(0)), // elem
         };
 
@@ -2712,10 +2960,16 @@ mod tests {
         let result = detect_reduction_pattern("xmm1", &pre, &post);
 
         // Assert
-        assert!(result.is_some(), "Select(Gt, elem, acc, acc, elem) should detect reduction");
+        assert!(
+            result.is_some(),
+            "Select(Gt, elem, acc, acc, elem) should detect reduction"
+        );
         let r = result.unwrap();
-        assert_eq!(r.kind, ReductionKind::Max,
-            "Select(Gt) rhs=pre, tv=pre should be Max");
+        assert_eq!(
+            r.kind,
+            ReductionKind::Max,
+            "Select(Gt) rhs=pre, tv=pre should be Max"
+        );
     }
 
     #[test]
@@ -2726,9 +2980,9 @@ mod tests {
         let pre = SymValue::Param(1); // acc
         let post = SymValue::Select {
             kind: SelectKind::Le,
-            cond_lhs: Box::new(SymValue::Param(0)), // elem
-            cond_rhs: Box::new(SymValue::Param(1)), // acc (pre)
-            true_val: Box::new(SymValue::Param(0)), // elem
+            cond_lhs: Box::new(SymValue::Param(0)),  // elem
+            cond_rhs: Box::new(SymValue::Param(1)),  // acc (pre)
+            true_val: Box::new(SymValue::Param(0)),  // elem
             false_val: Box::new(SymValue::Param(1)), // acc (pre)
         };
 
@@ -2736,10 +2990,16 @@ mod tests {
         let result = detect_reduction_pattern("xmm1", &pre, &post);
 
         // Assert
-        assert!(result.is_some(), "Select(Le, elem, acc, elem, acc) should detect reduction");
+        assert!(
+            result.is_some(),
+            "Select(Le, elem, acc, elem, acc) should detect reduction"
+        );
         let r = result.unwrap();
-        assert_eq!(r.kind, ReductionKind::Max,
-            "Select(Le) rhs=pre, fv=pre should be Max");
+        assert_eq!(
+            r.kind,
+            ReductionKind::Max,
+            "Select(Le) rhs=pre, fv=pre should be Max"
+        );
     }
 
     #[test]
@@ -2758,12 +3018,17 @@ mod tests {
         let result = detect_reduction_pattern("xmm0", &pre, &post);
 
         // Assert
-        assert!(result.is_some(), "nested Min tree containing +inf acc should be detected");
+        assert!(
+            result.is_some(),
+            "nested Min tree containing +inf acc should be detected"
+        );
         let r = result.unwrap();
         assert_eq!(r.kind, ReductionKind::Min);
         // Unrolled body produces Unknown("unrolled")
-        assert!(matches!(r.body_expr, SymValue::Unknown(ref s) if s == "unrolled"),
-            "unrolled reduction body should be Unknown(\"unrolled\")");
+        assert!(
+            matches!(r.body_expr, SymValue::Unknown(ref s) if s == "unrolled"),
+            "unrolled reduction body should be Unknown(\"unrolled\")"
+        );
     }
 
     #[test]
@@ -2790,7 +3055,8 @@ mod tests {
         // Assert
         assert!(
             matches!(pattern, ComputePattern::Gemm),
-            "2-deep + Sum(Mul) should be Gemm (dot product), got {:?}", pattern
+            "2-deep + Sum(Mul) should be Gemm (dot product), got {:?}",
+            pattern
         );
     }
 
@@ -2815,7 +3081,8 @@ mod tests {
         // Assert
         assert!(
             matches!(pattern, ComputePattern::Injective { .. }),
-            "3-deep without FMA/Mul should be Injective, got {:?}", pattern
+            "3-deep without FMA/Mul should be Injective, got {:?}",
+            pattern
         );
     }
 
@@ -2838,8 +3105,10 @@ mod tests {
         };
 
         // Act & Assert
-        assert!(!has_fma_or_mul_add_reduction(&trace),
-            "Max reduction should not be detected as FMA/Mul-add even with Mul body");
+        assert!(
+            !has_fma_or_mul_add_reduction(&trace),
+            "Max reduction should not be detected as FMA/Mul-add even with Mul body"
+        );
     }
 
     #[test]
@@ -2853,8 +3122,10 @@ mod tests {
         };
 
         // Act & Assert
-        assert!(!has_fma_or_mul_add_reduction(&trace),
-            "loop with no reductions should not be detected as FMA/Mul-add");
+        assert!(
+            !has_fma_or_mul_add_reduction(&trace),
+            "loop with no reductions should not be detected as FMA/Mul-add"
+        );
     }
 
     #[test]
@@ -2873,7 +3144,11 @@ mod tests {
         collect_params(&expr, &mut params);
 
         // Assert
-        assert_eq!(params.len(), 3, "should find 3 distinct params from Div/Sub tree");
+        assert_eq!(
+            params.len(),
+            3,
+            "should find 3 distinct params from Div/Sub tree"
+        );
         assert!(params.contains(&0));
         assert!(params.contains(&3));
         assert!(params.contains(&7));
@@ -2892,8 +3167,10 @@ mod tests {
         // Assert: construction succeeds, fields are accessible
         assert_eq!(analysis.max_depth, 1);
         assert_eq!(analysis.nesting_levels, 2);
-        assert!(analysis.inner_trace.is_none(),
-            "inner_trace should be None when inner loop analysis was skipped");
+        assert!(
+            analysis.inner_trace.is_none(),
+            "inner_trace should be None when inner loop analysis was skipped"
+        );
         assert!(matches!(analysis.pattern, ComputePattern::Gemm));
     }
 
@@ -2925,9 +3202,13 @@ mod tests {
 
         // Assert: identity comes from the first reduction (0.0), not the second (1.0)
         match &pattern {
-            ComputePattern::Reduction { identity, combine, .. } => {
-                assert_eq!(*identity, 0.0,
-                    "should use first reduction's identity, got {identity}");
+            ComputePattern::Reduction {
+                identity, combine, ..
+            } => {
+                assert_eq!(
+                    *identity, 0.0,
+                    "should use first reduction's identity, got {identity}"
+                );
                 assert_eq!(combine[2], TraceOp::Add(ValueId(0), ValueId(1)));
             }
             other => panic!("expected Reduction, got {other:?}"),
@@ -2942,7 +3223,9 @@ mod tests {
     fn test_natural_loop_construction_and_depth_field() {
         // Arrange: construct a NaturalLoop with depth=2 (3-deep nesting)
         use std::collections::BTreeSet;
-        let body: BTreeSet<BlockId> = vec![BlockId(10), BlockId(11), BlockId(12)].into_iter().collect();
+        let body: BTreeSet<BlockId> = vec![BlockId(10), BlockId(11), BlockId(12)]
+            .into_iter()
+            .collect();
         let lp = NaturalLoop {
             header: BlockId(10),
             body_blocks: body.clone(),
@@ -2959,7 +3242,10 @@ mod tests {
         assert_eq!(lp.exits.len(), 1);
         assert_eq!(lp.exits[0], BlockId(20));
         assert_eq!(lp.ordinal, 3);
-        assert_eq!(lp.depth, 2, "depth=2 means 3 levels of nesting (0-based depth)");
+        assert_eq!(
+            lp.depth, 2,
+            "depth=2 means 3 levels of nesting (0-based depth)"
+        );
     }
 
     #[test]
@@ -3027,8 +3313,11 @@ mod tests {
             };
 
             // Assert: nesting_levels = max_depth + 1 invariant holds
-            assert_eq!(analysis.nesting_levels, analysis.max_depth + 1,
-                "nesting_levels should always equal max_depth + 1, got max_depth={max_depth}");
+            assert_eq!(
+                analysis.nesting_levels,
+                analysis.max_depth + 1,
+                "nesting_levels should always equal max_depth + 1, got max_depth={max_depth}"
+            );
         }
     }
 
@@ -3037,7 +3326,7 @@ mod tests {
         // Arrange: Add(expr, pre) — the accumulator is the second operand
         let pre = SymValue::Const(0.0);
         let post = SymValue::Add(
-            Box::new(SymValue::Param(3)),  // expr (non-acc)
+            Box::new(SymValue::Param(3)),   // expr (non-acc)
             Box::new(SymValue::Const(0.0)), // pre (acc)
         );
 
@@ -3045,7 +3334,10 @@ mod tests {
         let result = detect_reduction_pattern("xmm0", &pre, &post);
 
         // Assert: reversed order should still be detected as Sum
-        assert!(result.is_some(), "Add(expr, acc) should detect Sum reduction");
+        assert!(
+            result.is_some(),
+            "Add(expr, acc) should detect Sum reduction"
+        );
         let r = result.unwrap();
         assert_eq!(r.kind, ReductionKind::Sum);
         // body_expr should be the non-acc operand (Param(3))
@@ -3057,15 +3349,18 @@ mod tests {
         // Arrange: Min(expr, pre) — the accumulator is the second operand
         let pre = SymValue::Param(1);
         let post = SymValue::Min(
-            Box::new(SymValue::Param(0)),  // expr
-            Box::new(SymValue::Param(1)),  // pre (acc)
+            Box::new(SymValue::Param(0)), // expr
+            Box::new(SymValue::Param(1)), // pre (acc)
         );
 
         // Act
         let result = detect_reduction_pattern("xmm1", &pre, &post);
 
         // Assert
-        assert!(result.is_some(), "Min(expr, acc) should detect Min reduction");
+        assert!(
+            result.is_some(),
+            "Min(expr, acc) should detect Min reduction"
+        );
         let r = result.unwrap();
         assert_eq!(r.kind, ReductionKind::Min);
     }
@@ -3105,19 +3400,25 @@ mod tests {
             register: "xmm7".into(),
             kind: ReductionKind::Min,
             init: AccumulatorInit::Const(f64::INFINITY),
-            body_expr: SymValue::Mul(
-                Box::new(SymValue::Param(2)),
-                Box::new(SymValue::Param(4)),
-            ),
+            body_expr: SymValue::Mul(Box::new(SymValue::Param(2)), Box::new(SymValue::Param(4))),
         };
 
         // Act
         let debug = format!("{det:?}");
 
         // Assert: Debug output should contain the register name, kind, and init type
-        assert!(debug.contains("xmm7"), "Debug should contain register name: {debug}");
-        assert!(debug.contains("Min"), "Debug should contain reduction kind: {debug}");
-        assert!(debug.contains("Const"), "Debug should contain init variant: {debug}");
+        assert!(
+            debug.contains("xmm7"),
+            "Debug should contain register name: {debug}"
+        );
+        assert!(
+            debug.contains("Min"),
+            "Debug should contain reduction kind: {debug}"
+        );
+        assert!(
+            debug.contains("Const"),
+            "Debug should contain init variant: {debug}"
+        );
     }
 
     #[test]
@@ -3139,9 +3440,18 @@ mod tests {
         let debug = format!("{trace:?}");
 
         // Assert: Debug output should contain header, reduction count, and body_block_count
-        assert!(debug.contains("99"), "Debug should contain header BlockId: {debug}");
-        assert!(debug.contains("Sum"), "Debug should contain reduction kind: {debug}");
-        assert!(debug.contains("5"), "Debug should contain body_block_count: {debug}");
+        assert!(
+            debug.contains("99"),
+            "Debug should contain header BlockId: {debug}"
+        );
+        assert!(
+            debug.contains("Sum"),
+            "Debug should contain reduction kind: {debug}"
+        );
+        assert!(
+            debug.contains("5"),
+            "Debug should contain body_block_count: {debug}"
+        );
     }
 
     #[test]
@@ -3187,7 +3497,10 @@ mod tests {
         let result = detect_reduction_pattern("xmm0", &pre, &post);
 
         // Assert: should detect as Max reduction (outer Max references pre)
-        assert!(result.is_some(), "Max(acc, expr) should be detected as Max reduction");
+        assert!(
+            result.is_some(),
+            "Max(acc, expr) should be detected as Max reduction"
+        );
         let r = result.unwrap();
         assert_eq!(r.kind, ReductionKind::Max);
     }
@@ -3208,7 +3521,10 @@ mod tests {
         let result = detect_reduction_pattern("xmm0", &pre, &post);
 
         // Assert
-        assert!(result.is_some(), "Add(acc, Div(a,b)) should be detected as Sum reduction");
+        assert!(
+            result.is_some(),
+            "Add(acc, Div(a,b)) should be detected as Sum reduction"
+        );
         let r = result.unwrap();
         assert_eq!(r.kind, ReductionKind::Sum);
         // body_expr should be the Div expression
@@ -3230,7 +3546,10 @@ mod tests {
         let result = detect_reduction_pattern("xmm0", &pre, &post);
 
         // Assert
-        assert!(result.is_some(), "Fma(a, b, acc) should be detected as Sum reduction");
+        assert!(
+            result.is_some(),
+            "Fma(a, b, acc) should be detected as Sum reduction"
+        );
         let r = result.unwrap();
         assert_eq!(r.kind, ReductionKind::Sum);
         // body_expr should be Mul(Param(0), Param(1))
@@ -3269,10 +3588,16 @@ mod tests {
         let result = combine_passes(&[main_loop, tail_loop, transform_loop]);
 
         // Assert: should succeed as NormLike (Sum reduction + transform)
-        assert!(result.is_ok(), "should coalesce tail loop and produce NormLike");
+        assert!(
+            result.is_ok(),
+            "should coalesce tail loop and produce NormLike"
+        );
         let pattern = result.unwrap();
-        assert!(matches!(pattern, ComputePattern::NormLike { .. }),
-            "expected NormLike, got {:?}", pattern);
+        assert!(
+            matches!(pattern, ComputePattern::NormLike { .. }),
+            "expected NormLike, got {:?}",
+            pattern
+        );
     }
 
     #[test]
@@ -3292,7 +3617,12 @@ mod tests {
         let pattern = classify_nested_pattern(2, &trace);
 
         // Assert
-        if let ComputePattern::Injective { num_inputs, num_outputs, .. } = &pattern {
+        if let ComputePattern::Injective {
+            num_inputs,
+            num_outputs,
+            ..
+        } = &pattern
+        {
             // num_inputs from count_distinct_params_in_trace = 2 (Param(0), Param(1))
             // num_outputs from unknown_mutations.len() = 2, but capped at 2
             assert_eq!(*num_inputs, 2, "should detect 2 distinct params");
@@ -3321,8 +3651,10 @@ mod tests {
         };
 
         // Act & Assert
-        assert!(has_fma_or_mul_add_reduction(&trace),
-            "Sum reduction with Mul body should be detected as FMA/Mul-add");
+        assert!(
+            has_fma_or_mul_add_reduction(&trace),
+            "Sum reduction with Mul body should be detected as FMA/Mul-add"
+        );
     }
 
     #[test]
@@ -3335,7 +3667,11 @@ mod tests {
         collect_params(&expr, &mut params);
 
         // Assert
-        assert_eq!(params.len(), 1, "should find Param(5) inside Recip(Abs(...))");
+        assert_eq!(
+            params.len(),
+            1,
+            "should find Param(5) inside Recip(Abs(...))"
+        );
         assert!(params.contains(&5));
     }
 
@@ -3348,9 +3684,9 @@ mod tests {
         let pre = SymValue::Param(1); // acc
         let post = SymValue::Select {
             kind: SelectKind::Ge,
-            cond_lhs: Box::new(SymValue::Param(0)), // elem
-            cond_rhs: Box::new(SymValue::Param(1)), // acc (pre)
-            true_val: Box::new(SymValue::Param(2)), // other (not acc)
+            cond_lhs: Box::new(SymValue::Param(0)),  // elem
+            cond_rhs: Box::new(SymValue::Param(1)),  // acc (pre)
+            true_val: Box::new(SymValue::Param(2)),  // other (not acc)
             false_val: Box::new(SymValue::Param(1)), // acc
         };
 
@@ -3358,8 +3694,10 @@ mod tests {
         let result = detect_reduction_pattern("xmm1", &pre, &post);
 
         // Assert: Ge + rhs=pre + fv=pre + tv≠pre → Min reduction
-        assert!(result.is_some(),
-            "Select(Ge) with rhs=pre, fv=pre should be detected as Min reduction");
+        assert!(
+            result.is_some(),
+            "Select(Ge) with rhs=pre, fv=pre should be detected as Min reduction"
+        );
         let r = result.unwrap();
         assert_eq!(r.kind, ReductionKind::Min);
     }

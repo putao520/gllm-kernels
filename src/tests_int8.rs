@@ -111,8 +111,14 @@ mod tests_int8 {
 
         unsafe {
             avx512_int8::dequantize_i32_to_f32(
-                &c_i32, &mut c_f32, 1, n,
-                scale_a, scale_b, None, crate::Activation::None,
+                &c_i32,
+                &mut c_f32,
+                1,
+                n,
+                scale_a,
+                scale_b,
+                None,
+                crate::Activation::None,
             );
         }
 
@@ -120,7 +126,10 @@ mod tests_int8 {
             let expected = c_i32[i] as f32 * scale_a * scale_b;
             assert!(
                 (c_f32[i] - expected).abs() < 1e-5,
-                "dequant mismatch at {}: got {} expected {}", i, c_f32[i], expected
+                "dequant mismatch at {}: got {} expected {}",
+                i,
+                c_f32[i],
+                expected
             );
         }
     }

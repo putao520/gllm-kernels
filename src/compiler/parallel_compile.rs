@@ -11,11 +11,11 @@
 
 use rayon::prelude::*;
 
+use crate::compiler::fusion::FusionPlan;
 use crate::compiler::graph::CompilerGraph;
+use crate::compiler::group_dep::{GroupDependencyAnalyzer, TopoLevel};
 use crate::compiler::registry::{OpKindKey, ScalarOpRegistry};
 use crate::compiler::trace::OpTrace;
-use crate::compiler::fusion::FusionPlan;
-use crate::compiler::group_dep::{GroupDependencyAnalyzer, TopoLevel};
 
 // ── Phase 0: 并行 trace 提取 ──────────────────────────────────────
 
@@ -86,11 +86,7 @@ pub fn analyze_parallel_emit_plan(
     graph: &CompilerGraph,
 ) -> (Vec<TopoLevel>, ParallelEmitStats) {
     let levels = GroupDependencyAnalyzer::analyze(plan, graph);
-    let max_parallelism = levels
-        .iter()
-        .map(|l| l.groups.len())
-        .max()
-        .unwrap_or(0);
+    let max_parallelism = levels.iter().map(|l| l.groups.len()).max().unwrap_or(0);
     let groups_per_level: Vec<usize> = levels.iter().map(|l| l.groups.len()).collect();
 
     let stats = ParallelEmitStats {
@@ -128,11 +124,7 @@ pub fn analyze_parallel_lower_plan(
     graph: &CompilerGraph,
 ) -> (Vec<TopoLevel>, ParallelLowerStats) {
     let levels = GroupDependencyAnalyzer::analyze(plan, graph);
-    let max_parallelism = levels
-        .iter()
-        .map(|l| l.groups.len())
-        .max()
-        .unwrap_or(0);
+    let max_parallelism = levels.iter().map(|l| l.groups.len()).max().unwrap_or(0);
     let total_groups: usize = levels.iter().map(|l| l.groups.len()).sum();
     let groups_per_level: Vec<usize> = levels.iter().map(|l| l.groups.len()).collect();
 
@@ -237,11 +229,7 @@ impl ParallelCompileScheduler {
     ///
     /// 必须在 fusion_plan 构建完成后调用。
     /// TopoLevel 分析结果被 Phase 2 和 Phase 3 共享（同一个依赖关系）。
-    pub fn analyze_schedule(
-        &mut self,
-        plan: &FusionPlan,
-        graph: &CompilerGraph,
-    ) {
+    pub fn analyze_schedule(&mut self, plan: &FusionPlan, graph: &CompilerGraph) {
         let (levels, emit_stats) = analyze_parallel_emit_plan(plan, graph);
         let total_groups: usize = levels.iter().map(|l| l.groups.len()).sum();
         let max_par = levels.iter().map(|l| l.groups.len()).max().unwrap_or(0);
@@ -299,7 +287,11 @@ impl ParallelCompileScheduler {
         let p2 = if self.phase2_parallel { "ON" } else { "OFF" };
         let p3 = if self.phase3_parallel { "ON" } else { "OFF" };
         let levels = self.topo_levels.as_ref().map(|l| l.len()).unwrap_or(0);
-        let max_par = self.emit_stats.as_ref().map(|s| s.max_parallelism).unwrap_or(0);
+        let max_par = self
+            .emit_stats
+            .as_ref()
+            .map(|s| s.max_parallelism)
+            .unwrap_or(0);
         format!(
             "ParallelCompileScheduler: P0={} P2={} P3={} levels={} max_par={}",
             p0, p2, p3, levels, max_par
@@ -316,8 +308,8 @@ impl Default for ParallelCompileScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::graph::{SymDim, Op};
     use crate::compiler::fusion::{FusionGroup, FusionMode, GroupMarker};
+    use crate::compiler::graph::{Op, SymDim};
     use crate::types::DType;
     use std::collections::HashMap;
 
@@ -598,8 +590,14 @@ mod tests {
         let mut scheduler = ParallelCompileScheduler::new();
         scheduler.phase2_parallel = true;
 
-        let wide_level = TopoLevel { level: 0, groups: vec![0, 1, 2, 3] };
-        let narrow_level = TopoLevel { level: 1, groups: vec![4] };
+        let wide_level = TopoLevel {
+            level: 0,
+            groups: vec![0, 1, 2, 3],
+        };
+        let narrow_level = TopoLevel {
+            level: 1,
+            groups: vec![4],
+        };
 
         assert!(scheduler.should_parallelize_level(&wide_level));
         assert!(!scheduler.should_parallelize_level(&narrow_level));
@@ -610,8 +608,14 @@ mod tests {
         let mut scheduler = ParallelCompileScheduler::new();
         scheduler.phase3_parallel = true;
 
-        let wide_level = TopoLevel { level: 0, groups: vec![0, 1] };
-        let narrow_level = TopoLevel { level: 1, groups: vec![2] };
+        let wide_level = TopoLevel {
+            level: 0,
+            groups: vec![0, 1],
+        };
+        let narrow_level = TopoLevel {
+            level: 1,
+            groups: vec![2],
+        };
 
         assert!(scheduler.should_parallelize_lower_level(&wide_level));
         assert!(!scheduler.should_parallelize_lower_level(&narrow_level));
@@ -623,7 +627,10 @@ mod tests {
         scheduler.phase2_parallel = false;
         scheduler.phase3_parallel = false;
 
-        let wide_level = TopoLevel { level: 0, groups: vec![0, 1, 2] };
+        let wide_level = TopoLevel {
+            level: 0,
+            groups: vec![0, 1, 2],
+        };
         assert!(!scheduler.should_parallelize_level(&wide_level));
         assert!(!scheduler.should_parallelize_lower_level(&wide_level));
     }
@@ -663,37 +670,60 @@ mod tests {
         let plan = FusionPlan {
             groups: vec![
                 FusionGroup {
-                    id: 0, anchor: op0, epilogue: Vec::new(),
-                    mode: FusionMode::Standalone, ops: vec![op0],
+                    id: 0,
+                    anchor: op0,
+                    epilogue: Vec::new(),
+                    mode: FusionMode::Standalone,
+                    ops: vec![op0],
                     multi_output: crate::compiler::graph::MultiOutputConfig::single(),
-                    dominant_dtype: None, marker: GroupMarker::None,
-                    is_layer_group: false, hetero_layer_type: None,
+                    dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+                    hetero_layer_type: None,
                 },
                 FusionGroup {
-                    id: 1, anchor: op1, epilogue: Vec::new(),
-                    mode: FusionMode::Standalone, ops: vec![op1],
+                    id: 1,
+                    anchor: op1,
+                    epilogue: Vec::new(),
+                    mode: FusionMode::Standalone,
+                    ops: vec![op1],
                     multi_output: crate::compiler::graph::MultiOutputConfig::single(),
-                    dominant_dtype: None, marker: GroupMarker::None,
-                    is_layer_group: false, hetero_layer_type: None,
+                    dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+                    hetero_layer_type: None,
                 },
                 FusionGroup {
-                    id: 2, anchor: op2, epilogue: Vec::new(),
-                    mode: FusionMode::Standalone, ops: vec![op2],
+                    id: 2,
+                    anchor: op2,
+                    epilogue: Vec::new(),
+                    mode: FusionMode::Standalone,
+                    ops: vec![op2],
                     multi_output: crate::compiler::graph::MultiOutputConfig::single(),
-                    dominant_dtype: None, marker: GroupMarker::None,
-                    is_layer_group: false, hetero_layer_type: None,
+                    dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+                    hetero_layer_type: None,
                 },
                 FusionGroup {
-                    id: 3, anchor: op3, epilogue: Vec::new(),
-                    mode: FusionMode::Standalone, ops: vec![op3],
+                    id: 3,
+                    anchor: op3,
+                    epilogue: Vec::new(),
+                    mode: FusionMode::Standalone,
+                    ops: vec![op3],
                     multi_output: crate::compiler::graph::MultiOutputConfig::single(),
-                    dominant_dtype: None, marker: GroupMarker::None,
-                    is_layer_group: false, hetero_layer_type: None,
+                    dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+                    hetero_layer_type: None,
                 },
             ],
             op_to_group: {
                 let mut m = HashMap::new();
-                m.insert(op0, 0); m.insert(op1, 1); m.insert(op2, 2); m.insert(op3, 3);
+                m.insert(op0, 0);
+                m.insert(op1, 1);
+                m.insert(op2, 2);
+                m.insert(op3, 3);
                 m
             },
         };
@@ -725,23 +755,34 @@ mod tests {
         let plan = FusionPlan {
             groups: vec![
                 FusionGroup {
-                    id: 0, anchor: op0, epilogue: Vec::new(),
-                    mode: FusionMode::Standalone, ops: vec![op0],
+                    id: 0,
+                    anchor: op0,
+                    epilogue: Vec::new(),
+                    mode: FusionMode::Standalone,
+                    ops: vec![op0],
                     multi_output: crate::compiler::graph::MultiOutputConfig::single(),
-                    dominant_dtype: None, marker: GroupMarker::None,
-                    is_layer_group: false, hetero_layer_type: None,
+                    dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+                    hetero_layer_type: None,
                 },
                 FusionGroup {
-                    id: 1, anchor: op1, epilogue: Vec::new(),
-                    mode: FusionMode::Standalone, ops: vec![op1],
+                    id: 1,
+                    anchor: op1,
+                    epilogue: Vec::new(),
+                    mode: FusionMode::Standalone,
+                    ops: vec![op1],
                     multi_output: crate::compiler::graph::MultiOutputConfig::single(),
-                    dominant_dtype: None, marker: GroupMarker::None,
-                    is_layer_group: false, hetero_layer_type: None,
+                    dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+                    hetero_layer_type: None,
                 },
             ],
             op_to_group: {
                 let mut m = HashMap::new();
-                m.insert(op0, 0); m.insert(op1, 1);
+                m.insert(op0, 0);
+                m.insert(op1, 1);
                 m
             },
         };
@@ -793,23 +834,34 @@ mod tests {
         let plan = FusionPlan {
             groups: vec![
                 FusionGroup {
-                    id: 0, anchor: op0, epilogue: Vec::new(),
-                    mode: FusionMode::Standalone, ops: vec![op0],
+                    id: 0,
+                    anchor: op0,
+                    epilogue: Vec::new(),
+                    mode: FusionMode::Standalone,
+                    ops: vec![op0],
                     multi_output: crate::compiler::graph::MultiOutputConfig::single(),
-                    dominant_dtype: None, marker: GroupMarker::None,
-                    is_layer_group: false, hetero_layer_type: None,
+                    dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+                    hetero_layer_type: None,
                 },
                 FusionGroup {
-                    id: 1, anchor: op1, epilogue: Vec::new(),
-                    mode: FusionMode::Standalone, ops: vec![op1],
+                    id: 1,
+                    anchor: op1,
+                    epilogue: Vec::new(),
+                    mode: FusionMode::Standalone,
+                    ops: vec![op1],
                     multi_output: crate::compiler::graph::MultiOutputConfig::single(),
-                    dominant_dtype: None, marker: GroupMarker::None,
-                    is_layer_group: false, hetero_layer_type: None,
+                    dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+                    hetero_layer_type: None,
                 },
             ],
             op_to_group: {
                 let mut m = HashMap::new();
-                m.insert(op0, 0); m.insert(op1, 1);
+                m.insert(op0, 0);
+                m.insert(op1, 1);
                 m
             },
         };
@@ -834,23 +886,34 @@ mod tests {
         let plan = FusionPlan {
             groups: vec![
                 FusionGroup {
-                    id: 0, anchor: op0, epilogue: Vec::new(),
-                    mode: FusionMode::Standalone, ops: vec![op0],
+                    id: 0,
+                    anchor: op0,
+                    epilogue: Vec::new(),
+                    mode: FusionMode::Standalone,
+                    ops: vec![op0],
                     multi_output: crate::compiler::graph::MultiOutputConfig::single(),
-                    dominant_dtype: None, marker: GroupMarker::None,
-                    is_layer_group: false, hetero_layer_type: None,
+                    dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+                    hetero_layer_type: None,
                 },
                 FusionGroup {
-                    id: 1, anchor: op1, epilogue: Vec::new(),
-                    mode: FusionMode::Standalone, ops: vec![op1],
+                    id: 1,
+                    anchor: op1,
+                    epilogue: Vec::new(),
+                    mode: FusionMode::Standalone,
+                    ops: vec![op1],
                     multi_output: crate::compiler::graph::MultiOutputConfig::single(),
-                    dominant_dtype: None, marker: GroupMarker::None,
-                    is_layer_group: false, hetero_layer_type: None,
+                    dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+                    hetero_layer_type: None,
                 },
             ],
             op_to_group: {
                 let mut m = HashMap::new();
-                m.insert(op0, 0); m.insert(op1, 1);
+                m.insert(op0, 0);
+                m.insert(op1, 1);
                 m
             },
         };
@@ -871,32 +934,46 @@ mod tests {
 
         let mut consumer_ops = Vec::new();
         for i in 0..5 {
-            let t_out = graph.add_tensor(&format!("out{}", i), vec![SymDim::Concrete(4)], DType::F32);
+            let t_out =
+                graph.add_tensor(&format!("out{}", i), vec![SymDim::Concrete(4)], DType::F32);
             let opi = graph.add_op(Op::Silu, vec![t_src], vec![t_out], &format!("c{}", i));
             consumer_ops.push(opi);
         }
 
         let mut groups = vec![FusionGroup {
-            id: 0, anchor: op0, epilogue: Vec::new(),
-            mode: FusionMode::Standalone, ops: vec![op0],
+            id: 0,
+            anchor: op0,
+            epilogue: Vec::new(),
+            mode: FusionMode::Standalone,
+            ops: vec![op0],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
-            dominant_dtype: None, marker: GroupMarker::None,
-            is_layer_group: false, hetero_layer_type: None,
+            dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         }];
         let mut op_map = HashMap::new();
         op_map.insert(op0, 0);
         for (i, &opi) in consumer_ops.iter().enumerate() {
             groups.push(FusionGroup {
-                id: i + 1, anchor: opi, epilogue: Vec::new(),
-                mode: FusionMode::Standalone, ops: vec![opi],
+                id: i + 1,
+                anchor: opi,
+                epilogue: Vec::new(),
+                mode: FusionMode::Standalone,
+                ops: vec![opi],
                 multi_output: crate::compiler::graph::MultiOutputConfig::single(),
-                dominant_dtype: None, marker: GroupMarker::None,
-                is_layer_group: false, hetero_layer_type: None,
+                dominant_dtype: None,
+                marker: GroupMarker::None,
+                is_layer_group: false,
+                hetero_layer_type: None,
             });
             op_map.insert(opi, i + 1);
         }
 
-        let plan = FusionPlan { groups, op_to_group: op_map };
+        let plan = FusionPlan {
+            groups,
+            op_to_group: op_map,
+        };
 
         let mut scheduler = ParallelCompileScheduler::new();
         scheduler.analyze_schedule(&plan, &graph);

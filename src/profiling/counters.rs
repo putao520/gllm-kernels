@@ -53,32 +53,58 @@ impl HwPeak {
     /// Uses: cores * frequency * FMA_throughput * SIMD_width * 2 (mul+add).
     pub fn detect() -> Self {
         let (gflops, bw) = detect_hw_peak();
-        Self { gflops, bandwidth_gbs: bw }
+        Self {
+            gflops,
+            bandwidth_gbs: bw,
+        }
     }
 
     /// Manually specify peaks (for when auto-detection is inaccurate).
     pub fn manual(gflops: f64, bandwidth_gbs: f64) -> Self {
-        Self { gflops, bandwidth_gbs }
+        Self {
+            gflops,
+            bandwidth_gbs,
+        }
     }
 }
 
 /// Compute performance metrics from workload, timing, and optional peak.
-pub fn compute_metrics(workload: OpWorkload, timer: &CycleTimer, peak: Option<&HwPeak>) -> PerfMetrics {
+pub fn compute_metrics(
+    workload: OpWorkload,
+    timer: &CycleTimer,
+    peak: Option<&HwPeak>,
+) -> PerfMetrics {
     let secs = timer.elapsed_secs();
     let cycles = timer.elapsed_cycles();
 
     let (gflops, bw_gbs) = match workload {
         OpWorkload::Compute { flops } => {
-            let gf = if secs > 0.0 { flops as f64 / secs / 1e9 } else { 0.0 };
+            let gf = if secs > 0.0 {
+                flops as f64 / secs / 1e9
+            } else {
+                0.0
+            };
             (gf, 0.0)
         }
         OpWorkload::Memory { bytes } => {
-            let bw = if secs > 0.0 { bytes as f64 / secs / 1e9 } else { 0.0 };
+            let bw = if secs > 0.0 {
+                bytes as f64 / secs / 1e9
+            } else {
+                0.0
+            };
             (0.0, bw)
         }
         OpWorkload::Mixed { flops, bytes } => {
-            let gf = if secs > 0.0 { flops as f64 / secs / 1e9 } else { 0.0 };
-            let bw = if secs > 0.0 { bytes as f64 / secs / 1e9 } else { 0.0 };
+            let gf = if secs > 0.0 {
+                flops as f64 / secs / 1e9
+            } else {
+                0.0
+            };
+            let bw = if secs > 0.0 {
+                bytes as f64 / secs / 1e9
+            } else {
+                0.0
+            };
             (gf, bw)
         }
     };
@@ -87,9 +113,7 @@ pub fn compute_metrics(workload: OpWorkload, timer: &CycleTimer, peak: Option<&H
         (OpWorkload::Compute { .. } | OpWorkload::Mixed { .. }, Some(p)) if p.gflops > 0.0 => {
             gflops / p.gflops
         }
-        (OpWorkload::Memory { .. }, Some(p)) if p.bandwidth_gbs > 0.0 => {
-            bw_gbs / p.bandwidth_gbs
-        }
+        (OpWorkload::Memory { .. }, Some(p)) if p.bandwidth_gbs > 0.0 => bw_gbs / p.bandwidth_gbs,
         _ => 0.0,
     };
 
@@ -108,22 +132,30 @@ pub fn compute_metrics(workload: OpWorkload, timer: &CycleTimer, peak: Option<&H
 
 /// GEMM workload: 2*M*N*K FLOPs.
 pub fn gemm_workload(m: usize, n: usize, k: usize) -> OpWorkload {
-    OpWorkload::Compute { flops: 2 * m as u64 * n as u64 * k as u64 }
+    OpWorkload::Compute {
+        flops: 2 * m as u64 * n as u64 * k as u64,
+    }
 }
 
 /// GEMV workload: 2*M*N FLOPs.
 pub fn gemv_workload(m: usize, n: usize) -> OpWorkload {
-    OpWorkload::Compute { flops: 2 * m as u64 * n as u64 }
+    OpWorkload::Compute {
+        flops: 2 * m as u64 * n as u64,
+    }
 }
 
 /// Element-wise unary op (silu, relu, exp, etc.): read N + write N elements.
 pub fn elementwise_unary_workload(n: usize, elem_bytes: usize) -> OpWorkload {
-    OpWorkload::Memory { bytes: 2 * n as u64 * elem_bytes as u64 }
+    OpWorkload::Memory {
+        bytes: 2 * n as u64 * elem_bytes as u64,
+    }
 }
 
 /// Element-wise binary op (add, mul, etc.): read 2N + write N elements.
 pub fn elementwise_binary_workload(n: usize, elem_bytes: usize) -> OpWorkload {
-    OpWorkload::Memory { bytes: 3 * n as u64 * elem_bytes as u64 }
+    OpWorkload::Memory {
+        bytes: 3 * n as u64 * elem_bytes as u64,
+    }
 }
 
 /// Dot product: read 2N elements, compute 2N FLOPs (mul + add).
@@ -151,7 +183,12 @@ pub fn softmax_workload(n: usize, elem_bytes: usize) -> OpWorkload {
 }
 
 /// Quantized GEMV: reads quantized weights + f32 input, compute-heavy decode+FMA.
-pub fn quant_gemv_workload(m: usize, n: usize, weight_bytes_per_row: usize, elem_bytes: usize) -> OpWorkload {
+pub fn quant_gemv_workload(
+    m: usize,
+    n: usize,
+    weight_bytes_per_row: usize,
+    elem_bytes: usize,
+) -> OpWorkload {
     OpWorkload::Mixed {
         flops: 2 * m as u64 * n as u64,
         bytes: m as u64 * weight_bytes_per_row as u64 + n as u64 * elem_bytes as u64,
@@ -182,7 +219,9 @@ fn detect_physical_cores() -> usize {
             .map(|n| n.get())
             .unwrap_or(1);
         // Heuristic: if > 1, assume HT and halve
-        if online > 1 { return online / 2; }
+        if online > 1 {
+            return online / 2;
+        }
         online
     }
     #[cfg(not(target_os = "linux"))]
@@ -235,7 +274,8 @@ fn detect_memory_bandwidth() -> f64 {
     {
         // Try to read from DMI or meminfo for a hint
         if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
-            let total_kb: u64 = content.lines()
+            let total_kb: u64 = content
+                .lines()
                 .find(|l| l.starts_with("MemTotal"))
                 .and_then(|l| l.split_whitespace().nth(1))
                 .and_then(|s| s.parse().ok())
@@ -257,7 +297,10 @@ mod tests {
     #[test]
     fn test_hw_peak_detect() {
         let peak = HwPeak::detect();
-        eprintln!("Detected peak: {:.1} GFLOPS, {:.1} GB/s", peak.gflops, peak.bandwidth_gbs);
+        eprintln!(
+            "Detected peak: {:.1} GFLOPS, {:.1} GB/s",
+            peak.gflops, peak.bandwidth_gbs
+        );
         assert!(peak.gflops > 0.0);
         assert!(peak.bandwidth_gbs > 0.0);
     }

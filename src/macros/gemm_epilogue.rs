@@ -9,7 +9,9 @@
 #[macro_export]
 macro_rules! apply_act {
     // No-op: pass through
-    ($isa:ident, $elem:ident, $v:expr, none) => { $v };
+    ($isa:ident, $elem:ident, $v:expr, none) => {
+        $v
+    };
 
     // ReLU: max(0, x)
     ($isa:ident, $elem:ident, $v:expr, relu) => {{
@@ -31,8 +33,14 @@ macro_rules! apply_act {
     ($isa:ident, $elem:ident, $v:expr, gelu) => {{
         let half = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(0.5));
         let one = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::ONE);
-        let vc = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(0.044715));
-        let vs = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(0.7978845608));
+        let vc =
+            $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(0.044715));
+        let vs = $crate::simd_primitive!(
+            $isa,
+            $elem,
+            splat,
+            <$elem as Element>::from_f32(0.7978845608)
+        );
         let two = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(2.0));
         // x^3
         let x2 = $crate::simd_primitive!($isa, $elem, mul, $v, $v);
@@ -124,7 +132,13 @@ macro_rules! apply_act_scalar_runtime {
     ($v:expr, $act:expr) => {
         match $act {
             $crate::Activation::None => $v,
-            $crate::Activation::Relu => if $v < 0.0 { 0.0 } else { $v },
+            $crate::Activation::Relu => {
+                if $v < 0.0 {
+                    0.0
+                } else {
+                    $v
+                }
+            }
             $crate::Activation::Silu => $v / (1.0 + (-$v).exp()),
             $crate::Activation::Gelu => {
                 let inner = 0.7978845608f32 * ($v + 0.044715f32 * $v * $v * $v);
@@ -141,8 +155,12 @@ macro_rules! apply_act_scalar_runtime {
 /// Apply activation to a scalar value. Used in remainder loops.
 #[macro_export]
 macro_rules! apply_act_scalar {
-    ($v:expr, $elem:ident, none) => { $v };
-    ($v:expr, $elem:ident, relu) => { <$elem as Element>::max($v, <$elem as Element>::ZERO) };
+    ($v:expr, $elem:ident, none) => {
+        $v
+    };
+    ($v:expr, $elem:ident, relu) => {
+        <$elem as Element>::max($v, <$elem as Element>::ZERO)
+    };
     ($v:expr, $elem:ident, silu) => {{
         let val_f = $v.to_f32();
         let sigmoid = 1.0f32 / (1.0f32 + (-val_f).exp());

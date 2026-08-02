@@ -74,13 +74,22 @@ impl QuantFormat {
             Self::Binary => 1,
             Self::Ternary => 2,
             Self::Kivi3Bit => 3,
-            Self::Int4PerTensor | Self::Int4PerChannel | Self::Int4BlockScale { .. }
-            | Self::Uint4PerTensor | Self::Uint4PerChannel
-            | Self::Kivi4Bit | Self::Fp4E2M1 => 4,
+            Self::Int4PerTensor
+            | Self::Int4PerChannel
+            | Self::Int4BlockScale { .. }
+            | Self::Uint4PerTensor
+            | Self::Uint4PerChannel
+            | Self::Kivi4Bit
+            | Self::Fp4E2M1 => 4,
             Self::Fp6E3M2 | Self::Fp6E2M3 => 6,
-            Self::Int8PerTensor | Self::Int8PerChannel | Self::Int8BlockScale { .. }
-            | Self::Uint8PerTensor | Self::Uint8PerChannel
-            | Self::Fp8E4M3 | Self::Fp8E5M2 | Self::Fp8E4M3Fn => 8,
+            Self::Int8PerTensor
+            | Self::Int8PerChannel
+            | Self::Int8BlockScale { .. }
+            | Self::Uint8PerTensor
+            | Self::Uint8PerChannel
+            | Self::Fp8E4M3
+            | Self::Fp8E5M2
+            | Self::Fp8E4M3Fn => 8,
             Self::Bf16 | Self::Fp16 => 16,
             Self::Tf32 | Self::Fp32 => 32,
             Self::Fp16Int8Mixed => 8,
@@ -91,12 +100,24 @@ impl QuantFormat {
 
     /// Is symmetric quantization (no zero-point).
     pub const fn is_symmetric(&self) -> bool {
-        matches!(self,
-            Self::Int4PerTensor | Self::Int4PerChannel | Self::Int4BlockScale { .. }
-            | Self::Int8PerTensor | Self::Int8PerChannel | Self::Int8BlockScale { .. }
-            | Self::Fp4E2M1 | Self::Fp6E3M2 | Self::Fp6E2M3
-            | Self::Fp8E4M3 | Self::Fp8E5M2 | Self::Fp8E4M3Fn
-            | Self::Kivi3Bit | Self::Kivi4Bit | Self::RaBitQ { .. })
+        matches!(
+            self,
+            Self::Int4PerTensor
+                | Self::Int4PerChannel
+                | Self::Int4BlockScale { .. }
+                | Self::Int8PerTensor
+                | Self::Int8PerChannel
+                | Self::Int8BlockScale { .. }
+                | Self::Fp4E2M1
+                | Self::Fp6E3M2
+                | Self::Fp6E2M3
+                | Self::Fp8E4M3
+                | Self::Fp8E5M2
+                | Self::Fp8E4M3Fn
+                | Self::Kivi3Bit
+                | Self::Kivi4Bit
+                | Self::RaBitQ { .. }
+        )
     }
 
     /// Requires scale parameter.
@@ -106,9 +127,13 @@ impl QuantFormat {
 
     /// Requires zero-point parameter.
     pub const fn requires_zero_point(&self) -> bool {
-        matches!(self,
-            Self::Uint4PerTensor | Self::Uint4PerChannel
-            | Self::Uint8PerTensor | Self::Uint8PerChannel)
+        matches!(
+            self,
+            Self::Uint4PerTensor
+                | Self::Uint4PerChannel
+                | Self::Uint8PerTensor
+                | Self::Uint8PerChannel
+        )
     }
 
     /// Map to existing QuantType (for compatibility).
@@ -127,13 +152,18 @@ impl QuantIR {
     /// Create new quantization IR.
     pub fn new(format: QuantFormat, input_shape: Vec<usize>) -> Self {
         let granularity = match &format {
-            QuantFormat::Int4PerTensor | QuantFormat::Int8PerTensor
-            | QuantFormat::Uint4PerTensor | QuantFormat::Uint8PerTensor => QuantGranularity::PerTensor,
-            QuantFormat::Int4PerChannel | QuantFormat::Int8PerChannel
-            | QuantFormat::Uint4PerChannel | QuantFormat::Uint8PerChannel => QuantGranularity::PerChannel,
-            QuantFormat::Int4BlockScale { block_size } | QuantFormat::Int8BlockScale { block_size } => {
-                QuantGranularity::BlockScale { block_size: *block_size }
-            }
+            QuantFormat::Int4PerTensor
+            | QuantFormat::Int8PerTensor
+            | QuantFormat::Uint4PerTensor
+            | QuantFormat::Uint8PerTensor => QuantGranularity::PerTensor,
+            QuantFormat::Int4PerChannel
+            | QuantFormat::Int8PerChannel
+            | QuantFormat::Uint4PerChannel
+            | QuantFormat::Uint8PerChannel => QuantGranularity::PerChannel,
+            QuantFormat::Int4BlockScale { block_size }
+            | QuantFormat::Int8BlockScale { block_size } => QuantGranularity::BlockScale {
+                block_size: *block_size,
+            },
             _ => QuantGranularity::PerTensor,
         };
 
@@ -152,7 +182,13 @@ impl QuantIR {
             None
         };
 
-        Self { format, input_shape, scale_shape, zero_point, granularity }
+        Self {
+            format,
+            input_shape,
+            scale_shape,
+            zero_point,
+            granularity,
+        }
     }
 
     /// Effective bit width.
@@ -222,7 +258,7 @@ mod tests {
     fn test_quant_ir_block_scale() {
         let ir = QuantIR::new(
             QuantFormat::Int4BlockScale { block_size: 32 },
-            vec![1024, 768]
+            vec![1024, 768],
         );
         let num_blocks = (1024 * 768) / 32;
         assert_eq!(ir.scale_shape, vec![num_blocks]);
@@ -270,7 +306,11 @@ mod tests {
             QuantFormat::Binary,
             QuantFormat::Ternary,
         ];
-        assert_eq!(formats.len(), 28, "Must support exactly 28 quantization formats");
+        assert_eq!(
+            formats.len(),
+            28,
+            "Must support exactly 28 quantization formats"
+        );
     }
 
     // ── Extended coverage ──
@@ -305,29 +345,52 @@ mod tests {
     #[test]
     fn test_all_fp_formats_do_not_require_zero_point() {
         for fmt in [
-            QuantFormat::Fp4E2M1, QuantFormat::Fp6E3M2, QuantFormat::Fp6E2M3,
-            QuantFormat::Fp8E4M3, QuantFormat::Fp8E5M2, QuantFormat::Fp8E4M3Fn,
+            QuantFormat::Fp4E2M1,
+            QuantFormat::Fp6E3M2,
+            QuantFormat::Fp6E2M3,
+            QuantFormat::Fp8E4M3,
+            QuantFormat::Fp8E5M2,
+            QuantFormat::Fp8E4M3Fn,
         ] {
-            assert!(!fmt.requires_zero_point(), "{:?} should not require zero_point", fmt);
+            assert!(
+                !fmt.requires_zero_point(),
+                "{:?} should not require zero_point",
+                fmt
+            );
         }
     }
 
     #[test]
     fn test_native_formats_no_scale_no_zp() {
-        for fmt in [QuantFormat::Fp32, QuantFormat::Fp16, QuantFormat::Bf16, QuantFormat::Tf32] {
+        for fmt in [
+            QuantFormat::Fp32,
+            QuantFormat::Fp16,
+            QuantFormat::Bf16,
+            QuantFormat::Tf32,
+        ] {
             assert!(!fmt.requires_scale(), "{:?} should not require scale", fmt);
-            assert!(!fmt.requires_zero_point(), "{:?} should not require zero_point", fmt);
+            assert!(
+                !fmt.requires_zero_point(),
+                "{:?} should not require zero_point",
+                fmt
+            );
         }
     }
 
     #[test]
     fn test_uint_formats_asymmetric() {
         for fmt in [
-            QuantFormat::Uint4PerTensor, QuantFormat::Uint4PerChannel,
-            QuantFormat::Uint8PerTensor, QuantFormat::Uint8PerChannel,
+            QuantFormat::Uint4PerTensor,
+            QuantFormat::Uint4PerChannel,
+            QuantFormat::Uint8PerTensor,
+            QuantFormat::Uint8PerChannel,
         ] {
             assert!(!fmt.is_symmetric(), "{:?} should be asymmetric", fmt);
-            assert!(fmt.requires_zero_point(), "{:?} should require zero_point", fmt);
+            assert!(
+                fmt.requires_zero_point(),
+                "{:?} should require zero_point",
+                fmt
+            );
         }
     }
 
@@ -339,10 +402,22 @@ mod tests {
 
     #[test]
     fn test_to_quant_type_mapping() {
-        assert_eq!(QuantFormat::Int4BlockScale { block_size: 32 }.to_quant_type(), Some(QuantType::Q4_0));
-        assert_eq!(QuantFormat::Int8BlockScale { block_size: 32 }.to_quant_type(), Some(QuantType::Q8_0));
-        assert_eq!(QuantFormat::Int4BlockScale { block_size: 256 }.to_quant_type(), Some(QuantType::Q4K));
-        assert_eq!(QuantFormat::Int8BlockScale { block_size: 256 }.to_quant_type(), Some(QuantType::Q8K));
+        assert_eq!(
+            QuantFormat::Int4BlockScale { block_size: 32 }.to_quant_type(),
+            Some(QuantType::Q4_0)
+        );
+        assert_eq!(
+            QuantFormat::Int8BlockScale { block_size: 32 }.to_quant_type(),
+            Some(QuantType::Q8_0)
+        );
+        assert_eq!(
+            QuantFormat::Int4BlockScale { block_size: 256 }.to_quant_type(),
+            Some(QuantType::Q4K)
+        );
+        assert_eq!(
+            QuantFormat::Int8BlockScale { block_size: 256 }.to_quant_type(),
+            Some(QuantType::Q8K)
+        );
     }
 
     #[test]
@@ -394,9 +469,21 @@ mod tests {
 
     #[test]
     fn test_quant_format_equality() {
-        assert_eq!(QuantFormat::Int4BlockScale { block_size: 32 }, QuantFormat::Int4BlockScale { block_size: 32 });
-        assert_ne!(QuantFormat::Int4BlockScale { block_size: 32 }, QuantFormat::Int4BlockScale { block_size: 64 });
-        assert_eq!(QuantFormat::RaBitQ { bits: 4 }, QuantFormat::RaBitQ { bits: 4 });
-        assert_ne!(QuantFormat::RaBitQ { bits: 2 }, QuantFormat::RaBitQ { bits: 4 });
+        assert_eq!(
+            QuantFormat::Int4BlockScale { block_size: 32 },
+            QuantFormat::Int4BlockScale { block_size: 32 }
+        );
+        assert_ne!(
+            QuantFormat::Int4BlockScale { block_size: 32 },
+            QuantFormat::Int4BlockScale { block_size: 64 }
+        );
+        assert_eq!(
+            QuantFormat::RaBitQ { bits: 4 },
+            QuantFormat::RaBitQ { bits: 4 }
+        );
+        assert_ne!(
+            QuantFormat::RaBitQ { bits: 2 },
+            QuantFormat::RaBitQ { bits: 4 }
+        );
     }
 }

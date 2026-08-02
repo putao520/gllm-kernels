@@ -44,9 +44,14 @@ use crate::compiler::graph::RopeScaling;
 /// `beta_fast` (high-rotation, fully extrapolated, unchanged). See
 /// [`yarn_find_correction_range`] for the cutoff math.
 pub fn compute_inv_freq(head_dim: usize, theta: f64, scaling: Option<RopeScaling>) -> Vec<f64> {
-    assert!(head_dim > 0 && head_dim % 2 == 0,
-        "compute_inv_freq: head_dim must be positive even, got {head_dim}");
-    assert!(theta > 0.0, "compute_inv_freq: theta must be positive, got {theta}");
+    assert!(
+        head_dim > 0 && head_dim % 2 == 0,
+        "compute_inv_freq: head_dim must be positive even, got {head_dim}"
+    );
+    assert!(
+        theta > 0.0,
+        "compute_inv_freq: theta must be positive, got {theta}"
+    );
 
     let half = head_dim / 2;
     // Standard base inv_freq (Llama / GPT-NeoX convention):
@@ -61,9 +66,20 @@ pub fn compute_inv_freq(head_dim: usize, theta: f64, scaling: Option<RopeScaling
             assert!(factor > 0.0, "Linear RoPE factor must be > 0, got {factor}");
             base.iter().map(|f| f / factor as f64).collect()
         }
-        Some(RopeScaling::Yarn { factor, beta_fast, beta_slow, original_max_position }) => {
-            yarn_inv_freq(&base, head_dim, theta, factor, beta_fast, beta_slow, original_max_position)
-        }
+        Some(RopeScaling::Yarn {
+            factor,
+            beta_fast,
+            beta_slow,
+            original_max_position,
+        }) => yarn_inv_freq(
+            &base,
+            head_dim,
+            theta,
+            factor,
+            beta_fast,
+            beta_slow,
+            original_max_position,
+        ),
     }
 }
 
@@ -104,7 +120,8 @@ fn yarn_find_correction_dim(
     original_max_position: usize,
 ) -> f64 {
     // dim * ln(L / (r * 2π)) / (2 * ln(theta))
-    (head_dim as f64 * (original_max_position as f64 / (num_rotations * 2.0 * std::f64::consts::PI)).ln())
+    (head_dim as f64
+        * (original_max_position as f64 / (num_rotations * 2.0 * std::f64::consts::PI)).ln())
         / (2.0 * theta.ln())
 }
 
@@ -118,8 +135,10 @@ pub(crate) fn yarn_find_correction_range(
     theta: f64,
     original_max_position: usize,
 ) -> (f64, f64) {
-    let low_raw = yarn_find_correction_dim(beta_fast as f64, head_dim, theta, original_max_position);
-    let high_raw = yarn_find_correction_dim(beta_slow as f64, head_dim, theta, original_max_position);
+    let low_raw =
+        yarn_find_correction_dim(beta_fast as f64, head_dim, theta, original_max_position);
+    let high_raw =
+        yarn_find_correction_dim(beta_slow as f64, head_dim, theta, original_max_position);
     let low = low_raw.floor().max(0.0);
     let high = high_raw.ceil().min(head_dim as f64 - 1.0);
     (low, high)
@@ -128,7 +147,11 @@ pub(crate) fn yarn_find_correction_range(
 /// Linear ramp mask `clamp((i - low) / (high - low), 0, 1)` over `[0, half)`.
 fn linear_ramp_mask(low: f64, high: f64, half: usize) -> Vec<f64> {
     // Avoid division by zero when low == high (tiny models / extreme cutoffs).
-    let span = if (high - low).abs() < 1e-3 { 1e-3 } else { high - low };
+    let span = if (high - low).abs() < 1e-3 {
+        1e-3
+    } else {
+        high - low
+    };
     (0..half)
         .map(|i| {
             let x = (i as f64 - low) / span;
@@ -160,16 +183,20 @@ fn yarn_inv_freq(
     original_max_position: usize,
 ) -> Vec<f64> {
     assert!(factor > 0.0, "Yarn factor must be > 0, got {factor}");
-    assert!(beta_fast > beta_slow,
-        "Yarn beta_fast ({beta_fast}) must be > beta_slow ({beta_slow})");
-    assert!(original_max_position > 0,
-        "Yarn original_max_position must be > 0");
+    assert!(
+        beta_fast > beta_slow,
+        "Yarn beta_fast ({beta_fast}) must be > beta_slow ({beta_slow})"
+    );
+    assert!(
+        original_max_position > 0,
+        "Yarn original_max_position must be > 0"
+    );
 
     let half = base.len();
     debug_assert_eq!(half, head_dim / 2);
 
-    let (low, high) = yarn_find_correction_range(
-        beta_fast, beta_slow, head_dim, theta, original_max_position);
+    let (low, high) =
+        yarn_find_correction_range(beta_fast, beta_slow, head_dim, theta, original_max_position);
     let ramp = linear_ramp_mask(low, high, half);
 
     base.iter()
@@ -222,8 +249,10 @@ pub fn fill_cos_sin_table_partial(
     partial: f32,
     scaling: Option<RopeScaling>,
 ) {
-    assert!(partial > 0.0 && partial <= 1.0,
-        "fill_cos_sin_table_partial: partial must be in (0,1], got {partial}");
+    assert!(
+        partial > 0.0 && partial <= 1.0,
+        "fill_cos_sin_table_partial: partial must be in (0,1], got {partial}"
+    );
     let half = head_dim / 2;
     let rot_dim = ((head_dim as f32 * partial) as usize).max(2) & !1;
     let half_rot = rot_dim / 2;
@@ -231,8 +260,11 @@ pub fn fill_cos_sin_table_partial(
     let mscale = compute_attention_scaling(scaling) as f64;
     assert_eq!(inv_freq.len(), half_rot);
     let needed = positions.len() * head_dim;
-    assert!(out.len() >= needed,
-        "fill_cos_sin_table_partial: out len {} < required {needed}", out.len());
+    assert!(
+        out.len() >= needed,
+        "fill_cos_sin_table_partial: out len {} < required {needed}",
+        out.len()
+    );
 
     for (row_idx, &pos) in positions.iter().enumerate() {
         let row = &mut out[row_idx * head_dim..(row_idx + 1) * head_dim];
@@ -265,7 +297,11 @@ mod tests {
         assert!((inv[16] - 0.01).abs() < 1e-12, "inv[16]={}", inv[16]);
         // inv_freq[31] = 1/theta^(62/64)
         let expected = 1.0 / 10000.0_f64.powf(62.0 / 64.0);
-        assert!((inv[31] - expected).abs() < 1e-12, "inv[31]={}, expected {expected}", inv[31]);
+        assert!(
+            (inv[31] - expected).abs() < 1e-12,
+            "inv[31]={}, expected {expected}",
+            inv[31]
+        );
     }
 
     /// Standard RoPE attention_scaling = 1.0.
@@ -286,14 +322,17 @@ mod tests {
             assert!((s - b / factor as f64).abs() < 1e-12);
         }
         // No temperature on Linear
-        assert_eq!(compute_attention_scaling(Some(RopeScaling::Linear { factor })), 1.0);
+        assert_eq!(
+            compute_attention_scaling(Some(RopeScaling::Linear { factor })),
+            1.0
+        );
     }
 
     /// YaRN attention_scaling formula: sqrt(0.1*ln(factor) + 1).
     #[test]
     fn yarn_attention_scaling_formula() {
         let cases = [
-            (1.0_f32, 1.0_f64),                         // ln(1) = 0 ⇒ mscale = 1
+            (1.0_f32, 1.0_f64), // ln(1) = 0 ⇒ mscale = 1
             (4.0_f32, (0.1 * 4.0_f64.ln() + 1.0).sqrt()),
             (32.0_f32, (0.1 * 32.0_f64.ln() + 1.0).sqrt()),
         ];
@@ -305,8 +344,10 @@ mod tests {
                 original_max_position: 4096,
             };
             let got = compute_attention_scaling(Some(yarn)) as f64;
-            assert!((got - expected).abs() < 1e-6,
-                "factor={factor}: got {got}, expected {expected}");
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "factor={factor}: got {got}, expected {expected}"
+            );
         }
     }
 
@@ -319,29 +360,43 @@ mod tests {
         let factor = 32.0;
         let original_max = 4096;
         let base = compute_inv_freq(head_dim, theta, None);
-        let yarn = compute_inv_freq(head_dim, theta, Some(RopeScaling::Yarn {
-            factor, beta_fast: 32.0, beta_slow: 1.0,
-            original_max_position: original_max,
-        }));
+        let yarn = compute_inv_freq(
+            head_dim,
+            theta,
+            Some(RopeScaling::Yarn {
+                factor,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+                original_max_position: original_max,
+            }),
+        );
 
         // Find low cutoff: dims with i < low must equal base (extrapolation weight = 1)
-        let (low, _high) = yarn_find_correction_range(
-            32.0, 1.0, head_dim, theta, original_max);
+        let (low, _high) = yarn_find_correction_range(32.0, 1.0, head_dim, theta, original_max);
         let low_int = low as usize;
         for i in 0..low_int {
-            assert!((yarn[i] - base[i]).abs() < 1e-12,
-                "yarn[{i}] should be extrapolation: {} vs base {}", yarn[i], base[i]);
+            assert!(
+                (yarn[i] - base[i]).abs() < 1e-12,
+                "yarn[{i}] should be extrapolation: {} vs base {}",
+                yarn[i],
+                base[i]
+            );
         }
         // Middle / high-i dims must be ≤ base[i] (interpolated, divided by factor)
         let interpolation = base[half_minus_one(head_dim)] / factor as f64;
         // last dim (i = half-1) is well past `high` → fully interpolated
         let last = base.len() - 1;
-        assert!((yarn[last] - interpolation).abs() < 1e-12,
+        assert!(
+            (yarn[last] - interpolation).abs() < 1e-12,
             "yarn[last] should be interpolation: {} vs {} = base/factor",
-            yarn[last], interpolation);
+            yarn[last],
+            interpolation
+        );
     }
 
-    fn half_minus_one(head_dim: usize) -> usize { head_dim / 2 - 1 }
+    fn half_minus_one(head_dim: usize) -> usize {
+        head_dim / 2 - 1
+    }
 
     /// YaRN high-i dims (low-rotation) collapse to interpolation `= base / factor`.
     #[test]
@@ -351,19 +406,27 @@ mod tests {
         let factor = 8.0;
         let original_max = 4096;
         let base = compute_inv_freq(head_dim, theta, None);
-        let yarn = compute_inv_freq(head_dim, theta, Some(RopeScaling::Yarn {
-            factor, beta_fast: 32.0, beta_slow: 1.0,
-            original_max_position: original_max,
-        }));
+        let yarn = compute_inv_freq(
+            head_dim,
+            theta,
+            Some(RopeScaling::Yarn {
+                factor,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+                original_max_position: original_max,
+            }),
+        );
 
-        let (_low, high) = yarn_find_correction_range(
-            32.0, 1.0, head_dim, theta, original_max);
+        let (_low, high) = yarn_find_correction_range(32.0, 1.0, head_dim, theta, original_max);
         let high_int = high.ceil() as usize;
         for i in (high_int + 1)..base.len() {
             let interp = base[i] / factor as f64;
-            assert!((yarn[i] - interp).abs() < 1e-12,
+            assert!(
+                (yarn[i] - interp).abs() < 1e-12,
                 "yarn[{i}] should be pure interpolation: {} vs {}",
-                yarn[i], interp);
+                yarn[i],
+                interp
+            );
         }
     }
 
@@ -385,10 +448,14 @@ mod tests {
                 let want_sin = angle.sin() as f32;
                 let got_cos = out[row_idx * head_dim + i];
                 let got_sin = out[row_idx * head_dim + half + i];
-                assert!((got_cos - want_cos).abs() < 1e-6,
-                    "row {row_idx} i {i}: cos {got_cos} vs {want_cos}");
-                assert!((got_sin - want_sin).abs() < 1e-6,
-                    "row {row_idx} i {i}: sin {got_sin} vs {want_sin}");
+                assert!(
+                    (got_cos - want_cos).abs() < 1e-6,
+                    "row {row_idx} i {i}: cos {got_cos} vs {want_cos}"
+                );
+                assert!(
+                    (got_sin - want_sin).abs() < 1e-6,
+                    "row {row_idx} i {i}: sin {got_sin} vs {want_sin}"
+                );
             }
         }
     }
@@ -421,10 +488,14 @@ mod tests {
                 let want_sin = (angle.sin() * mscale) as f32;
                 let got_cos = out[row_idx * head_dim + i];
                 let got_sin = out[row_idx * head_dim + half + i];
-                assert!((got_cos - want_cos).abs() < 1e-6,
-                    "yarn row {row_idx} i {i}: cos {got_cos} vs {want_cos}");
-                assert!((got_sin - want_sin).abs() < 1e-6,
-                    "yarn row {row_idx} i {i}: sin {got_sin} vs {want_sin}");
+                assert!(
+                    (got_cos - want_cos).abs() < 1e-6,
+                    "yarn row {row_idx} i {i}: cos {got_cos} vs {want_cos}"
+                );
+                assert!(
+                    (got_sin - want_sin).abs() < 1e-6,
+                    "yarn row {row_idx} i {i}: sin {got_sin} vs {want_sin}"
+                );
             }
         }
     }
@@ -464,15 +535,18 @@ mod tests {
         let base = compute_inv_freq(head_dim, theta, None);
 
         // Find correction range and verify low-i dims are extrapolation.
-        let (low, high) = yarn_find_correction_range(
-            32.0, 1.0, head_dim, theta, 4096);
+        let (low, high) = yarn_find_correction_range(32.0, 1.0, head_dim, theta, 4096);
 
         // low should be a small positive integer (~0–4 range for these params).
         // high should be < head_dim/2 - 1 (some interpolation happens).
-        assert!(low >= 0.0 && low < high,
-            "low={low} high={high} out of order");
-        assert!(high <= (head_dim / 2 - 1) as f64,
-            "high={high} exceeds half-1");
+        assert!(
+            low >= 0.0 && low < high,
+            "low={low} high={high} out of order"
+        );
+        assert!(
+            high <= (head_dim / 2 - 1) as f64,
+            "high={high} exceeds half-1"
+        );
 
         // Property: ramp at i=low is 0 (pure extrapolation) and at i=high is 1
         // (pure interpolation). Pick the floor/ceil indices.
@@ -485,8 +559,13 @@ mod tests {
         // i > high → must equal base / factor
         if high_idx + 1 < inv.len() {
             let interp = base[high_idx + 1] / 32.0_f64;
-            assert!((inv[high_idx + 1] - interp).abs() < 1e-12,
-                "i={} expected interp {} got {}", high_idx + 1, interp, inv[high_idx + 1]);
+            assert!(
+                (inv[high_idx + 1] - interp).abs() < 1e-12,
+                "i={} expected interp {} got {}",
+                high_idx + 1,
+                interp,
+                inv[high_idx + 1]
+            );
         }
 
         // mscale = sqrt(0.1*ln(32) + 1.0) ≈ 1.16299
@@ -510,29 +589,39 @@ mod tests {
         let inv = compute_inv_freq(head_dim, theta, Some(yarn));
         let base = compute_inv_freq(head_dim, theta, None);
 
-        let (low, high) = yarn_find_correction_range(
-            32.0, 1.0, head_dim, theta, 8192);
+        let (low, high) = yarn_find_correction_range(32.0, 1.0, head_dim, theta, 8192);
         assert!(low < high, "low {low} >= high {high}");
 
         // Pure extrapolation tail
         let low_idx = low as usize;
         for i in 0..low_idx {
-            assert!((inv[i] - base[i]).abs() < 1e-12,
-                "i={i}: extrapolation broke ({} vs {})", inv[i], base[i]);
+            assert!(
+                (inv[i] - base[i]).abs() < 1e-12,
+                "i={i}: extrapolation broke ({} vs {})",
+                inv[i],
+                base[i]
+            );
         }
         // Pure interpolation tail
         let high_idx = high.ceil() as usize;
         for i in (high_idx + 1)..inv.len() {
             let want = base[i] / 4.0;
-            assert!((inv[i] - want).abs() < 1e-12,
-                "i={i}: interpolation broke ({} vs {})", inv[i], want);
+            assert!(
+                (inv[i] - want).abs() < 1e-12,
+                "i={i}: interpolation broke ({} vs {})",
+                inv[i],
+                want
+            );
         }
 
         // Monotonicity: yarn_inv_freq is monotonically non-increasing.
         for i in 1..inv.len() {
-            assert!(inv[i] <= inv[i - 1] + 1e-12,
+            assert!(
+                inv[i] <= inv[i - 1] + 1e-12,
                 "yarn inv_freq must be non-increasing at i={i}: {} > {}",
-                inv[i], inv[i - 1]);
+                inv[i],
+                inv[i - 1]
+            );
         }
     }
 
@@ -561,8 +650,13 @@ mod tests {
         for i in 0..inv.len() {
             let lo = base[i] / 8.0;
             let hi = base[i];
-            assert!(inv[i] >= lo - 1e-12 && inv[i] <= hi + 1e-12,
-                "i={i}: yarn {} not in [{}, {}]", inv[i], lo, hi);
+            assert!(
+                inv[i] >= lo - 1e-12 && inv[i] <= hi + 1e-12,
+                "i={i}: yarn {} not in [{}, {}]",
+                inv[i],
+                lo,
+                hi
+            );
         }
     }
 
@@ -572,17 +666,19 @@ mod tests {
     fn yarn_correction_range_shifts_with_original_max() {
         let head_dim = 128;
         let theta = 10000.0;
-        let (low_4k, high_4k) = yarn_find_correction_range(
-            32.0, 1.0, head_dim, theta, 4096);
-        let (low_8k, high_8k) = yarn_find_correction_range(
-            32.0, 1.0, head_dim, theta, 8192);
+        let (low_4k, high_4k) = yarn_find_correction_range(32.0, 1.0, head_dim, theta, 4096);
+        let (low_8k, high_8k) = yarn_find_correction_range(32.0, 1.0, head_dim, theta, 8192);
         // Larger original_max → both cutoffs shift toward higher dim indices
         // (the model already covered more positions natively, so fewer dims
         // need extrapolation).
-        assert!(low_8k >= low_4k,
-            "low cutoff should shift up with larger orig_max: {low_4k} → {low_8k}");
-        assert!(high_8k >= high_4k,
-            "high cutoff should shift up with larger orig_max: {high_4k} → {high_8k}");
+        assert!(
+            low_8k >= low_4k,
+            "low cutoff should shift up with larger orig_max: {low_4k} → {low_8k}"
+        );
+        assert!(
+            high_8k >= high_4k,
+            "high cutoff should shift up with larger orig_max: {high_4k} → {high_8k}"
+        );
     }
 
     /// Fingerprint round-trip: same params ⇒ same fingerprint, different
@@ -590,15 +686,21 @@ mod tests {
     #[test]
     fn fingerprint_collision_resistance() {
         let a = RopeScaling::Yarn {
-            factor: 32.0, beta_fast: 32.0, beta_slow: 1.0,
+            factor: 32.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
             original_max_position: 4096,
         };
         let b = RopeScaling::Yarn {
-            factor: 32.0, beta_fast: 32.0, beta_slow: 1.0,
+            factor: 32.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
             original_max_position: 4096,
         };
         let c = RopeScaling::Yarn {
-            factor: 16.0, beta_fast: 32.0, beta_slow: 1.0,
+            factor: 16.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
             original_max_position: 4096,
         };
         let d = RopeScaling::Linear { factor: 32.0 };
@@ -615,23 +717,25 @@ mod tests {
         let partial = 0.5; // rot_dim = 32, half_rot = 16
         let positions = [0u32, 10, 100];
         let mut out = vec![0.0f32; positions.len() * head_dim];
-        fill_cos_sin_table_partial(
-            &mut out, &positions, head_dim, theta, partial, None,
-        );
+        fill_cos_sin_table_partial(&mut out, &positions, head_dim, theta, partial, None);
         let half = head_dim / 2; // 32
         let half_rot = 16;
         for (row_idx, _) in positions.iter().enumerate() {
             // cos region: [half_rot..half) must be zero
             for i in half_rot..half {
                 let got_cos = out[row_idx * head_dim + i];
-                assert_eq!(got_cos, 0.0f32,
-                    "row {row_idx} cos[{i}] should be 0, got {got_cos}");
+                assert_eq!(
+                    got_cos, 0.0f32,
+                    "row {row_idx} cos[{i}] should be 0, got {got_cos}"
+                );
             }
             // sin region: [half + half_rot..head_dim) must be zero
             for i in half_rot..half {
                 let got_sin = out[row_idx * head_dim + half + i];
-                assert_eq!(got_sin, 0.0f32,
-                    "row {row_idx} sin[{i}] should be 0, got {got_sin}");
+                assert_eq!(
+                    got_sin, 0.0f32,
+                    "row {row_idx} sin[{i}] should be 0, got {got_sin}"
+                );
             }
         }
     }
@@ -645,12 +749,12 @@ mod tests {
         let mut out_full = vec![0.0f32; positions.len() * head_dim];
         let mut out_partial = vec![0.0f32; positions.len() * head_dim];
         fill_cos_sin_table(&mut out_full, &positions, head_dim, theta, None);
-        fill_cos_sin_table_partial(
-            &mut out_partial, &positions, head_dim, theta, 1.0, None,
-        );
+        fill_cos_sin_table_partial(&mut out_partial, &positions, head_dim, theta, 1.0, None);
         for (i, (a, b)) in out_full.iter().zip(out_partial.iter()).enumerate() {
-            assert!((a - b).abs() < 1e-6,
-                "full vs partial(p=1.0) mismatch at index {i}: {a} vs {b}");
+            assert!(
+                (a - b).abs() < 1e-6,
+                "full vs partial(p=1.0) mismatch at index {i}: {a} vs {b}"
+            );
         }
     }
 
@@ -676,10 +780,14 @@ mod tests {
                 let want_sin = angle.sin() as f32;
                 let got_cos = out[row_idx * head_dim + i];
                 let got_sin = out[row_idx * head_dim + half + i];
-                assert!((got_cos - want_cos).abs() < 1e-6,
-                    "linear row {row_idx} i {i}: cos {got_cos} vs {want_cos}");
-                assert!((got_sin - want_sin).abs() < 1e-6,
-                    "linear row {row_idx} i {i}: sin {got_sin} vs {want_sin}");
+                assert!(
+                    (got_cos - want_cos).abs() < 1e-6,
+                    "linear row {row_idx} i {i}: cos {got_cos} vs {want_cos}"
+                );
+                assert!(
+                    (got_sin - want_sin).abs() < 1e-6,
+                    "linear row {row_idx} i {i}: sin {got_sin} vs {want_sin}"
+                );
             }
         }
     }
@@ -689,7 +797,11 @@ mod tests {
     fn compute_inv_freq_head_dim_2() {
         let inv = compute_inv_freq(2, 10000.0, None);
         assert_eq!(inv.len(), 1);
-        assert!((inv[0] - 1.0).abs() < 1e-12, "inv[0] should be 1.0, got {}", inv[0]);
+        assert!(
+            (inv[0] - 1.0).abs() < 1e-12,
+            "inv[0] should be 1.0, got {}",
+            inv[0]
+        );
     }
 
     /// fill_cos_sin_table with head_dim=2 produces valid cos/sin.
@@ -719,8 +831,7 @@ mod tests {
         let mask = linear_ramp_mask(5.0, 5.0, 10);
         // All values must be in [0, 1] — span protection prevents div-by-zero.
         for (i, &v) in mask.iter().enumerate() {
-            assert!(v >= 0.0 && v <= 1.0,
-                "ramp[{i}] = {v} out of [0,1]");
+            assert!(v >= 0.0 && v <= 1.0, "ramp[{i}] = {v} out of [0,1]");
         }
     }
 
@@ -742,27 +853,40 @@ mod tests {
     #[test]
     fn rope_scaling_debug_and_clone() {
         let yarn = RopeScaling::Yarn {
-            factor: 4.0, beta_fast: 32.0, beta_slow: 1.0,
+            factor: 4.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
             original_max_position: 8192,
         };
         let cloned = yarn.clone();
         assert_eq!(yarn, cloned);
         let debug_str = format!("{yarn:?}");
-        assert!(debug_str.contains("Yarn"), "Debug should contain Yarn: {debug_str}");
-        assert!(debug_str.contains("4"), "Debug should contain factor: {debug_str}");
+        assert!(
+            debug_str.contains("Yarn"),
+            "Debug should contain Yarn: {debug_str}"
+        );
+        assert!(
+            debug_str.contains("4"),
+            "Debug should contain factor: {debug_str}"
+        );
 
         let linear = RopeScaling::Linear { factor: 8.0 };
         let linear_cloned = linear.clone();
         assert_eq!(linear, linear_cloned);
         let lin_debug = format!("{linear:?}");
-        assert!(lin_debug.contains("Linear"), "Debug should contain Linear: {lin_debug}");
+        assert!(
+            lin_debug.contains("Linear"),
+            "Debug should contain Linear: {lin_debug}"
+        );
     }
 
     /// RopeScaling PartialEq: different variants are not equal.
     #[test]
     fn rope_scaling_partial_eq_cross_variant() {
         let yarn = RopeScaling::Yarn {
-            factor: 8.0, beta_fast: 32.0, beta_slow: 1.0,
+            factor: 8.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
             original_max_position: 4096,
         };
         let linear = RopeScaling::Linear { factor: 8.0 };
@@ -775,22 +899,35 @@ mod tests {
         let head_dim = 64;
         let theta = 10000.0;
         let base = compute_inv_freq(head_dim, theta, None);
-        let yarn = compute_inv_freq(head_dim, theta, Some(RopeScaling::Yarn {
-            factor: 1.0, beta_fast: 32.0, beta_slow: 1.0,
-            original_max_position: 4096,
-        }));
+        let yarn = compute_inv_freq(
+            head_dim,
+            theta,
+            Some(RopeScaling::Yarn {
+                factor: 1.0,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+                original_max_position: 4096,
+            }),
+        );
         // factor=1.0 → interpolation = base/1 = base, so the blend is
         // (1-r)*base + r*base = base for all dims.
         for (i, (b, y)) in base.iter().zip(yarn.iter()).enumerate() {
-            assert!((y - b).abs() < 1e-12,
-                "factor=1.0 mismatch at i={i}: base={b}, yarn={y}");
+            assert!(
+                (y - b).abs() < 1e-12,
+                "factor=1.0 mismatch at i={i}: base={b}, yarn={y}"
+            );
         }
         // mscale for factor=1.0: sqrt(0.1*ln(1) + 1) = sqrt(1) = 1.0
         let mscale = compute_attention_scaling(Some(RopeScaling::Yarn {
-            factor: 1.0, beta_fast: 32.0, beta_slow: 1.0,
+            factor: 1.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
             original_max_position: 4096,
         }));
-        assert!((mscale - 1.0).abs() < 1e-6, "mscale for factor=1 should be 1.0, got {mscale}");
+        assert!(
+            (mscale - 1.0).abs() < 1e-6,
+            "mscale for factor=1 should be 1.0, got {mscale}"
+        );
     }
 
     /// Standard inv_freq is monotonically decreasing: higher dim indices
@@ -801,9 +938,12 @@ mod tests {
         let theta = 10000.0;
         let inv = compute_inv_freq(head_dim, theta, None);
         for i in 1..inv.len() {
-            assert!(inv[i] < inv[i - 1],
+            assert!(
+                inv[i] < inv[i - 1],
                 "inv_freq must be strictly decreasing at i={i}: {} >= {}",
-                inv[i], inv[i - 1]);
+                inv[i],
+                inv[i - 1]
+            );
         }
     }
 
@@ -815,9 +955,12 @@ mod tests {
         let factor = 2.5_f32;
         let inv = compute_inv_freq(head_dim, theta, Some(RopeScaling::Linear { factor }));
         for i in 1..inv.len() {
-            assert!(inv[i] < inv[i - 1],
+            assert!(
+                inv[i] < inv[i - 1],
                 "linear inv_freq must be strictly decreasing at i={i}: {} >= {}",
-                inv[i], inv[i - 1]);
+                inv[i],
+                inv[i - 1]
+            );
         }
     }
 
@@ -830,9 +973,12 @@ mod tests {
         let inv_f2 = compute_inv_freq(head_dim, theta, Some(RopeScaling::Linear { factor: 2.0 }));
         let inv_f8 = compute_inv_freq(head_dim, theta, Some(RopeScaling::Linear { factor: 8.0 }));
         for (v2, v8) in inv_f2.iter().zip(inv_f8.iter()) {
-            assert!(v8 < v2,
+            assert!(
+                v8 < v2,
                 "factor=8 inv_freq ({}) must be < factor=2 ({})",
-                v8, v2);
+                v8,
+                v2
+            );
         }
     }
 
@@ -841,7 +987,9 @@ mod tests {
     #[test]
     fn yarn_attention_scaling_increases_with_factor() {
         let make_yarn = |f: f32| RopeScaling::Yarn {
-            factor: f, beta_fast: 32.0, beta_slow: 1.0,
+            factor: f,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
             original_max_position: 4096,
         };
         let s2 = compute_attention_scaling(Some(make_yarn(2.0)));
@@ -865,10 +1013,14 @@ mod tests {
         for i in 0..half {
             let cos_val = out[i];
             let sin_val = out[half + i];
-            assert!((cos_val - 1.0f32).abs() < 1e-6,
-                "cos[{i}] at pos=0 should be 1.0, got {cos_val}");
-            assert!(sin_val.abs() < 1e-6,
-                "sin[{i}] at pos=0 should be 0.0, got {sin_val}");
+            assert!(
+                (cos_val - 1.0f32).abs() < 1e-6,
+                "cos[{i}] at pos=0 should be 1.0, got {cos_val}"
+            );
+            assert!(
+                sin_val.abs() < 1e-6,
+                "sin[{i}] at pos=0 should be 0.0, got {sin_val}"
+            );
         }
     }
 
@@ -880,15 +1032,23 @@ mod tests {
         let theta = 10000.0;
         let factor = 16.0_f32;
         let base = compute_inv_freq(head_dim, theta, None);
-        let yarn_inv = compute_inv_freq(head_dim, theta, Some(RopeScaling::Yarn {
-            factor, beta_fast: 32.0, beta_slow: 1.0,
-            original_max_position: 4096,
-        }));
+        let yarn_inv = compute_inv_freq(
+            head_dim,
+            theta,
+            Some(RopeScaling::Yarn {
+                factor,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+                original_max_position: 4096,
+            }),
+        );
         // For every dim: base/factor <= yarn_inv <= base
         for (i, (&y, &b)) in yarn_inv.iter().zip(base.iter()).enumerate() {
             let lo = b / factor as f64;
-            assert!(y >= lo - 1e-12 && y <= b + 1e-12,
-                "yarn[{i}]={y} not in [{lo}, {b}]");
+            assert!(
+                y >= lo - 1e-12 && y <= b + 1e-12,
+                "yarn[{i}]={y} not in [{lo}, {b}]"
+            );
         }
     }
 
@@ -900,11 +1060,16 @@ mod tests {
         let head_dim = 64;
         let theta = 10000.0;
         let yarn = RopeScaling::Yarn {
-            factor: 8.0, beta_fast: 32.0, beta_slow: 1.0,
+            factor: 8.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
             original_max_position: 4096,
         };
         let mscale = compute_attention_scaling(Some(yarn));
-        assert!(mscale > 1.0, "mscale for factor=8 should be > 1.0, got {mscale}");
+        assert!(
+            mscale > 1.0,
+            "mscale for factor=8 should be > 1.0, got {mscale}"
+        );
         let positions = [0u32];
         let mut out = vec![0.0f32; head_dim];
         fill_cos_sin_table(&mut out, &positions, head_dim, theta, Some(yarn));
@@ -912,10 +1077,14 @@ mod tests {
         for i in 0..half {
             let cos_val = out[i];
             let sin_val = out[half + i];
-            assert!((cos_val - mscale).abs() < 1e-5,
-                "yarn cos[{i}] at pos=0 should be mscale={mscale}, got {cos_val}");
-            assert!(sin_val.abs() < 1e-5,
-                "yarn sin[{i}] at pos=0 should be 0, got {sin_val}");
+            assert!(
+                (cos_val - mscale).abs() < 1e-5,
+                "yarn cos[{i}] at pos=0 should be mscale={mscale}, got {cos_val}"
+            );
+            assert!(
+                sin_val.abs() < 1e-5,
+                "yarn sin[{i}] at pos=0 should be 0, got {sin_val}"
+            );
         }
     }
 
@@ -933,8 +1102,8 @@ mod tests {
             (128.0, 1.0, 2048),
         ];
         for (beta_fast, beta_slow, orig_max) in cases {
-            let (low, high) = yarn_find_correction_range(
-                beta_fast, beta_slow, head_dim, theta, orig_max);
+            let (low, high) =
+                yarn_find_correction_range(beta_fast, beta_slow, head_dim, theta, orig_max);
             assert!(low <= high,
                 "low ({low}) > high ({high}) for beta_fast={beta_fast}, beta_slow={beta_slow}, orig_max={orig_max}");
         }
@@ -948,16 +1117,19 @@ mod tests {
         let theta = 10000.0;
         let partial = 0.5;
         let yarn = RopeScaling::Yarn {
-            factor: 4.0, beta_fast: 32.0, beta_slow: 1.0,
+            factor: 4.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
             original_max_position: 4096,
         };
         let mscale = compute_attention_scaling(Some(yarn));
-        assert!(mscale > 1.0, "mscale for factor=4 should be > 1.0, got {mscale}");
+        assert!(
+            mscale > 1.0,
+            "mscale for factor=4 should be > 1.0, got {mscale}"
+        );
         let positions = [10u32, 50];
         let mut out = vec![0.0f32; positions.len() * head_dim];
-        fill_cos_sin_table_partial(
-            &mut out, &positions, head_dim, theta, partial, Some(yarn),
-        );
+        fill_cos_sin_table_partial(&mut out, &positions, head_dim, theta, partial, Some(yarn));
         let half = head_dim / 2;
         let half_rot = 16; // head_dim * 0.5 / 2 = 16
         for (row_idx, &pos) in positions.iter().enumerate() {
@@ -966,17 +1138,27 @@ mod tests {
             // and bounded by mscale.
             for i in 0..half_rot {
                 let cos_val = out[row_idx * head_dim + i].abs();
-                assert!(cos_val > 0.0,
-                    "rotated cos[{i}] at pos={pos} should be non-zero");
-                assert!(cos_val <= mscale + 1e-5,
-                    "rotated cos[{i}] at pos={pos}: |{cos_val}| > mscale {mscale}");
+                assert!(
+                    cos_val > 0.0,
+                    "rotated cos[{i}] at pos={pos} should be non-zero"
+                );
+                assert!(
+                    cos_val <= mscale + 1e-5,
+                    "rotated cos[{i}] at pos={pos}: |{cos_val}| > mscale {mscale}"
+                );
             }
             // Non-rotated dims must be exactly zero
             for i in half_rot..half {
-                assert_eq!(out[row_idx * head_dim + i], 0.0f32,
-                    "non-rotated cos row {row_idx}[{i}] should be 0");
-                assert_eq!(out[row_idx * head_dim + half + i], 0.0f32,
-                    "non-rotated sin row {row_idx}[{i}] should be 0");
+                assert_eq!(
+                    out[row_idx * head_dim + i],
+                    0.0f32,
+                    "non-rotated cos row {row_idx}[{i}] should be 0"
+                );
+                assert_eq!(
+                    out[row_idx * head_dim + half + i],
+                    0.0f32,
+                    "non-rotated sin row {row_idx}[{i}] should be 0"
+                );
             }
         }
     }

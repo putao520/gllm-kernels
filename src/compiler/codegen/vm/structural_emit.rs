@@ -2,7 +2,7 @@
 
 use super::instr::*;
 use super::plan_lower::SymDimSlotMap;
-use crate::compiler::trace::{QuantPrecision, TraceOp, ReduceKind, ValueId};
+use crate::compiler::trace::{QuantPrecision, ReduceKind, TraceOp, ValueId};
 use crate::types::CompilerError;
 
 pub(crate) fn emit_gather_inline(
@@ -22,7 +22,9 @@ pub(crate) fn emit_gather_inline(
     use crate::compiler::graph::GatherIndicesKind;
 
     if embed_dim == 0 {
-        return Err(CompilerError::CodegenViolation("emit_gather_inline: embed_dim is 0".into()));
+        return Err(CompilerError::CodegenViolation(
+            "emit_gather_inline: embed_dim is 0".into(),
+        ));
     }
 
     let lanes = width.f32_lanes().max(1);
@@ -42,18 +44,23 @@ pub(crate) fn emit_gather_inline(
     // dim_vecs 次迭代覆盖整行 (embed_dim*weight_elem bytes)。
     let load_vec_step = lanes * weight_elem;
     let dim_vecs = embed_dim / lanes;
-    let index_elem = 4usize;  // I32 indices (token_ids are u32)
+    let index_elem = 4usize; // I32 indices (token_ids are u32)
 
     prog.emit(VmInstr::Comment(match indices_kind {
         GatherIndicesKind::Tensor => "Gather: indexed embedding lookup (auto_select)".into(),
         GatherIndicesKind::Arange => "Gather: sequential position lookup (auto_select)".into(),
-        GatherIndicesKind::Zeros  => "Gather: broadcast first row (auto_select)".into(),
+        GatherIndicesKind::Zeros => "Gather: broadcast first row (auto_select)".into(),
     }));
 
     // §13.10 L2 norm accumulator
     let norm_sq_acc = if telemetry_ptr.is_some() && dim_vecs > 0 {
         let acc = prog.alloc_vreg(VRegKind::Vec, width);
-        prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::Const(0.0), width, dtype: compute_dtype, });
+        prog.emit(VmInstr::Broadcast {
+            dst: acc,
+            src: ScalarExpr::Const(0.0),
+            width,
+            dtype: compute_dtype,
+        });
         Some(acc)
     } else {
         None
@@ -61,17 +68,24 @@ pub(crate) fn emit_gather_inline(
 
     // TraceOp body for optional embedding scale: Input(0) * scale
     let scale_body: Vec<TraceOp> = if let Some(s) = embedding_scale {
-        vec![TraceOp::Const(s as f64), TraceOp::Input(0), TraceOp::Mul(ValueId(0), ValueId(1))]
+        vec![
+            TraceOp::Const(s as f64),
+            TraceOp::Input(0),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ]
     } else {
         vec![TraceOp::Input(0)] // identity pass-through
     };
 
     // TraceOp body for L2 norm telemetry: HReduce(Sum, x²) + Sqrt
     let norm_body = vec![
-        TraceOp::Input(0),            // 0: x
-        TraceOp::Mul(ValueId(0), ValueId(0)),           // 1: x²
-        TraceOp::HReduce { src: ValueId(1), op: ReduceKind::Sum }, // 2: sum(x²)
-        TraceOp::Sqrt(ValueId(2)),             // 3: sqrt(sum(x²))
+        TraceOp::Input(0),                    // 0: x
+        TraceOp::Mul(ValueId(0), ValueId(0)), // 1: x²
+        TraceOp::HReduce {
+            src: ValueId(1),
+            op: ReduceKind::Sum,
+        }, // 2: sum(x²)
+        TraceOp::Sqrt(ValueId(2)),            // 3: sqrt(sum(x²))
     ];
 
     // Scalar scratch VRegs for index computation
@@ -79,7 +93,10 @@ pub(crate) fn emit_gather_inline(
     let row_offset = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     let table_row = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     let out_row = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: out_row, src: PtrExpr::VRegPlusConst(output_ptr, 0) });
+    prog.emit(VmInstr::LoadPtr {
+        dst: out_row,
+        src: PtrExpr::VRegPlusConst(output_ptr, 0),
+    });
 
     // Outer seq loop
     prog.emit_loop(seq_bound, index_elem, |prog, _seq_ctr, seq_byte_off| {
@@ -87,28 +104,36 @@ pub(crate) fn emit_gather_inline(
         match indices_kind {
             GatherIndicesKind::Tensor => {
                 prog.emit(VmInstr::ScalarLoad {
-                    dst: idx_scalar, base: input_ptr,
+                    dst: idx_scalar,
+                    base: input_ptr,
                     offset: OffsetExpr::LoopOffset(seq_byte_off),
                 });
                 prog.emit(VmInstr::IntMulStride {
-                    dst: row_offset, src: idx_scalar, stride: weight_row_bytes,
+                    dst: row_offset,
+                    src: idx_scalar,
+                    stride: weight_row_bytes,
                 });
                 prog.emit(VmInstr::LoadPtr {
-                    dst: table_row, src: PtrExpr::VRegPlusVReg(weight_ptr, row_offset),
+                    dst: table_row,
+                    src: PtrExpr::VRegPlusVReg(weight_ptr, row_offset),
                 });
             }
             GatherIndicesKind::Arange => {
                 let scale = weight_row_bytes / index_elem;
                 prog.emit(VmInstr::IntMulStride {
-                    dst: row_offset, src: seq_byte_off, stride: scale,
+                    dst: row_offset,
+                    src: seq_byte_off,
+                    stride: scale,
                 });
                 prog.emit(VmInstr::LoadPtr {
-                    dst: table_row, src: PtrExpr::VRegPlusVReg(weight_ptr, row_offset),
+                    dst: table_row,
+                    src: PtrExpr::VRegPlusVReg(weight_ptr, row_offset),
                 });
             }
             GatherIndicesKind::Zeros => {
                 prog.emit(VmInstr::LoadPtr {
-                    dst: table_row, src: PtrExpr::VRegPlusConst(weight_ptr, 0),
+                    dst: table_row,
+                    src: PtrExpr::VRegPlusConst(weight_ptr, 0),
                 });
             }
         }
@@ -120,41 +145,69 @@ pub(crate) fn emit_gather_inline(
         // 禁止再发 VecWiden（双重 widen → 把已 F32 的位当 BF16 再拆 → NaN）。
         // weight_blob 保留原始 dtype（宪法1），widen 责任在 VecLoad WidenCompute。
         if dim_vecs > 0 {
-            prog.emit_loop(BoundExpr::Const(dim_vecs), load_vec_step, |prog, ctr, d_off| {
-                let data = prog.alloc_vreg(VRegKind::Vec, width);
-                prog.emit(VmInstr::VecLoad {
-                    dst: data, base: table_row,
-                    offset: OffsetExpr::LoopOffset(d_off), width,
-                    dtype: weight_dtype, predicate: None,
-                });
-                // data 已是 F32（VecLoad WidenCompute 完成 BF16→F32），无需再 widen
-                let slots = super::auto_select::auto_lower_trace_raw(
-                    prog, &scale_body, &[data], width, compute_dtype).expect("gather scale trace auto_lower failed");
-                let result = slots.last().copied().unwrap_or(data);
+            prog.emit_loop(
+                BoundExpr::Const(dim_vecs),
+                load_vec_step,
+                |prog, ctr, d_off| {
+                    let data = prog.alloc_vreg(VRegKind::Vec, width);
+                    prog.emit(VmInstr::VecLoad {
+                        dst: data,
+                        base: table_row,
+                        offset: OffsetExpr::LoopOffset(d_off),
+                        width,
+                        dtype: weight_dtype,
+                        predicate: None,
+                    });
+                    // data 已是 F32（VecLoad WidenCompute 完成 BF16→F32），无需再 widen
+                    let slots = super::auto_select::auto_lower_trace_raw(
+                        prog,
+                        &scale_body,
+                        &[data],
+                        width,
+                        compute_dtype,
+                    )
+                    .expect("gather scale trace auto_lower failed");
+                    let result = slots.last().copied().unwrap_or(data);
 
-                // Output buffer 偏移 = lane_index * compute_elem = ctr * lanes * compute_elem
-                // （ctr 是循环迭代索引，每次迭代写 lanes 个 compute_dtype 元素）
-                let store_off = OffsetExpr::Mul(
-                    Box::new(OffsetExpr::LoopOffset(ctr)),
-                    lanes * compute_elem,
-                );
-                prog.emit(VmInstr::VecStore {
-                    base: out_row, offset: store_off,
-                    src: result, width,
-                    dtype: compute_dtype, predicate: None,
-                });
-                if let Some(acc) = norm_sq_acc {
-                    let l2_body = vec![TraceOp::Input(0), TraceOp::Mul(ValueId(0), ValueId(0)), TraceOp::Input(1), TraceOp::Add(ValueId(1), ValueId(2))];
-                    super::auto_select::auto_lower_trace_into(
-                        prog, &l2_body, &[data, acc], acc, width, compute_dtype,
-                    ).expect("gather L2 norm auto_lower failed");
-                }
-            });
+                    // Output buffer 偏移 = lane_index * compute_elem = ctr * lanes * compute_elem
+                    // （ctr 是循环迭代索引，每次迭代写 lanes 个 compute_dtype 元素）
+                    let store_off = OffsetExpr::Mul(
+                        Box::new(OffsetExpr::LoopOffset(ctr)),
+                        lanes * compute_elem,
+                    );
+                    prog.emit(VmInstr::VecStore {
+                        base: out_row,
+                        offset: store_off,
+                        src: result,
+                        width,
+                        dtype: compute_dtype,
+                        predicate: None,
+                    });
+                    if let Some(acc) = norm_sq_acc {
+                        let l2_body = vec![
+                            TraceOp::Input(0),
+                            TraceOp::Mul(ValueId(0), ValueId(0)),
+                            TraceOp::Input(1),
+                            TraceOp::Add(ValueId(1), ValueId(2)),
+                        ];
+                        super::auto_select::auto_lower_trace_into(
+                            prog,
+                            &l2_body,
+                            &[data, acc],
+                            acc,
+                            width,
+                            compute_dtype,
+                        )
+                        .expect("gather L2 norm auto_lower failed");
+                    }
+                },
+            );
         }
 
         // Advance output row pointer
         prog.emit(VmInstr::LoadPtr {
-            dst: out_row, src: PtrExpr::VRegPlusConst(out_row, compute_row_bytes),
+            dst: out_row,
+            src: PtrExpr::VRegPlusConst(out_row, compute_row_bytes),
         });
     });
 
@@ -162,15 +215,25 @@ pub(crate) fn emit_gather_inline(
     if let Some(tel_ptr) = telemetry_ptr {
         if let Some(acc) = norm_sq_acc {
             use crate::compiler::graph::telemetry_offsets;
-            prog.emit(VmInstr::Comment("§13.10 Embedding L2 norm telemetry (auto_select)".into()));
+            prog.emit(VmInstr::Comment(
+                "§13.10 Embedding L2 norm telemetry (auto_select)".into(),
+            ));
             let slots = super::auto_select::auto_lower_trace_raw(
-                prog, &norm_body, &[acc], width, compute_dtype).expect("gather norm trace auto_lower failed");
+                prog,
+                &norm_body,
+                &[acc],
+                width,
+                compute_dtype,
+            )
+            .expect("gather norm trace auto_lower failed");
             let l2_norm = slots.last().copied().unwrap_or(acc);
             prog.emit(VmInstr::VecStore {
                 base: tel_ptr,
                 offset: OffsetExpr::Const(telemetry_offsets::EMBED_L2_NORM_OFFSET),
-                src: l2_norm, width: SimdWidth::Scalar,
-                dtype: compute_dtype, predicate: None,
+                src: l2_norm,
+                width: SimdWidth::Scalar,
+                dtype: compute_dtype,
+                predicate: None,
             });
         }
     }
@@ -202,7 +265,9 @@ pub(crate) fn emit_column_slice_inline(
     dtype: QuantPrecision,
 ) -> Result<(), CompilerError> {
     if slice_dim == 0 {
-        return Err(CompilerError::CodegenViolation("emit_column_slice_inline: slice_dim is 0".into()));
+        return Err(CompilerError::CodegenViolation(
+            "emit_column_slice_inline: slice_dim is 0".into(),
+        ));
     }
     if start + slice_dim > input_inner {
         return Err(CompilerError::CodegenViolation(format!(
@@ -230,30 +295,52 @@ pub(crate) fn emit_column_slice_inline(
     // Row pointers with different strides
     let in_row = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     let out_row = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: in_row, src: PtrExpr::VRegPlusConst(input_ptr, start_bytes) });
-    prog.emit(VmInstr::LoadPtr { dst: out_row, src: PtrExpr::VRegPlusConst(output_ptr, 0) });
+    prog.emit(VmInstr::LoadPtr {
+        dst: in_row,
+        src: PtrExpr::VRegPlusConst(input_ptr, start_bytes),
+    });
+    prog.emit(VmInstr::LoadPtr {
+        dst: out_row,
+        src: PtrExpr::VRegPlusConst(output_ptr, 0),
+    });
 
     // Outer seq loop
     prog.emit_loop(seq_bound, output_row_bytes, |prog, _seq_ctr, _byte_off| {
         // Inner vectorized copy: auto_select driven
         if slice_vecs > 0 {
-            prog.emit_loop(BoundExpr::Const(slice_vecs), vec_step, |prog, _ctr, col_off| {
-                let data = prog.alloc_vreg(VRegKind::Vec, width);
-                prog.emit(VmInstr::VecLoad {
-                    dst: data, base: in_row,
-                    offset: OffsetExpr::LoopOffset(col_off), width,
-                    dtype, predicate: None,
-                });
-                // Apply identity trace via auto_lower_trace_raw
-                let slots = super::auto_select::auto_lower_trace_raw(
-                    prog, &copy_body, &[data], width, dtype).expect("column_slice copy trace auto_lower failed");
-                let result = slots[0];
-                prog.emit(VmInstr::VecStore {
-                    base: out_row, offset: OffsetExpr::LoopOffset(col_off),
-                    src: result, width,
-                    dtype, predicate: None,
-                });
-            });
+            prog.emit_loop(
+                BoundExpr::Const(slice_vecs),
+                vec_step,
+                |prog, _ctr, col_off| {
+                    let data = prog.alloc_vreg(VRegKind::Vec, width);
+                    prog.emit(VmInstr::VecLoad {
+                        dst: data,
+                        base: in_row,
+                        offset: OffsetExpr::LoopOffset(col_off),
+                        width,
+                        dtype,
+                        predicate: None,
+                    });
+                    // Apply identity trace via auto_lower_trace_raw
+                    let slots = super::auto_select::auto_lower_trace_raw(
+                        prog,
+                        &copy_body,
+                        &[data],
+                        width,
+                        dtype,
+                    )
+                    .expect("column_slice copy trace auto_lower failed");
+                    let result = slots[0];
+                    prog.emit(VmInstr::VecStore {
+                        base: out_row,
+                        offset: OffsetExpr::LoopOffset(col_off),
+                        src: result,
+                        width,
+                        dtype,
+                        predicate: None,
+                    });
+                },
+            );
         }
 
         // Tail: scalar elements
@@ -264,24 +351,32 @@ pub(crate) fn emit_column_slice_inline(
             for t in 0..tail {
                 let col_off_const = tail_base_bytes + t * elem;
                 prog.emit(VmInstr::VecLoad {
-                    dst: s_data, base: in_row,
-                    offset: OffsetExpr::Const(col_off_const), width: s_width,
-                    dtype, predicate: None,
+                    dst: s_data,
+                    base: in_row,
+                    offset: OffsetExpr::Const(col_off_const),
+                    width: s_width,
+                    dtype,
+                    predicate: None,
                 });
                 prog.emit(VmInstr::VecStore {
-                    base: out_row, offset: OffsetExpr::Const(col_off_const),
-                    src: s_data, width: s_width,
-                    dtype, predicate: None,
+                    base: out_row,
+                    offset: OffsetExpr::Const(col_off_const),
+                    src: s_data,
+                    width: s_width,
+                    dtype,
+                    predicate: None,
                 });
             }
         }
 
         // Advance row pointers (different strides)
         prog.emit(VmInstr::LoadPtr {
-            dst: in_row, src: PtrExpr::VRegPlusConst(in_row, input_row_bytes),
+            dst: in_row,
+            src: PtrExpr::VRegPlusConst(in_row, input_row_bytes),
         });
         prog.emit(VmInstr::LoadPtr {
-            dst: out_row, src: PtrExpr::VRegPlusConst(out_row, output_row_bytes),
+            dst: out_row,
+            src: PtrExpr::VRegPlusConst(out_row, output_row_bytes),
         });
     });
 
@@ -316,14 +411,14 @@ pub(crate) fn emit_rope_inline(
     position_offset: Option<VRegId>,
 ) -> Result<(), CompilerError> {
     if head_dim == 0 || head_dim % 2 != 0 || num_heads == 0 {
-        return Err(CompilerError::CodegenViolation(
-            format!("emit_rope_inline: invalid params (heads={num_heads}, head_dim={head_dim})"),
-        ));
+        return Err(CompilerError::CodegenViolation(format!(
+            "emit_rope_inline: invalid params (heads={num_heads}, head_dim={head_dim})"
+        )));
     }
     if partial <= 0.0 || partial > 1.0 {
-        return Err(CompilerError::CodegenViolation(
-            format!("emit_rope_inline: partial must be in (0,1], got {partial}"),
-        ));
+        return Err(CompilerError::CodegenViolation(format!(
+            "emit_rope_inline: partial must be in (0,1], got {partial}"
+        )));
     }
 
     let lanes = width.f32_lanes().max(1);
@@ -339,8 +434,7 @@ pub(crate) fn emit_rope_inline(
     prog.emit(VmInstr::LoadPtr {
         dst: scratch_base,
         src: sym_map.resolve("scratchpad").cloned().ok_or_else(|| {
-            CompilerError::CodegenViolation(
-                "emit_rope_inline: scratchpad ABI slot missing".into())
+            CompilerError::CodegenViolation("emit_rope_inline: scratchpad ABI slot missing".into())
         })?,
     });
     let cos_sin_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -369,10 +463,10 @@ pub(crate) fn emit_rope_inline(
 
     // TraceOp body for rotation: out_even = x0*cos - x1*sin, out_odd = x1*cos + x0*sin
     let rope_body: Vec<TraceOp> = vec![
-        TraceOp::Input(0),  // [0] x0
-        TraceOp::Input(1),  // [1] x1
-        TraceOp::Input(2),  // [2] cos
-        TraceOp::Input(3),  // [3] sin
+        TraceOp::Input(0),                    // [0] x0
+        TraceOp::Input(1),                    // [1] x1
+        TraceOp::Input(2),                    // [2] cos
+        TraceOp::Input(3),                    // [3] sin
         TraceOp::Mul(ValueId(0), ValueId(2)), // [4] x0 * cos
         TraceOp::Mul(ValueId(1), ValueId(3)), // [5] x1 * sin
         TraceOp::Sub(ValueId(4), ValueId(5)), // [6] out_even = x0*cos - x1*sin
@@ -386,121 +480,284 @@ pub(crate) fn emit_rope_inline(
 
     // Outer seq loop
     prog.emit_loop(seq_bound, token_step_bytes, |prog, p_ctr, tok_off| {
-        prog.emit(VmInstr::LoadPtr { dst: tok_input, src: PtrExpr::VRegPlusVReg(input_ptr, tok_off) });
-        prog.emit(VmInstr::LoadPtr { dst: tok_output, src: PtrExpr::VRegPlusVReg(output_ptr, tok_off) });
+        prog.emit(VmInstr::LoadPtr {
+            dst: tok_input,
+            src: PtrExpr::VRegPlusVReg(input_ptr, tok_off),
+        });
+        prog.emit(VmInstr::LoadPtr {
+            dst: tok_output,
+            src: PtrExpr::VRegPlusVReg(output_ptr, tok_off),
+        });
 
         // When position_offset is set (mega-kernel decode), use gen_counter as the
         // cos/sin position. p_ctr=0 (seq_bound=1), so offset = position_offset.
         let pos_vreg = if let Some(offset) = position_offset {
             let abs_pos = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprBinOp { dst: abs_pos, a: p_ctr, b: GprOperand::VReg(offset ), op: GprOp::Add });
+            prog.emit(VmInstr::GprBinOp {
+                dst: abs_pos,
+                a: p_ctr,
+                b: GprOperand::VReg(offset),
+                op: GprOp::Add,
+            });
             abs_pos
         } else {
             p_ctr
         };
 
         // Middle head loop
-        prog.emit_loop(BoundExpr::Const(num_heads), head_step_bytes, |prog, _h_ctr, h_off| {
-            prog.emit(VmInstr::LoadPtr { dst: head_input, src: PtrExpr::VRegPlusVReg(tok_input, h_off) });
-            prog.emit(VmInstr::LoadPtr { dst: head_output, src: PtrExpr::VRegPlusVReg(tok_output, h_off) });
+        prog.emit_loop(
+            BoundExpr::Const(num_heads),
+            head_step_bytes,
+            |prog, _h_ctr, h_off| {
+                prog.emit(VmInstr::LoadPtr {
+                    dst: head_input,
+                    src: PtrExpr::VRegPlusVReg(tok_input, h_off),
+                });
+                prog.emit(VmInstr::LoadPtr {
+                    dst: head_output,
+                    src: PtrExpr::VRegPlusVReg(tok_output, h_off),
+                });
 
-            // Part 1: Rotation via auto_lower_trace_multi
-            if vec_count > 0 {
-                prog.emit_loop(BoundExpr::Const(vec_count), vec_step, |prog, _pair_ctr, pair_off| {
-                    prog.emit(VmInstr::VecLoad { dst: x_even, base: head_input, offset: OffsetExpr::LoopOffset(pair_off), width, dtype, predicate: None, });
+                // Part 1: Rotation via auto_lower_trace_multi
+                if vec_count > 0 {
+                    prog.emit_loop(
+                        BoundExpr::Const(vec_count),
+                        vec_step,
+                        |prog, _pair_ctr, pair_off| {
+                            prog.emit(VmInstr::VecLoad {
+                                dst: x_even,
+                                base: head_input,
+                                offset: OffsetExpr::LoopOffset(pair_off),
+                                width,
+                                dtype,
+                                predicate: None,
+                            });
+                            prog.emit(VmInstr::VecLoad {
+                                dst: x_odd,
+                                base: head_input,
+                                offset: OffsetExpr::loop_plus_const(
+                                    pair_off,
+                                    half_rot * dtype.elem_bytes(),
+                                ),
+                                width,
+                                dtype,
+                                predicate: None,
+                            });
+                            let p_bytes = OffsetExpr::Mul(
+                                Box::new(OffsetExpr::ScalarVReg(pos_vreg)),
+                                cos_row_bytes,
+                            );
+                            let cos_off = OffsetExpr::Add(
+                                Box::new(p_bytes.clone()),
+                                Box::new(OffsetExpr::LoopOffset(pair_off)),
+                            );
+                            let sin_off = OffsetExpr::Add(
+                                Box::new(cos_off.clone()),
+                                Box::new(OffsetExpr::Const(half * dtype.elem_bytes())),
+                            );
+                            prog.emit(VmInstr::VecLoad {
+                                dst: cos_val,
+                                base: cos_sin_base,
+                                offset: cos_off,
+                                width,
+                                dtype,
+                                predicate: None,
+                            });
+                            prog.emit(VmInstr::VecLoad {
+                                dst: sin_val,
+                                base: cos_sin_base,
+                                offset: sin_off,
+                                width,
+                                dtype,
+                                predicate: None,
+                            });
+
+                            let out_even = prog.alloc_vreg(VRegKind::Vec, width);
+                            let out_odd = prog.alloc_vreg(VRegKind::Vec, width);
+                            super::auto_select::auto_lower_trace_multi(
+                                prog,
+                                &rope_body,
+                                &[x_even, x_odd, cos_val, sin_val],
+                                &[(out_even, 6), (out_odd, 9)],
+                                width,
+                                dtype,
+                            )
+                            .expect("emit_rope_inline: rotation trace auto_lower failed");
+
+                            prog.emit(VmInstr::VecStore {
+                                base: head_output,
+                                offset: OffsetExpr::LoopOffset(pair_off),
+                                src: out_even,
+                                width,
+                                dtype,
+                                predicate: None,
+                            });
+                            prog.emit(VmInstr::VecStore {
+                                base: head_output,
+                                offset: OffsetExpr::loop_plus_const(
+                                    pair_off,
+                                    half_rot * dtype.elem_bytes(),
+                                ),
+                                src: out_odd,
+                                width,
+                                dtype,
+                                predicate: None,
+                            });
+                        },
+                    );
+                }
+
+                // Scalar tail pairs
+                let pair_tail = half_rot - vec_count * lanes;
+                for t in 0..pair_tail {
+                    let off_even = vec_count * vec_step + t * elem;
+                    let s1 = SimdWidth::Scalar;
+                    let sx_even = prog.alloc_vreg(VRegKind::Vec, s1);
+                    let sx_odd = prog.alloc_vreg(VRegKind::Vec, s1);
+                    let scos = prog.alloc_vreg(VRegKind::Vec, s1);
+                    let ssin = prog.alloc_vreg(VRegKind::Vec, s1);
                     prog.emit(VmInstr::VecLoad {
-                        dst: x_odd, base: head_input,
-                        offset: OffsetExpr::loop_plus_const(pair_off, half_rot * dtype.elem_bytes()), width,
-                        dtype, predicate: None,
+                        dst: sx_even,
+                        base: head_input,
+                        offset: OffsetExpr::Const(off_even),
+                        width: s1,
+                        dtype,
+                        predicate: None,
                     });
-                    let p_bytes = OffsetExpr::Mul(Box::new(OffsetExpr::ScalarVReg(pos_vreg)), cos_row_bytes);
-                    let cos_off = OffsetExpr::Add(Box::new(p_bytes.clone()), Box::new(OffsetExpr::LoopOffset(pair_off)));
-                    let sin_off = OffsetExpr::Add(Box::new(cos_off.clone()), Box::new(OffsetExpr::Const(half * dtype.elem_bytes())));
-                    prog.emit(VmInstr::VecLoad { dst: cos_val, base: cos_sin_base, offset: cos_off, width, dtype, predicate: None, });
-                    prog.emit(VmInstr::VecLoad { dst: sin_val, base: cos_sin_base, offset: sin_off, width, dtype, predicate: None, });
+                    prog.emit(VmInstr::VecLoad {
+                        dst: sx_odd,
+                        base: head_input,
+                        offset: OffsetExpr::Const(off_even + half_rot * dtype.elem_bytes()),
+                        width: s1,
+                        dtype,
+                        predicate: None,
+                    });
+                    let p_bytes =
+                        OffsetExpr::Mul(Box::new(OffsetExpr::ScalarVReg(p_ctr)), cos_row_bytes);
+                    let cos_off = OffsetExpr::Add(
+                        Box::new(p_bytes.clone()),
+                        Box::new(OffsetExpr::Const(off_even)),
+                    );
+                    let sin_off = OffsetExpr::Add(
+                        Box::new(cos_off.clone()),
+                        Box::new(OffsetExpr::Const(half * dtype.elem_bytes())),
+                    );
+                    prog.emit(VmInstr::VecLoad {
+                        dst: scos,
+                        base: cos_sin_base,
+                        offset: cos_off,
+                        width: s1,
+                        dtype,
+                        predicate: None,
+                    });
+                    prog.emit(VmInstr::VecLoad {
+                        dst: ssin,
+                        base: cos_sin_base,
+                        offset: sin_off,
+                        width: s1,
+                        dtype,
+                        predicate: None,
+                    });
 
-                    let out_even = prog.alloc_vreg(VRegKind::Vec, width);
-                    let out_odd = prog.alloc_vreg(VRegKind::Vec, width);
-                    super::auto_select::auto_lower_trace_multi(prog, &rope_body,
-                        &[x_even, x_odd, cos_val, sin_val],
-                        &[(out_even, 6), (out_odd, 9)], width, dtype)
-                        .expect("emit_rope_inline: rotation trace auto_lower failed");
-
-                    prog.emit(VmInstr::VecStore { base: head_output, offset: OffsetExpr::LoopOffset(pair_off), src: out_even, width, dtype, predicate: None, });
+                    let s_out_even = prog.alloc_vreg(VRegKind::Vec, s1);
+                    let s_out_odd = prog.alloc_vreg(VRegKind::Vec, s1);
+                    super::auto_select::auto_lower_trace_multi(
+                        prog,
+                        &rope_body,
+                        &[sx_even, sx_odd, scos, ssin],
+                        &[(s_out_even, 6), (s_out_odd, 9)],
+                        s1,
+                        dtype,
+                    )
+                    .expect("emit_rope_inline: scalar rotation trace auto_lower failed");
                     prog.emit(VmInstr::VecStore {
                         base: head_output,
-                        offset: OffsetExpr::loop_plus_const(pair_off, half_rot * dtype.elem_bytes()),
-                        src: out_odd, width,
-                        dtype, predicate: None,
+                        offset: OffsetExpr::Const(off_even),
+                        src: s_out_even,
+                        width: s1,
+                        dtype,
+                        predicate: None,
                     });
-                });
-            }
+                    prog.emit(VmInstr::VecStore {
+                        base: head_output,
+                        offset: OffsetExpr::Const(off_even + half_rot * dtype.elem_bytes()),
+                        src: s_out_odd,
+                        width: s1,
+                        dtype,
+                        predicate: None,
+                    });
+                }
 
-            // Scalar tail pairs
-            let pair_tail = half_rot - vec_count * lanes;
-            for t in 0..pair_tail {
-                let off_even = vec_count * vec_step + t * elem;
-                let s1 = SimdWidth::Scalar;
-                let sx_even = prog.alloc_vreg(VRegKind::Vec, s1);
-                let sx_odd = prog.alloc_vreg(VRegKind::Vec, s1);
-                let scos = prog.alloc_vreg(VRegKind::Vec, s1);
-                let ssin = prog.alloc_vreg(VRegKind::Vec, s1);
-                prog.emit(VmInstr::VecLoad { dst: sx_even, base: head_input, offset: OffsetExpr::Const(off_even), width: s1, dtype, predicate: None, });
-                prog.emit(VmInstr::VecLoad { dst: sx_odd, base: head_input, offset: OffsetExpr::Const(off_even + half_rot * dtype.elem_bytes()), width: s1, dtype, predicate: None, });
-                let p_bytes = OffsetExpr::Mul(Box::new(OffsetExpr::ScalarVReg(p_ctr)), cos_row_bytes);
-                let cos_off = OffsetExpr::Add(Box::new(p_bytes.clone()), Box::new(OffsetExpr::Const(off_even)));
-                let sin_off = OffsetExpr::Add(Box::new(cos_off.clone()), Box::new(OffsetExpr::Const(half * dtype.elem_bytes())));
-                prog.emit(VmInstr::VecLoad { dst: scos, base: cos_sin_base, offset: cos_off, width: s1, dtype, predicate: None, });
-                prog.emit(VmInstr::VecLoad { dst: ssin, base: cos_sin_base, offset: sin_off, width: s1, dtype, predicate: None, });
-
-                let s_out_even = prog.alloc_vreg(VRegKind::Vec, s1);
-                let s_out_odd = prog.alloc_vreg(VRegKind::Vec, s1);
-                super::auto_select::auto_lower_trace_multi(prog, &rope_body,
-                    &[sx_even, sx_odd, scos, ssin],
-                    &[(s_out_even, 6), (s_out_odd, 9)], s1, dtype)
-                    .expect("emit_rope_inline: scalar rotation trace auto_lower failed");
-                prog.emit(VmInstr::VecStore { base: head_output, offset: OffsetExpr::Const(off_even), src: s_out_even, width: s1, dtype, predicate: None, });
-                prog.emit(VmInstr::VecStore {
-                    base: head_output, offset: OffsetExpr::Const(off_even + half_rot * dtype.elem_bytes()),
-                    src: s_out_odd, width: s1,
-                    dtype, predicate: None,
-                });
-            }
-
-            // Part 2: Passthrough via auto_lower_trace_raw (identity trace)
-            if passthrough_dim > 0 {
-                let pt_base_off = rot_dim * dtype.elem_bytes();
-                if pt_vecs > 0 {
-                    prog.emit_loop(BoundExpr::Const(pt_vecs), vec_step, |prog, _ctr, byte_off| {
-                        let data = prog.alloc_vreg(VRegKind::Vec, width);
+                // Part 2: Passthrough via auto_lower_trace_raw (identity trace)
+                if passthrough_dim > 0 {
+                    let pt_base_off = rot_dim * dtype.elem_bytes();
+                    if pt_vecs > 0 {
+                        prog.emit_loop(
+                            BoundExpr::Const(pt_vecs),
+                            vec_step,
+                            |prog, _ctr, byte_off| {
+                                let data = prog.alloc_vreg(VRegKind::Vec, width);
+                                prog.emit(VmInstr::VecLoad {
+                                    dst: data,
+                                    base: head_input,
+                                    offset: OffsetExpr::loop_plus_const(byte_off, pt_base_off),
+                                    width,
+                                    dtype,
+                                    predicate: None,
+                                });
+                                let slots = super::auto_select::auto_lower_trace_raw(
+                                    prog,
+                                    &passthrough_body,
+                                    &[data],
+                                    width,
+                                    dtype,
+                                )
+                                .expect("emit_rope_inline: passthrough trace auto_lower failed");
+                                prog.emit(VmInstr::VecStore {
+                                    base: head_output,
+                                    offset: OffsetExpr::loop_plus_const(byte_off, pt_base_off),
+                                    src: slots[0],
+                                    width,
+                                    dtype,
+                                    predicate: None,
+                                });
+                            },
+                        );
+                    }
+                    // scalar tail
+                    let pt_tail = passthrough_dim % lanes;
+                    for t in 0..pt_tail {
+                        let off = pt_base_off + pt_vecs * vec_step + t * elem;
+                        let s1 = SimdWidth::Scalar;
+                        let s_data = prog.alloc_vreg(VRegKind::Vec, s1);
                         prog.emit(VmInstr::VecLoad {
-                            dst: data, base: head_input,
-                            offset: OffsetExpr::loop_plus_const(byte_off, pt_base_off), width,
-                            dtype, predicate: None,
+                            dst: s_data,
+                            base: head_input,
+                            offset: OffsetExpr::Const(off),
+                            width: s1,
+                            dtype,
+                            predicate: None,
                         });
                         let slots = super::auto_select::auto_lower_trace_raw(
-                            prog, &passthrough_body, &[data], width, dtype).expect("emit_rope_inline: passthrough trace auto_lower failed");
+                            prog,
+                            &passthrough_body,
+                            &[s_data],
+                            s1,
+                            dtype,
+                        )
+                        .expect("emit_rope_inline: scalar passthrough trace auto_lower failed");
                         prog.emit(VmInstr::VecStore {
                             base: head_output,
-                            offset: OffsetExpr::loop_plus_const(byte_off, pt_base_off),
-                            src: slots[0], width,
-                            dtype, predicate: None,
+                            offset: OffsetExpr::Const(off),
+                            src: slots[0],
+                            width: s1,
+                            dtype,
+                            predicate: None,
                         });
-                    });
+                    }
                 }
-                // scalar tail
-                let pt_tail = passthrough_dim % lanes;
-                for t in 0..pt_tail {
-                    let off = pt_base_off + pt_vecs * vec_step + t * elem;
-                    let s1 = SimdWidth::Scalar;
-                    let s_data = prog.alloc_vreg(VRegKind::Vec, s1);
-                    prog.emit(VmInstr::VecLoad { dst: s_data, base: head_input, offset: OffsetExpr::Const(off), width: s1, dtype, predicate: None, });
-                    let slots = super::auto_select::auto_lower_trace_raw(
-                        prog, &passthrough_body, &[s_data], s1, dtype).expect("emit_rope_inline: scalar passthrough trace auto_lower failed");
-                    prog.emit(VmInstr::VecStore { base: head_output, offset: OffsetExpr::Const(off), src: slots[0], width: s1, dtype, predicate: None, });
-                }
-            }
-        }); // head
+            },
+        ); // head
     }); // seq
 
     Ok(())
@@ -525,8 +782,8 @@ pub(crate) fn emit_rope_template_driven(
     scratchpad_ptr: VRegId,
     dtype: QuantPrecision,
 ) -> Option<()> {
+    use super::algo_interpreter::{ParamTable, TemplateInputs, TemplateInterpreter};
     use super::algo_registry;
-    use super::algo_interpreter::{TemplateInterpreter, ParamTable, TemplateInputs};
     use crate::dispatch::device_profile::DeviceProfile;
 
     let strategy = if partial < 1.0 {
@@ -554,9 +811,13 @@ pub(crate) fn emit_rope_template_driven(
     let trace_ops = interp.instantiate(template, &inputs);
 
     super::auto_select::auto_lower_trace_raw(
-        prog, &trace_ops, &[input_ptr, cos_ptr, sin_ptr, seq_offset],
-        width, dtype,
-    ).ok()?;
+        prog,
+        &trace_ops,
+        &[input_ptr, cos_ptr, sin_ptr, seq_offset],
+        width,
+        dtype,
+    )
+    .ok()?;
 
     let _ = (num_heads, scratchpad_ptr, output_ptr);
     Some(())
@@ -583,8 +844,11 @@ mod tests {
             BoundExpr::Const(1),
             0, // embed_dim = 0 → error
             SimdWidth::W256,
-            input, weight, output,
-            None, None,
+            input,
+            weight,
+            output,
+            None,
+            None,
             GatherIndicesKind::Tensor,
             QuantPrecision::F32,
             QuantPrecision::F32,
@@ -593,7 +857,10 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             CompilerError::CodegenViolation(msg) => {
-                assert!(msg.contains("embed_dim"), "expected mention of embed_dim, got: {msg}");
+                assert!(
+                    msg.contains("embed_dim"),
+                    "expected mention of embed_dim, got: {msg}"
+                );
             }
             other => panic!("expected CodegenViolation, got: {other:?}"),
         }
@@ -611,16 +878,29 @@ mod tests {
             BoundExpr::Const(4),
             64,
             SimdWidth::W256,
-            input, weight, output,
-            None, None,
+            input,
+            weight,
+            output,
+            None,
+            None,
             GatherIndicesKind::Tensor,
             QuantPrecision::F32,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let has_scalar_load = prog.instrs.iter().any(|i| matches!(i, VmInstr::ScalarLoad { .. }));
-        assert!(has_scalar_load, "Tensor gather must emit ScalarLoad for index loading");
-        let has_loop = prog.instrs.iter().any(|i| matches!(i, VmInstr::LoopBegin { .. }));
+        let has_scalar_load = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::ScalarLoad { .. }));
+        assert!(
+            has_scalar_load,
+            "Tensor gather must emit ScalarLoad for index loading"
+        );
+        let has_loop = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::LoopBegin { .. }));
         assert!(has_loop, "Gather must produce a seq loop");
     }
 
@@ -636,18 +916,31 @@ mod tests {
             BoundExpr::Const(8),
             128,
             SimdWidth::W256,
-            input, weight, output,
-            None, None,
+            input,
+            weight,
+            output,
+            None,
+            None,
             GatherIndicesKind::Arange,
             QuantPrecision::F32,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let has_scalar_load = prog.instrs.iter().any(|i| matches!(i, VmInstr::ScalarLoad { .. }));
+        let has_scalar_load = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::ScalarLoad { .. }));
         assert!(!has_scalar_load, "Arange gather should not emit ScalarLoad");
         // Still has IntMulStride for offset computation
-        let has_int_mul = prog.instrs.iter().any(|i| matches!(i, VmInstr::IntMulStride { .. }));
-        assert!(has_int_mul, "Arange gather must compute row offset via IntMulStride");
+        let has_int_mul = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::IntMulStride { .. }));
+        assert!(
+            has_int_mul,
+            "Arange gather must compute row offset via IntMulStride"
+        );
     }
 
     #[test]
@@ -662,20 +955,37 @@ mod tests {
             BoundExpr::Const(4),
             64,
             SimdWidth::W256,
-            input, weight, output,
-            None, None,
+            input,
+            weight,
+            output,
+            None,
+            None,
             GatherIndicesKind::Zeros,
             QuantPrecision::F32,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let has_scalar_load = prog.instrs.iter().any(|i| matches!(i, VmInstr::ScalarLoad { .. }));
+        let has_scalar_load = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::ScalarLoad { .. }));
         assert!(!has_scalar_load, "Zeros gather should not emit ScalarLoad");
-        let has_int_mul = prog.instrs.iter().any(|i| matches!(i, VmInstr::IntMulStride { .. }));
+        let has_int_mul = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::IntMulStride { .. }));
         assert!(!has_int_mul, "Zeros gather should not emit IntMulStride");
         // Zeros path: LoadPtr with VRegPlusConst(weight, 0)
-        let load_ptr_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoadPtr { .. })).count();
-        assert!(load_ptr_count > 0, "Zeros gather must load the table row pointer");
+        let load_ptr_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoadPtr { .. }))
+            .count();
+        assert!(
+            load_ptr_count > 0,
+            "Zeros gather must load the table row pointer"
+        );
     }
 
     #[test]
@@ -691,23 +1001,31 @@ mod tests {
             BoundExpr::Const(2),
             64,
             SimdWidth::W256,
-            input, weight, output,
-            Some(telemetry), None,
+            input,
+            weight,
+            output,
+            Some(telemetry),
+            None,
             GatherIndicesKind::Tensor,
             QuantPrecision::F32,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // With telemetry, a Broadcast(0.0) accumulator is allocated for L2 norm
-        let has_broadcast_zero = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::Broadcast { src: ScalarExpr::Const(v), .. } if *v == 0.0)
-        });
-        assert!(has_broadcast_zero, "Telemetry gather must emit Broadcast(0.0) for L2 norm accumulator");
+        let has_broadcast_zero = prog.instrs.iter().any(
+            |i| matches!(i, VmInstr::Broadcast { src: ScalarExpr::Const(v), .. } if *v == 0.0),
+        );
+        assert!(
+            has_broadcast_zero,
+            "Telemetry gather must emit Broadcast(0.0) for L2 norm accumulator"
+        );
 
         // Must contain a comment about L2 norm telemetry
-        let has_l2_comment = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::Comment(s) if s.contains("L2 norm"))
-        });
+        let has_l2_comment = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::Comment(s) if s.contains("L2 norm")));
         assert!(has_l2_comment, "Telemetry gather must emit L2 norm comment");
     }
 
@@ -723,17 +1041,26 @@ mod tests {
             BoundExpr::Const(2),
             64,
             SimdWidth::W256,
-            input, weight, output,
+            input,
+            weight,
+            output,
             None,
             Some(0.125), // embedding scale
             GatherIndicesKind::Arange,
             QuantPrecision::F32,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Scale body: Const(scale) * Input(0) → produces VecMul via auto_lower_trace
-        let has_vec_op = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecBinOp { .. }));
-        assert!(has_vec_op, "Gather with embedding scale must produce VecBinOp for scale multiply");
+        let has_vec_op = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecBinOp { .. }));
+        assert!(
+            has_vec_op,
+            "Gather with embedding scale must produce VecBinOp for scale multiply"
+        );
     }
 
     // ── emit_column_slice_inline tests (4) ──────────────────────────
@@ -747,16 +1074,22 @@ mod tests {
         let result = emit_column_slice_inline(
             &mut prog,
             BoundExpr::Const(4),
-            64, 0, 0, // start=0, slice_dim=0 → error
+            64,
+            0,
+            0, // start=0, slice_dim=0 → error
             SimdWidth::W256,
-            input, output,
+            input,
+            output,
             QuantPrecision::F32,
         );
 
         assert!(result.is_err());
         match result.unwrap_err() {
             CompilerError::CodegenViolation(msg) => {
-                assert!(msg.contains("slice_dim"), "expected mention of slice_dim, got: {msg}");
+                assert!(
+                    msg.contains("slice_dim"),
+                    "expected mention of slice_dim, got: {msg}"
+                );
             }
             other => panic!("expected CodegenViolation, got: {other:?}"),
         }
@@ -775,7 +1108,8 @@ mod tests {
             20, // start = 20
             20, // slice_dim = 20 → start+slice=40 > input_inner=32
             SimdWidth::W256,
-            input, output,
+            input,
+            output,
             QuantPrecision::F32,
         );
 
@@ -792,25 +1126,49 @@ mod tests {
         emit_column_slice_inline(
             &mut prog,
             BoundExpr::Const(8),
-            128, 32, 64,
+            128,
+            32,
+            64,
             SimdWidth::W256,
-            input, output,
+            input,
+            output,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Must have a seq loop (outer) and a dim loop (inner)
-        let loop_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
-        assert!(loop_count >= 2, "ColumnSlice must emit at least 2 loops (seq + dim), got {loop_count}");
+        let loop_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopBegin { .. }))
+            .count();
+        assert!(
+            loop_count >= 2,
+            "ColumnSlice must emit at least 2 loops (seq + dim), got {loop_count}"
+        );
 
         // Must have VecLoad and VecStore for the copy
-        let has_load = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecLoad { .. }));
-        let has_store = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecStore { .. }));
+        let has_load = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecLoad { .. }));
+        let has_store = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecStore { .. }));
         assert!(has_load, "ColumnSlice must emit VecLoad");
         assert!(has_store, "ColumnSlice must emit VecStore");
 
         // Must have exactly 2 row pointer advances (in_row + out_row) per seq iteration
-        let load_ptr_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoadPtr { .. })).count();
-        assert!(load_ptr_count >= 4, "ColumnSlice must advance both in_row and out_row pointers");
+        let load_ptr_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoadPtr { .. }))
+            .count();
+        assert!(
+            load_ptr_count >= 4,
+            "ColumnSlice must advance both in_row and out_row pointers"
+        );
     }
 
     #[test]
@@ -823,21 +1181,51 @@ mod tests {
         emit_column_slice_inline(
             &mut prog,
             BoundExpr::Const(1),
-            16, 0, 10,
+            16,
+            0,
+            10,
             SimdWidth::W256,
-            input, output,
+            input,
+            output,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Check that there are scalar VecLoad/VecStore for tail handling
-        let scalar_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { width: SimdWidth::Scalar, .. })
-        }).count();
-        let scalar_stores = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecStore { width: SimdWidth::Scalar, .. })
-        }).count();
-        assert!(scalar_loads > 0, "Non-aligned slice_dim must produce scalar tail loads");
-        assert!(scalar_stores > 0, "Non-aligned slice_dim must produce scalar tail stores");
+        let scalar_loads = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecLoad {
+                        width: SimdWidth::Scalar,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let scalar_stores = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecStore {
+                        width: SimdWidth::Scalar,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            scalar_loads > 0,
+            "Non-aligned slice_dim must produce scalar tail loads"
+        );
+        assert!(
+            scalar_stores > 0,
+            "Non-aligned slice_dim must produce scalar tail stores"
+        );
     }
 
     // ── emit_rope_inline tests (3) ───────────────────────────────
@@ -852,11 +1240,14 @@ mod tests {
         let result = emit_rope_inline(
             &mut prog,
             BoundExpr::Const(1),
-            4, 0, // num_heads=4, head_dim=0 → error
+            4,
+            0, // num_heads=4, head_dim=0 → error
             1.0,
             SimdWidth::W256,
-            input, output,
-            0, &sym_map,
+            input,
+            output,
+            0,
+            &sym_map,
             QuantPrecision::F32,
             None,
         );
@@ -864,7 +1255,10 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             CompilerError::CodegenViolation(msg) => {
-                assert!(msg.contains("head_dim") || msg.contains("heads"), "error should mention head params: {msg}");
+                assert!(
+                    msg.contains("head_dim") || msg.contains("heads"),
+                    "error should mention head params: {msg}"
+                );
             }
             other => panic!("expected CodegenViolation, got: {other:?}"),
         }
@@ -880,11 +1274,14 @@ mod tests {
         let result = emit_rope_inline(
             &mut prog,
             BoundExpr::Const(1),
-            4, 127, // head_dim=127 (odd) → error
+            4,
+            127, // head_dim=127 (odd) → error
             1.0,
             SimdWidth::W256,
-            input, output,
-            0, &sym_map,
+            input,
+            output,
+            0,
+            &sym_map,
             QuantPrecision::F32,
             None,
         );
@@ -902,11 +1299,14 @@ mod tests {
         let result = emit_rope_inline(
             &mut prog,
             BoundExpr::Const(1),
-            4, 64,
+            4,
+            64,
             0.0, // partial=0.0 → invalid
             SimdWidth::W256,
-            input, output,
-            0, &sym_map,
+            input,
+            output,
+            0,
+            &sym_map,
             QuantPrecision::F32,
             None,
         );
@@ -914,7 +1314,10 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             CompilerError::CodegenViolation(msg) => {
-                assert!(msg.contains("partial"), "error should mention partial: {msg}");
+                assert!(
+                    msg.contains("partial"),
+                    "error should mention partial: {msg}"
+                );
             }
             other => panic!("expected CodegenViolation, got: {other:?}"),
         }
@@ -935,15 +1338,25 @@ mod tests {
             BoundExpr::Const(4),
             64,
             SimdWidth::W256,
-            input, weight, output,
-            None, None,
+            input,
+            weight,
+            output,
+            None,
+            None,
             GatherIndicesKind::Tensor,
             QuantPrecision::BF16, // compute_dtype = BF16
             QuantPrecision::F32,  // weight stored as F32
-        ).unwrap();
+        )
+        .unwrap();
 
-        let has_vec_load = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecLoad { .. }));
-        let has_vec_store = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecStore { .. }));
+        let has_vec_load = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecLoad { .. }));
+        let has_vec_store = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecStore { .. }));
         assert!(has_vec_load, "BF16 gather must emit VecLoad");
         assert!(has_vec_store, "BF16 gather must emit VecStore");
     }
@@ -961,20 +1374,44 @@ mod tests {
             BoundExpr::Const(2),
             128,
             SimdWidth::W512,
-            input, weight, output,
-            None, None,
+            input,
+            weight,
+            output,
+            None,
+            None,
             GatherIndicesKind::Arange,
             QuantPrecision::F32,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // W512 has 16 lanes, so dim_vecs = 128/16 = 8 inner iterations
-        let w512_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { width: SimdWidth::W512, .. })
-        }).count();
-        let w512_stores = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecStore { width: SimdWidth::W512, .. })
-        }).count();
+        let w512_loads = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecLoad {
+                        width: SimdWidth::W512,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let w512_stores = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecStore {
+                        width: SimdWidth::W512,
+                        ..
+                    }
+                )
+            })
+            .count();
         assert!(w512_loads > 0, "W512 gather must emit W512 VecLoad");
         assert!(w512_stores > 0, "W512 gather must emit W512 VecStore");
     }
@@ -992,20 +1429,38 @@ mod tests {
             BoundExpr::Const(1), // single token
             32,
             SimdWidth::W256,
-            input, weight, output,
-            None, None,
+            input,
+            weight,
+            output,
+            None,
+            None,
             GatherIndicesKind::Tensor,
             QuantPrecision::F32,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Must have at least 1 outer loop (seq) and 1 inner loop (dim)
-        let loop_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
-        assert!(loop_count >= 2, "Single-token gather must still emit seq+dim loops, got {loop_count}");
+        let loop_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopBegin { .. }))
+            .count();
+        assert!(
+            loop_count >= 2,
+            "Single-token gather must still emit seq+dim loops, got {loop_count}"
+        );
 
         // ScalarLoad for index read
-        let scalar_loads = prog.instrs.iter().filter(|i| matches!(i, VmInstr::ScalarLoad { .. })).count();
-        assert!(scalar_loads >= 1, "Tensor gather must emit ScalarLoad for index");
+        let scalar_loads = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::ScalarLoad { .. }))
+            .count();
+        assert!(
+            scalar_loads >= 1,
+            "Tensor gather must emit ScalarLoad for index"
+        );
     }
 
     // 4. Gather with embedding scale AND telemetry simultaneously
@@ -1022,21 +1477,30 @@ mod tests {
             BoundExpr::Const(3),
             64,
             SimdWidth::W256,
-            input, weight, output,
+            input,
+            weight,
+            output,
             Some(telemetry),
             Some(1.5), // embedding scale
             GatherIndicesKind::Tensor,
             QuantPrecision::F32,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Must have both: scale VecBinOp and L2 norm telemetry
-        let has_binop = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecBinOp { .. }));
-        let has_broadcast_zero = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::Broadcast { src: ScalarExpr::Const(v), .. } if *v == 0.0)
-        });
+        let has_binop = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecBinOp { .. }));
+        let has_broadcast_zero = prog.instrs.iter().any(
+            |i| matches!(i, VmInstr::Broadcast { src: ScalarExpr::Const(v), .. } if *v == 0.0),
+        );
         assert!(has_binop, "Scale + telemetry gather must produce VecBinOp");
-        assert!(has_broadcast_zero, "Scale + telemetry gather must initialize L2 norm accumulator");
+        assert!(
+            has_broadcast_zero,
+            "Scale + telemetry gather must initialize L2 norm accumulator"
+        );
     }
 
     // 5. Gather Zeros with embed_dim not aligned to SIMD width still succeeds
@@ -1053,15 +1517,25 @@ mod tests {
             BoundExpr::Const(2),
             10, // not a multiple of 8
             SimdWidth::W256,
-            input, weight, output,
-            None, None,
+            input,
+            weight,
+            output,
+            None,
+            None,
             GatherIndicesKind::Zeros,
             QuantPrecision::F32,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let has_load = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecLoad { .. }));
-        let has_store = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecStore { .. }));
+        let has_load = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecLoad { .. }));
+        let has_store = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecStore { .. }));
         assert!(has_load, "Non-aligned gather must still emit VecLoad");
         assert!(has_store, "Non-aligned gather must still emit VecStore");
     }
@@ -1077,16 +1551,24 @@ mod tests {
         emit_column_slice_inline(
             &mut prog,
             BoundExpr::Const(4),
-            128, 0, 64,
+            128,
+            0,
+            64,
             SimdWidth::W256,
-            input, output,
+            input,
+            output,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let has_comment = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::Comment(s) if s.contains("0..64"))
-        });
-        assert!(has_comment, "ColumnSlice with start=0 must include range 0..64 in comment");
+        let has_comment = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::Comment(s) if s.contains("0..64")));
+        assert!(
+            has_comment,
+            "ColumnSlice with start=0 must include range 0..64 in comment"
+        );
     }
 
     // 7. ColumnSlice with BF16 dtype uses 2-byte element stride
@@ -1100,19 +1582,45 @@ mod tests {
         emit_column_slice_inline(
             &mut prog,
             BoundExpr::Const(2),
-            64, 16, 32,
+            64,
+            16,
+            32,
             SimdWidth::W256,
-            input, output,
+            input,
+            output,
             QuantPrecision::BF16,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Verify BF16 VecLoad and VecStore are emitted
-        let bf16_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { dtype: QuantPrecision::BF16, predicate: None, .. })
-        }).count();
-        let bf16_stores = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecStore { dtype: QuantPrecision::BF16, predicate: None, .. })
-        }).count();
+        let bf16_loads = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecLoad {
+                        dtype: QuantPrecision::BF16,
+                        predicate: None,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let bf16_stores = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecStore {
+                        dtype: QuantPrecision::BF16,
+                        predicate: None,
+                        ..
+                    }
+                )
+            })
+            .count();
         assert!(bf16_loads > 0, "BF16 ColumnSlice must emit BF16 VecLoad");
         assert!(bf16_stores > 0, "BF16 ColumnSlice must emit BF16 VecStore");
     }
@@ -1128,13 +1636,19 @@ mod tests {
         let result = emit_column_slice_inline(
             &mut prog,
             BoundExpr::Const(1),
-            64, 48, 16,
+            64,
+            48,
+            16,
             SimdWidth::W256,
-            input, output,
+            input,
+            output,
             QuantPrecision::F32,
         );
 
-        assert!(result.is_ok(), "Exact boundary (start+slice==input_inner) must succeed");
+        assert!(
+            result.is_ok(),
+            "Exact boundary (start+slice==input_inner) must succeed"
+        );
     }
 
     // 9. ColumnSlice with W128 produces narrower vector ops
@@ -1148,15 +1662,29 @@ mod tests {
         emit_column_slice_inline(
             &mut prog,
             BoundExpr::Const(1),
-            32, 0, 16,
+            32,
+            0,
+            16,
             SimdWidth::W128,
-            input, output,
+            input,
+            output,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let w128_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { width: SimdWidth::W128, .. })
-        }).count();
+        let w128_loads = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecLoad {
+                        width: SimdWidth::W128,
+                        ..
+                    }
+                )
+            })
+            .count();
         assert!(w128_loads > 0, "W128 ColumnSlice must emit W128 VecLoad");
     }
 
@@ -1171,11 +1699,14 @@ mod tests {
         let result = emit_rope_inline(
             &mut prog,
             BoundExpr::Const(1),
-            4, 64,
+            4,
+            64,
             1.5, // partial=1.5 → invalid
             SimdWidth::W256,
-            input, output,
-            0, &sym_map,
+            input,
+            output,
+            0,
+            &sym_map,
             QuantPrecision::F32,
             None,
         );
@@ -1183,7 +1714,10 @@ mod tests {
         assert!(result.is_err(), "partial > 1.0 must be rejected");
         match result.unwrap_err() {
             CompilerError::CodegenViolation(msg) => {
-                assert!(msg.contains("partial"), "error should mention partial: {msg}");
+                assert!(
+                    msg.contains("partial"),
+                    "error should mention partial: {msg}"
+                );
             }
             other => panic!("expected CodegenViolation, got: {other:?}"),
         }
@@ -1200,11 +1734,14 @@ mod tests {
         let result = emit_rope_inline(
             &mut prog,
             BoundExpr::Const(1),
-            0, 64, // num_heads=0 → error
+            0,
+            64, // num_heads=0 → error
             1.0,
             SimdWidth::W256,
-            input, output,
-            0, &sym_map,
+            input,
+            output,
+            0,
+            &sym_map,
             QuantPrecision::F32,
             None,
         );
@@ -1230,20 +1767,30 @@ mod tests {
         emit_rope_inline(
             &mut prog,
             BoundExpr::Const(1),
-            4, 64,
+            4,
+            64,
             0.25,
             SimdWidth::W256,
-            input, output,
-            0, &sym_map,
+            input,
+            output,
+            0,
+            &sym_map,
             QuantPrecision::F32,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // With partial < 1.0, must have 3 nested loops: seq, heads, rotation pairs
-        let loop_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
+        let loop_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopBegin { .. }))
+            .count();
         // seq loop + head loop + rotation vec loop + passthrough vec loop >= 4
-        assert!(loop_count >= 4,
-            "Partial RoPE must emit seq+head+rotation+passthrough loops, got {loop_count}");
+        assert!(
+            loop_count >= 4,
+            "Partial RoPE must emit seq+head+rotation+passthrough loops, got {loop_count}"
+        );
     }
 
     // 13. RoPE with position_offset emits GprBinOp for position calculation
@@ -1258,21 +1805,28 @@ mod tests {
         emit_rope_inline(
             &mut prog,
             BoundExpr::Const(1),
-            4, 64,
+            4,
+            64,
             1.0,
             SimdWidth::W256,
-            input, output,
-            0, &sym_map,
+            input,
+            output,
+            0,
+            &sym_map,
             QuantPrecision::F32,
             Some(pos_offset), // position_offset set → mega-kernel decode path
-        ).unwrap();
+        )
+        .unwrap();
 
         // position_offset triggers GprBinOp(Add) to compute absolute position
-        let has_gpr_add = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::GprBinOp { op: GprOp::Add, .. })
-        });
-        assert!(has_gpr_add,
-            "RoPE with position_offset must emit GprBinOp(Add) for position calculation");
+        let has_gpr_add = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::GprBinOp { op: GprOp::Add, .. }));
+        assert!(
+            has_gpr_add,
+            "RoPE with position_offset must emit GprBinOp(Add) for position calculation"
+        );
     }
 
     // ── Wave 12k79: additional tests ─────────────────────────────────────
@@ -1290,15 +1844,25 @@ mod tests {
             BoundExpr::Const(8),
             32,
             SimdWidth::W256,
-            input, weight, output,
-            None, None,
+            input,
+            weight,
+            output,
+            None,
+            None,
             GatherIndicesKind::Arange,
             QuantPrecision::F32,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let has_loop_begin = prog.instrs.iter().any(|i| matches!(i, VmInstr::LoopBegin { .. }));
-        assert!(has_loop_begin, "Arange gather must emit loop for seq dimension");
+        let has_loop_begin = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::LoopBegin { .. }));
+        assert!(
+            has_loop_begin,
+            "Arange gather must emit loop for seq dimension"
+        );
     }
 
     // @trace TEST-12k79
@@ -1314,17 +1878,34 @@ mod tests {
             BoundExpr::Const(2),
             4,
             SimdWidth::Scalar,
-            input, weight, output,
-            None, None,
+            input,
+            weight,
+            output,
+            None,
+            None,
             GatherIndicesKind::Arange,
             QuantPrecision::F32,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let scalar_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { width: SimdWidth::Scalar, .. })
-        }).count();
-        assert!(scalar_loads > 0, "Scalar width gather must emit scalar VecLoad");
+        let scalar_loads = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecLoad {
+                        width: SimdWidth::Scalar,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            scalar_loads > 0,
+            "Scalar width gather must emit scalar VecLoad"
+        );
     }
 
     // @trace TEST-12k79
@@ -1337,9 +1918,12 @@ mod tests {
         let result = emit_column_slice_inline(
             &mut prog,
             BoundExpr::Const(1),
-            32, 40, 8, // start=40 > input_inner=32 → error
+            32,
+            40,
+            8, // start=40 > input_inner=32 → error
             SimdWidth::W256,
-            input, output,
+            input,
+            output,
             QuantPrecision::F32,
         );
 
@@ -1358,18 +1942,29 @@ mod tests {
         emit_rope_inline(
             &mut prog,
             BoundExpr::Const(1),
-            8, 64,
+            8,
+            64,
             1.0,
             SimdWidth::W256,
-            input, output,
-            0, &sym_map,
+            input,
+            output,
+            0,
+            &sym_map,
             QuantPrecision::F32,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Must have at least 3 nested loops: seq, head, rotation-vec
-        let loop_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
-        assert!(loop_count >= 3, "RoPE with full partial must emit >= 3 nested loops (seq+head+vec), got {loop_count}");
+        let loop_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopBegin { .. }))
+            .count();
+        assert!(
+            loop_count >= 3,
+            "RoPE with full partial must emit >= 3 nested loops (seq+head+vec), got {loop_count}"
+        );
     }
 
     // @trace TEST-12k79
@@ -1383,17 +1978,28 @@ mod tests {
         emit_rope_inline(
             &mut prog,
             BoundExpr::Const(1),
-            4, 64,
+            4,
+            64,
             1.0,
             SimdWidth::W256,
-            input, output,
-            0, &sym_map,
+            input,
+            output,
+            0,
+            &sym_map,
             QuantPrecision::BF16,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         let has_bf16_load = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::VecLoad { dtype: QuantPrecision::BF16, predicate: None, .. })
+            matches!(
+                i,
+                VmInstr::VecLoad {
+                    dtype: QuantPrecision::BF16,
+                    predicate: None,
+                    ..
+                }
+            )
         });
         assert!(has_bf16_load, "BF16 RoPE must emit BF16 VecLoad");
     }
@@ -1410,19 +2016,29 @@ mod tests {
         emit_rope_inline(
             &mut prog,
             BoundExpr::Const(1),
-            2, 128,
+            2,
+            128,
             0.5,
             SimdWidth::W256,
-            input, output,
-            0, &sym_map,
+            input,
+            output,
+            0,
+            &sym_map,
             QuantPrecision::F32,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Must have multiple loops for rotation and passthrough sections
-        let loop_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
-        assert!(loop_count >= 4,
-            "Half-partial RoPE must emit seq+head+rot+passthrough loops, got {loop_count}");
+        let loop_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopBegin { .. }))
+            .count();
+        assert!(
+            loop_count >= 4,
+            "Half-partial RoPE must emit seq+head+rot+passthrough loops, got {loop_count}"
+        );
     }
 
     // @trace TEST-12k79
@@ -1443,14 +2059,21 @@ mod tests {
             sym_bound,
             32,
             SimdWidth::W256,
-            input, weight, output,
-            None, None,
+            input,
+            weight,
+            output,
+            None,
+            None,
             GatherIndicesKind::Arange,
             QuantPrecision::F32,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let has_loop = prog.instrs.iter().any(|i| matches!(i, VmInstr::LoopBegin { .. }));
+        let has_loop = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::LoopBegin { .. }));
         assert!(has_loop, "Symbolic bound gather must emit loop");
     }
 
@@ -1464,16 +2087,33 @@ mod tests {
         emit_column_slice_inline(
             &mut prog,
             BoundExpr::Const(1),
-            4, 0, 4,
+            4,
+            0,
+            4,
             SimdWidth::Scalar,
-            input, output,
+            input,
+            output,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let scalar_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { width: SimdWidth::Scalar, .. })
-        }).count();
-        assert!(scalar_loads > 0, "Scalar width ColumnSlice must emit scalar loads");
+        let scalar_loads = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecLoad {
+                        width: SimdWidth::Scalar,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            scalar_loads > 0,
+            "Scalar width ColumnSlice must emit scalar loads"
+        );
     }
 
     // @trace TEST-12k79
@@ -1490,15 +2130,22 @@ mod tests {
             BoundExpr::Const(0),
             32,
             SimdWidth::W256,
-            input, weight, output,
-            None, None,
+            input,
+            weight,
+            output,
+            None,
+            None,
             GatherIndicesKind::Arange,
             QuantPrecision::F32,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Zero seq should either be clean or emit minimal loop structure
-        assert!(prog.len() > 0, "Even zero-seq gather must emit setup instructions");
+        assert!(
+            prog.len() > 0,
+            "Even zero-seq gather must emit setup instructions"
+        );
     }
 
     // @trace TEST-12k79
@@ -1512,14 +2159,24 @@ mod tests {
         emit_column_slice_inline(
             &mut prog,
             BoundExpr::Const(2),
-            64, 0, 64,
+            64,
+            0,
+            64,
             SimdWidth::W256,
-            input, output,
+            input,
+            output,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let has_load = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecLoad { .. }));
-        let has_store = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecStore { .. }));
+        let has_load = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecLoad { .. }));
+        let has_store = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecStore { .. }));
         assert!(has_load, "Full copy ColumnSlice must emit VecLoad");
         assert!(has_store, "Full copy ColumnSlice must emit VecStore");
     }
@@ -1540,19 +2197,26 @@ mod tests {
             BoundExpr::Const(4),
             embed_dim,
             SimdWidth::W256,
-            input, weight, output,
-            None, None,
+            input,
+            weight,
+            output,
+            None,
+            None,
             GatherIndicesKind::Tensor,
             QuantPrecision::F32,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let stride_matches = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::IntMulStride { stride, .. } if *stride == embed_dim * 4)
-        });
-        assert!(stride_matches,
+        let stride_matches = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::IntMulStride { stride, .. } if *stride == embed_dim * 4));
+        assert!(
+            stride_matches,
             "Tensor gather IntMulStride stride must equal weight_row_bytes ({})",
-            embed_dim * 4);
+            embed_dim * 4
+        );
     }
 
     // 2. Gather Arange: verify IntMulStride scale = weight_row_bytes / index_elem
@@ -1569,19 +2233,26 @@ mod tests {
             BoundExpr::Const(4),
             embed_dim,
             SimdWidth::W256,
-            input, weight, output,
-            None, None,
+            input,
+            weight,
+            output,
+            None,
+            None,
             GatherIndicesKind::Arange,
             QuantPrecision::F32,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         let expected_scale = (embed_dim * 4) / 4; // weight_row_bytes / index_elem
-        let scale_matches = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::IntMulStride { stride, .. } if *stride == expected_scale)
-        });
-        assert!(scale_matches,
-            "Arange gather IntMulStride scale must be weight_row_bytes/index_elem = {}", expected_scale);
+        let scale_matches = prog.instrs.iter().any(
+            |i| matches!(i, VmInstr::IntMulStride { stride, .. } if *stride == expected_scale),
+        );
+        assert!(
+            scale_matches,
+            "Arange gather IntMulStride scale must be weight_row_bytes/index_elem = {}",
+            expected_scale
+        );
     }
 
     // 3. Gather Zeros with multi-token seq: verify no index-dependent ops, output row advances
@@ -1597,22 +2268,45 @@ mod tests {
             BoundExpr::Const(6), // 6 tokens, all should broadcast row 0
             64,
             SimdWidth::W256,
-            input, weight, output,
-            None, None,
+            input,
+            weight,
+            output,
+            None,
+            None,
             GatherIndicesKind::Zeros,
             QuantPrecision::F32,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Must NOT have ScalarLoad or IntMulStride (no index computation)
-        let has_scalar_load = prog.instrs.iter().any(|i| matches!(i, VmInstr::ScalarLoad { .. }));
-        let has_int_mul = prog.instrs.iter().any(|i| matches!(i, VmInstr::IntMulStride { .. }));
-        assert!(!has_scalar_load, "Zeros gather must not emit ScalarLoad regardless of seq count");
-        assert!(!has_int_mul, "Zeros gather must not emit IntMulStride regardless of seq count");
+        let has_scalar_load = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::ScalarLoad { .. }));
+        let has_int_mul = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::IntMulStride { .. }));
+        assert!(
+            !has_scalar_load,
+            "Zeros gather must not emit ScalarLoad regardless of seq count"
+        );
+        assert!(
+            !has_int_mul,
+            "Zeros gather must not emit IntMulStride regardless of seq count"
+        );
 
         // Must have VecStore for writing output rows
-        let store_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::VecStore { .. })).count();
-        assert!(store_count > 0, "Zeros gather must emit VecStore for output");
+        let store_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::VecStore { .. }))
+            .count();
+        assert!(
+            store_count > 0,
+            "Zeros gather must emit VecStore for output"
+        );
     }
 
     // 4. ColumnSlice with W512 SIMD width produces wider vector operations
@@ -1626,18 +2320,42 @@ mod tests {
         emit_column_slice_inline(
             &mut prog,
             BoundExpr::Const(2),
-            128, 0, 64,
+            128,
+            0,
+            64,
             SimdWidth::W512,
-            input, output,
+            input,
+            output,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let w512_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { width: SimdWidth::W512, .. })
-        }).count();
-        let w512_stores = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecStore { width: SimdWidth::W512, .. })
-        }).count();
+        let w512_loads = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecLoad {
+                        width: SimdWidth::W512,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let w512_stores = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecStore {
+                        width: SimdWidth::W512,
+                        ..
+                    }
+                )
+            })
+            .count();
         assert!(w512_loads > 0, "W512 ColumnSlice must emit W512 VecLoad");
         assert!(w512_stores > 0, "W512 ColumnSlice must emit W512 VecStore");
     }
@@ -1654,21 +2372,35 @@ mod tests {
         emit_rope_inline(
             &mut prog,
             BoundExpr::Const(1),
-            2, 2, // 2 heads, head_dim=2
+            2,
+            2, // 2 heads, head_dim=2
             1.0,
             SimdWidth::W256,
-            input, output,
-            0, &sym_map,
+            input,
+            output,
+            0,
+            &sym_map,
             QuantPrecision::F32,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Must have seq + head loops
-        let loop_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
-        assert!(loop_count >= 2, "Minimal RoPE must emit seq+head loops, got {loop_count}");
+        let loop_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopBegin { .. }))
+            .count();
+        assert!(
+            loop_count >= 2,
+            "Minimal RoPE must emit seq+head loops, got {loop_count}"
+        );
 
         // Must have VecLoad for reading input elements
-        let has_load = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecLoad { .. }));
+        let has_load = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecLoad { .. }));
         assert!(has_load, "Minimal RoPE must load input values");
     }
 
@@ -1688,17 +2420,27 @@ mod tests {
         emit_rope_inline(
             &mut prog,
             sym_bound,
-            4, 64,
+            4,
+            64,
             1.0,
             SimdWidth::W256,
-            input, output,
-            0, &sym_map,
+            input,
+            output,
+            0,
+            &sym_map,
             QuantPrecision::F32,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let has_loop = prog.instrs.iter().any(|i| matches!(i, VmInstr::LoopBegin { .. }));
-        assert!(has_loop, "RoPE with symbolic bound must emit outer seq loop");
+        let has_loop = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::LoopBegin { .. }));
+        assert!(
+            has_loop,
+            "RoPE with symbolic bound must emit outer seq loop"
+        );
     }
 
     // 7. RoPE with Scalar width falls back to scalar rotation pairs
@@ -1713,23 +2455,53 @@ mod tests {
         emit_rope_inline(
             &mut prog,
             BoundExpr::Const(1),
-            2, 4,
+            2,
+            4,
             1.0,
             SimdWidth::Scalar,
-            input, output,
-            0, &sym_map,
+            input,
+            output,
+            0,
+            &sym_map,
             QuantPrecision::F32,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let scalar_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { width: SimdWidth::Scalar, .. })
-        }).count();
-        let scalar_stores = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecStore { width: SimdWidth::Scalar, .. })
-        }).count();
-        assert!(scalar_loads > 0, "Scalar width RoPE must emit scalar VecLoad");
-        assert!(scalar_stores > 0, "Scalar width RoPE must emit scalar VecStore");
+        let scalar_loads = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecLoad {
+                        width: SimdWidth::Scalar,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let scalar_stores = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecStore {
+                        width: SimdWidth::Scalar,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            scalar_loads > 0,
+            "Scalar width RoPE must emit scalar VecLoad"
+        );
+        assert!(
+            scalar_stores > 0,
+            "Scalar width RoPE must emit scalar VecStore"
+        );
     }
 
     // 8. Gather with BF16 weight_dtype uses 2-byte element for weight row
@@ -1747,19 +2519,26 @@ mod tests {
             BoundExpr::Const(2),
             64,
             SimdWidth::W256,
-            input, weight, output,
-            None, None,
+            input,
+            weight,
+            output,
+            None,
+            None,
             GatherIndicesKind::Tensor,
             QuantPrecision::F32,
             QuantPrecision::BF16, // weight stored as BF16
-        ).unwrap();
+        )
+        .unwrap();
 
         // IntMulStride stride should use weight_row_bytes (64*2=128 for BF16)
-        let bf16_stride = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::IntMulStride { stride, .. } if *stride == 64 * 2)
-        });
-        assert!(bf16_stride,
-            "BF16 weight gather must use BF16 weight_row_bytes (128) as stride");
+        let bf16_stride = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::IntMulStride { stride, .. } if *stride == 64 * 2));
+        assert!(
+            bf16_stride,
+            "BF16 weight gather must use BF16 weight_row_bytes (128) as stride"
+        );
     }
 
     // 9. ColumnSlice with Symbolic bound emits dynamic outer loop
@@ -1777,16 +2556,32 @@ mod tests {
         emit_column_slice_inline(
             &mut prog,
             sym_bound,
-            64, 0, 32,
+            64,
+            0,
+            32,
             SimdWidth::W256,
-            input, output,
+            input,
+            output,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let has_loop = prog.instrs.iter().any(|i| matches!(i, VmInstr::LoopBegin { .. }));
-        assert!(has_loop, "ColumnSlice with symbolic bound must emit outer seq loop");
-        let has_load = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecLoad { .. }));
-        assert!(has_load, "Symbolic ColumnSlice must still emit VecLoad for copy");
+        let has_loop = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::LoopBegin { .. }));
+        assert!(
+            has_loop,
+            "ColumnSlice with symbolic bound must emit outer seq loop"
+        );
+        let has_load = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecLoad { .. }));
+        assert!(
+            has_load,
+            "Symbolic ColumnSlice must still emit VecLoad for copy"
+        );
     }
 
     // 10. RoPE head_dim not divisible by lanes emits scalar tail rotation pairs
@@ -1802,20 +2597,36 @@ mod tests {
         emit_rope_inline(
             &mut prog,
             BoundExpr::Const(1),
-            4, 24,
+            4,
+            24,
             1.0,
             SimdWidth::W256,
-            input, output,
-            0, &sym_map,
+            input,
+            output,
+            0,
+            &sym_map,
             QuantPrecision::F32,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let scalar_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { width: SimdWidth::Scalar, .. })
-        }).count();
-        assert!(scalar_loads > 0,
-            "head_dim=24 with W256 must emit scalar tail rotation pairs (pair_tail=4)");
+        let scalar_loads = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecLoad {
+                        width: SimdWidth::Scalar,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            scalar_loads > 0,
+            "head_dim=24 with W256 must emit scalar tail rotation pairs (pair_tail=4)"
+        );
     }
 
     // ── Wave 12kkd: 10 additional tests (56 total) ──────────────────────────
@@ -1834,20 +2645,37 @@ mod tests {
             BoundExpr::Const(2),
             4,
             SimdWidth::W256,
-            input, weight, output,
-            None, None,
+            input,
+            weight,
+            output,
+            None,
+            None,
             GatherIndicesKind::Arange,
             QuantPrecision::F32,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Must have outer seq loop but NO inner dim loop (dim_vecs=0)
-        let loop_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
-        assert_eq!(loop_count, 1, "embed_dim < lanes must produce exactly 1 loop (outer seq only), got {loop_count}");
+        let loop_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopBegin { .. }))
+            .count();
+        assert_eq!(
+            loop_count, 1,
+            "embed_dim < lanes must produce exactly 1 loop (outer seq only), got {loop_count}"
+        );
 
         // Still must emit VecStore for output row advance (LoadPtr with out_row)
-        let has_load_ptr = prog.instrs.iter().any(|i| matches!(i, VmInstr::LoadPtr { .. }));
-        assert!(has_load_ptr, "Gather must emit LoadPtr for output row pointer management");
+        let has_load_ptr = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::LoadPtr { .. }));
+        assert!(
+            has_load_ptr,
+            "Gather must emit LoadPtr for output row pointer management"
+        );
     }
 
     // 2. Gather with both BF16 weight and BF16 compute dtype: strides use 2-byte elements throughout
@@ -1864,23 +2692,42 @@ mod tests {
             BoundExpr::Const(4),
             32,
             SimdWidth::W256,
-            input, weight, output,
-            None, None,
+            input,
+            weight,
+            output,
+            None,
+            None,
             GatherIndicesKind::Tensor,
             QuantPrecision::BF16,
             QuantPrecision::BF16,
-        ).unwrap();
+        )
+        .unwrap();
 
         // IntMulStride for Tensor index: stride = weight_row_bytes = 32*2 = 64
-        let stride_bf16 = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::IntMulStride { stride, .. } if *stride == 32 * 2)
-        });
-        assert!(stride_bf16, "BF16/BF16 gather must use BF16 weight_row_bytes (64) as stride");
+        let stride_bf16 = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::IntMulStride { stride, .. } if *stride == 32 * 2));
+        assert!(
+            stride_bf16,
+            "BF16/BF16 gather must use BF16 weight_row_bytes (64) as stride"
+        );
 
         // VecLoad dtype must be BF16 (reading from weight table)
-        let bf16_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { dtype: QuantPrecision::BF16, predicate: None, .. })
-        }).count();
+        let bf16_loads = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecLoad {
+                        dtype: QuantPrecision::BF16,
+                        predicate: None,
+                        ..
+                    }
+                )
+            })
+            .count();
         assert!(bf16_loads > 0, "BF16 weight gather must emit BF16 VecLoad");
     }
 
@@ -1895,23 +2742,50 @@ mod tests {
         emit_column_slice_inline(
             &mut prog,
             BoundExpr::Const(1),
-            16, 0, 10,
+            16,
+            0,
+            10,
             SimdWidth::W128,
-            input, output,
+            input,
+            output,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // W128 vectorized loads
-        let w128_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { width: SimdWidth::W128, .. })
-        }).count();
+        let w128_loads = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecLoad {
+                        width: SimdWidth::W128,
+                        ..
+                    }
+                )
+            })
+            .count();
         assert!(w128_loads > 0, "W128 ColumnSlice must emit W128 VecLoad");
 
         // Scalar tail for remainder
-        let scalar_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { width: SimdWidth::Scalar, .. })
-        }).count();
-        assert!(scalar_loads > 0, "W128 ColumnSlice with tail must emit scalar tail loads");
+        let scalar_loads = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecLoad {
+                        width: SimdWidth::Scalar,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            scalar_loads > 0,
+            "W128 ColumnSlice with tail must emit scalar tail loads"
+        );
     }
 
     // 4. ColumnSlice comment contains correct start and end column range
@@ -1925,17 +2799,24 @@ mod tests {
         emit_column_slice_inline(
             &mut prog,
             BoundExpr::Const(1),
-            64, 8, 16,
+            64,
+            8,
+            16,
             SimdWidth::W256,
-            input, output,
+            input,
+            output,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
-        let has_correct_comment = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::Comment(s) if s.contains("8..24"))
-        });
-        assert!(has_correct_comment,
-            "ColumnSlice comment must reflect correct range 8..24 for start=8, slice_dim=16");
+        let has_correct_comment = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::Comment(s) if s.contains("8..24")));
+        assert!(
+            has_correct_comment,
+            "ColumnSlice comment must reflect correct range 8..24 for start=8, slice_dim=16"
+        );
     }
 
     // 5. RoPE with partial=1.0 and head_dim=128: no passthrough section (all dims rotated)
@@ -1950,19 +2831,29 @@ mod tests {
         emit_rope_inline(
             &mut prog,
             BoundExpr::Const(1),
-            4, 128,
+            4,
+            128,
             1.0,
             SimdWidth::W256,
-            input, output,
-            0, &sym_map,
+            input,
+            output,
+            0,
+            &sym_map,
             QuantPrecision::F32,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // seq loop + head loop + rotation vec loop = exactly 3
-        let loop_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
-        assert_eq!(loop_count, 3,
-            "Full partial RoPE must emit exactly 3 loops (seq+head+rot vec), got {loop_count}");
+        let loop_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopBegin { .. }))
+            .count();
+        assert_eq!(
+            loop_count, 3,
+            "Full partial RoPE must emit exactly 3 loops (seq+head+rot vec), got {loop_count}"
+        );
     }
 
     // 6. RoPE with non-zero cos_sin_offset: scratchpad offset used for cos/sin base
@@ -1976,22 +2867,27 @@ mod tests {
         emit_rope_inline(
             &mut prog,
             BoundExpr::Const(1),
-            4, 64,
+            4,
+            64,
             1.0,
             SimdWidth::W256,
-            input, output,
+            input,
+            output,
             256, // cos_sin_offset=256 → cos/sin table starts 256 bytes into scratchpad
             &sym_map,
             QuantPrecision::F32,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Must have LoadPtr with VRegPlusConst(scratch_base, 256) to set cos_sin_base
         let has_offset_load = prog.instrs.iter().any(|i| {
             matches!(i, VmInstr::LoadPtr { src: PtrExpr::VRegPlusConst(_, off), .. } if *off == 256)
         });
-        assert!(has_offset_load,
-            "RoPE with cos_sin_offset=256 must load cos/sin base at offset 256 from scratchpad");
+        assert!(
+            has_offset_load,
+            "RoPE with cos_sin_offset=256 must load cos/sin base at offset 256 from scratchpad"
+        );
     }
 
     // 7. RoPE with multi-token seq produces correct token stride bytes
@@ -2006,24 +2902,38 @@ mod tests {
         emit_rope_inline(
             &mut prog,
             BoundExpr::Const(8), // 8 tokens
-            4, 32,
+            4,
+            32,
             1.0,
             SimdWidth::W256,
-            input, output,
-            0, &sym_map,
+            input,
+            output,
+            0,
+            &sym_map,
             QuantPrecision::F32,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Must emit tok_input and tok_output LoadPtr from base ptrs
-        let load_ptr_count = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::LoadPtr { .. })
-        }).count();
-        assert!(load_ptr_count >= 4,
-            "Multi-token RoPE must emit tok_input/tok_output/head_input/head_output LoadPtr");
+        let load_ptr_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoadPtr { .. }))
+            .count();
+        assert!(
+            load_ptr_count >= 4,
+            "Multi-token RoPE must emit tok_input/tok_output/head_input/head_output LoadPtr"
+        );
 
-        let has_vec_store = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecStore { .. }));
-        assert!(has_vec_store, "Multi-token RoPE must emit VecStore for rotation output");
+        let has_vec_store = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecStore { .. }));
+        assert!(
+            has_vec_store,
+            "Multi-token RoPE must emit VecStore for rotation output"
+        );
     }
 
     // 8. Gather with telemetry (no scale): verifies VecStore to telemetry ptr after seq loop
@@ -2040,26 +2950,45 @@ mod tests {
             BoundExpr::Const(2),
             64,
             SimdWidth::W256,
-            input, weight, output,
-            Some(telemetry), None, // telemetry, no scale
+            input,
+            weight,
+            output,
+            Some(telemetry),
+            None, // telemetry, no scale
             GatherIndicesKind::Arange,
             QuantPrecision::F32,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // After seq loop: VecStore to telemetry ptr with Scalar width for L2 norm result
-        let scalar_stores = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecStore { width: SimdWidth::Scalar, .. })
-        }).count();
-        assert!(scalar_stores > 0,
-            "Gather with telemetry must emit scalar VecStore for L2 norm finalization");
+        let scalar_stores = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecStore {
+                        width: SimdWidth::Scalar,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            scalar_stores > 0,
+            "Gather with telemetry must emit scalar VecStore for L2 norm finalization"
+        );
 
         // Must have Sqrt trace op lowered (from norm_body) — produces VecUnOp or similar
-        let has_sqrt_comment = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::Comment(s) if s.contains("L2 norm"))
-        });
-        assert!(has_sqrt_comment,
-            "Gather with telemetry must emit L2 norm finalization comment");
+        let has_sqrt_comment = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::Comment(s) if s.contains("L2 norm")));
+        assert!(
+            has_sqrt_comment,
+            "Gather with telemetry must emit L2 norm finalization comment"
+        );
     }
 
     // 9. Gather with embed_dim exactly matching lanes: no scalar tail, clean vectorized path
@@ -2076,26 +3005,52 @@ mod tests {
             BoundExpr::Const(3),
             16,
             SimdWidth::W256,
-            input, weight, output,
-            None, None,
+            input,
+            weight,
+            output,
+            None,
+            None,
             GatherIndicesKind::Tensor,
             QuantPrecision::F32,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // All VecLoad should be W256 (no scalar loads for tail)
-        let vec_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { width: SimdWidth::W256, .. })
-        }).count();
+        let vec_loads = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecLoad {
+                        width: SimdWidth::W256,
+                        ..
+                    }
+                )
+            })
+            .count();
         assert!(vec_loads > 0, "Lane-aligned gather must emit W256 VecLoad");
 
         // No scalar VecLoad from the inner dim loop (ScalarLoad for index reading is ok)
         // Check that there are no VecLoad with Scalar width (only ScalarLoad for indices)
-        let scalar_vec_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { width: SimdWidth::Scalar, .. })
-        }).count();
-        assert_eq!(scalar_vec_loads, 0,
-            "Lane-aligned gather must not emit scalar VecLoad in dim loop, got {scalar_vec_loads}");
+        let scalar_vec_loads = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecLoad {
+                        width: SimdWidth::Scalar,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            scalar_vec_loads, 0,
+            "Lane-aligned gather must not emit scalar VecLoad in dim loop, got {scalar_vec_loads}"
+        );
     }
 
     // 10. ColumnSlice with BF16 and exact boundary: no tail, no scalar ops in dim loop
@@ -2109,25 +3064,55 @@ mod tests {
         emit_column_slice_inline(
             &mut prog,
             BoundExpr::Const(2),
-            32, 0, 16,
+            32,
+            0,
+            16,
             SimdWidth::W256,
-            input, output,
+            input,
+            output,
             QuantPrecision::BF16,
-        ).unwrap();
+        )
+        .unwrap();
 
         // All VecLoad must be BF16 W256
-        let bf16_vec_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { width: SimdWidth::W256, dtype: QuantPrecision::BF16, predicate: None, .. })
-        }).count();
-        assert!(bf16_vec_loads > 0,
-            "BF16 ColumnSlice with aligned dims must emit BF16 W256 VecLoad");
+        let bf16_vec_loads = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecLoad {
+                        width: SimdWidth::W256,
+                        dtype: QuantPrecision::BF16,
+                        predicate: None,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            bf16_vec_loads > 0,
+            "BF16 ColumnSlice with aligned dims must emit BF16 W256 VecLoad"
+        );
 
         // No scalar VecLoad (tail=0)
-        let scalar_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { width: SimdWidth::Scalar, .. })
-        }).count();
-        assert_eq!(scalar_loads, 0,
-            "BF16 aligned ColumnSlice must not emit scalar tail loads, got {scalar_loads}");
+        let scalar_loads = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecLoad {
+                        width: SimdWidth::Scalar,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            scalar_loads, 0,
+            "BF16 aligned ColumnSlice must not emit scalar tail loads, got {scalar_loads}"
+        );
     }
 
     // ── Wave 12x88: 10 additional tests (66 total) ──────────────────────────
@@ -2142,20 +3127,36 @@ mod tests {
         let telemetry = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         emit_gather_inline(
-            &mut prog, BoundExpr::Const(2), 64, SimdWidth::W256,
-            input, weight, output, Some(telemetry), None,
-            GatherIndicesKind::Zeros, QuantPrecision::F32, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            BoundExpr::Const(2),
+            64,
+            SimdWidth::W256,
+            input,
+            weight,
+            output,
+            Some(telemetry),
+            None,
+            GatherIndicesKind::Zeros,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
-        let has_broadcast_zero = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::Broadcast { src: ScalarExpr::Const(v), .. } if *v == 0.0)
-        });
-        assert!(has_broadcast_zero,
-            "Zeros gather with telemetry must emit Broadcast(0.0) for L2 norm accumulator");
-        let has_l2_comment = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::Comment(s) if s.contains("L2 norm"))
-        });
-        assert!(has_l2_comment, "Zeros gather with telemetry must emit L2 norm comment");
+        let has_broadcast_zero = prog.instrs.iter().any(
+            |i| matches!(i, VmInstr::Broadcast { src: ScalarExpr::Const(v), .. } if *v == 0.0),
+        );
+        assert!(
+            has_broadcast_zero,
+            "Zeros gather with telemetry must emit Broadcast(0.0) for L2 norm accumulator"
+        );
+        let has_l2_comment = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::Comment(s) if s.contains("L2 norm")));
+        assert!(
+            has_l2_comment,
+            "Zeros gather with telemetry must emit L2 norm comment"
+        );
     }
 
     // 2. ColumnSlice with slice_dim=1: all scalar ops, no vectorized inner loop
@@ -2167,16 +3168,44 @@ mod tests {
 
         // W256=8 lanes, slice_dim=1 → slice_vecs=0, tail=1 → scalar-only path
         emit_column_slice_inline(
-            &mut prog, BoundExpr::Const(2), 8, 0, 1,
-            SimdWidth::W256, input, output, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            BoundExpr::Const(2),
+            8,
+            0,
+            1,
+            SimdWidth::W256,
+            input,
+            output,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
-        let loop_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
-        assert_eq!(loop_count, 1, "slice_dim=1 must emit only outer seq loop, got {loop_count}");
-        let scalar_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { width: SimdWidth::Scalar, .. })
-        }).count();
-        assert!(scalar_loads > 0, "slice_dim=1 must emit scalar VecLoad for tail element");
+        let loop_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopBegin { .. }))
+            .count();
+        assert_eq!(
+            loop_count, 1,
+            "slice_dim=1 must emit only outer seq loop, got {loop_count}"
+        );
+        let scalar_loads = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecLoad {
+                        width: SimdWidth::Scalar,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            scalar_loads > 0,
+            "slice_dim=1 must emit scalar VecLoad for tail element"
+        );
     }
 
     // 3. RoPE rejects negative partial value
@@ -2188,15 +3217,27 @@ mod tests {
         let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let result = emit_rope_inline(
-            &mut prog, BoundExpr::Const(1), 4, 64,
-            -0.5, SimdWidth::W256, input, output, 0, &sym_map,
-            QuantPrecision::F32, None,
+            &mut prog,
+            BoundExpr::Const(1),
+            4,
+            64,
+            -0.5,
+            SimdWidth::W256,
+            input,
+            output,
+            0,
+            &sym_map,
+            QuantPrecision::F32,
+            None,
         );
 
         assert!(result.is_err(), "negative partial must be rejected");
         match result.unwrap_err() {
             CompilerError::CodegenViolation(msg) => {
-                assert!(msg.contains("partial"), "error should mention partial: {msg}");
+                assert!(
+                    msg.contains("partial"),
+                    "error should mention partial: {msg}"
+                );
             }
             other => panic!("expected CodegenViolation, got: {other:?}"),
         }
@@ -2212,18 +3253,47 @@ mod tests {
 
         // W256=8, embed_dim=8 → dim_vecs=1, no scalar tail
         emit_gather_inline(
-            &mut prog, BoundExpr::Const(2), 8, SimdWidth::W256,
-            input, weight, output, None, None,
-            GatherIndicesKind::Tensor, QuantPrecision::F32, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            BoundExpr::Const(2),
+            8,
+            SimdWidth::W256,
+            input,
+            weight,
+            output,
+            None,
+            None,
+            GatherIndicesKind::Tensor,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
-        let loop_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
-        assert_eq!(loop_count, 2, "embed_dim=lanes must emit seq+dim loops, got {loop_count}");
-        let scalar_vec_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { width: SimdWidth::Scalar, .. })
-        }).count();
-        assert_eq!(scalar_vec_loads, 0,
-            "embed_dim=lanes must not emit scalar VecLoad, got {scalar_vec_loads}");
+        let loop_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopBegin { .. }))
+            .count();
+        assert_eq!(
+            loop_count, 2,
+            "embed_dim=lanes must emit seq+dim loops, got {loop_count}"
+        );
+        let scalar_vec_loads = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecLoad {
+                        width: SimdWidth::Scalar,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            scalar_vec_loads, 0,
+            "embed_dim=lanes must not emit scalar VecLoad, got {scalar_vec_loads}"
+        );
     }
 
     // 5. ColumnSlice with large input_inner: initial LoadPtr offset matches start*elem_bytes
@@ -2235,15 +3305,25 @@ mod tests {
 
         // F32: start_bytes = 128*4 = 512
         emit_column_slice_inline(
-            &mut prog, BoundExpr::Const(1), 256, 128, 64,
-            SimdWidth::W256, input, output, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            BoundExpr::Const(1),
+            256,
+            128,
+            64,
+            SimdWidth::W256,
+            input,
+            output,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         let has_start_offset = prog.instrs.iter().any(|i| {
             matches!(i, VmInstr::LoadPtr { src: PtrExpr::VRegPlusConst(_, off), .. } if *off == 128 * 4)
         });
-        assert!(has_start_offset,
-            "ColumnSlice must initialize in_row with start*elem_bytes offset (512)");
+        assert!(
+            has_start_offset,
+            "ColumnSlice must initialize in_row with start*elem_bytes offset (512)"
+        );
     }
 
     // 6. RoPE W512 with head_dim=128 full rotation: W512 VecLoad/VecStore
@@ -2255,17 +3335,47 @@ mod tests {
         let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         emit_rope_inline(
-            &mut prog, BoundExpr::Const(1), 4, 128,
-            1.0, SimdWidth::W512, input, output, 0, &sym_map,
-            QuantPrecision::F32, None,
-        ).unwrap();
+            &mut prog,
+            BoundExpr::Const(1),
+            4,
+            128,
+            1.0,
+            SimdWidth::W512,
+            input,
+            output,
+            0,
+            &sym_map,
+            QuantPrecision::F32,
+            None,
+        )
+        .unwrap();
 
-        let w512_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { width: SimdWidth::W512, .. })
-        }).count();
-        let w512_stores = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecStore { width: SimdWidth::W512, .. })
-        }).count();
+        let w512_loads = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecLoad {
+                        width: SimdWidth::W512,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let w512_stores = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecStore {
+                        width: SimdWidth::W512,
+                        ..
+                    }
+                )
+            })
+            .count();
         assert!(w512_loads > 0, "W512 RoPE must emit W512 VecLoad");
         assert!(w512_stores > 0, "W512 RoPE must emit W512 VecStore");
     }
@@ -2279,15 +3389,39 @@ mod tests {
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         emit_gather_inline(
-            &mut prog, BoundExpr::Const(2), 64, SimdWidth::W256,
-            input, weight, output, None, None,
-            GatherIndicesKind::Arange, QuantPrecision::BF16, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            BoundExpr::Const(2),
+            64,
+            SimdWidth::W256,
+            input,
+            weight,
+            output,
+            None,
+            None,
+            GatherIndicesKind::Arange,
+            QuantPrecision::BF16,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
-        let bf16_stores = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecStore { dtype: QuantPrecision::BF16, predicate: None, .. })
-        }).count();
-        assert!(bf16_stores > 0, "BF16 compute gather must emit BF16 VecStore");
+        let bf16_stores = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecStore {
+                        dtype: QuantPrecision::BF16,
+                        predicate: None,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            bf16_stores > 0,
+            "BF16 compute gather must emit BF16 VecStore"
+        );
     }
 
     // 8. ColumnSlice W128 BF16 aligned: no scalar tail, clean W128 path
@@ -2299,19 +3433,54 @@ mod tests {
 
         // W128=4 lanes, BF16, slice_dim=8 → slice_vecs=2, tail=0
         emit_column_slice_inline(
-            &mut prog, BoundExpr::Const(2), 16, 0, 8,
-            SimdWidth::W128, input, output, QuantPrecision::BF16,
-        ).unwrap();
+            &mut prog,
+            BoundExpr::Const(2),
+            16,
+            0,
+            8,
+            SimdWidth::W128,
+            input,
+            output,
+            QuantPrecision::BF16,
+        )
+        .unwrap();
 
-        let w128_bf16_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { width: SimdWidth::W128, dtype: QuantPrecision::BF16, predicate: None, .. })
-        }).count();
-        assert!(w128_bf16_loads > 0, "W128 BF16 ColumnSlice must emit W128 BF16 VecLoad");
-        let scalar_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { width: SimdWidth::Scalar, .. })
-        }).count();
-        assert_eq!(scalar_loads, 0,
-            "W128 BF16 aligned ColumnSlice must not emit scalar tail, got {scalar_loads}");
+        let w128_bf16_loads = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecLoad {
+                        width: SimdWidth::W128,
+                        dtype: QuantPrecision::BF16,
+                        predicate: None,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            w128_bf16_loads > 0,
+            "W128 BF16 ColumnSlice must emit W128 BF16 VecLoad"
+        );
+        let scalar_loads = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecLoad {
+                        width: SimdWidth::Scalar,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            scalar_loads, 0,
+            "W128 BF16 aligned ColumnSlice must not emit scalar tail, got {scalar_loads}"
+        );
     }
 
     // 9. RoPE with position_offset AND BF16: GprBinOp(Add) and BF16 loads
@@ -2324,17 +3493,38 @@ mod tests {
         let pos_offset = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
 
         emit_rope_inline(
-            &mut prog, BoundExpr::Const(1), 4, 64,
-            1.0, SimdWidth::W256, input, output, 0, &sym_map,
-            QuantPrecision::BF16, Some(pos_offset),
-        ).unwrap();
+            &mut prog,
+            BoundExpr::Const(1),
+            4,
+            64,
+            1.0,
+            SimdWidth::W256,
+            input,
+            output,
+            0,
+            &sym_map,
+            QuantPrecision::BF16,
+            Some(pos_offset),
+        )
+        .unwrap();
 
-        let has_gpr_add = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::GprBinOp { op: GprOp::Add, .. })
-        });
-        assert!(has_gpr_add, "BF16 RoPE with position_offset must emit GprBinOp(Add)");
+        let has_gpr_add = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::GprBinOp { op: GprOp::Add, .. }));
+        assert!(
+            has_gpr_add,
+            "BF16 RoPE with position_offset must emit GprBinOp(Add)"
+        );
         let has_bf16_load = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::VecLoad { dtype: QuantPrecision::BF16, predicate: None, .. })
+            matches!(
+                i,
+                VmInstr::VecLoad {
+                    dtype: QuantPrecision::BF16,
+                    predicate: None,
+                    ..
+                }
+            )
         });
         assert!(has_bf16_load, "BF16 RoPE must emit BF16 VecLoad");
     }
@@ -2349,16 +3539,28 @@ mod tests {
 
         // F32, embed_dim=32 → compute_row_bytes=128
         emit_gather_inline(
-            &mut prog, BoundExpr::Const(1), 32, SimdWidth::W256,
-            input, weight, output, None, None,
-            GatherIndicesKind::Tensor, QuantPrecision::F32, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            BoundExpr::Const(1),
+            32,
+            SimdWidth::W256,
+            input,
+            weight,
+            output,
+            None,
+            None,
+            GatherIndicesKind::Tensor,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         let has_row_advance = prog.instrs.iter().any(|i| {
             matches!(i, VmInstr::LoadPtr { src: PtrExpr::VRegPlusConst(_, off), .. } if *off == 32 * 4)
         });
-        assert!(has_row_advance,
-            "Gather must emit output row advance with compute_row_bytes offset");
+        assert!(
+            has_row_advance,
+            "Gather must emit output row advance with compute_row_bytes offset"
+        );
     }
 
     // ── Wave 12x91: 10 additional tests (76 total) ──────────────────────────
@@ -2372,17 +3574,35 @@ mod tests {
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         emit_gather_inline(
-            &mut prog, BoundExpr::Const(4), 64, SimdWidth::W256,
-            input, weight, output, None, None,
-            GatherIndicesKind::Tensor, QuantPrecision::F32, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            BoundExpr::Const(4),
+            64,
+            SimdWidth::W256,
+            input,
+            weight,
+            output,
+            None,
+            None,
+            GatherIndicesKind::Tensor,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Tensor gather's ScalarLoad must use LoopOffset (not Const) for index reading
         let has_loop_offset_load = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::ScalarLoad { offset: OffsetExpr::LoopOffset(_), .. })
+            matches!(
+                i,
+                VmInstr::ScalarLoad {
+                    offset: OffsetExpr::LoopOffset(_),
+                    ..
+                }
+            )
         });
-        assert!(has_loop_offset_load,
-            "Tensor gather must emit ScalarLoad with LoopOffset for sequential index reading");
+        assert!(
+            has_loop_offset_load,
+            "Tensor gather must emit ScalarLoad with LoopOffset for sequential index reading"
+        );
     }
 
     // 2. Gather Arange: IntMulStride src is the seq loop byte_offset counter
@@ -2394,10 +3614,20 @@ mod tests {
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         emit_gather_inline(
-            &mut prog, BoundExpr::Const(4), 32, SimdWidth::W256,
-            input, weight, output, None, None,
-            GatherIndicesKind::Arange, QuantPrecision::F32, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            BoundExpr::Const(4),
+            32,
+            SimdWidth::W256,
+            input,
+            weight,
+            output,
+            None,
+            None,
+            GatherIndicesKind::Arange,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Arange gather: IntMulStride computes row_offset from seq byte_offset
         // The src must be a ByteOffset VReg (from the outer seq loop)
@@ -2411,8 +3641,10 @@ mod tests {
                 false
             }
         });
-        assert!(intmul_uses_byte_offset,
-            "Arange gather IntMulStride must use ByteOffset VReg as src");
+        assert!(
+            intmul_uses_byte_offset,
+            "Arange gather IntMulStride must use ByteOffset VReg as src"
+        );
     }
 
     // 3. Gather Zeros: LoadPtr uses VRegPlusConst with offset 0 for weight table row
@@ -2424,17 +3656,35 @@ mod tests {
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         emit_gather_inline(
-            &mut prog, BoundExpr::Const(2), 64, SimdWidth::W256,
-            input, weight, output, None, None,
-            GatherIndicesKind::Zeros, QuantPrecision::F32, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            BoundExpr::Const(2),
+            64,
+            SimdWidth::W256,
+            input,
+            weight,
+            output,
+            None,
+            None,
+            GatherIndicesKind::Zeros,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Zeros path: LoadPtr with VRegPlusConst(weight_ptr, 0) for table row
         let has_zero_offset_load = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::LoadPtr { src: PtrExpr::VRegPlusConst(_, 0), .. })
+            matches!(
+                i,
+                VmInstr::LoadPtr {
+                    src: PtrExpr::VRegPlusConst(_, 0),
+                    ..
+                }
+            )
         });
-        assert!(has_zero_offset_load,
-            "Zeros gather must emit LoadPtr with VRegPlusConst offset 0 for weight table row");
+        assert!(
+            has_zero_offset_load,
+            "Zeros gather must emit LoadPtr with VRegPlusConst offset 0 for weight table row"
+        );
     }
 
     // 4. ColumnSlice: output row advance uses slice_dim * elem_bytes stride
@@ -2447,16 +3697,27 @@ mod tests {
         // F32: output_row_bytes = 32*4 = 128
         let slice_dim = 32;
         emit_column_slice_inline(
-            &mut prog, BoundExpr::Const(2), 64, 0, slice_dim,
-            SimdWidth::W256, input, output, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            BoundExpr::Const(2),
+            64,
+            0,
+            slice_dim,
+            SimdWidth::W256,
+            input,
+            output,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Output row advance: LoadPtr with VRegPlusConst(out_row, 128)
         let has_output_stride = prog.instrs.iter().any(|i| {
             matches!(i, VmInstr::LoadPtr { src: PtrExpr::VRegPlusConst(_, off), .. } if *off == slice_dim * 4)
         });
-        assert!(has_output_stride,
-            "ColumnSlice must advance output row by slice_dim*elem_bytes = {}", slice_dim * 4);
+        assert!(
+            has_output_stride,
+            "ColumnSlice must advance output row by slice_dim*elem_bytes = {}",
+            slice_dim * 4
+        );
     }
 
     // 5. ColumnSlice: input row advance uses input_inner * elem_bytes stride
@@ -2469,16 +3730,27 @@ mod tests {
         // F32: input_row_bytes = 128*4 = 512
         let input_inner = 128;
         emit_column_slice_inline(
-            &mut prog, BoundExpr::Const(2), input_inner, 16, 32,
-            SimdWidth::W256, input, output, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            BoundExpr::Const(2),
+            input_inner,
+            16,
+            32,
+            SimdWidth::W256,
+            input,
+            output,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Input row advance: LoadPtr with VRegPlusConst(in_row, 512)
         let has_input_stride = prog.instrs.iter().any(|i| {
             matches!(i, VmInstr::LoadPtr { src: PtrExpr::VRegPlusConst(_, off), .. } if *off == input_inner * 4)
         });
-        assert!(has_input_stride,
-            "ColumnSlice must advance input row by input_inner*elem_bytes = {}", input_inner * 4);
+        assert!(
+            has_input_stride,
+            "ColumnSlice must advance input row by input_inner*elem_bytes = {}",
+            input_inner * 4
+        );
     }
 
     // 6. RoPE: loop step_bytes matches token stride (num_heads * head_dim * elem_bytes)
@@ -2495,17 +3767,29 @@ mod tests {
         let expected_step = num_heads * head_dim * 4;
 
         emit_rope_inline(
-            &mut prog, BoundExpr::Const(4), num_heads, head_dim,
-            1.0, SimdWidth::W256, input, output, 0, &sym_map,
-            QuantPrecision::F32, None,
-        ).unwrap();
+            &mut prog,
+            BoundExpr::Const(4),
+            num_heads,
+            head_dim,
+            1.0,
+            SimdWidth::W256,
+            input,
+            output,
+            0,
+            &sym_map,
+            QuantPrecision::F32,
+            None,
+        )
+        .unwrap();
 
         // Outer seq loop must have step_bytes = token_step_bytes
         let has_correct_step = prog.instrs.iter().any(|i| {
             matches!(i, VmInstr::LoopBegin { offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(expected_step))
         });
-        assert!(has_correct_step,
-            "RoPE seq loop step must be token_step_bytes = {expected_step}");
+        assert!(
+            has_correct_step,
+            "RoPE seq loop step must be token_step_bytes = {expected_step}"
+        );
     }
 
     // 7. RoPE: head loop uses BoundExpr::Const(num_heads) as bound
@@ -2518,17 +3802,29 @@ mod tests {
 
         let num_heads = 6;
         emit_rope_inline(
-            &mut prog, BoundExpr::Const(1), num_heads, 64,
-            1.0, SimdWidth::W256, input, output, 0, &sym_map,
-            QuantPrecision::F32, None,
-        ).unwrap();
+            &mut prog,
+            BoundExpr::Const(1),
+            num_heads,
+            64,
+            1.0,
+            SimdWidth::W256,
+            input,
+            output,
+            0,
+            &sym_map,
+            QuantPrecision::F32,
+            None,
+        )
+        .unwrap();
 
         // Head loop must have BoundExpr::Const(6)
         let has_head_bound = prog.instrs.iter().any(|i| {
             matches!(i, VmInstr::LoopBegin { bound: BoundExpr::Const(n), .. } if *n == num_heads)
         });
-        assert!(has_head_bound,
-            "RoPE must emit head loop with BoundExpr::Const({num_heads})");
+        assert!(
+            has_head_bound,
+            "RoPE must emit head loop with BoundExpr::Const({num_heads})"
+        );
     }
 
     // 8. Gather with embedding_scale=1.0: scale body still produces VecBinOp (1.0 * x)
@@ -2540,16 +3836,30 @@ mod tests {
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         emit_gather_inline(
-            &mut prog, BoundExpr::Const(2), 64, SimdWidth::W256,
-            input, weight, output, None,
+            &mut prog,
+            BoundExpr::Const(2),
+            64,
+            SimdWidth::W256,
+            input,
+            weight,
+            output,
+            None,
             Some(1.0), // scale = 1.0 (identity in math, but still emits trace)
-            GatherIndicesKind::Arange, QuantPrecision::F32, QuantPrecision::F32,
-        ).unwrap();
+            GatherIndicesKind::Arange,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // scale=1.0 still generates Const(1.0) * Input(0) trace → VecBinOp
-        let has_binop = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecBinOp { .. }));
-        assert!(has_binop,
-            "Gather with embedding_scale=1.0 must still emit VecBinOp for scale trace");
+        let has_binop = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecBinOp { .. }));
+        assert!(
+            has_binop,
+            "Gather with embedding_scale=1.0 must still emit VecBinOp for scale trace"
+        );
     }
 
     // 9. ColumnSlice: both in_row and out_row LoadPtr initializations present
@@ -2561,23 +3871,47 @@ mod tests {
 
         // start=16, F32: start_bytes = 64
         emit_column_slice_inline(
-            &mut prog, BoundExpr::Const(2), 64, 16, 32,
-            SimdWidth::W256, input, output, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            BoundExpr::Const(2),
+            64,
+            16,
+            32,
+            SimdWidth::W256,
+            input,
+            output,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // in_row init: LoadPtr with VRegPlusConst(input_ptr, 64)
         let has_in_row_init = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::LoadPtr { src: PtrExpr::VRegPlusConst(_, 64), .. })
+            matches!(
+                i,
+                VmInstr::LoadPtr {
+                    src: PtrExpr::VRegPlusConst(_, 64),
+                    ..
+                }
+            )
         });
-        assert!(has_in_row_init,
-            "ColumnSlice must initialize in_row with start*elem_bytes = 64");
+        assert!(
+            has_in_row_init,
+            "ColumnSlice must initialize in_row with start*elem_bytes = 64"
+        );
 
         // out_row init: LoadPtr with VRegPlusConst(output_ptr, 0)
         let has_out_row_init = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::LoadPtr { src: PtrExpr::VRegPlusConst(_, 0), .. })
+            matches!(
+                i,
+                VmInstr::LoadPtr {
+                    src: PtrExpr::VRegPlusConst(_, 0),
+                    ..
+                }
+            )
         });
-        assert!(has_out_row_init,
-            "ColumnSlice must initialize out_row with offset 0");
+        assert!(
+            has_out_row_init,
+            "ColumnSlice must initialize out_row with offset 0"
+        );
     }
 
     // 10. RoPE: passthrough section with partial=0.5 uses identity trace (no VecBinOp in passthrough)
@@ -2591,21 +3925,48 @@ mod tests {
         // head_dim=128, partial=0.5 → rot_dim=64, passthrough_dim=64
         // Passthrough uses identity trace (Input(0)) → VecLoad + VecStore only, no VecBinOp
         emit_rope_inline(
-            &mut prog, BoundExpr::Const(1), 4, 128,
-            0.5, SimdWidth::W256, input, output, 0, &sym_map,
-            QuantPrecision::F32, None,
-        ).unwrap();
+            &mut prog,
+            BoundExpr::Const(1),
+            4,
+            128,
+            0.5,
+            SimdWidth::W256,
+            input,
+            output,
+            0,
+            &sym_map,
+            QuantPrecision::F32,
+            None,
+        )
+        .unwrap();
 
         // Must have VecLoad and VecStore (both rotation and passthrough)
-        let has_load = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecLoad { .. }));
-        let has_store = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecStore { .. }));
-        assert!(has_load, "RoPE must emit VecLoad for rotation and passthrough");
-        assert!(has_store, "RoPE must emit VecStore for rotation and passthrough");
+        let has_load = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecLoad { .. }));
+        let has_store = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecStore { .. }));
+        assert!(
+            has_load,
+            "RoPE must emit VecLoad for rotation and passthrough"
+        );
+        assert!(
+            has_store,
+            "RoPE must emit VecStore for rotation and passthrough"
+        );
 
         // Must have at least 4 loops: seq + head + rotation_vec + passthrough_vec
-        let loop_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
-        assert!(loop_count >= 4,
-            "Partial=0.5 RoPE must emit >= 4 loops (seq+head+rot+pt), got {loop_count}");
+        let loop_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopBegin { .. }))
+            .count();
+        assert!(
+            loop_count >= 4,
+            "Partial=0.5 RoPE must emit >= 4 loops (seq+head+rot+pt), got {loop_count}"
+        );
     }
 }
-

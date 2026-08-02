@@ -6,8 +6,8 @@
 //! jit_ctx=None → 使用 DeviceProfile 保守估计（不阻止融合）。
 
 use crate::compiler::graph::{CompilerGraph, CompilerOp, OpId};
-use crate::compiler::semantic_dag::{SemanticDAG, OpClass};
 use crate::compiler::jit_context::{JitContext, ResourceKind};
+use crate::compiler::semantic_dag::{OpClass, SemanticDAG};
 
 /// Register pressure estimate per op class (in SimdVec registers).
 ///
@@ -32,9 +32,19 @@ fn op_class_register_pressure(op_class: OpClass) -> usize {
 /// op would use independently. When fusing, the intermediate tensor
 /// is kept in a register instead of written to memory, so the extra
 /// cost is approximately 1 register for the intermediate value.
-pub fn estimate_register_pressure(op_a: &CompilerOp, op_b: &CompilerOp, dag: Option<&SemanticDAG>) -> usize {
-    let class_a = dag.and_then(|d| d.node(op_a.id)).map(|n| n.op_class).unwrap_or(OpClass::Opaque);
-    let class_b = dag.and_then(|d| d.node(op_b.id)).map(|n| n.op_class).unwrap_or(OpClass::Opaque);
+pub fn estimate_register_pressure(
+    op_a: &CompilerOp,
+    op_b: &CompilerOp,
+    dag: Option<&SemanticDAG>,
+) -> usize {
+    let class_a = dag
+        .and_then(|d| d.node(op_a.id))
+        .map(|n| n.op_class)
+        .unwrap_or(OpClass::Opaque);
+    let class_b = dag
+        .and_then(|d| d.node(op_b.id))
+        .map(|n| n.op_class)
+        .unwrap_or(OpClass::Opaque);
     // Fused: the intermediate output stays in register instead of being
     // written to memory and re-loaded. Extra cost = 1 register for the
     // intermediate, plus any register pressure from the second op that
@@ -59,7 +69,9 @@ pub fn estimate_tile_resource_bytes(
         if let Some(&out_tid) = pred_op.outputs.first() {
             if let Some(tensor) = graph.tensor(out_tid) {
                 let elem_bytes = tensor.dtype.size_bytes();
-                let total_elems: usize = tensor.shape.iter()
+                let total_elems: usize = tensor
+                    .shape
+                    .iter()
                     .map(|d| d.max_for_allocation_strict().unwrap_or(graph.max_seq_len))
                     .product();
                 return total_elems * elem_bytes;
@@ -225,7 +237,10 @@ fn estimate_tile_rows(graph: &CompilerGraph, anchor: OpId) -> usize {
     if let Some(op) = graph.op(anchor) {
         if let Some((m, _, _)) = op.op_gemm_dims(graph) {
             // MC = min(m, 64) — typical L1 blocking factor
-            return m.max_for_allocation_strict().unwrap_or(graph.max_seq_len).min(64);
+            return m
+                .max_for_allocation_strict()
+                .unwrap_or(graph.max_seq_len)
+                .min(64);
         }
     }
     64 // default MC
@@ -234,12 +249,16 @@ fn estimate_tile_rows(graph: &CompilerGraph, anchor: OpId) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::graph::{CompilerGraph, OpId, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+    use crate::compiler::codegen::vm::isa_profile::IsaProfile;
+    use crate::compiler::graph::{
+        AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+        DualRopeSpec, GemmSpec, MlaSpec, NormSpec, Op, OpId, QuantGemmSpec, RopeSpec, SinksSpec,
+        SymDim,
+    };
+    use crate::compiler::jit_context::JitContext;
+    use crate::compiler::planner::ExecutionPlan;
     use crate::compiler::registry::ScalarOpRegistry;
     use crate::compiler::semantic_dag::SemanticDAG;
-    use crate::compiler::planner::ExecutionPlan;
-    use crate::compiler::jit_context::JitContext;
-    use crate::compiler::codegen::vm::isa_profile::IsaProfile;
     use crate::dispatch::DeviceProfile;
     use crate::types::DType;
 
@@ -260,8 +279,18 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[16, 16], DType::F32);
         let mid = g.add_tensor_concrete("mid", &[1, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 16], DType::F32);
-        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![mid], "gemm",
+        let gemm = g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 16,
+                k: 16,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![mid],
+            "gemm",
         );
         let silu = g.add_op(Op::Silu, vec![mid], vec![out], "silu");
 
@@ -343,7 +372,13 @@ mod tests {
         let tanh_op = g.op(tanh).unwrap();
         let silu_op = g.op(silu).unwrap();
         // Fresh context has full budget available
-        assert!(can_fuse_with_budget(Some(&ctx), &g, tanh_op, silu_op, Some(&dag)));
+        assert!(can_fuse_with_budget(
+            Some(&ctx),
+            &g,
+            tanh_op,
+            silu_op,
+            Some(&dag)
+        ));
     }
 
     #[test]
@@ -368,7 +403,13 @@ mod tests {
         let tanh_op = g.op(tanh).unwrap();
         let silu_op = g.op(silu).unwrap();
         // Budget exhausted — should reject fusion
-        assert!(!can_fuse_with_budget(Some(&ctx), &g, tanh_op, silu_op, None));
+        assert!(!can_fuse_with_budget(
+            Some(&ctx),
+            &g,
+            tanh_op,
+            silu_op,
+            None
+        ));
 
         // Cleanup
         for idx in allocated {
@@ -392,7 +433,12 @@ mod tests {
         // cumulative + additional*2 + headroom(4) <= simd_cap
         let cumulative = simd_cap.saturating_sub(10);
         let additional = 2; // extra = 4, total = cumulative + 4 + 4 headroom
-        assert!(can_extend_group_with_budget(Some(&ctx), cumulative, additional, None));
+        assert!(can_extend_group_with_budget(
+            Some(&ctx),
+            cumulative,
+            additional,
+            None
+        ));
     }
 
     #[test]
@@ -406,7 +452,12 @@ mod tests {
         let cumulative = simd_cap.saturating_sub(3);
         let additional = 2;
         // cumulative + additional*2 > simd_cap - headroom
-        assert!(!can_extend_group_with_budget(Some(&ctx), cumulative, additional, None));
+        assert!(!can_extend_group_with_budget(
+            Some(&ctx),
+            cumulative,
+            additional,
+            None
+        ));
     }
 
     // ── can_inject_epilogue_with_budget ──
@@ -432,8 +483,18 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 16], DType::F32);
         let w = g.add_tensor_concrete("w", &[16, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 16], DType::F32);
-        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![out], "gemm",
+        let gemm = g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 16,
+                k: 16,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![out],
+            "gemm",
         );
 
         assert!(can_tile_fuse_with_budget(None, &g, gemm, OpId(999)));
@@ -446,9 +507,29 @@ mod tests {
         let norm_out = g.add_tensor_concrete("norm_out", &[1, 16], DType::F32);
         let w = g.add_tensor_concrete("w", &[16, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 16], DType::F32);
-        let norm = g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![a], vec![norm_out], "norm");
-        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![norm_out, w], vec![out], "gemm",
+        let norm = g.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![a],
+            vec![norm_out],
+            "norm",
+        );
+        let gemm = g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 16,
+                k: 16,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![norm_out, w],
+            vec![out],
+            "gemm",
         );
 
         let profile = make_profile();
@@ -466,9 +547,29 @@ mod tests {
         let norm_out = g.add_tensor_concrete("norm_out", &[1, 16], DType::F32);
         let w = g.add_tensor_concrete("w", &[16, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 16], DType::F32);
-        let norm = g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![a], vec![norm_out], "norm");
-        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![norm_out, w], vec![out], "gemm",
+        let norm = g.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![a],
+            vec![norm_out],
+            "norm",
+        );
+        let gemm = g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 16,
+                k: 16,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![norm_out, w],
+            vec![out],
+            "gemm",
         );
 
         let bytes = estimate_tile_resource_bytes(&g, gemm, norm);
@@ -482,8 +583,18 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 16], DType::F32);
         let w = g.add_tensor_concrete("w", &[16, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 16], DType::F32);
-        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![out], "gemm",
+        let gemm = g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 16,
+                k: 16,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![out],
+            "gemm",
         );
 
         let bytes = estimate_tile_resource_bytes(&g, gemm, OpId(999));

@@ -8,10 +8,10 @@
 //! This module extracts all derivable geometry, leaving only non-derivable fields
 //! (max_seq_len, business_config) in the external config.
 
-use crate::types::{DType, InferenceError};
-use super::graph::{CompilerGraph, Op, RopeScaling, SymDim};
 use super::dtype_chain::derive_compute_dtype;
+use super::graph::{CompilerGraph, Op, RopeScaling, SymDim};
 use crate::dispatch::device_profile::DeviceProfile;
+use crate::types::{DType, InferenceError};
 
 /// Geometry extracted purely from CompilerGraph tensor shapes + OpKind variants.
 #[derive(Debug, Clone)]
@@ -73,7 +73,10 @@ impl GraphDerivedGeometry {
     /// REQ-DTYPE-CHAIN-005: compute_dtype is derived from (storage_dtype, DeviceProfile),
     /// not simply equal to storage_dtype. This allows hardware-aware promotion
     /// (e.g. BF16 storage → F32 compute on AVX-512).
-    pub fn from_graph(graph: &CompilerGraph, device: &DeviceProfile) -> Result<Self, InferenceError> {
+    pub fn from_graph(
+        graph: &CompilerGraph,
+        device: &DeviceProfile,
+    ) -> Result<Self, InferenceError> {
         let mut num_heads = None;
         let mut num_kv_heads = None;
         let mut head_dim = None;
@@ -88,8 +91,12 @@ impl GraphDerivedGeometry {
         for op in &graph.ops {
             match op.op_resolved(graph) {
                 Some(Op::RoPE(spec)) => {
-                    if num_heads.is_none() { num_heads = Some(spec.num_heads); }
-                    if head_dim.is_none() { head_dim = Some(spec.head_dim); }
+                    if num_heads.is_none() {
+                        num_heads = Some(spec.num_heads);
+                    }
+                    if head_dim.is_none() {
+                        head_dim = Some(spec.head_dim);
+                    }
                     if !rope_found {
                         rope_theta = Some(spec.theta);
                         rope_partial = Some(spec.partial);
@@ -98,21 +105,34 @@ impl GraphDerivedGeometry {
                     }
                 }
                 Some(Op::MultiHeadAttention(spec)) => {
-                    if num_heads.is_none() { num_heads = Some(spec.geometry.num_q_heads); }
-                    if num_kv_heads.is_none() { num_kv_heads = Some(spec.geometry.num_kv_heads); }
-                    if head_dim.is_none() { head_dim = Some(spec.geometry.head_dim); }
+                    if num_heads.is_none() {
+                        num_heads = Some(spec.geometry.num_q_heads);
+                    }
+                    if num_kv_heads.is_none() {
+                        num_kv_heads = Some(spec.geometry.num_kv_heads);
+                    }
+                    if head_dim.is_none() {
+                        head_dim = Some(spec.geometry.head_dim);
+                    }
                 }
                 Some(Op::RmsNorm(spec)) | Some(Op::LayerNorm(spec)) | Some(Op::ValueNorm(spec)) => {
-                    if rms_eps.is_none() { rms_eps = Some(spec.eps); }
+                    if rms_eps.is_none() {
+                        rms_eps = Some(spec.eps);
+                    }
                 }
                 Some(Op::Gather { table_rows, .. }) => {
-                    if vocab_size.is_none() { vocab_size = Some(table_rows); }
+                    if vocab_size.is_none() {
+                        vocab_size = Some(table_rows);
+                    }
                 }
                 Some(Op::QuantGather { vocab_size: vs, .. }) => {
-                    if vocab_size.is_none() { vocab_size = Some(vs); }
+                    if vocab_size.is_none() {
+                        vocab_size = Some(vs);
+                    }
                 }
-                Some(Op::Argmax { vocab_size: vs })
-                    if vocab_size.is_none() => { vocab_size = Some(vs); }
+                Some(Op::Argmax { vocab_size: vs }) if vocab_size.is_none() => {
+                    vocab_size = Some(vs);
+                }
                 _ => {}
             }
         }
@@ -128,11 +148,22 @@ impl GraphDerivedGeometry {
         // must be a fallback (mirrors topology.rs:251-252). Without it,
         // mixed-quant graphs (Q5_K_M etc.) set only mixed_quant_layer_loop_config,
         // so num_layers falls to unwrap_or(1) → KV buffer 1/N size → SIGSEGV.
-        let num_layers = graph.layer_loop_config.as_ref().map(|c| c.num_layers)
-            .or_else(|| graph.mixed_quant_layer_loop_config.as_ref().map(|c| c.num_layers))
-            .or_else(|| graph.hetero_layer_loop_config.as_ref().map(|c| {
-                c.num_segments * (c.sliding_per_segment + 1)
-            }))
+        let num_layers = graph
+            .layer_loop_config
+            .as_ref()
+            .map(|c| c.num_layers)
+            .or_else(|| {
+                graph
+                    .mixed_quant_layer_loop_config
+                    .as_ref()
+                    .map(|c| c.num_layers)
+            })
+            .or_else(|| {
+                graph
+                    .hetero_layer_loop_config
+                    .as_ref()
+                    .map(|c| c.num_segments * (c.sliding_per_segment + 1))
+            })
             .unwrap_or(1);
 
         // Derive storage dtype — most common dtype among weight (input) tensors.
@@ -175,7 +206,9 @@ fn derive_hidden(graph: &CompilerGraph) -> Result<usize, InferenceError> {
     // The activation tensor is always first among non-weight inputs.
     let mut first_2d_hidden: Option<usize> = None;
     for &tid in &graph.inputs {
-        let Some(tensor) = graph.tensors.get(tid.0 as usize) else { continue };
+        let Some(tensor) = graph.tensors.get(tid.0 as usize) else {
+            continue;
+        };
         if tensor.shape.len() == 2 {
             let last = match &tensor.shape[1] {
                 SymDim::Concrete(v) => *v,
@@ -205,9 +238,11 @@ fn derive_hidden(graph: &CompilerGraph) -> Result<usize, InferenceError> {
         // hidden_dim directly — fall through to first-2d-input fallback.
     }
     // Ultimate fallback: first 2D input tensor's last dimension.
-    first_2d_hidden.ok_or_else(|| InferenceError::CompileError(
-        "GraphDerivedGeometry: cannot derive hidden dimension from graph".into(),
-    ))
+    first_2d_hidden.ok_or_else(|| {
+        InferenceError::CompileError(
+            "GraphDerivedGeometry: cannot derive hidden dimension from graph".into(),
+        )
+    })
 }
 
 /// Derive storage dtype from weight (input) tensors in the graph.
@@ -286,7 +321,15 @@ fn derive_intermediate(graph: &CompilerGraph, hidden: usize) -> Result<usize, In
         for op in &graph.ops {
             let (n, k) = match op.op_gemm_dims(graph) {
                 // 仅 Gemm/GemmBias（不含 QuantGemm）
-                Some((_, n, k)) if k == hidden && matches!(op.op_resolved(graph), Some(Op::Gemm(_)) | Some(Op::GemmBias(_))) => (n, k),
+                Some((_, n, k))
+                    if k == hidden
+                        && matches!(
+                            op.op_resolved(graph),
+                            Some(Op::Gemm(_)) | Some(Op::GemmBias(_))
+                        ) =>
+                {
+                    (n, k)
+                }
                 _ => continue,
             };
             if n != hidden && n > max_n_not_hidden {
@@ -307,7 +350,11 @@ fn derive_intermediate(graph: &CompilerGraph, hidden: usize) -> Result<usize, In
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::graph::{CompilerGraph, HeteroLayerLoopConfig, LayerLoopConfig, KvSource, RopeScaling, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+    use crate::compiler::graph::{
+        AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+        DualRopeSpec, GemmSpec, HeteroLayerLoopConfig, KvSource, LayerLoopConfig, MlaSpec,
+        NormSpec, Op, QuantGemmSpec, RopeScaling, RopeSpec, SinksSpec, SymDim,
+    };
     use crate::types::DType;
 
     #[test]
@@ -325,21 +372,90 @@ mod tests {
         g.inputs = vec![input, embed_w, norm_w, q_w, k_w, gate_w];
 
         let normed = g.add_tensor_concrete("normed", &[512, 1024], dt);
-        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }), vec![input, norm_w], vec![normed], "norm");
+        g.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-6,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![input, norm_w],
+            vec![normed],
+            "norm",
+        );
 
         let q_out = g.add_tensor_concrete("q_out", &[512, 1024], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 1024, k: 1024, dtype: dt, trans_b: false, has_bias: false }), vec![normed, q_w], vec![q_out], "q_proj");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(512),
+                n: 1024,
+                k: 1024,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![normed, q_w],
+            vec![q_out],
+            "q_proj",
+        );
 
         let gathered = g.add_tensor_concrete("gathered", &[512, 1024], dt);
-        g.add_op(Op::Gather { table_rows: 32000, embed_dim: 1024, index_dim: SymDim::Concrete(512).clone(), indices_kind: crate::compiler::graph::GatherIndicesKind::Tensor.clone(), scale: None }, vec![input, embed_w], vec![gathered], "embed");
+        g.add_op(
+            Op::Gather {
+                table_rows: 32000,
+                embed_dim: 1024,
+                index_dim: SymDim::Concrete(512).clone(),
+                indices_kind: crate::compiler::graph::GatherIndicesKind::Tensor.clone(),
+                scale: None,
+            },
+            vec![input, embed_w],
+            vec![gathered],
+            "embed",
+        );
 
         let k_out = g.add_tensor_concrete("k_out", &[512, 512], dt);
         let v_out = g.add_tensor_concrete("v_out", &[512, 512], dt);
         let attn_out = g.add_tensor_concrete("attn_out", &[512, 1024], dt);
-        g.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 16, num_kv_heads: 8, head_dim: 64 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(512), kv_cache_layer: 0, kv_write: false  }), vec![q_out, k_out, v_out], vec![attn_out], "attn");
+        g.add_op(
+            Op::MultiHeadAttention(AttentionSpec {
+                geometry: AttentionGeometry {
+                    num_q_heads: 16,
+                    num_kv_heads: 8,
+                    head_dim: 64,
+                },
+                mask: if true {
+                    AttentionMask::Causal
+                } else {
+                    AttentionMask::Full
+                },
+                kv_source: KvSource::FromTensor,
+                sinks: if false {
+                    SinksSpec::Learnable
+                } else {
+                    SinksSpec::None
+                },
+                seq_len: SymDim::Concrete(512),
+                kv_cache_layer: 0,
+                kv_write: false,
+            }),
+            vec![q_out, k_out, v_out],
+            vec![attn_out],
+            "attn",
+        );
 
         let rope_out = g.add_tensor_concrete("rope_out", &[512, 1024], dt);
-        g.add_op(Op::RoPE(RopeSpec { num_heads: 16, head_dim: 64, theta: 1000000.0, partial: 0.25, rope_scaling: None }), vec![q_out], vec![rope_out], "rope");
+        g.add_op(
+            Op::RoPE(RopeSpec {
+                num_heads: 16,
+                head_dim: 64,
+                theta: 1000000.0,
+                partial: 0.25,
+                rope_scaling: None,
+            }),
+            vec![q_out],
+            vec![rope_out],
+            "rope",
+        );
 
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
@@ -364,7 +480,19 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[64, 768], dt);
         let b = g.add_tensor_concrete("b", &[768, 768], dt);
         let c = g.add_tensor_concrete("c", &[64, 768], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 768, k: 768, dtype: dt, trans_b: false, has_bias: false }), vec![a, b], vec![c], "proj");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(64),
+                n: 768,
+                k: 768,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, b],
+            vec![c],
+            "proj",
+        );
         g.inputs = vec![a, b];
 
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -382,7 +510,19 @@ mod tests {
         g.inputs = vec![act, w1, w2, w3];
 
         let out = g.add_tensor_concrete("out", &[1, 512], DType::F32);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), vec![act, w1], vec![out], "gemm1");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![act, w1],
+            vec![out],
+            "gemm1",
+        );
 
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
         assert_eq!(geo.storage_dtype, DType::BF16);
@@ -399,10 +539,34 @@ mod tests {
         g.inputs = vec![input, q_w, gate_w];
 
         let q_out = g.add_tensor_concrete("q_out", &[1, 512], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: dt, trans_b: false, has_bias: false }), vec![input, q_w], vec![q_out], "q_proj");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, q_w],
+            vec![q_out],
+            "q_proj",
+        );
 
         let gate_out = g.add_tensor_concrete("gate_out", &[1, 2048], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 2048, k: 512, dtype: dt, trans_b: false, has_bias: false }), vec![input, gate_w], vec![gate_out], "gate_proj");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 2048,
+                k: 512,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, gate_w],
+            vec![gate_out],
+            "gate_proj",
+        );
 
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
         assert_eq!(geo.intermediate, 2048);
@@ -416,7 +580,19 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 256], dt);
         let b = g.add_tensor_concrete("w", &[256, 256], dt);
         let c = g.add_tensor_concrete("out", &[1, 256], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: dt, trans_b: false, has_bias: false }), vec![a, b], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, b],
+            vec![c],
+            "gemm",
+        );
         g.inputs = vec![a, b];
 
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -438,7 +614,19 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 512], dt);
         let w = g.add_tensor_concrete("w", &[512, 512], dt);
         let c = g.add_tensor_concrete("out", &[1, 512], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "attn_proj");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "attn_proj",
+        );
         g.inputs = vec![a, w];
 
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -459,15 +647,46 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 256], dt);
         let w = g.add_tensor_concrete("w", &[256, 256], dt);
         let c = g.add_tensor_concrete("out", &[1, 256], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "gemm",
+        );
         let rope_out = g.add_tensor_concrete("rope_out", &[1, 256], dt);
-        let scaling = RopeScaling::Yarn { factor: 32.0, beta_fast: 32.0, beta_slow: 1.0, original_max_position: 4096 };
-        g.add_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 32, theta: 500000.0, partial: 1.0, rope_scaling: Some(scaling) }), vec![a], vec![rope_out], "rope");
+        let scaling = RopeScaling::Yarn {
+            factor: 32.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            original_max_position: 4096,
+        };
+        g.add_op(
+            Op::RoPE(RopeSpec {
+                num_heads: 8,
+                head_dim: 32,
+                theta: 500000.0,
+                partial: 1.0,
+                rope_scaling: Some(scaling),
+            }),
+            vec![a],
+            vec![rope_out],
+            "rope",
+        );
         g.inputs = vec![a, w];
 
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
         assert_eq!(geo.rope_theta, 500000.0);
-        assert!(matches!(geo.rope_scaling, Some(RopeScaling::Yarn { factor: 32.0, .. })));
+        assert!(matches!(
+            geo.rope_scaling,
+            Some(RopeScaling::Yarn { factor: 32.0, .. })
+        ));
     }
 
     #[test]
@@ -479,7 +698,19 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[768, 768], dt);
         g.inputs = vec![hidden, w];
         let out = g.add_tensor_concrete("out", &[128, 768], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(128), n: 768, k: 768, dtype: dt, trans_b: false, has_bias: false }), vec![hidden, w], vec![out], "proj");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(128),
+                n: 768,
+                k: 768,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![hidden, w],
+            vec![out],
+            "proj",
+        );
 
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
         assert_eq!(geo.hidden, 768);
@@ -496,7 +727,15 @@ mod tests {
         let b = g.add_tensor_concrete("b", &[2048, 2048], dt);
         let bias = g.add_tensor_concrete("bias", &[2048], dt);
         let c = g.add_tensor_concrete("c", &[1, 2048], dt);
-        g.add_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 2048, k: 2048, dtype: dt, trans_b: false, has_bias: true }),
+        g.add_op(
+            Op::GemmBias(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 2048,
+                k: 2048,
+                dtype: dt,
+                trans_b: false,
+                has_bias: true,
+            }),
             vec![a, b, bias],
             vec![c],
             "proj_with_bias",
@@ -518,7 +757,13 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 1024], dt);
         let b = g.add_tensor_concrete("b", &[1024, 4096], dt);
         let c = g.add_tensor_concrete("c", &[1, 4096], dt);
-        g.add_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 4096, k: 1024, quant_type: crate::quant::QuantType::Bf16 }),
+        g.add_op(
+            Op::QuantGemm(QuantGemmSpec {
+                m: SymDim::Concrete(1),
+                n: 4096,
+                k: 1024,
+                quant_type: crate::quant::QuantType::Bf16,
+            }),
             vec![a, b],
             vec![c],
             "quant_proj",
@@ -544,7 +789,19 @@ mod tests {
         g.inputs = vec![act, w1, w2, w3, w_bf16];
 
         let out = g.add_tensor_concrete("out", &[1, 512], DType::F32);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), vec![act, w1], vec![out], "gemm1");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![act, w1],
+            vec![out],
+            "gemm1",
+        );
 
         // Act
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -561,7 +818,19 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[256, 256], DType::F32);
         g.inputs = vec![act, w];
         let out = g.add_tensor_concrete("out", &[1, 256], DType::F32);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![act, w], vec![out], "gemm1");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![act, w],
+            vec![out],
+            "gemm1",
+        );
 
         // Act
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -581,7 +850,15 @@ mod tests {
         g.inputs = vec![input, gate_w, bias];
 
         let gate_out = g.add_tensor_concrete("gate_out", &[1, 3072], dt);
-        g.add_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 3072, k: 768, dtype: dt, trans_b: false, has_bias: true }),
+        g.add_op(
+            Op::GemmBias(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 3072,
+                k: 768,
+                dtype: dt,
+                trans_b: false,
+                has_bias: true,
+            }),
             vec![input, gate_w, bias],
             vec![gate_out],
             "gate_proj",
@@ -602,7 +879,19 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 512], dt);
         let w = g.add_tensor_concrete("w", &[512, 512], dt);
         let c = g.add_tensor_concrete("out", &[1, 512], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "gemm",
+        );
         g.inputs = vec![a, w];
         g.layer_loop_config = Some(LayerLoopConfig {
             num_layers: 32,
@@ -628,7 +917,19 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 256], dt);
         let w = g.add_tensor_concrete("w", &[256, 256], dt);
         let c = g.add_tensor_concrete("out", &[1, 256], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "gemm",
+        );
         g.inputs = vec![a, w];
         g.hetero_layer_loop_config = Some(HeteroLayerLoopConfig {
             num_segments: 7,
@@ -663,10 +964,32 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 512], dt);
         let w = g.add_tensor_concrete("w", &[512, 512], dt);
         let c = g.add_tensor_concrete("out", &[1, 512], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "gemm",
+        );
         g.inputs = vec![a, w];
         let normed = g.add_tensor_concrete("normed", &[1, 512], dt);
-        g.add_op(Op::LayerNorm(NormSpec { feature_dim: 4096, eps: 1e-12, dtype: DType::F32, has_weight: true }), vec![a], vec![normed], "layernorm");
+        g.add_op(
+            Op::LayerNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-12,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![a],
+            vec![normed],
+            "layernorm",
+        );
 
         // Act
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -683,10 +1006,32 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 256], dt);
         let w = g.add_tensor_concrete("w", &[256, 256], dt);
         let c = g.add_tensor_concrete("out", &[1, 256], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "gemm",
+        );
         g.inputs = vec![a, w];
         let vnormed = g.add_tensor_concrete("vnormed", &[1, 256], dt);
-        g.add_op(Op::ValueNorm(NormSpec { feature_dim: 4096, eps: 1e-4, dtype: DType::F32, has_weight: false }), vec![a], vec![vnormed], "value_norm");
+        g.add_op(
+            Op::ValueNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-4,
+                dtype: DType::F32,
+                has_weight: false,
+            }),
+            vec![a],
+            vec![vnormed],
+            "value_norm",
+        );
 
         // Act
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -703,10 +1048,29 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 256], dt);
         let w = g.add_tensor_concrete("w", &[256, 256], dt);
         let c = g.add_tensor_concrete("out", &[1, 256], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "gemm",
+        );
         let rope_out = g.add_tensor_concrete("rope_out", &[1, 256], dt);
         let scaling = RopeScaling::Linear { factor: 4.0 };
-        g.add_op(Op::RoPE(RopeSpec { num_heads: 4, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: Some(scaling) }),
+        g.add_op(
+            Op::RoPE(RopeSpec {
+                num_heads: 4,
+                head_dim: 64,
+                theta: 10000.0,
+                partial: 1.0,
+                rope_scaling: Some(scaling),
+            }),
             vec![a],
             vec![rope_out],
             "rope",
@@ -718,7 +1082,10 @@ mod tests {
 
         // Assert
         assert_eq!(geo.rope_theta, 10000.0);
-        assert!(matches!(geo.rope_scaling, Some(RopeScaling::Linear { factor: 4.0 })));
+        assert!(matches!(
+            geo.rope_scaling,
+            Some(RopeScaling::Linear { factor: 4.0 })
+        ));
     }
 
     #[test]
@@ -729,11 +1096,30 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 768], dt);
         let w = g.add_tensor_concrete("w", &[768, 768], dt);
         let c = g.add_tensor_concrete("out", &[1, 768], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 768, k: 768, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 768,
+                k: 768,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "gemm",
+        );
         g.inputs = vec![a, w];
 
         let qg_out = g.add_tensor_concrete("qg_out", &[4, 768], dt);
-        g.add_op(Op::QuantGather { vocab_size: 128256, hidden_dim: 768, index_dim: SymDim::Concrete(4).clone(), quant_type: crate::quant::QuantType::Bf16, scale: None },
+        g.add_op(
+            Op::QuantGather {
+                vocab_size: 128256,
+                hidden_dim: 768,
+                index_dim: SymDim::Concrete(4).clone(),
+                quant_type: crate::quant::QuantType::Bf16,
+                scale: None,
+            },
             vec![a],
             vec![qg_out],
             "quant_embed",
@@ -754,11 +1140,28 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 512], dt);
         let w = g.add_tensor_concrete("w", &[512, 512], dt);
         let c = g.add_tensor_concrete("out", &[1, 512], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "gemm",
+        );
         g.inputs = vec![a, w];
 
         let argmax_out = g.add_tensor_concrete("argmax_out", &[1], dt);
-        g.add_op(Op::Argmax { vocab_size: 50257 }, vec![c], vec![argmax_out], "argmax");
+        g.add_op(
+            Op::Argmax { vocab_size: 50257 },
+            vec![c],
+            vec![argmax_out],
+            "argmax",
+        );
 
         // Act
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -779,7 +1182,13 @@ mod tests {
         g.inputs = vec![input, gate_w];
 
         let gate_out = g.add_tensor_concrete("gate_out", &[1, 8192], dt);
-        g.add_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 8192, k: 1024, quant_type: crate::quant::QuantType::Bf16 }),
+        g.add_op(
+            Op::QuantGemm(QuantGemmSpec {
+                m: SymDim::Concrete(1),
+                n: 8192,
+                k: 1024,
+                quant_type: crate::quant::QuantType::Bf16,
+            }),
             vec![input, gate_w],
             vec![gate_out],
             "quant_gate",
@@ -800,18 +1209,44 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 256], dt);
         let w = g.add_tensor_concrete("w", &[256, 256], dt);
         let c = g.add_tensor_concrete("out", &[1, 256], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "gemm",
+        );
         g.inputs = vec![a, w];
 
         let rope_out1 = g.add_tensor_concrete("rope_out1", &[1, 256], dt);
-        g.add_op(Op::RoPE(RopeSpec { num_heads: 4, head_dim: 64, theta: 500000.0, partial: 0.25, rope_scaling: None }),
+        g.add_op(
+            Op::RoPE(RopeSpec {
+                num_heads: 4,
+                head_dim: 64,
+                theta: 500000.0,
+                partial: 0.25,
+                rope_scaling: None,
+            }),
             vec![a],
             vec![rope_out1],
             "rope_first",
         );
 
         let rope_out2 = g.add_tensor_concrete("rope_out2", &[1, 256], dt);
-        g.add_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 32, theta: 10000.0, partial: 1.0, rope_scaling: None }),
+        g.add_op(
+            Op::RoPE(RopeSpec {
+                num_heads: 8,
+                head_dim: 32,
+                theta: 10000.0,
+                partial: 1.0,
+                rope_scaling: None,
+            }),
             vec![a],
             vec![rope_out2],
             "rope_second",
@@ -837,7 +1272,19 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[2048, 2048], dt);
         g.inputs = vec![input, w];
         let out = g.add_tensor_concrete("out", &[64, 2048], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 2048, k: 2048, dtype: dt, trans_b: false, has_bias: false }), vec![input, w], vec![out], "proj");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(64),
+                n: 2048,
+                k: 2048,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, w],
+            vec![out],
+            "proj",
+        );
 
         // Act
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -851,10 +1298,32 @@ mod tests {
         // Arrange: input tensor has Symbolic last dim — should be skipped, falling back to GEMM k.
         let mut g = CompilerGraph::new();
         let dt = DType::F32;
-        let input = g.add_tensor("input", vec![SymDim::Concrete(32), SymDim::Symbolic { name: "hidden".into(), max_value: Some(4096) }], dt);
+        let input = g.add_tensor(
+            "input",
+            vec![
+                SymDim::Concrete(32),
+                SymDim::Symbolic {
+                    name: "hidden".into(),
+                    max_value: Some(4096),
+                },
+            ],
+            dt,
+        );
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[32, 4096], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(32), n: 4096, k: 4096, dtype: dt, trans_b: false, has_bias: false }), vec![input, w], vec![out], "proj");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(32),
+                n: 4096,
+                k: 4096,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, w],
+            vec![out],
+            "proj",
+        );
         g.inputs = vec![input, w];
 
         // Act
@@ -872,7 +1341,19 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 128], dt);
         let w = g.add_tensor_concrete("w", &[128, 128], dt);
         let c = g.add_tensor_concrete("out", &[1, 128], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 128, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 128,
+                k: 128,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "gemm",
+        );
         g.inputs = vec![a, w];
 
         // Act
@@ -892,7 +1373,19 @@ mod tests {
         let w2 = g.add_tensor_concrete("w2", &[512, 512], DType::BF16);
         g.inputs = vec![act, w1, w2];
         let out = g.add_tensor_concrete("out", &[1, 512], DType::F32);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), vec![act, w1], vec![out], "gemm1");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![act, w1],
+            vec![out],
+            "gemm1",
+        );
 
         // Act
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -911,10 +1404,32 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 512], dt);
         let w = g.add_tensor_concrete("w", &[512, 512], dt);
         let c = g.add_tensor_concrete("out", &[1, 512], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "gemm",
+        );
         g.inputs = vec![a, w];
         let normed = g.add_tensor_concrete("normed", &[1, 512], dt);
-        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-4, dtype: DType::F32, has_weight: true }), vec![a], vec![normed], "rmsnorm");
+        g.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-4,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![a],
+            vec![normed],
+            "rmsnorm",
+        );
 
         // Act
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -934,13 +1449,41 @@ mod tests {
         g.inputs = vec![a, embed_w, w];
 
         let gathered = g.add_tensor_concrete("gathered", &[1, 768], dt);
-        g.add_op(Op::Gather { table_rows: 50000, embed_dim: 768, index_dim: SymDim::Concrete(1).clone(), indices_kind: crate::compiler::graph::GatherIndicesKind::Tensor.clone(), scale: None }, vec![a, embed_w], vec![gathered], "embed");
+        g.add_op(
+            Op::Gather {
+                table_rows: 50000,
+                embed_dim: 768,
+                index_dim: SymDim::Concrete(1).clone(),
+                indices_kind: crate::compiler::graph::GatherIndicesKind::Tensor.clone(),
+                scale: None,
+            },
+            vec![a, embed_w],
+            vec![gathered],
+            "embed",
+        );
 
         let proj_out = g.add_tensor_concrete("proj_out", &[1, 768], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 768, k: 768, dtype: dt, trans_b: false, has_bias: false }), vec![gathered, w], vec![proj_out], "proj");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 768,
+                k: 768,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![gathered, w],
+            vec![proj_out],
+            "proj",
+        );
 
         let argmax_out = g.add_tensor_concrete("argmax_out", &[1], dt);
-        g.add_op(Op::Argmax { vocab_size: 99999 }, vec![proj_out], vec![argmax_out], "argmax");
+        g.add_op(
+            Op::Argmax { vocab_size: 99999 },
+            vec![proj_out],
+            vec![argmax_out],
+            "argmax",
+        );
 
         // Act
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -957,14 +1500,51 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 512], dt);
         let w = g.add_tensor_concrete("w", &[512, 512], dt);
         let c = g.add_tensor_concrete("out", &[1, 512], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "gemm",
+        );
         g.inputs = vec![a, w];
 
         let q_out = g.add_tensor_concrete("q_out", &[1, 512], dt);
         let k_out = g.add_tensor_concrete("k_out", &[1, 512], dt);
         let v_out = g.add_tensor_concrete("v_out", &[1, 512], dt);
         let attn_out = g.add_tensor_concrete("attn_out", &[1, 512], dt);
-        g.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 8, num_kv_heads: 8, head_dim: 64 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), kv_cache_layer: 0, kv_write: false  }), vec![q_out, k_out, v_out], vec![attn_out], "attn");
+        g.add_op(
+            Op::MultiHeadAttention(AttentionSpec {
+                geometry: AttentionGeometry {
+                    num_q_heads: 8,
+                    num_kv_heads: 8,
+                    head_dim: 64,
+                },
+                mask: if true {
+                    AttentionMask::Causal
+                } else {
+                    AttentionMask::Full
+                },
+                kv_source: KvSource::FromTensor,
+                sinks: if false {
+                    SinksSpec::Learnable
+                } else {
+                    SinksSpec::None
+                },
+                seq_len: SymDim::Concrete(1),
+                kv_cache_layer: 0,
+                kv_write: false,
+            }),
+            vec![q_out, k_out, v_out],
+            vec![attn_out],
+            "attn",
+        );
 
         // Act
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -983,7 +1563,19 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 768], dt);
         let w = g.add_tensor_concrete("w", &[768, 768], dt);
         let c = g.add_tensor_concrete("out", &[1, 768], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 768, k: 768, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 768,
+                k: 768,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "gemm",
+        );
         g.inputs = vec![a, w];
 
         let rope_out = g.add_tensor_concrete("rope_out", &[1, 768], dt);
@@ -992,7 +1584,14 @@ mod tests {
         // Actually to test the fallback: no op provides head_dim at all.
         // The code sets head_dim = hidden / num_heads when head_dim is None.
         // With num_heads from RoPE = 12 and hidden = 768: head_dim = 768/12 = 64.
-        g.add_op(Op::RoPE(RopeSpec { num_heads: 12, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }),
+        g.add_op(
+            Op::RoPE(RopeSpec {
+                num_heads: 12,
+                head_dim: 64,
+                theta: 10000.0,
+                partial: 1.0,
+                rope_scaling: None,
+            }),
             vec![a],
             vec![rope_out],
             "rope",
@@ -1021,7 +1620,19 @@ mod tests {
         let w2 = g.add_tensor_concrete("w2", &[512, 512], DType::F8E4M3);
         g.inputs = vec![act, w1, w2];
         let out = g.add_tensor_concrete("out", &[1, 512], DType::F32);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), vec![act, w1], vec![out], "gemm1");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![act, w1],
+            vec![out],
+            "gemm1",
+        );
 
         // Act
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -1038,11 +1649,26 @@ mod tests {
         let w1 = g.add_tensor_concrete("w1", &[512, 512], DType::U8);
         g.inputs = vec![act, w1];
         let out = g.add_tensor_concrete("out", &[1, 512], DType::F32);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), vec![act, w1], vec![out], "gemm1");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![act, w1],
+            vec![out],
+            "gemm1",
+        );
 
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
-        assert!(geo.is_weight_quantized, "U8 weight must set is_weight_quantized=true");
+        assert!(
+            geo.is_weight_quantized,
+            "U8 weight must set is_weight_quantized=true"
+        );
     }
 
     #[test]
@@ -1053,11 +1679,26 @@ mod tests {
         let w1 = g.add_tensor_concrete("w1", &[512, 512], DType::F8E4M3);
         g.inputs = vec![act, w1];
         let out = g.add_tensor_concrete("out", &[1, 512], DType::F32);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), vec![act, w1], vec![out], "gemm1");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![act, w1],
+            vec![out],
+            "gemm1",
+        );
 
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
-        assert!(geo.is_weight_quantized, "F8E4M3 weight must set is_weight_quantized=true");
+        assert!(
+            geo.is_weight_quantized,
+            "F8E4M3 weight must set is_weight_quantized=true"
+        );
     }
 
     #[test]
@@ -1068,11 +1709,26 @@ mod tests {
         let w1 = g.add_tensor_concrete("w1", &[256, 256], DType::F4E2M1);
         g.inputs = vec![act, w1];
         let out = g.add_tensor_concrete("out", &[1, 256], DType::F32);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![act, w1], vec![out], "gemm1");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![act, w1],
+            vec![out],
+            "gemm1",
+        );
 
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
-        assert!(geo.is_weight_quantized, "F4E2M1 weight must set is_weight_quantized=true");
+        assert!(
+            geo.is_weight_quantized,
+            "F4E2M1 weight must set is_weight_quantized=true"
+        );
     }
 
     #[test]
@@ -1086,11 +1742,26 @@ mod tests {
         let w3 = g.add_tensor_concrete("w3", &[512, 2048], DType::BF16);
         g.inputs = vec![act, w1, w2, w3];
         let out = g.add_tensor_concrete("out", &[1, 512], DType::F32);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), vec![act, w1], vec![out], "gemm1");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![act, w1],
+            vec![out],
+            "gemm1",
+        );
 
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
-        assert!(!geo.is_weight_quantized, "BF16 native weights must NOT trigger TurboQuant");
+        assert!(
+            !geo.is_weight_quantized,
+            "BF16 native weights must NOT trigger TurboQuant"
+        );
         // Cross-check: storage_dtype is BF16 (native float), compute_dtype is F32 (widened).
         assert_eq!(geo.storage_dtype, DType::BF16);
         assert_eq!(geo.compute_dtype, DType::F32);
@@ -1104,7 +1775,19 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[256, 256], DType::F32);
         g.inputs = vec![act, w];
         let out = g.add_tensor_concrete("out", &[1, 256], DType::F32);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![act, w], vec![out], "gemm1");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![act, w],
+            vec![out],
+            "gemm1",
+        );
 
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
@@ -1120,11 +1803,26 @@ mod tests {
         let w_u8 = g.add_tensor_concrete("w_u8", &[512, 512], DType::U8);
         g.inputs = vec![act, w_bf16, w_u8];
         let out = g.add_tensor_concrete("out", &[1, 512], DType::F32);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), vec![act, w_bf16], vec![out], "gemm1");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![act, w_bf16],
+            vec![out],
+            "gemm1",
+        );
 
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
-        assert!(geo.is_weight_quantized, "any quantized weight (even mixed) must trigger");
+        assert!(
+            geo.is_weight_quantized,
+            "any quantized weight (even mixed) must trigger"
+        );
         // storage_dtype still picks BF16 (dominant float), but is_weight_quantized=true.
         assert_eq!(geo.storage_dtype, DType::BF16);
     }
@@ -1136,7 +1834,19 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 128], DType::F32);
         let b = g.add_tensor_concrete("w", &[128, 128], DType::F32);
         let c = g.add_tensor_concrete("out", &[1, 128], DType::F32);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }), vec![a, b], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 128,
+                k: 128,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, b],
+            vec![c],
+            "gemm",
+        );
         g.inputs = vec![a]; // skip(1) means no weight tensors scanned
 
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -1153,11 +1863,26 @@ mod tests {
             let w = g.add_tensor_concrete("w", &[64, 64], dt);
             g.inputs = vec![act, w];
             let out = g.add_tensor_concrete("out", &[1, 64], DType::F32);
-            g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), vec![act, w], vec![out], "gemm1");
+            g.add_op(
+                Op::Gemm(GemmSpec {
+                    m: SymDim::Concrete(1),
+                    n: 64,
+                    k: 64,
+                    dtype: DType::F32,
+                    trans_b: false,
+                    has_bias: false,
+                }),
+                vec![act, w],
+                vec![out],
+                "gemm1",
+            );
 
             let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
-            assert!(geo.is_weight_quantized, "{dt:?} weight must set is_weight_quantized=true");
+            assert!(
+                geo.is_weight_quantized,
+                "{dt:?} weight must set is_weight_quantized=true"
+            );
         }
     }
 
@@ -1172,10 +1897,34 @@ mod tests {
         g.inputs = vec![input, gate_w_small, gate_w_large];
 
         let gate_out_small = g.add_tensor_concrete("gate_out_small", &[1, 2048], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 2048, k: 768, dtype: dt, trans_b: false, has_bias: false }), vec![input, gate_w_small], vec![gate_out_small], "gate_small");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 2048,
+                k: 768,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, gate_w_small],
+            vec![gate_out_small],
+            "gate_small",
+        );
 
         let gate_out_large = g.add_tensor_concrete("gate_out_large", &[1, 4096], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 768, dtype: dt, trans_b: false, has_bias: false }), vec![input, gate_w_large], vec![gate_out_large], "gate_large");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 4096,
+                k: 768,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, gate_w_large],
+            vec![gate_out_large],
+            "gate_large",
+        );
 
         // Act
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -1192,10 +1941,32 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 256], dt);
         let w = g.add_tensor_concrete("w", &[256, 256], dt);
         let c = g.add_tensor_concrete("out", &[1, 256], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "gemm",
+        );
         g.inputs = vec![a, w];
         let normed = g.add_tensor_concrete("normed", &[1, 256], dt);
-        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }), vec![a], vec![normed], "norm");
+        g.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-6,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![a],
+            vec![normed],
+            "norm",
+        );
 
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
@@ -1203,11 +1974,26 @@ mod tests {
         let debug_str = format!("{:?}", geo);
 
         // Assert: Debug output contains key field names and values.
-        assert!(debug_str.contains("hidden"), "Debug output should contain 'hidden'");
-        assert!(debug_str.contains("storage_dtype"), "Debug output should contain 'storage_dtype'");
-        assert!(debug_str.contains("is_weight_quantized"), "Debug output should contain 'is_weight_quantized'");
-        assert!(debug_str.contains("compute_dtype"), "Debug output should contain 'compute_dtype'");
-        assert!(debug_str.contains("rms_eps"), "Debug output should contain 'rms_eps'");
+        assert!(
+            debug_str.contains("hidden"),
+            "Debug output should contain 'hidden'"
+        );
+        assert!(
+            debug_str.contains("storage_dtype"),
+            "Debug output should contain 'storage_dtype'"
+        );
+        assert!(
+            debug_str.contains("is_weight_quantized"),
+            "Debug output should contain 'is_weight_quantized'"
+        );
+        assert!(
+            debug_str.contains("compute_dtype"),
+            "Debug output should contain 'compute_dtype'"
+        );
+        assert!(
+            debug_str.contains("rms_eps"),
+            "Debug output should contain 'rms_eps'"
+        );
     }
 
     #[test]
@@ -1218,7 +2004,19 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 512], dt);
         let w = g.add_tensor_concrete("w", &[512, 512], dt);
         let c = g.add_tensor_concrete("out", &[1, 512], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "gemm",
+        );
         g.inputs = vec![a, w];
 
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -1252,7 +2050,19 @@ mod tests {
         let w_f16 = g.add_tensor_concrete("w_f16", &[256, 256], DType::F16);
         g.inputs = vec![act, w_bf16, w_f16];
         let out = g.add_tensor_concrete("out", &[1, 256], DType::F32);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![act, w_bf16], vec![out], "gemm1");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![act, w_bf16],
+            vec![out],
+            "gemm1",
+        );
 
         // Act
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -1268,7 +2078,19 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 128], DType::F32);
         let b = g.add_tensor_concrete("w", &[128, 128], DType::F32);
         let c = g.add_tensor_concrete("out", &[1, 128], DType::F32);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }), vec![a, b], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 128,
+                k: 128,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, b],
+            vec![c],
+            "gemm",
+        );
         // Only one input — skip(1) means no weight tensors scanned.
         g.inputs = vec![a];
 
@@ -1290,15 +2112,30 @@ mod tests {
         g.inputs = vec![input, kv_w];
 
         let kv_out = g.add_tensor_concrete("kv_out", &[1, 256], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 1024, dtype: dt, trans_b: false, has_bias: false }), vec![input, kv_w], vec![kv_out], "kv_proj");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 1024,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, kv_w],
+            vec![kv_out],
+            "kv_proj",
+        );
 
         // Act
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: derive_intermediate picks the GEMM n value even when n < hidden.
         // The function selects the largest GEMM n across all ops, not just FFN ops.
-        assert!(geo.intermediate >= 256,
-            "intermediate ({}) should be at least the GEMM n=256", geo.intermediate);
+        assert!(
+            geo.intermediate >= 256,
+            "intermediate ({}) should be at least the GEMM n=256",
+            geo.intermediate
+        );
     }
 
     #[test]
@@ -1310,7 +2147,19 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[2048, 2048], dt);
         g.inputs = vec![hidden, w];
         let out = g.add_tensor_concrete("out", &[32, 2048], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(32), n: 2048, k: 2048, dtype: dt, trans_b: false, has_bias: false }), vec![hidden, w], vec![out], "proj");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(32),
+                n: 2048,
+                k: 2048,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![hidden, w],
+            vec![out],
+            "proj",
+        );
 
         // Act
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -1327,7 +2176,19 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 256], dt);
         let w = g.add_tensor_concrete("w", &[256, 256], dt);
         let c = g.add_tensor_concrete("out", &[1, 256], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "gemm",
+        );
         g.inputs = vec![a, w];
 
         // Act
@@ -1346,14 +2207,51 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 1024], dt);
         let w = g.add_tensor_concrete("w", &[1024, 1024], dt);
         let c = g.add_tensor_concrete("out", &[1, 1024], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 1024, k: 1024, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 1024,
+                k: 1024,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "gemm",
+        );
         g.inputs = vec![a, w];
 
         let q_out = g.add_tensor_concrete("q_out", &[1, 1024], dt);
         let k_out = g.add_tensor_concrete("k_out", &[1, 256], dt);
         let v_out = g.add_tensor_concrete("v_out", &[1, 256], dt);
         let attn_out = g.add_tensor_concrete("attn_out", &[1, 1024], dt);
-        g.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 16, num_kv_heads: 4, head_dim: 64 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), kv_cache_layer: 0, kv_write: false  }), vec![q_out, k_out, v_out], vec![attn_out], "attn");
+        g.add_op(
+            Op::MultiHeadAttention(AttentionSpec {
+                geometry: AttentionGeometry {
+                    num_q_heads: 16,
+                    num_kv_heads: 4,
+                    head_dim: 64,
+                },
+                mask: if true {
+                    AttentionMask::Causal
+                } else {
+                    AttentionMask::Full
+                },
+                kv_source: KvSource::FromTensor,
+                sinks: if false {
+                    SinksSpec::Learnable
+                } else {
+                    SinksSpec::None
+                },
+                seq_len: SymDim::Concrete(1),
+                kv_cache_layer: 0,
+                kv_write: false,
+            }),
+            vec![q_out, k_out, v_out],
+            vec![attn_out],
+            "attn",
+        );
 
         // Act
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -1374,7 +2272,19 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[512], dt); // 1D tensor
         let w = g.add_tensor_concrete("w", &[512, 512], dt);
         let c = g.add_tensor_concrete("out", &[512], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "gemm",
+        );
         g.inputs = vec![a, w];
 
         // Act
@@ -1392,7 +2302,19 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[8, 64, 1024], dt); // 3D tensor
         let w = g.add_tensor_concrete("w", &[1024, 1024], dt);
         let c = g.add_tensor_concrete("out", &[8, 64, 1024], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 1024, k: 1024, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(512),
+                n: 1024,
+                k: 1024,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "gemm",
+        );
         g.inputs = vec![a, w];
 
         // Act
@@ -1415,13 +2337,49 @@ mod tests {
         g.inputs = vec![input, w1, w2, w3];
 
         let out1 = g.add_tensor_concrete("out1", &[1, 1024], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 1024, k: 512, dtype: dt, trans_b: false, has_bias: false }), vec![input, w1], vec![out1], "proj1");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 1024,
+                k: 512,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, w1],
+            vec![out1],
+            "proj1",
+        );
 
         let out2 = g.add_tensor_concrete("out2", &[1, 2048], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 2048, k: 512, dtype: dt, trans_b: false, has_bias: false }), vec![input, w2], vec![out2], "proj2");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 2048,
+                k: 512,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, w2],
+            vec![out2],
+            "proj2",
+        );
 
         let out3 = g.add_tensor_concrete("out3", &[1, 1536], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 1536, k: 512, dtype: dt, trans_b: false, has_bias: false }), vec![input, w3], vec![out3], "proj3");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 1536,
+                k: 512,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, w3],
+            vec![out3],
+            "proj3",
+        );
 
         // Act
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -1441,7 +2399,19 @@ mod tests {
         g.inputs = vec![input, attn_w];
 
         let attn_out = g.add_tensor_concrete("attn_out", &[1, 768], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 768, k: 768, dtype: dt, trans_b: false, has_bias: false }), vec![input, attn_w], vec![attn_out], "attn_proj");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 768,
+                k: 768,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, attn_w],
+            vec![attn_out],
+            "attn_proj",
+        );
 
         // Act
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -1458,11 +2428,30 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 256], dt);
         let w = g.add_tensor_concrete("w", &[256, 256], dt);
         let c = g.add_tensor_concrete("out", &[1, 256], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "gemm",
+        );
         g.inputs = vec![a, w];
 
         let rope_out = g.add_tensor_concrete("rope_out", &[1, 256], dt);
-        g.add_op(Op::RoPE(RopeSpec { num_heads: 4, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }),
+        g.add_op(
+            Op::RoPE(RopeSpec {
+                num_heads: 4,
+                head_dim: 64,
+                theta: 10000.0,
+                partial: 1.0,
+                rope_scaling: None,
+            }),
             vec![a],
             vec![rope_out],
             "rope",
@@ -1483,7 +2472,19 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 1024], dt);
         let w = g.add_tensor_concrete("w", &[1024, 1024], dt);
         let c = g.add_tensor_concrete("out", &[1, 1024], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 1024, k: 1024, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 1024,
+                k: 1024,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "gemm",
+        );
         g.inputs = vec![a, w];
 
         // Act
@@ -1501,11 +2502,30 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 512], dt);
         let w = g.add_tensor_concrete("w", &[512, 512], dt);
         let c = g.add_tensor_concrete("out", &[1, 512], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "gemm",
+        );
         g.inputs = vec![a, w];
 
         let rope_out = g.add_tensor_concrete("rope_out", &[1, 512], dt);
-        g.add_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }),
+        g.add_op(
+            Op::RoPE(RopeSpec {
+                num_heads: 8,
+                head_dim: 64,
+                theta: 10000.0,
+                partial: 1.0,
+                rope_scaling: None,
+            }),
             vec![a],
             vec![rope_out],
             "rope",
@@ -1527,11 +2547,30 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 1000], dt);
         let w = g.add_tensor_concrete("w", &[1000, 1000], dt);
         let c = g.add_tensor_concrete("out", &[1, 1000], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 1000, k: 1000, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 1000,
+                k: 1000,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "gemm",
+        );
         g.inputs = vec![a, w];
 
         let rope_out = g.add_tensor_concrete("rope_out", &[1, 1000], dt);
-        g.add_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 125, theta: 10000.0, partial: 1.0, rope_scaling: None }),
+        g.add_op(
+            Op::RoPE(RopeSpec {
+                num_heads: 8,
+                head_dim: 125,
+                theta: 10000.0,
+                partial: 1.0,
+                rope_scaling: None,
+            }),
             vec![a],
             vec![rope_out],
             "rope",
@@ -1555,7 +2594,19 @@ mod tests {
         let a = g.add_tensor_concrete("input", &[1, 256], dt);
         let w = g.add_tensor_concrete("w", &[256, 256], dt);
         let c = g.add_tensor_concrete("out", &[1, 256], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![c], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![c],
+            "gemm",
+        );
         g.inputs = vec![a, w];
 
         g.layer_loop_config = Some(LayerLoopConfig {
@@ -1599,12 +2650,30 @@ mod tests {
         let dt = DType::F32;
         let input = g.add_tensor(
             "input",
-            vec![SymDim::Concrete(32), SymDim::Symbolic { name: "hidden".into(), max_value: Some(2048) }],
+            vec![
+                SymDim::Concrete(32),
+                SymDim::Symbolic {
+                    name: "hidden".into(),
+                    max_value: Some(2048),
+                },
+            ],
             dt,
         );
         let w = g.add_tensor_concrete("w", &[2048, 2048], dt);
         let out = g.add_tensor_concrete("out", &[32, 2048], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(32), n: 2048, k: 2048, dtype: dt, trans_b: false, has_bias: false }), vec![input, w], vec![out], "proj");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(32),
+                n: 2048,
+                k: 2048,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![input, w],
+            vec![out],
+            "proj",
+        );
         g.inputs = vec![input, w];
 
         // Act

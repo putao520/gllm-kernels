@@ -3,7 +3,7 @@
 //! Collects profiling results from multiple kernel runs and produces
 //! structured reports for analysis.
 
-use crate::profiling::counters::{PerfMetrics, HwPeak, OpWorkload};
+use crate::profiling::counters::{HwPeak, OpWorkload, PerfMetrics};
 use crate::profiling::perf_events::HwCounters;
 
 /// A single profiled kernel invocation.
@@ -58,24 +58,48 @@ impl ProfileReport {
         s.push_str("{\n");
         s.push_str(&format!("  \"timestamp\": \"{}\",\n", self.timestamp));
         s.push_str(&format!("  \"isa\": \"{}\",\n", self.isa));
-        s.push_str(&format!("  \"hw_peak_gflops\": {:.2},\n", self.hw_peak.gflops));
-        s.push_str(&format!("  \"hw_peak_bandwidth_gbs\": {:.2},\n", self.hw_peak.bandwidth_gbs));
+        s.push_str(&format!(
+            "  \"hw_peak_gflops\": {:.2},\n",
+            self.hw_peak.gflops
+        ));
+        s.push_str(&format!(
+            "  \"hw_peak_bandwidth_gbs\": {:.2},\n",
+            self.hw_peak.bandwidth_gbs
+        ));
         s.push_str("  \"entries\": [\n");
 
         for (i, e) in self.entries.iter().enumerate() {
             s.push_str("    {\n");
             s.push_str(&format!("      \"name\": \"{}\",\n", e.name));
-            s.push_str(&format!("      \"workload_type\": \"{}\",\n", workload_type_str(&e.workload)));
-            s.push_str(&format!("      \"elapsed_secs\": {:.9},\n", e.metrics.elapsed_secs));
-            s.push_str(&format!("      \"elapsed_cycles\": {},\n", e.metrics.elapsed_cycles));
+            s.push_str(&format!(
+                "      \"workload_type\": \"{}\",\n",
+                workload_type_str(&e.workload)
+            ));
+            s.push_str(&format!(
+                "      \"elapsed_secs\": {:.9},\n",
+                e.metrics.elapsed_secs
+            ));
+            s.push_str(&format!(
+                "      \"elapsed_cycles\": {},\n",
+                e.metrics.elapsed_cycles
+            ));
             s.push_str(&format!("      \"gflops\": {:.3},\n", e.metrics.gflops));
-            s.push_str(&format!("      \"bandwidth_gbs\": {:.3},\n", e.metrics.bandwidth_gbs));
-            s.push_str(&format!("      \"efficiency\": {:.4}", e.metrics.efficiency));
+            s.push_str(&format!(
+                "      \"bandwidth_gbs\": {:.3},\n",
+                e.metrics.bandwidth_gbs
+            ));
+            s.push_str(&format!(
+                "      \"efficiency\": {:.4}",
+                e.metrics.efficiency
+            ));
 
             if let Some(ref hw) = e.hw_counters {
                 s.push_str(",\n");
                 s.push_str(&format!("      \"hw_cycles\": {},\n", hw.cycles));
-                s.push_str(&format!("      \"hw_instructions\": {},\n", hw.instructions));
+                s.push_str(&format!(
+                    "      \"hw_instructions\": {},\n",
+                    hw.instructions
+                ));
                 s.push_str(&format!("      \"ipc\": {:.3},\n", hw.ipc()));
                 s.push_str(&format!("      \"l1d_misses\": {},\n", hw.l1d_misses));
                 s.push_str(&format!("      \"llc_misses\": {},\n", hw.llc_misses));
@@ -107,9 +131,18 @@ impl ProfileReport {
         // Hardware info
         s.push_str("<div class=\"hw-info\">\n");
         s.push_str(&format!("<p><strong>ISA:</strong> {}</p>\n", self.isa));
-        s.push_str(&format!("<p><strong>Peak GFLOPS:</strong> {:.1}</p>\n", self.hw_peak.gflops));
-        s.push_str(&format!("<p><strong>Peak Bandwidth:</strong> {:.1} GB/s</p>\n", self.hw_peak.bandwidth_gbs));
-        s.push_str(&format!("<p><strong>Timestamp:</strong> {}</p>\n", self.timestamp));
+        s.push_str(&format!(
+            "<p><strong>Peak GFLOPS:</strong> {:.1}</p>\n",
+            self.hw_peak.gflops
+        ));
+        s.push_str(&format!(
+            "<p><strong>Peak Bandwidth:</strong> {:.1} GB/s</p>\n",
+            self.hw_peak.bandwidth_gbs
+        ));
+        s.push_str(&format!(
+            "<p><strong>Timestamp:</strong> {}</p>\n",
+            self.timestamp
+        ));
         s.push_str("</div>\n");
 
         // Summary table
@@ -122,9 +155,13 @@ impl ProfileReport {
 
         for e in &self.entries {
             let eff_pct = e.metrics.efficiency * 100.0;
-            let eff_class = if eff_pct >= 85.0 { "eff-good" }
-                else if eff_pct >= 60.0 { "eff-ok" }
-                else { "eff-bad" };
+            let eff_class = if eff_pct >= 85.0 {
+                "eff-good"
+            } else if eff_pct >= 60.0 {
+                "eff-ok"
+            } else {
+                "eff-bad"
+            };
 
             s.push_str("<tr>\n");
             s.push_str(&format!("<td class=\"name\">{}</td>\n", e.name));
@@ -133,7 +170,10 @@ impl ProfileReport {
             s.push_str(&format!("<td>{}</td>\n", e.metrics.elapsed_cycles));
             s.push_str(&format!("<td>{:.2}</td>\n", e.metrics.gflops));
             s.push_str(&format!("<td>{:.2}</td>\n", e.metrics.bandwidth_gbs));
-            s.push_str(&format!("<td class=\"{}\">{:.1}%</td>\n", eff_class, eff_pct));
+            s.push_str(&format!(
+                "<td class=\"{}\">{:.1}%</td>\n",
+                eff_class, eff_pct
+            ));
 
             if let Some(ref hw) = e.hw_counters {
                 s.push_str(&format!("<td>{:.2}</td>\n", hw.ipc()));
@@ -152,9 +192,13 @@ impl ProfileReport {
         s.push_str("<div class=\"chart\">\n");
         for e in &self.entries {
             let pct = (e.metrics.efficiency * 100.0).min(100.0);
-            let color = if pct >= 85.0 { "#4caf50" }
-                else if pct >= 60.0 { "#ff9800" }
-                else { "#f44336" };
+            let color = if pct >= 85.0 {
+                "#4caf50"
+            } else if pct >= 60.0 {
+                "#ff9800"
+            } else {
+                "#f44336"
+            };
             s.push_str(&format!(
                 "<div class=\"bar-row\"><span class=\"bar-label\">{}</span>\
                  <div class=\"bar-bg\"><div class=\"bar-fill\" style=\"width:{pct:.1}%;background:{color}\">\
@@ -465,7 +509,10 @@ mod tests {
         assert!(json.contains("\"name\": \"kernel_1\""));
         assert!(json.contains("\"name\": \"kernel_2\""));
         assert!(json.contains("\"hw_peak_gflops\": 500.00"));
-        assert!(json.contains("\"hw_cycles\"") == false, "no hw_cycles when counters are None");
+        assert!(
+            json.contains("\"hw_cycles\"") == false,
+            "no hw_cycles when counters are None"
+        );
     }
 
     #[test]
@@ -675,7 +722,10 @@ mod tests {
         };
 
         // Act — struct update syntax, override name only
-        let derived = ProfileEntry { name: "derived_kernel".to_string(), ..base };
+        let derived = ProfileEntry {
+            name: "derived_kernel".to_string(),
+            ..base
+        };
 
         // Assert
         assert_eq!(derived.name, "derived_kernel");
@@ -866,9 +916,15 @@ mod tests {
         let report = ProfileReport::new(peak, "avx2");
 
         // Assert — timestamp is a string of decimal digits (UNIX epoch seconds)
-        assert!(report.timestamp.chars().all(|c| c.is_ascii_digit()),
-            "timestamp must be a numeric string, got: {}", report.timestamp);
-        assert!(report.timestamp.len() >= 9, "timestamp should be >= 9 digits (post-2001 epoch)");
+        assert!(
+            report.timestamp.chars().all(|c| c.is_ascii_digit()),
+            "timestamp must be a numeric string, got: {}",
+            report.timestamp
+        );
+        assert!(
+            report.timestamp.len() >= 9,
+            "timestamp should be >= 9 digits (post-2001 epoch)"
+        );
     }
 
     #[test]
@@ -995,7 +1051,10 @@ mod tests {
         let json = report.to_json();
 
         // Assert — last entry must close with "}\n" not "},\n"
-        assert!(json.contains("    }\n  ]\n"), "last entry must not have trailing comma");
+        assert!(
+            json.contains("    }\n  ]\n"),
+            "last entry must not have trailing comma"
+        );
         assert_eq!(json.matches("\"name\": \"solo\"").count(), 1);
     }
 
@@ -1009,10 +1068,16 @@ mod tests {
         let html = report.to_html();
 
         // Assert — table structure present but tbody is empty (no <tr> in body)
-        assert!(html.contains("<tbody>\n</tbody>"), "empty report must have empty tbody");
+        assert!(
+            html.contains("<tbody>\n</tbody>"),
+            "empty report must have empty tbody"
+        );
         assert!(html.contains("Efficiency Overview"));
         // CSS defines .bar-row in stylesheet; verify no bar-row elements rendered in body
-        assert!(!html.contains("class=\"bar-row\""), "no bar-row elements when no entries");
+        assert!(
+            !html.contains("class=\"bar-row\""),
+            "no bar-row elements when no entries"
+        );
     }
 
     #[test]
@@ -1208,7 +1273,12 @@ mod tests {
         // Assert — all 10 entries present, no duplication
         for i in 0..10 {
             let name = format!("\"name\": \"batch_op_{:02}\"", i);
-            assert_eq!(json.matches(&name).count(), 1, "entry {} must appear exactly once", i);
+            assert_eq!(
+                json.matches(&name).count(),
+                1,
+                "entry {} must appear exactly once",
+                i
+            );
         }
     }
 
@@ -1234,7 +1304,10 @@ mod tests {
         let html = report.to_html();
 
         // Assert — bar width capped at 100%, but the label still shows 150%
-        assert!(html.contains("width:100.0%"), "bar width must be capped at 100%");
+        assert!(
+            html.contains("width:100.0%"),
+            "bar width must be capped at 100%"
+        );
         assert!(html.contains("150.0%"), "label shows actual efficiency");
     }
 }

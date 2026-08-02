@@ -1,9 +1,9 @@
 //! Norm, LayerNorm, Softmax inline lowering.
 
-use super::instr::*;
 use super::auto_select;
-use crate::compiler::trace::{ComputePattern, QuantPrecision, ReduceKind, TraceOp, ValueId};
+use super::instr::*;
 use crate::compiler::graph;
+use crate::compiler::trace::{ComputePattern, QuantPrecision, ReduceKind, TraceOp, ValueId};
 use crate::types::CompilerError;
 
 /// Norm variant — derived from OpKind, replaces `has_weight: bool`.
@@ -52,21 +52,28 @@ pub(crate) fn emit_normlike_inline(
     weight_dtype: QuantPrecision, // BCE-20260629-011: VecLoad weight 用 weight 实际 dtype
 ) -> Result<(), CompilerError> {
     let (reduce, finalize, transform) = match pattern {
-        ComputePattern::NormLike { reduce, finalize, transform } => {
-            (reduce.as_slice(), finalize.as_slice(), transform.as_slice())
+        ComputePattern::NormLike {
+            reduce,
+            finalize,
+            transform,
+        } => (reduce.as_slice(), finalize.as_slice(), transform.as_slice()),
+        _ => {
+            return Err(CompilerError::CodegenViolation(
+                "emit_normlike_inline: expected NormLike pattern".into(),
+            ))
         }
-        _ => return Err(CompilerError::CodegenViolation(
-            "emit_normlike_inline: expected NormLike pattern".into())),
     };
 
     let lanes = width.f32_lanes();
     if lanes == 0 || feature_dim == 0 {
         return Err(CompilerError::CodegenViolation(
-            "emit_normlike_inline: zero lanes or feature_dim".into()));
+            "emit_normlike_inline: zero lanes or feature_dim".into(),
+        ));
     }
     if groups_per_row == 0 {
         return Err(CompilerError::CodegenViolation(
-            "emit_normlike_inline: groups_per_row must be >= 1".into()));
+            "emit_normlike_inline: groups_per_row must be >= 1".into(),
+        ));
     }
 
     let vec_count = feature_dim / lanes;
@@ -89,40 +96,99 @@ pub(crate) fn emit_normlike_inline(
 
     // 外层 row loop: seq_len 维度 (ARCH-SYMDIM-THREADING)。
     prog.emit_loop(seq_bound, outer_step, |prog, _row_ctr, row_byte_off| {
-        prog.emit(VmInstr::LoadPtr { dst: outer_input, src: PtrExpr::VRegPlusVReg(input_ptr, row_byte_off) });
-        prog.emit(VmInstr::LoadPtr { dst: outer_output, src: PtrExpr::VRegPlusVReg(output_ptr, row_byte_off) });
+        prog.emit(VmInstr::LoadPtr {
+            dst: outer_input,
+            src: PtrExpr::VRegPlusVReg(input_ptr, row_byte_off),
+        });
+        prog.emit(VmInstr::LoadPtr {
+            dst: outer_output,
+            src: PtrExpr::VRegPlusVReg(output_ptr, row_byte_off),
+        });
 
         let body = |prog: &mut VmProgram, _g_ctr: VRegId, group_off: VRegId| {
-            prog.emit(VmInstr::LoadPtr { dst: row_input, src: PtrExpr::VRegPlusVReg(outer_input, group_off) });
-            prog.emit(VmInstr::LoadPtr { dst: row_output, src: PtrExpr::VRegPlusVReg(outer_output, group_off) });
+            prog.emit(VmInstr::LoadPtr {
+                dst: row_input,
+                src: PtrExpr::VRegPlusVReg(outer_input, group_off),
+            });
+            prog.emit(VmInstr::LoadPtr {
+                dst: row_output,
+                src: PtrExpr::VRegPlusVReg(outer_output, group_off),
+            });
             if norm_kind.has_weight() {
                 if broadcast_weight {
-                    prog.emit(VmInstr::LoadPtr { dst: row_weight, src: PtrExpr::VRegPlusConst(weight_ptr, 0) });
+                    prog.emit(VmInstr::LoadPtr {
+                        dst: row_weight,
+                        src: PtrExpr::VRegPlusConst(weight_ptr, 0),
+                    });
                 } else {
-                    prog.emit(VmInstr::LoadPtr { dst: row_weight, src: PtrExpr::VRegPlusVReg(weight_ptr, group_off) });
+                    prog.emit(VmInstr::LoadPtr {
+                        dst: row_weight,
+                        src: PtrExpr::VRegPlusVReg(weight_ptr, group_off),
+                    });
                 }
             }
             emit_normlike_one_group(
-                prog, reduce, finalize, transform,
-                feature_dim, vec_count, step_bytes, elem, lanes, width,
-                norm_kind, acc, temp, scale, dim_bc,
-                row_input, row_weight, row_output, dtype, weight_dtype,
+                prog,
+                reduce,
+                finalize,
+                transform,
+                feature_dim,
+                vec_count,
+                step_bytes,
+                elem,
+                lanes,
+                width,
+                norm_kind,
+                acc,
+                temp,
+                scale,
+                dim_bc,
+                row_input,
+                row_weight,
+                row_output,
+                dtype,
+                weight_dtype,
             );
         };
 
         if groups_per_row > 1 {
             prog.emit_loop(BoundExpr::Const(groups_per_row), row_bytes, body);
         } else {
-            prog.emit(VmInstr::LoadPtr { dst: row_input, src: PtrExpr::VRegPlusConst(outer_input, 0) });
-            prog.emit(VmInstr::LoadPtr { dst: row_output, src: PtrExpr::VRegPlusConst(outer_output, 0) });
+            prog.emit(VmInstr::LoadPtr {
+                dst: row_input,
+                src: PtrExpr::VRegPlusConst(outer_input, 0),
+            });
+            prog.emit(VmInstr::LoadPtr {
+                dst: row_output,
+                src: PtrExpr::VRegPlusConst(outer_output, 0),
+            });
             if norm_kind.has_weight() {
-                prog.emit(VmInstr::LoadPtr { dst: row_weight, src: PtrExpr::VRegPlusConst(weight_ptr, 0) });
+                prog.emit(VmInstr::LoadPtr {
+                    dst: row_weight,
+                    src: PtrExpr::VRegPlusConst(weight_ptr, 0),
+                });
             }
             emit_normlike_one_group(
-                prog, reduce, finalize, transform,
-                feature_dim, vec_count, step_bytes, elem, lanes, width,
-                norm_kind, acc, temp, scale, dim_bc,
-                row_input, row_weight, row_output, dtype, weight_dtype,
+                prog,
+                reduce,
+                finalize,
+                transform,
+                feature_dim,
+                vec_count,
+                step_bytes,
+                elem,
+                lanes,
+                width,
+                norm_kind,
+                acc,
+                temp,
+                scale,
+                dim_bc,
+                row_input,
+                row_weight,
+                row_output,
+                dtype,
+                weight_dtype,
             );
         }
     });
@@ -179,70 +245,173 @@ pub(crate) fn emit_normlike_one_group(
     let acc_dtype = dtype.accumulator_dtype();
 
     // Phase 1: Reduce
-    prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::Const(0.0), width, dtype: acc_dtype });
+    prog.emit(VmInstr::Broadcast {
+        dst: acc,
+        src: ScalarExpr::Const(0.0),
+        width,
+        dtype: acc_dtype,
+    });
     if vec_count > 0 {
-        prog.emit_loop(BoundExpr::Const(vec_count), step_bytes, |prog, _counter, byte_off| {
-            prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
-            auto_select::auto_lower_trace(prog, reduce, &[temp, acc], width, acc_dtype).expect("normlike reduce");
-            prog.emit(VmInstr::Accumulate { acc, src: temp });
-        });
+        prog.emit_loop(
+            BoundExpr::Const(vec_count),
+            step_bytes,
+            |prog, _counter, byte_off| {
+                prog.emit(VmInstr::VecLoad {
+                    dst: temp,
+                    base: row_input,
+                    offset: OffsetExpr::LoopOffset(byte_off),
+                    width,
+                    dtype,
+                    predicate: None,
+                });
+                auto_select::auto_lower_trace(prog, reduce, &[temp, acc], width, acc_dtype)
+                    .expect("normlike reduce");
+                prog.emit(VmInstr::Accumulate { acc, src: temp });
+            },
+        );
     }
     if tail > 0 {
         let s_tmp = prog.alloc_vreg(VRegKind::Vec, s1);
         for t in 0..tail {
-            prog.emit(VmInstr::VecLoad { dst: s_tmp, base: row_input, offset: OffsetExpr::Const(tail_off + t * elem), width: s1, dtype , predicate: None });
-            auto_select::auto_lower_trace(prog, reduce, &[s_tmp, acc], s1, acc_dtype).expect("normlike reduce tail");
+            prog.emit(VmInstr::VecLoad {
+                dst: s_tmp,
+                base: row_input,
+                offset: OffsetExpr::Const(tail_off + t * elem),
+                width: s1,
+                dtype,
+                predicate: None,
+            });
+            auto_select::auto_lower_trace(prog, reduce, &[s_tmp, acc], s1, acc_dtype)
+                .expect("normlike reduce tail");
             prog.emit(VmInstr::Accumulate { acc, src: s_tmp });
         }
     }
 
     // HReduce
-    let hr = auto_select::auto_lower_trace_raw(prog,
-        &[TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Sum }], &[acc], width, acc_dtype).expect("normlike HReduce");
-    prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::ExtractLane0(hr[1]), width, dtype: acc_dtype });
+    let hr = auto_select::auto_lower_trace_raw(
+        prog,
+        &[
+            TraceOp::Input(0),
+            TraceOp::HReduce {
+                src: ValueId(0),
+                op: ReduceKind::Sum,
+            },
+        ],
+        &[acc],
+        width,
+        acc_dtype,
+    )
+    .expect("normlike HReduce");
+    prog.emit(VmInstr::Broadcast {
+        dst: acc,
+        src: ScalarExpr::ExtractLane0(hr[1]),
+        width,
+        dtype: acc_dtype,
+    });
 
     // Phase 2: Finalize
-    prog.emit(VmInstr::Broadcast { dst: dim_bc, src: ScalarExpr::Const(feature_dim as f32), width, dtype });
-    auto_select::auto_lower_trace(prog, finalize, &[acc, dim_bc], width, dtype).expect("normlike finalize");
+    prog.emit(VmInstr::Broadcast {
+        dst: dim_bc,
+        src: ScalarExpr::Const(feature_dim as f32),
+        width,
+        dtype,
+    });
+    auto_select::auto_lower_trace(prog, finalize, &[acc, dim_bc], width, dtype)
+        .expect("normlike finalize");
 
     // Phase 3: Transform
-    prog.emit(VmInstr::Broadcast { dst: scale, src: ScalarExpr::ExtractLane0(acc), width, dtype });
+    prog.emit(VmInstr::Broadcast {
+        dst: scale,
+        src: ScalarExpr::ExtractLane0(acc),
+        width,
+        dtype,
+    });
     if vec_count > 0 {
-        prog.emit_loop(BoundExpr::Const(vec_count), step_bytes, |prog, counter, byte_off| {
-            prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
-            if has_weight {
-                let w = prog.alloc_vreg(VRegKind::Vec, width);
-                // BCE-20260629-011: VecLoad weight 用 weight 实际 dtype，而非计算 dtype
-                // BCE-20260703-NORM-MIXED-PRECISION-STEPBYTES: weight offset = counter × weight_step_bytes
-                // (counter 是纯索引 VReg; byte_off 已是 counter×step_bytes=input步长, 不能复用)。
-                // 用 OffsetExpr::Mul(LoopOffset(counter), weight_step_bytes) 表达独立步长。
-                let w_off = OffsetExpr::Mul(
-                    Box::new(OffsetExpr::LoopOffset(counter)),
-                    weight_step_bytes,
-                );
-                prog.emit(VmInstr::VecLoad { dst: w, base: weight_ptr, offset: w_off, width, dtype: weight_dtype, predicate: None });
-                auto_select::auto_lower_trace(prog, transform, &[temp, scale, w], width, dtype).expect("normlike transform");
-            } else {
-                auto_select::auto_lower_trace(prog, transform, &[temp, scale], width, dtype).expect("normlike transform");
-            }
-            prog.emit(VmInstr::VecStore { base: row_output, offset: OffsetExpr::LoopOffset(byte_off), src: temp, width, dtype , predicate: None });
-        });
+        prog.emit_loop(
+            BoundExpr::Const(vec_count),
+            step_bytes,
+            |prog, counter, byte_off| {
+                prog.emit(VmInstr::VecLoad {
+                    dst: temp,
+                    base: row_input,
+                    offset: OffsetExpr::LoopOffset(byte_off),
+                    width,
+                    dtype,
+                    predicate: None,
+                });
+                if has_weight {
+                    let w = prog.alloc_vreg(VRegKind::Vec, width);
+                    // BCE-20260629-011: VecLoad weight 用 weight 实际 dtype，而非计算 dtype
+                    // BCE-20260703-NORM-MIXED-PRECISION-STEPBYTES: weight offset = counter × weight_step_bytes
+                    // (counter 是纯索引 VReg; byte_off 已是 counter×step_bytes=input步长, 不能复用)。
+                    // 用 OffsetExpr::Mul(LoopOffset(counter), weight_step_bytes) 表达独立步长。
+                    let w_off = OffsetExpr::Mul(
+                        Box::new(OffsetExpr::LoopOffset(counter)),
+                        weight_step_bytes,
+                    );
+                    prog.emit(VmInstr::VecLoad {
+                        dst: w,
+                        base: weight_ptr,
+                        offset: w_off,
+                        width,
+                        dtype: weight_dtype,
+                        predicate: None,
+                    });
+                    auto_select::auto_lower_trace(prog, transform, &[temp, scale, w], width, dtype)
+                        .expect("normlike transform");
+                } else {
+                    auto_select::auto_lower_trace(prog, transform, &[temp, scale], width, dtype)
+                        .expect("normlike transform");
+                }
+                prog.emit(VmInstr::VecStore {
+                    base: row_output,
+                    offset: OffsetExpr::LoopOffset(byte_off),
+                    src: temp,
+                    width,
+                    dtype,
+                    predicate: None,
+                });
+            },
+        );
     }
     if tail > 0 {
         let s_temp = prog.alloc_vreg(VRegKind::Vec, s1);
         for t in 0..tail {
             let off = tail_off + t * elem;
             let w_off = weight_tail_off + t * weight_elem;
-            prog.emit(VmInstr::VecLoad { dst: s_temp, base: row_input, offset: OffsetExpr::Const(off), width: s1, dtype , predicate: None });
+            prog.emit(VmInstr::VecLoad {
+                dst: s_temp,
+                base: row_input,
+                offset: OffsetExpr::Const(off),
+                width: s1,
+                dtype,
+                predicate: None,
+            });
             if has_weight {
                 let s_w = prog.alloc_vreg(VRegKind::Vec, s1);
                 // BCE-20260703-NORM-MIXED-PRECISION-STEPBYTES: tail weight offset 用 weight_elem 推进, 非 input elem
-                prog.emit(VmInstr::VecLoad { dst: s_w, base: weight_ptr, offset: OffsetExpr::Const(w_off), width: s1, dtype: weight_dtype, predicate: None });
-                auto_select::auto_lower_trace(prog, transform, &[s_temp, scale, s_w], s1, dtype).expect("normlike transform tail");
+                prog.emit(VmInstr::VecLoad {
+                    dst: s_w,
+                    base: weight_ptr,
+                    offset: OffsetExpr::Const(w_off),
+                    width: s1,
+                    dtype: weight_dtype,
+                    predicate: None,
+                });
+                auto_select::auto_lower_trace(prog, transform, &[s_temp, scale, s_w], s1, dtype)
+                    .expect("normlike transform tail");
             } else {
-                auto_select::auto_lower_trace(prog, transform, &[s_temp, scale], s1, dtype).expect("normlike transform tail");
+                auto_select::auto_lower_trace(prog, transform, &[s_temp, scale], s1, dtype)
+                    .expect("normlike transform tail");
             }
-            prog.emit(VmInstr::VecStore { base: row_output, offset: OffsetExpr::Const(off), src: s_temp, width: s1, dtype , predicate: None });
+            prog.emit(VmInstr::VecStore {
+                base: row_output,
+                offset: OffsetExpr::Const(off),
+                src: s_temp,
+                width: s1,
+                dtype,
+                predicate: None,
+            });
         }
     }
 }
@@ -274,7 +443,9 @@ pub(crate) fn emit_layernorm_auto(
 ) -> Result<(), CompilerError> {
     let lanes = width.f32_lanes();
     if lanes == 0 || feature_dim == 0 {
-        return Err(CompilerError::CodegenViolation("emit_layernorm_auto: zero lanes or feature_dim".into()));
+        return Err(CompilerError::CodegenViolation(
+            "emit_layernorm_auto: zero lanes or feature_dim".into(),
+        ));
     }
     let vec_count = feature_dim / lanes;
     let step_bytes = width.bytes();
@@ -303,99 +474,267 @@ pub(crate) fn emit_layernorm_auto(
     let row_input = prog.alloc_vreg(VRegKind::Ptr, s1);
     let row_output = prog.alloc_vreg(VRegKind::Ptr, s1);
 
-    prog.emit(VmInstr::Broadcast { dst: dim_bc, src: ScalarExpr::Const(feature_dim as f32), width, dtype });
+    prog.emit(VmInstr::Broadcast {
+        dst: dim_bc,
+        src: ScalarExpr::Const(feature_dim as f32),
+        width,
+        dtype,
+    });
 
     let finalize_body = vec![
-        TraceOp::Input(0), TraceOp::Input(1), TraceOp::Input(2),
+        TraceOp::Input(0),
+        TraceOp::Input(1),
+        TraceOp::Input(2),
         TraceOp::Const(eps as f64),
-        TraceOp::Div(ValueId(0), ValueId(2)),   // mean = sum_x / dim
-        TraceOp::Div(ValueId(1), ValueId(2)),   // sq_mean = sum_sq / dim
-        TraceOp::Mul(ValueId(4), ValueId(4)),   // mean²
-        TraceOp::Sub(ValueId(5), ValueId(6)),   // var
-        TraceOp::Add(ValueId(7), ValueId(3)),   // var + eps
-        TraceOp::Rsqrt(ValueId(8)),    // inv_std
+        TraceOp::Div(ValueId(0), ValueId(2)), // mean = sum_x / dim
+        TraceOp::Div(ValueId(1), ValueId(2)), // sq_mean = sum_sq / dim
+        TraceOp::Mul(ValueId(4), ValueId(4)), // mean²
+        TraceOp::Sub(ValueId(5), ValueId(6)), // var
+        TraceOp::Add(ValueId(7), ValueId(3)), // var + eps
+        TraceOp::Rsqrt(ValueId(8)),           // inv_std
     ];
     let transform_body = vec![
-        TraceOp::Input(0), TraceOp::Input(1), TraceOp::Input(2), TraceOp::Input(3),
-        TraceOp::Sub(ValueId(0), ValueId(2)),  // x - mean
-        TraceOp::Mul(ValueId(4), ValueId(1)),  // * inv_std
-        TraceOp::Mul(ValueId(5), ValueId(3)),  // * weight
+        TraceOp::Input(0),
+        TraceOp::Input(1),
+        TraceOp::Input(2),
+        TraceOp::Input(3),
+        TraceOp::Sub(ValueId(0), ValueId(2)), // x - mean
+        TraceOp::Mul(ValueId(4), ValueId(1)), // * inv_std
+        TraceOp::Mul(ValueId(5), ValueId(3)), // * weight
         TraceOp::Input(4),
-        TraceOp::Add(ValueId(6), ValueId(7)),  // + bias
+        TraceOp::Add(ValueId(6), ValueId(7)), // + bias
     ];
     let mul_sq_body = [TraceOp::Input(0), TraceOp::Mul(ValueId(0), ValueId(0))];
-    let hr_sum_body = vec![TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Sum }];
+    let hr_sum_body = vec![
+        TraceOp::Input(0),
+        TraceOp::HReduce {
+            src: ValueId(0),
+            op: ReduceKind::Sum,
+        },
+    ];
 
     prog.emit_loop(seq_bound, row_bytes, |prog, _row_ctr, row_byte_off| {
-        prog.emit(VmInstr::LoadPtr { dst: row_input, src: PtrExpr::VRegPlusVReg(input_ptr, row_byte_off) });
-        prog.emit(VmInstr::LoadPtr { dst: row_output, src: PtrExpr::VRegPlusVReg(output_ptr, row_byte_off) });
+        prog.emit(VmInstr::LoadPtr {
+            dst: row_input,
+            src: PtrExpr::VRegPlusVReg(input_ptr, row_byte_off),
+        });
+        prog.emit(VmInstr::LoadPtr {
+            dst: row_output,
+            src: PtrExpr::VRegPlusVReg(output_ptr, row_byte_off),
+        });
 
         // Phase 1: Dual Accumulator Reduce (sum_x + sum_x²)
-        prog.emit(VmInstr::Broadcast { dst: acc_sum, src: ScalarExpr::Const(0.0), width, dtype: acc_dtype });
-        prog.emit(VmInstr::Broadcast { dst: acc_sq, src: ScalarExpr::Const(0.0), width, dtype: acc_dtype });
+        prog.emit(VmInstr::Broadcast {
+            dst: acc_sum,
+            src: ScalarExpr::Const(0.0),
+            width,
+            dtype: acc_dtype,
+        });
+        prog.emit(VmInstr::Broadcast {
+            dst: acc_sq,
+            src: ScalarExpr::Const(0.0),
+            width,
+            dtype: acc_dtype,
+        });
         if vec_count > 0 {
-            prog.emit_loop(BoundExpr::Const(vec_count), step_bytes, |prog, _ctr, byte_off| {
-                prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
-                prog.emit(VmInstr::Accumulate { acc: acc_sum, src: temp });
-                auto_select::auto_lower_trace(prog, &mul_sq_body, &[temp], width, acc_dtype).expect("layernorm sq");
-                prog.emit(VmInstr::Accumulate { acc: acc_sq, src: temp });
-            });
+            prog.emit_loop(
+                BoundExpr::Const(vec_count),
+                step_bytes,
+                |prog, _ctr, byte_off| {
+                    prog.emit(VmInstr::VecLoad {
+                        dst: temp,
+                        base: row_input,
+                        offset: OffsetExpr::LoopOffset(byte_off),
+                        width,
+                        dtype,
+                        predicate: None,
+                    });
+                    prog.emit(VmInstr::Accumulate {
+                        acc: acc_sum,
+                        src: temp,
+                    });
+                    auto_select::auto_lower_trace(prog, &mul_sq_body, &[temp], width, acc_dtype)
+                        .expect("layernorm sq");
+                    prog.emit(VmInstr::Accumulate {
+                        acc: acc_sq,
+                        src: temp,
+                    });
+                },
+            );
         }
         if tail > 0 {
             for t in 0..tail {
-                prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::Const(tail_off + t * elem), width: s1, dtype , predicate: None });
-                prog.emit(VmInstr::Accumulate { acc: acc_sum, src: temp });
-                auto_select::auto_lower_trace(prog, &mul_sq_body, &[temp], s1, acc_dtype).expect("layernorm sq tail");
-                prog.emit(VmInstr::Accumulate { acc: acc_sq, src: temp });
+                prog.emit(VmInstr::VecLoad {
+                    dst: temp,
+                    base: row_input,
+                    offset: OffsetExpr::Const(tail_off + t * elem),
+                    width: s1,
+                    dtype,
+                    predicate: None,
+                });
+                prog.emit(VmInstr::Accumulate {
+                    acc: acc_sum,
+                    src: temp,
+                });
+                auto_select::auto_lower_trace(prog, &mul_sq_body, &[temp], s1, acc_dtype)
+                    .expect("layernorm sq tail");
+                prog.emit(VmInstr::Accumulate {
+                    acc: acc_sq,
+                    src: temp,
+                });
             }
         }
         // HReduce both accumulators
-        let hr_s = auto_select::auto_lower_trace_raw(prog, &hr_sum_body, &[acc_sum], width, acc_dtype).expect("layernorm HReduce sum");
-        prog.emit(VmInstr::Broadcast { dst: acc_sum, src: ScalarExpr::ExtractLane0(hr_s[1]), width, dtype: acc_dtype });
-        let hr_q = auto_select::auto_lower_trace_raw(prog, &hr_sum_body, &[acc_sq], width, acc_dtype).expect("layernorm HReduce sq");
-        prog.emit(VmInstr::Broadcast { dst: acc_sq, src: ScalarExpr::ExtractLane0(hr_q[1]), width, dtype: acc_dtype });
+        let hr_s =
+            auto_select::auto_lower_trace_raw(prog, &hr_sum_body, &[acc_sum], width, acc_dtype)
+                .expect("layernorm HReduce sum");
+        prog.emit(VmInstr::Broadcast {
+            dst: acc_sum,
+            src: ScalarExpr::ExtractLane0(hr_s[1]),
+            width,
+            dtype: acc_dtype,
+        });
+        let hr_q =
+            auto_select::auto_lower_trace_raw(prog, &hr_sum_body, &[acc_sq], width, acc_dtype)
+                .expect("layernorm HReduce sq");
+        prog.emit(VmInstr::Broadcast {
+            dst: acc_sq,
+            src: ScalarExpr::ExtractLane0(hr_q[1]),
+            width,
+            dtype: acc_dtype,
+        });
 
         // Phase 2: Finalize → inv_std (slot 9), mean (slot 4)
         auto_select::auto_lower_trace_multi(
-            prog, &finalize_body, &[acc_sum, acc_sq, dim_bc],
-            &[(acc_sum, 9), (acc_sq, 4)], width, dtype,
-        ).expect("layernorm finalize");
-        prog.emit(VmInstr::Broadcast { dst: scale, src: ScalarExpr::ExtractLane0(acc_sum), width, dtype });
-        prog.emit(VmInstr::Broadcast { dst: mean_bc, src: ScalarExpr::ExtractLane0(acc_sq), width, dtype });
+            prog,
+            &finalize_body,
+            &[acc_sum, acc_sq, dim_bc],
+            &[(acc_sum, 9), (acc_sq, 4)],
+            width,
+            dtype,
+        )
+        .expect("layernorm finalize");
+        prog.emit(VmInstr::Broadcast {
+            dst: scale,
+            src: ScalarExpr::ExtractLane0(acc_sum),
+            width,
+            dtype,
+        });
+        prog.emit(VmInstr::Broadcast {
+            dst: mean_bc,
+            src: ScalarExpr::ExtractLane0(acc_sq),
+            width,
+            dtype,
+        });
 
         // Phase 3: Transform (x - mean) * inv_std * weight + bias
         if vec_count > 0 {
-            prog.emit_loop(BoundExpr::Const(vec_count), step_bytes, |prog, counter, byte_off| {
-                prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
-                let w = prog.alloc_vreg(VRegKind::Vec, width);
-                // BCE-20260703-NORM-MIXED-PRECISION-STEPBYTES: weight offset = counter × weight_step_bytes
-                // (counter 是纯索引 VReg; byte_off 已是 counter×step_bytes=input步长, 不能复用)。
-                let w_off = OffsetExpr::Mul(
-                    Box::new(OffsetExpr::LoopOffset(counter)),
-                    weight_step_bytes,
-                );
-                prog.emit(VmInstr::VecLoad { dst: w, base: weight_ptr, offset: w_off.clone(), width, dtype: weight_dtype, predicate: None });
-                let b = prog.alloc_vreg(VRegKind::Vec, width);
-                // bias 区起始 = bias_offset (按 weight_elem 算); bias 内偏移同 weight (counter × weight_step_bytes)
-                prog.emit(VmInstr::VecLoad { dst: b, base: weight_ptr,
-                    offset: OffsetExpr::Add(Box::new(OffsetExpr::Const(bias_offset)), Box::new(w_off)),
-                    width, dtype: weight_dtype, predicate: None });
-                auto_select::auto_lower_trace(prog, &transform_body, &[temp, scale, mean_bc, w, b], width, dtype).expect("layernorm transform");
-                prog.emit(VmInstr::VecStore { base: row_output, offset: OffsetExpr::LoopOffset(byte_off), src: temp, width, dtype , predicate: None });
-            });
+            prog.emit_loop(
+                BoundExpr::Const(vec_count),
+                step_bytes,
+                |prog, counter, byte_off| {
+                    prog.emit(VmInstr::VecLoad {
+                        dst: temp,
+                        base: row_input,
+                        offset: OffsetExpr::LoopOffset(byte_off),
+                        width,
+                        dtype,
+                        predicate: None,
+                    });
+                    let w = prog.alloc_vreg(VRegKind::Vec, width);
+                    // BCE-20260703-NORM-MIXED-PRECISION-STEPBYTES: weight offset = counter × weight_step_bytes
+                    // (counter 是纯索引 VReg; byte_off 已是 counter×step_bytes=input步长, 不能复用)。
+                    let w_off = OffsetExpr::Mul(
+                        Box::new(OffsetExpr::LoopOffset(counter)),
+                        weight_step_bytes,
+                    );
+                    prog.emit(VmInstr::VecLoad {
+                        dst: w,
+                        base: weight_ptr,
+                        offset: w_off.clone(),
+                        width,
+                        dtype: weight_dtype,
+                        predicate: None,
+                    });
+                    let b = prog.alloc_vreg(VRegKind::Vec, width);
+                    // bias 区起始 = bias_offset (按 weight_elem 算); bias 内偏移同 weight (counter × weight_step_bytes)
+                    prog.emit(VmInstr::VecLoad {
+                        dst: b,
+                        base: weight_ptr,
+                        offset: OffsetExpr::Add(
+                            Box::new(OffsetExpr::Const(bias_offset)),
+                            Box::new(w_off),
+                        ),
+                        width,
+                        dtype: weight_dtype,
+                        predicate: None,
+                    });
+                    auto_select::auto_lower_trace(
+                        prog,
+                        &transform_body,
+                        &[temp, scale, mean_bc, w, b],
+                        width,
+                        dtype,
+                    )
+                    .expect("layernorm transform");
+                    prog.emit(VmInstr::VecStore {
+                        base: row_output,
+                        offset: OffsetExpr::LoopOffset(byte_off),
+                        src: temp,
+                        width,
+                        dtype,
+                        predicate: None,
+                    });
+                },
+            );
         }
         if tail > 0 {
             for t in 0..tail {
                 let off = tail_off + t * elem;
                 let w_off = weight_tail_off + t * weight_elem;
-                prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::Const(off), width: s1, dtype , predicate: None });
+                prog.emit(VmInstr::VecLoad {
+                    dst: temp,
+                    base: row_input,
+                    offset: OffsetExpr::Const(off),
+                    width: s1,
+                    dtype,
+                    predicate: None,
+                });
                 let s_w = prog.alloc_vreg(VRegKind::Vec, s1);
                 // BCE-20260703-NORM-MIXED-PRECISION-STEPBYTES: tail weight offset 用 weight_elem 推进
-                prog.emit(VmInstr::VecLoad { dst: s_w, base: weight_ptr, offset: OffsetExpr::Const(w_off), width: s1, dtype: weight_dtype, predicate: None });
+                prog.emit(VmInstr::VecLoad {
+                    dst: s_w,
+                    base: weight_ptr,
+                    offset: OffsetExpr::Const(w_off),
+                    width: s1,
+                    dtype: weight_dtype,
+                    predicate: None,
+                });
                 let s_b = prog.alloc_vreg(VRegKind::Vec, s1);
-                prog.emit(VmInstr::VecLoad { dst: s_b, base: weight_ptr, offset: OffsetExpr::Const(bias_offset + w_off), width: s1, dtype: weight_dtype, predicate: None });
-                auto_select::auto_lower_trace(prog, &transform_body, &[temp, scale, mean_bc, s_w, s_b], s1, dtype).expect("layernorm transform tail");
-                prog.emit(VmInstr::VecStore { base: row_output, offset: OffsetExpr::Const(off), src: temp, width: s1, dtype , predicate: None });
+                prog.emit(VmInstr::VecLoad {
+                    dst: s_b,
+                    base: weight_ptr,
+                    offset: OffsetExpr::Const(bias_offset + w_off),
+                    width: s1,
+                    dtype: weight_dtype,
+                    predicate: None,
+                });
+                auto_select::auto_lower_trace(
+                    prog,
+                    &transform_body,
+                    &[temp, scale, mean_bc, s_w, s_b],
+                    s1,
+                    dtype,
+                )
+                .expect("layernorm transform tail");
+                prog.emit(VmInstr::VecStore {
+                    base: row_output,
+                    offset: OffsetExpr::Const(off),
+                    src: temp,
+                    width: s1,
+                    dtype,
+                    predicate: None,
+                });
             }
         }
     });
@@ -425,7 +764,9 @@ pub(crate) fn emit_softmax_inline(
     dtype: QuantPrecision,
 ) -> Result<(VRegId, VRegId), CompilerError> {
     if feature_dim == 0 {
-        return Err(CompilerError::CodegenViolation("emit_softmax_inline: zero feature_dim".into()));
+        return Err(CompilerError::CodegenViolation(
+            "emit_softmax_inline: zero feature_dim".into(),
+        ));
     }
     let lanes = width.f32_lanes().max(1);
     let elem = dtype.elem_bytes();
@@ -440,82 +781,275 @@ pub(crate) fn emit_softmax_inline(
     let tmp = prog.alloc_vreg(VRegKind::Vec, width);
     let max_val = prog.alloc_vreg(VRegKind::Vec, width);
     let sum_val = prog.alloc_vreg(VRegKind::Vec, width);
-    let combine_max: Vec<TraceOp> = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Max(ValueId(0), ValueId(1))];
+    let combine_max: Vec<TraceOp> = vec![
+        TraceOp::Input(0),
+        TraceOp::Input(1),
+        TraceOp::Max(ValueId(0), ValueId(1)),
+    ];
 
     // Phase 1: max reduce
-    prog.emit(VmInstr::Broadcast { dst: max_val, src: ScalarExpr::Const(f32::NEG_INFINITY), width, dtype: acc_dtype });
+    prog.emit(VmInstr::Broadcast {
+        dst: max_val,
+        src: ScalarExpr::Const(f32::NEG_INFINITY),
+        width,
+        dtype: acc_dtype,
+    });
     if vec_count > 0 {
         prog.emit_loop(BoundExpr::Const(vec_count), step, |prog, _ctr, byte_off| {
-            prog.emit(VmInstr::VecLoad { dst: tmp, base: input_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
-            auto_select::auto_lower_trace(prog, &combine_max, &[tmp, max_val], width, acc_dtype).expect("softmax max");
-            prog.emit(VmInstr::Accumulate { acc: max_val, src: tmp });
+            prog.emit(VmInstr::VecLoad {
+                dst: tmp,
+                base: input_ptr,
+                offset: OffsetExpr::LoopOffset(byte_off),
+                width,
+                dtype,
+                predicate: None,
+            });
+            auto_select::auto_lower_trace(prog, &combine_max, &[tmp, max_val], width, acc_dtype)
+                .expect("softmax max");
+            prog.emit(VmInstr::Accumulate {
+                acc: max_val,
+                src: tmp,
+            });
         });
     }
     if tail > 0 {
         let s_tmp = prog.alloc_vreg(VRegKind::Vec, s1);
         let s_max = prog.alloc_vreg(VRegKind::Vec, s1);
-        prog.emit(VmInstr::Broadcast { dst: s_max, src: ScalarExpr::ExtractLane0(max_val), width: s1, dtype: acc_dtype });
+        prog.emit(VmInstr::Broadcast {
+            dst: s_max,
+            src: ScalarExpr::ExtractLane0(max_val),
+            width: s1,
+            dtype: acc_dtype,
+        });
         for t in 0..tail {
-            prog.emit(VmInstr::VecLoad { dst: s_tmp, base: input_ptr, offset: OffsetExpr::Const(tail_off + t * elem), width: s1, dtype , predicate: None });
-            auto_select::auto_lower_trace(prog, &combine_max, &[s_tmp, s_max], s1, acc_dtype).expect("softmax max tail");
-            prog.emit(VmInstr::Accumulate { acc: max_val, src: s_tmp });
+            prog.emit(VmInstr::VecLoad {
+                dst: s_tmp,
+                base: input_ptr,
+                offset: OffsetExpr::Const(tail_off + t * elem),
+                width: s1,
+                dtype,
+                predicate: None,
+            });
+            auto_select::auto_lower_trace(prog, &combine_max, &[s_tmp, s_max], s1, acc_dtype)
+                .expect("softmax max tail");
+            prog.emit(VmInstr::Accumulate {
+                acc: max_val,
+                src: s_tmp,
+            });
         }
     }
-    let hr_max = auto_select::auto_lower_trace_raw(prog,
-        &[TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Max }], &[max_val], width, dtype).expect("softmax HReduce max");
-    prog.emit(VmInstr::Broadcast { dst: max_val, src: ScalarExpr::ExtractLane0(hr_max[1]), width, dtype: acc_dtype });
+    let hr_max = auto_select::auto_lower_trace_raw(
+        prog,
+        &[
+            TraceOp::Input(0),
+            TraceOp::HReduce {
+                src: ValueId(0),
+                op: ReduceKind::Max,
+            },
+        ],
+        &[max_val],
+        width,
+        dtype,
+    )
+    .expect("softmax HReduce max");
+    prog.emit(VmInstr::Broadcast {
+        dst: max_val,
+        src: ScalarExpr::ExtractLane0(hr_max[1]),
+        width,
+        dtype: acc_dtype,
+    });
 
     // Phase 2: exp(x - max) + sum
-    let exp_sub: Vec<TraceOp> = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Sub(ValueId(0), ValueId(1)), TraceOp::Exp(ValueId(2))];
-    let combine_sum: Vec<TraceOp> = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Add(ValueId(0), ValueId(1))];
-    prog.emit(VmInstr::Broadcast { dst: sum_val, src: ScalarExpr::Const(0.0), width, dtype: acc_dtype });
+    let exp_sub: Vec<TraceOp> = vec![
+        TraceOp::Input(0),
+        TraceOp::Input(1),
+        TraceOp::Sub(ValueId(0), ValueId(1)),
+        TraceOp::Exp(ValueId(2)),
+    ];
+    let combine_sum: Vec<TraceOp> = vec![
+        TraceOp::Input(0),
+        TraceOp::Input(1),
+        TraceOp::Add(ValueId(0), ValueId(1)),
+    ];
+    prog.emit(VmInstr::Broadcast {
+        dst: sum_val,
+        src: ScalarExpr::Const(0.0),
+        width,
+        dtype: acc_dtype,
+    });
     if vec_count > 0 {
         prog.emit_loop(BoundExpr::Const(vec_count), step, |prog, _ctr, byte_off| {
-            prog.emit(VmInstr::VecLoad { dst: tmp, base: input_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
-            auto_select::auto_lower_trace(prog, &exp_sub, &[tmp, max_val], width, dtype).expect("softmax exp");
-            prog.emit(VmInstr::VecStore { base: output_ptr, offset: OffsetExpr::LoopOffset(byte_off), src: tmp, width, dtype , predicate: None });
-            auto_select::auto_lower_trace(prog, &combine_sum, &[sum_val, tmp], width, acc_dtype).expect("softmax sum");
-            prog.emit(VmInstr::Accumulate { acc: sum_val, src: tmp });
+            prog.emit(VmInstr::VecLoad {
+                dst: tmp,
+                base: input_ptr,
+                offset: OffsetExpr::LoopOffset(byte_off),
+                width,
+                dtype,
+                predicate: None,
+            });
+            auto_select::auto_lower_trace(prog, &exp_sub, &[tmp, max_val], width, dtype)
+                .expect("softmax exp");
+            prog.emit(VmInstr::VecStore {
+                base: output_ptr,
+                offset: OffsetExpr::LoopOffset(byte_off),
+                src: tmp,
+                width,
+                dtype,
+                predicate: None,
+            });
+            auto_select::auto_lower_trace(prog, &combine_sum, &[sum_val, tmp], width, acc_dtype)
+                .expect("softmax sum");
+            prog.emit(VmInstr::Accumulate {
+                acc: sum_val,
+                src: tmp,
+            });
         });
     }
     if tail > 0 {
         let s_max_bc = prog.alloc_vreg(VRegKind::Vec, s1);
         let s_sum = prog.alloc_vreg(VRegKind::Vec, s1);
         let s_tmp = prog.alloc_vreg(VRegKind::Vec, s1);
-        prog.emit(VmInstr::Broadcast { dst: s_max_bc, src: ScalarExpr::ExtractLane0(max_val), width: s1, dtype: acc_dtype });
-        prog.emit(VmInstr::Broadcast { dst: s_sum, src: ScalarExpr::ExtractLane0(sum_val), width: s1, dtype: acc_dtype });
+        prog.emit(VmInstr::Broadcast {
+            dst: s_max_bc,
+            src: ScalarExpr::ExtractLane0(max_val),
+            width: s1,
+            dtype: acc_dtype,
+        });
+        prog.emit(VmInstr::Broadcast {
+            dst: s_sum,
+            src: ScalarExpr::ExtractLane0(sum_val),
+            width: s1,
+            dtype: acc_dtype,
+        });
         for t in 0..tail {
             let off = tail_off + t * elem;
-            prog.emit(VmInstr::VecLoad { dst: s_tmp, base: input_ptr, offset: OffsetExpr::Const(off), width: s1, dtype , predicate: None });
-            auto_select::auto_lower_trace_into(prog, &exp_sub, &[s_tmp, s_max_bc], s_tmp, s1, dtype).expect("softmax tail exp");
-            prog.emit(VmInstr::VecStore { base: output_ptr, offset: OffsetExpr::Const(off), src: s_tmp, width: s1, dtype , predicate: None });
-            auto_select::auto_lower_trace_into(prog, &combine_sum, &[s_sum, s_tmp], s_sum, s1, acc_dtype).expect("softmax tail sum");
+            prog.emit(VmInstr::VecLoad {
+                dst: s_tmp,
+                base: input_ptr,
+                offset: OffsetExpr::Const(off),
+                width: s1,
+                dtype,
+                predicate: None,
+            });
+            auto_select::auto_lower_trace_into(
+                prog,
+                &exp_sub,
+                &[s_tmp, s_max_bc],
+                s_tmp,
+                s1,
+                dtype,
+            )
+            .expect("softmax tail exp");
+            prog.emit(VmInstr::VecStore {
+                base: output_ptr,
+                offset: OffsetExpr::Const(off),
+                src: s_tmp,
+                width: s1,
+                dtype,
+                predicate: None,
+            });
+            auto_select::auto_lower_trace_into(
+                prog,
+                &combine_sum,
+                &[s_sum, s_tmp],
+                s_sum,
+                s1,
+                acc_dtype,
+            )
+            .expect("softmax tail sum");
         }
-        prog.emit(VmInstr::Accumulate { acc: sum_val, src: s_sum });
+        prog.emit(VmInstr::Accumulate {
+            acc: sum_val,
+            src: s_sum,
+        });
     }
-    let hr_sum = auto_select::auto_lower_trace_raw(prog,
-        &[TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Sum }], &[sum_val], width, dtype).expect("softmax HReduce sum");
-    prog.emit(VmInstr::Broadcast { dst: sum_val, src: ScalarExpr::ExtractLane0(hr_sum[1]), width, dtype: acc_dtype });
+    let hr_sum = auto_select::auto_lower_trace_raw(
+        prog,
+        &[
+            TraceOp::Input(0),
+            TraceOp::HReduce {
+                src: ValueId(0),
+                op: ReduceKind::Sum,
+            },
+        ],
+        &[sum_val],
+        width,
+        dtype,
+    )
+    .expect("softmax HReduce sum");
+    prog.emit(VmInstr::Broadcast {
+        dst: sum_val,
+        src: ScalarExpr::ExtractLane0(hr_sum[1]),
+        width,
+        dtype: acc_dtype,
+    });
 
     // Phase 3: normalize by sum
-    let normalize: Vec<TraceOp> = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
-    auto_select::auto_lower_trace_into(prog, &[TraceOp::Input(0), TraceOp::Recip(ValueId(0))], &[sum_val], sum_val, width, dtype).expect("softmax recip");
+    let normalize: Vec<TraceOp> = vec![
+        TraceOp::Input(0),
+        TraceOp::Input(1),
+        TraceOp::Mul(ValueId(0), ValueId(1)),
+    ];
+    auto_select::auto_lower_trace_into(
+        prog,
+        &[TraceOp::Input(0), TraceOp::Recip(ValueId(0))],
+        &[sum_val],
+        sum_val,
+        width,
+        dtype,
+    )
+    .expect("softmax recip");
     if vec_count > 0 {
         prog.emit_loop(BoundExpr::Const(vec_count), step, |prog, _ctr, byte_off| {
-            prog.emit(VmInstr::VecLoad { dst: tmp, base: output_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
-            auto_select::auto_lower_trace(prog, &normalize, &[tmp, sum_val], width, dtype).expect("softmax normalize");
-            prog.emit(VmInstr::VecStore { base: output_ptr, offset: OffsetExpr::LoopOffset(byte_off), src: tmp, width, dtype , predicate: None });
+            prog.emit(VmInstr::VecLoad {
+                dst: tmp,
+                base: output_ptr,
+                offset: OffsetExpr::LoopOffset(byte_off),
+                width,
+                dtype,
+                predicate: None,
+            });
+            auto_select::auto_lower_trace(prog, &normalize, &[tmp, sum_val], width, dtype)
+                .expect("softmax normalize");
+            prog.emit(VmInstr::VecStore {
+                base: output_ptr,
+                offset: OffsetExpr::LoopOffset(byte_off),
+                src: tmp,
+                width,
+                dtype,
+                predicate: None,
+            });
         });
     }
     if tail > 0 {
         let s_inv = prog.alloc_vreg(VRegKind::Vec, s1);
         let s_tmp = prog.alloc_vreg(VRegKind::Vec, s1);
-        prog.emit(VmInstr::Broadcast { dst: s_inv, src: ScalarExpr::ExtractLane0(sum_val), width: s1, dtype });
+        prog.emit(VmInstr::Broadcast {
+            dst: s_inv,
+            src: ScalarExpr::ExtractLane0(sum_val),
+            width: s1,
+            dtype,
+        });
         for t in 0..tail {
             let off = tail_off + t * elem;
-            prog.emit(VmInstr::VecLoad { dst: s_tmp, base: output_ptr, offset: OffsetExpr::Const(off), width: s1, dtype , predicate: None });
-            auto_select::auto_lower_trace_into(prog, &normalize, &[s_tmp, s_inv], s_tmp, s1, dtype).expect("softmax tail normalize");
-            prog.emit(VmInstr::VecStore { base: output_ptr, offset: OffsetExpr::Const(off), src: s_tmp, width: s1, dtype , predicate: None });
+            prog.emit(VmInstr::VecLoad {
+                dst: s_tmp,
+                base: output_ptr,
+                offset: OffsetExpr::Const(off),
+                width: s1,
+                dtype,
+                predicate: None,
+            });
+            auto_select::auto_lower_trace_into(prog, &normalize, &[s_tmp, s_inv], s_tmp, s1, dtype)
+                .expect("softmax tail normalize");
+            prog.emit(VmInstr::VecStore {
+                base: output_ptr,
+                offset: OffsetExpr::Const(off),
+                src: s_tmp,
+                width: s1,
+                dtype,
+                predicate: None,
+            });
         }
     }
 
@@ -536,7 +1070,9 @@ pub(crate) fn emit_softmax_telemetry(
     use graph::telemetry_offsets;
     use graph::SOFTMAX_SINK_THRESHOLD;
 
-    prog.emit(VmInstr::Comment("§13.9 Softmax telemetry: max + sharpness + is_sink".into()));
+    prog.emit(VmInstr::Comment(
+        "§13.9 Softmax telemetry: max + sharpness + is_sink".into(),
+    ));
 
     // Store softmax max value to telemetry[SOFTMAX_MAX_OFFSET]
     prog.emit(VmInstr::VecStore {
@@ -544,7 +1080,8 @@ pub(crate) fn emit_softmax_telemetry(
         offset: OffsetExpr::Const(telemetry_offsets::SOFTMAX_MAX_OFFSET),
         src: max_val,
         width: SimdWidth::Scalar,
-        dtype, predicate: None,
+        dtype,
+        predicate: None,
     });
 
     // sharpness = 1/sum
@@ -559,7 +1096,8 @@ pub(crate) fn emit_softmax_telemetry(
         offset: OffsetExpr::Const(telemetry_offsets::SOFTMAX_SHARPNESS_OFFSET),
         src: sharpness,
         width: SimdWidth::Scalar,
-        dtype, predicate: None,
+        dtype,
+        predicate: None,
     });
 
     // is_sink = (sharpness > SOFTMAX_SINK_THRESHOLD) ? 1.0 : 0.0
@@ -568,24 +1106,32 @@ pub(crate) fn emit_softmax_telemetry(
     //   clamped = Min(Max(diff, 0.0), 1.0)
     // TraceOp body: clamp(sharpness - threshold, 0.0, 1.0)
     let sink_body: Vec<TraceOp> = vec![
-        TraceOp::Input(0),                           // [0] sharpness
+        TraceOp::Input(0),                             // [0] sharpness
         TraceOp::Const(SOFTMAX_SINK_THRESHOLD as f64), // [1] threshold
-        TraceOp::Sub(ValueId(0), ValueId(1)),                          // [2] diff
-        TraceOp::Const(0.0),                         // [3] zero
-        TraceOp::Max(ValueId(2), ValueId(3)),                          // [4] diff_clamped
-        TraceOp::Const(1.0),                         // [5] one
-        TraceOp::Min(ValueId(4), ValueId(5)),                          // [6] clamped
+        TraceOp::Sub(ValueId(0), ValueId(1)),          // [2] diff
+        TraceOp::Const(0.0),                           // [3] zero
+        TraceOp::Max(ValueId(2), ValueId(3)),          // [4] diff_clamped
+        TraceOp::Const(1.0),                           // [5] one
+        TraceOp::Min(ValueId(4), ValueId(5)),          // [6] clamped
     ];
     let clamped = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
-    auto_select::auto_lower_trace_into(prog, &sink_body, &[sharpness], clamped, SimdWidth::Scalar, dtype)
-        .expect("emit_softmax_telemetry: sink_body auto_lower invariant violation");
+    auto_select::auto_lower_trace_into(
+        prog,
+        &sink_body,
+        &[sharpness],
+        clamped,
+        SimdWidth::Scalar,
+        dtype,
+    )
+    .expect("emit_softmax_telemetry: sink_body auto_lower invariant violation");
 
     prog.emit(VmInstr::VecStore {
         base: telemetry_ptr,
         offset: OffsetExpr::Const(telemetry_offsets::IS_ATTENTION_SINK_OFFSET),
         src: clamped,
         width: SimdWidth::Scalar,
-        dtype, predicate: None,
+        dtype,
+        predicate: None,
     });
 }
 
@@ -610,8 +1156,8 @@ pub(crate) fn emit_norm_template_driven(
     dtype: QuantPrecision,
     is_rms: bool,
 ) -> Option<()> {
+    use super::algo_interpreter::{ParamTable, TemplateInputs, TemplateInterpreter};
     use super::algo_registry;
-    use super::algo_interpreter::{TemplateInterpreter, ParamTable, TemplateInputs};
     use crate::dispatch::device_profile::DeviceProfile;
 
     let strategy = if is_rms {
@@ -635,9 +1181,13 @@ pub(crate) fn emit_norm_template_driven(
     let trace_ops = interp.instantiate(template, &inputs);
 
     super::auto_select::auto_lower_trace_raw(
-        prog, &trace_ops, &[input_ptr, weight_ptr, output_ptr, seq_offset],
-        width, dtype,
-    ).ok()?;
+        prog,
+        &trace_ops,
+        &[input_ptr, weight_ptr, output_ptr, seq_offset],
+        width,
+        dtype,
+    )
+    .ok()?;
 
     Some(())
 }
@@ -650,9 +1200,17 @@ mod tests {
     /// Helper: create a NormLike pattern with trivial reduce/finalize/transform bodies.
     fn make_normlike_pattern() -> ComputePattern {
         ComputePattern::NormLike {
-            reduce: vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))],
+            reduce: vec![
+                TraceOp::Input(0),
+                TraceOp::Input(1),
+                TraceOp::Mul(ValueId(0), ValueId(1)),
+            ],
             finalize: vec![TraceOp::Input(0), TraceOp::Rsqrt(ValueId(0))],
-            transform: vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))],
+            transform: vec![
+                TraceOp::Input(0),
+                TraceOp::Input(1),
+                TraceOp::Mul(ValueId(0), ValueId(1)),
+            ],
         }
     }
 
@@ -661,7 +1219,9 @@ mod tests {
     fn offset_contains_mul_const(off: &OffsetExpr, scale: usize) -> bool {
         match off {
             OffsetExpr::Mul(_, s) => *s == scale,
-            OffsetExpr::Add(a, b) => offset_contains_mul_const(a, scale) || offset_contains_mul_const(b, scale),
+            OffsetExpr::Add(a, b) => {
+                offset_contains_mul_const(a, scale) || offset_contains_mul_const(b, scale)
+            }
             _ => false,
         }
     }
@@ -681,15 +1241,29 @@ mod tests {
 
         // Act
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 64, 1, false, NormKind::RmsNorm,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            &pattern,
+            64,
+            1,
+            false,
+            NormKind::RmsNorm,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
         assert!(result.is_err(), "Should reject Elementwise pattern");
         let err = result.unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("expected NormLike"), "Error message should mention NormLike, got: {msg}");
+        assert!(
+            msg.contains("expected NormLike"),
+            "Error message should mention NormLike, got: {msg}"
+        );
     }
 
     // ── Test 2: emit_normlike_inline rejects zero lanes ──
@@ -705,14 +1279,28 @@ mod tests {
 
         // Act: SimdWidth::Scalable has f32_lanes() == 0
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 64, 1, false, NormKind::RmsNorm,
-            SimdWidth::Scalable, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            &pattern,
+            64,
+            1,
+            false,
+            NormKind::RmsNorm,
+            SimdWidth::Scalable,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
         assert!(result.is_err(), "Should reject zero lanes (Scalable)");
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("zero lanes"), "Error message should mention zero lanes, got: {msg}");
+        assert!(
+            msg.contains("zero lanes"),
+            "Error message should mention zero lanes, got: {msg}"
+        );
     }
 
     // ── Test 3: emit_normlike_inline rejects zero feature_dim ──
@@ -728,14 +1316,28 @@ mod tests {
 
         // Act: feature_dim = 0
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 0, 1, false, NormKind::RmsNorm,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            &pattern,
+            0,
+            1,
+            false,
+            NormKind::RmsNorm,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
         assert!(result.is_err(), "Should reject zero feature_dim");
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("zero"), "Error should mention zero, got: {msg}");
+        assert!(
+            msg.contains("zero"),
+            "Error should mention zero, got: {msg}"
+        );
     }
 
     // ── Test 4: emit_normlike_inline rejects zero groups_per_row ──
@@ -751,14 +1353,28 @@ mod tests {
 
         // Act: groups_per_row = 0
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 64, 0, false, NormKind::RmsNorm,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            &pattern,
+            64,
+            0,
+            false,
+            NormKind::RmsNorm,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
         assert!(result.is_err(), "Should reject groups_per_row == 0");
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("groups_per_row"), "Error should mention groups_per_row, got: {msg}");
+        assert!(
+            msg.contains("groups_per_row"),
+            "Error should mention groups_per_row, got: {msg}"
+        );
     }
 
     // ── Test 5: emit_normlike_inline succeeds with valid parameters (groups=1) ──
@@ -775,14 +1391,28 @@ mod tests {
 
         // Act
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 64, 1, false, NormKind::RmsNorm,
-            SimdWidth::W256, BoundExpr::Const(2),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            &pattern,
+            64,
+            1,
+            false,
+            NormKind::RmsNorm,
+            SimdWidth::W256,
+            BoundExpr::Const(2),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
         assert!(result.is_ok(), "Should succeed with valid parameters");
         // Should have allocated additional vregs for internal use
-        assert!(prog.vreg_count() > initial_count, "Should allocate internal vregs");
+        assert!(
+            prog.vreg_count() > initial_count,
+            "Should allocate internal vregs"
+        );
         // Should have emitted instructions
         assert!(!prog.instrs.is_empty(), "Should emit VmInstr instructions");
     }
@@ -800,9 +1430,20 @@ mod tests {
 
         // Act: groups_per_row=4 simulates per-head normalization (e.g., QkNorm)
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 64, 4, false, NormKind::ValueNorm,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            &pattern,
+            64,
+            4,
+            false,
+            NormKind::ValueNorm,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
         assert!(result.is_ok(), "Should succeed with groups_per_row > 1");
@@ -819,14 +1460,21 @@ mod tests {
 
         // Act
         let result = emit_softmax_inline(
-            &mut prog, 0, SimdWidth::W256,
-            input_ptr, output_ptr, QuantPrecision::F32,
+            &mut prog,
+            0,
+            SimdWidth::W256,
+            input_ptr,
+            output_ptr,
+            QuantPrecision::F32,
         );
 
         // Assert
         assert!(result.is_err(), "Should reject zero feature_dim");
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("zero feature_dim"), "Error should mention zero feature_dim, got: {msg}");
+        assert!(
+            msg.contains("zero feature_dim"),
+            "Error should mention zero feature_dim, got: {msg}"
+        );
     }
 
     // ── Test 8: emit_softmax_inline returns (max_val, sum_val) vregs on success ──
@@ -841,17 +1489,30 @@ mod tests {
 
         // Act
         let result = emit_softmax_inline(
-            &mut prog, 16, SimdWidth::W256,
-            input_ptr, output_ptr, QuantPrecision::F32,
+            &mut prog,
+            16,
+            SimdWidth::W256,
+            input_ptr,
+            output_ptr,
+            QuantPrecision::F32,
         );
 
         // Assert
         assert!(result.is_ok(), "Should succeed with feature_dim=16, W256");
         let (max_val, sum_val) = result.unwrap();
         // max_val and sum_val should be within the allocated vreg range
-        assert!(max_val.0 < prog.vreg_count(), "max_val should be a valid vreg");
-        assert!(sum_val.0 < prog.vreg_count(), "sum_val should be a valid vreg");
-        assert!(prog.vreg_count() > initial_count, "Should allocate internal vregs");
+        assert!(
+            max_val.0 < prog.vreg_count(),
+            "max_val should be a valid vreg"
+        );
+        assert!(
+            sum_val.0 < prog.vreg_count(),
+            "sum_val should be a valid vreg"
+        );
+        assert!(
+            prog.vreg_count() > initial_count,
+            "Should allocate internal vregs"
+        );
     }
 
     // ── Test 9: emit_softmax_inline with BF16 dtype ──
@@ -865,8 +1526,12 @@ mod tests {
 
         // Act
         let result = emit_softmax_inline(
-            &mut prog, 32, SimdWidth::W256,
-            input_ptr, output_ptr, QuantPrecision::BF16,
+            &mut prog,
+            32,
+            SimdWidth::W256,
+            input_ptr,
+            output_ptr,
+            QuantPrecision::BF16,
         );
 
         // Assert
@@ -885,14 +1550,25 @@ mod tests {
 
         // Act: SimdWidth::Scalable has f32_lanes() == 0
         let result = emit_layernorm_auto(
-            &mut prog, 64, 1e-5,
-            SimdWidth::Scalable, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            64,
+            1e-5,
+            SimdWidth::Scalable,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
         assert!(result.is_err(), "Should reject zero lanes");
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("zero lanes"), "Error should mention zero lanes, got: {msg}");
+        assert!(
+            msg.contains("zero lanes"),
+            "Error should mention zero lanes, got: {msg}"
+        );
     }
 
     // ── Test 11: emit_layernorm_auto rejects zero feature_dim ──
@@ -907,14 +1583,25 @@ mod tests {
 
         // Act: feature_dim = 0
         let result = emit_layernorm_auto(
-            &mut prog, 0, 1e-5,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            0,
+            1e-5,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
         assert!(result.is_err(), "Should reject zero feature_dim");
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("zero"), "Error should mention zero, got: {msg}");
+        assert!(
+            msg.contains("zero"),
+            "Error should mention zero, got: {msg}"
+        );
     }
 
     // ── Test 12: emit_layernorm_auto succeeds and emits instructions ──
@@ -930,13 +1617,24 @@ mod tests {
 
         // Act
         let result = emit_layernorm_auto(
-            &mut prog, 32, 1e-5,
-            SimdWidth::W256, BoundExpr::Const(2),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            32,
+            1e-5,
+            SimdWidth::W256,
+            BoundExpr::Const(2),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
         assert!(result.is_ok(), "Should succeed with valid parameters");
-        assert!(prog.vreg_count() > initial_count, "Should allocate internal vregs");
+        assert!(
+            prog.vreg_count() > initial_count,
+            "Should allocate internal vregs"
+        );
         assert!(!prog.instrs.is_empty(), "Should emit instructions");
     }
 
@@ -951,14 +1649,24 @@ mod tests {
 
         // Act: feature_dim=10 is not a multiple of 8 lanes, so tail handling is exercised
         let result = emit_softmax_inline(
-            &mut prog, 10, SimdWidth::W256,
-            input_ptr, output_ptr, QuantPrecision::F32,
+            &mut prog,
+            10,
+            SimdWidth::W256,
+            input_ptr,
+            output_ptr,
+            QuantPrecision::F32,
         );
 
         // Assert
-        assert!(result.is_ok(), "Should handle non-aligned feature_dim correctly");
+        assert!(
+            result.is_ok(),
+            "Should handle non-aligned feature_dim correctly"
+        );
         // Verify the program has instructions (not empty)
-        assert!(!prog.instrs.is_empty(), "Should emit instructions for non-aligned case");
+        assert!(
+            !prog.instrs.is_empty(),
+            "Should emit instructions for non-aligned case"
+        );
     }
 
     // ── Test 14: emit_normlike_inline with broadcast_weight=true and multiple groups ──
@@ -976,13 +1684,27 @@ mod tests {
 
         // Act: groups_per_row=4, broadcast_weight=true, has_weight=true
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 32, 4, true, NormKind::HeadRmsNorm,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            &pattern,
+            32,
+            4,
+            true,
+            NormKind::HeadRmsNorm,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
         assert!(result.is_ok(), "Should succeed with broadcast_weight=true");
-        assert!(prog.vreg_count() > initial_count, "Should allocate internal vregs");
+        assert!(
+            prog.vreg_count() > initial_count,
+            "Should allocate internal vregs"
+        );
         assert!(!prog.instrs.is_empty(), "Should emit instructions");
     }
 
@@ -1000,12 +1722,26 @@ mod tests {
 
         // Act: has_weight=false, groups_per_row=1
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 64, 1, false, NormKind::ValueNorm,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            &pattern,
+            64,
+            1,
+            false,
+            NormKind::ValueNorm,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
-        assert!(result.is_ok(), "Should succeed without weight (ValueNorm semantics)");
+        assert!(
+            result.is_ok(),
+            "Should succeed without weight (ValueNorm semantics)"
+        );
         assert!(!prog.instrs.is_empty(), "Should emit instructions");
     }
 
@@ -1024,13 +1760,27 @@ mod tests {
 
         // Act: feature_dim=3 is less than 8 lanes, vec_count=0
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 3, 1, false, NormKind::RmsNorm,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            &pattern,
+            3,
+            1,
+            false,
+            NormKind::RmsNorm,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
         assert!(result.is_ok(), "Should succeed with feature_dim < lanes");
-        assert!(!prog.instrs.is_empty(), "Should emit instructions for tail-only case");
+        assert!(
+            !prog.instrs.is_empty(),
+            "Should emit instructions for tail-only case"
+        );
     }
 
     // ── Test 17: emit_normlike_inline with SimdWidth::W128 ──
@@ -1047,13 +1797,27 @@ mod tests {
 
         // Act: feature_dim=10, W128 => vec_count=2, tail=2
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 10, 1, false, NormKind::RmsNorm,
-            SimdWidth::W128, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            &pattern,
+            10,
+            1,
+            false,
+            NormKind::RmsNorm,
+            SimdWidth::W128,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
         assert!(result.is_ok(), "Should succeed with W128 width");
-        assert!(!prog.instrs.is_empty(), "Should emit instructions with W128");
+        assert!(
+            !prog.instrs.is_empty(),
+            "Should emit instructions with W128"
+        );
     }
 
     // ── Test 18: emit_normlike_one_group direct call with weight and non-aligned feature_dim ──
@@ -1080,21 +1844,49 @@ mod tests {
         let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, s1);
         let row_output = prog.alloc_vreg(VRegKind::Ptr, s1);
 
-        let reduce = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let reduce = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
         let finalize = vec![TraceOp::Input(0), TraceOp::Rsqrt(ValueId(0))];
-        let transform = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let transform = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
 
         let initial_count = prog.instrs.len();
 
         // Act: has_weight=true with non-aligned feature_dim exercises both vec loop and tail
         emit_normlike_one_group(
-            &mut prog, &reduce, &finalize, &transform,
-            feature_dim, vec_count, step_bytes, elem, lanes, width,
-            NormKind::RmsNorm, acc, temp, scale, dim_bc,
-            row_input, weight_ptr, row_output, dtype, dtype,);
+            &mut prog,
+            &reduce,
+            &finalize,
+            &transform,
+            feature_dim,
+            vec_count,
+            step_bytes,
+            elem,
+            lanes,
+            width,
+            NormKind::RmsNorm,
+            acc,
+            temp,
+            scale,
+            dim_bc,
+            row_input,
+            weight_ptr,
+            row_output,
+            dtype,
+            dtype,
+        );
 
         // Assert: should have emitted instructions for reduce + finalize + transform phases
-        assert!(prog.instrs.len() > initial_count, "Should emit instructions for all 3 phases");
+        assert!(
+            prog.instrs.len() > initial_count,
+            "Should emit instructions for all 3 phases"
+        );
     }
 
     // ── Test 19: emit_normlike_one_group direct call without weight ──
@@ -1121,21 +1913,49 @@ mod tests {
         let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, s1);
         let row_output = prog.alloc_vreg(VRegKind::Ptr, s1);
 
-        let reduce = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let reduce = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
         let finalize = vec![TraceOp::Input(0), TraceOp::Rsqrt(ValueId(0))];
-        let transform = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let transform = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
 
         let initial_count = prog.instrs.len();
 
         // Act: has_weight=false
         emit_normlike_one_group(
-            &mut prog, &reduce, &finalize, &transform,
-            feature_dim, vec_count, step_bytes, elem, lanes, width,
-            NormKind::ValueNorm, acc, temp, scale, dim_bc,
-            row_input, weight_ptr, row_output, dtype, dtype,);
+            &mut prog,
+            &reduce,
+            &finalize,
+            &transform,
+            feature_dim,
+            vec_count,
+            step_bytes,
+            elem,
+            lanes,
+            width,
+            NormKind::ValueNorm,
+            acc,
+            temp,
+            scale,
+            dim_bc,
+            row_input,
+            weight_ptr,
+            row_output,
+            dtype,
+            dtype,
+        );
 
         // Assert: should emit instructions even without weight
-        assert!(prog.instrs.len() > initial_count, "Should emit instructions without weight");
+        assert!(
+            prog.instrs.len() > initial_count,
+            "Should emit instructions without weight"
+        );
     }
 
     // ── Test 20: emit_softmax_telemetry emits telemetry instructions ──
@@ -1156,7 +1976,10 @@ mod tests {
         emit_softmax_telemetry(&mut prog, max_val, sum_val, telemetry_ptr, width, dtype);
 
         // Assert: should emit instructions for max store, sharpness (recip), and is_sink
-        assert!(prog.instrs.len() > initial_count, "Should emit telemetry instructions");
+        assert!(
+            prog.instrs.len() > initial_count,
+            "Should emit telemetry instructions"
+        );
     }
 
     // ── Test 21: emit_layernorm_auto handles non-aligned feature_dim (tail elements) ──
@@ -1173,13 +1996,27 @@ mod tests {
 
         // Act: non-aligned feature_dim exercises tail code paths
         let result = emit_layernorm_auto(
-            &mut prog, 10, 1e-5,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            10,
+            1e-5,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
-        assert!(result.is_ok(), "Should succeed with non-aligned feature_dim");
-        assert!(prog.vreg_count() > initial_count, "Should allocate internal vregs");
+        assert!(
+            result.is_ok(),
+            "Should succeed with non-aligned feature_dim"
+        );
+        assert!(
+            prog.vreg_count() > initial_count,
+            "Should allocate internal vregs"
+        );
         assert!(!prog.instrs.is_empty(), "Should emit instructions");
     }
 
@@ -1196,9 +2033,17 @@ mod tests {
 
         // Act: BF16 dtype affects elem_bytes and VecStore dtype
         let result = emit_layernorm_auto(
-            &mut prog, 32, 1e-5,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::BF16, QuantPrecision::BF16,);
+            &mut prog,
+            32,
+            1e-5,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+        );
 
         // Assert
         assert!(result.is_ok(), "Should succeed with BF16 dtype");
@@ -1218,13 +2063,24 @@ mod tests {
 
         // Act
         let result = emit_layernorm_auto(
-            &mut prog, 12, 1e-5,
-            SimdWidth::W128, BoundExpr::Const(2),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            12,
+            1e-5,
+            SimdWidth::W128,
+            BoundExpr::Const(2),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
         assert!(result.is_ok(), "Should succeed with W128 width");
-        assert!(!prog.instrs.is_empty(), "Should emit instructions with W128");
+        assert!(
+            !prog.instrs.is_empty(),
+            "Should emit instructions with W128"
+        );
     }
 
     // ── Test 24: emit_softmax_inline with SimdWidth::W128 ──
@@ -1239,16 +2095,29 @@ mod tests {
 
         // Act
         let result = emit_softmax_inline(
-            &mut prog, 10, SimdWidth::W128,
-            input_ptr, output_ptr, QuantPrecision::F32,
+            &mut prog,
+            10,
+            SimdWidth::W128,
+            input_ptr,
+            output_ptr,
+            QuantPrecision::F32,
         );
 
         // Assert
         assert!(result.is_ok(), "Should succeed with W128");
         let (max_val, sum_val) = result.unwrap();
-        assert!(max_val.0 < prog.vreg_count(), "max_val should be a valid vreg");
-        assert!(sum_val.0 < prog.vreg_count(), "sum_val should be a valid vreg");
-        assert!(!prog.instrs.is_empty(), "Should emit instructions with W128");
+        assert!(
+            max_val.0 < prog.vreg_count(),
+            "max_val should be a valid vreg"
+        );
+        assert!(
+            sum_val.0 < prog.vreg_count(),
+            "sum_val should be a valid vreg"
+        );
+        assert!(
+            !prog.instrs.is_empty(),
+            "Should emit instructions with W128"
+        );
     }
 
     // ── Test 25: emit_normlike_inline with Symbolic seq bound ──
@@ -1270,13 +2139,27 @@ mod tests {
 
         // Act: Symbolic bound tests dynamic seq_len code path
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 64, 1, false, NormKind::RmsNorm,
-            SimdWidth::W256, sym_bound,
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            &pattern,
+            64,
+            1,
+            false,
+            NormKind::RmsNorm,
+            SimdWidth::W256,
+            sym_bound,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
         assert!(result.is_ok(), "Should succeed with Symbolic bound");
-        assert!(!prog.instrs.is_empty(), "Should emit instructions for Symbolic bound");
+        assert!(
+            !prog.instrs.is_empty(),
+            "Should emit instructions for Symbolic bound"
+        );
     }
 
     // ── Test 26: emit_softmax_inline with feature_dim=1 (single element, pure tail) ──
@@ -1292,16 +2175,29 @@ mod tests {
 
         // Act: single element exercises pure-scalar tail handling
         let result = emit_softmax_inline(
-            &mut prog, 1, SimdWidth::W256,
-            input_ptr, output_ptr, QuantPrecision::F32,
+            &mut prog,
+            1,
+            SimdWidth::W256,
+            input_ptr,
+            output_ptr,
+            QuantPrecision::F32,
         );
 
         // Assert
         assert!(result.is_ok(), "Should succeed with feature_dim=1");
         let (max_val, sum_val) = result.unwrap();
-        assert!(max_val.0 < prog.vreg_count(), "max_val should be a valid vreg");
-        assert!(sum_val.0 < prog.vreg_count(), "sum_val should be a valid vreg");
-        assert!(!prog.instrs.is_empty(), "Should emit instructions for single element");
+        assert!(
+            max_val.0 < prog.vreg_count(),
+            "max_val should be a valid vreg"
+        );
+        assert!(
+            sum_val.0 < prog.vreg_count(),
+            "sum_val should be a valid vreg"
+        );
+        assert!(
+            !prog.instrs.is_empty(),
+            "Should emit instructions for single element"
+        );
     }
 
     // ── Test 27: emit_normlike_inline with BF16 dtype exercises elem_bytes=2 path ──
@@ -1318,13 +2214,27 @@ mod tests {
 
         // Act: BF16 dtype with non-aligned feature_dim
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 12, 1, false, NormKind::RmsNorm,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::BF16, QuantPrecision::BF16,);
+            &mut prog,
+            &pattern,
+            12,
+            1,
+            false,
+            NormKind::RmsNorm,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+        );
 
         // Assert
         assert!(result.is_ok(), "Should succeed with BF16 dtype");
-        assert!(!prog.instrs.is_empty(), "Should emit instructions with BF16 elem_bytes=2");
+        assert!(
+            !prog.instrs.is_empty(),
+            "Should emit instructions with BF16 elem_bytes=2"
+        );
     }
 
     // ── Test 28: emit_layernorm_auto with Symbolic seq bound ──
@@ -1346,13 +2256,24 @@ mod tests {
 
         // Act
         let result = emit_layernorm_auto(
-            &mut prog, 32, 1e-5,
-            SimdWidth::W256, sym_bound,
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            32,
+            1e-5,
+            SimdWidth::W256,
+            sym_bound,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
         assert!(result.is_ok(), "Should succeed with Symbolic seq bound");
-        assert!(prog.instrs.len() > initial_count, "Should emit instructions for Symbolic bound");
+        assert!(
+            prog.instrs.len() > initial_count,
+            "Should emit instructions for Symbolic bound"
+        );
     }
 
     // ── Test 29: emit_layernorm_auto with feature_dim exactly equal to lanes (no tail) ──
@@ -1368,12 +2289,23 @@ mod tests {
 
         // Act
         let result = emit_layernorm_auto(
-            &mut prog, 8, 1e-5,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            8,
+            1e-5,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert: no tail means fewer instructions than a non-aligned case
-        assert!(result.is_ok(), "Should succeed with perfectly aligned feature_dim");
+        assert!(
+            result.is_ok(),
+            "Should succeed with perfectly aligned feature_dim"
+        );
         assert!(!prog.instrs.is_empty(), "Should emit instructions");
     }
 
@@ -1400,21 +2332,49 @@ mod tests {
         let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, s1);
         let row_output = prog.alloc_vreg(VRegKind::Ptr, s1);
 
-        let reduce = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let reduce = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
         let finalize = vec![TraceOp::Input(0), TraceOp::Rsqrt(ValueId(0))];
-        let transform = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let transform = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
 
         let initial_count = prog.instrs.len();
 
         // Act: feature_dim=8 perfectly aligned, no tail path exercised
         emit_normlike_one_group(
-            &mut prog, &reduce, &finalize, &transform,
-            feature_dim, vec_count, step_bytes, elem, lanes, width,
-            NormKind::RmsNorm, acc, temp, scale, dim_bc,
-            row_input, weight_ptr, row_output, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            &reduce,
+            &finalize,
+            &transform,
+            feature_dim,
+            vec_count,
+            step_bytes,
+            elem,
+            lanes,
+            width,
+            NormKind::RmsNorm,
+            acc,
+            temp,
+            scale,
+            dim_bc,
+            row_input,
+            weight_ptr,
+            row_output,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert: should emit instructions for vec loop only, no scalar tail
-        assert!(prog.instrs.len() > initial_count, "Should emit instructions for aligned feature_dim");
+        assert!(
+            prog.instrs.len() > initial_count,
+            "Should emit instructions for aligned feature_dim"
+        );
     }
 
     // ── Test 31: emit_softmax_inline with W512 width (16 lanes) ──
@@ -1429,16 +2389,29 @@ mod tests {
 
         // Act
         let result = emit_softmax_inline(
-            &mut prog, 20, SimdWidth::W512,
-            input_ptr, output_ptr, QuantPrecision::F32,
+            &mut prog,
+            20,
+            SimdWidth::W512,
+            input_ptr,
+            output_ptr,
+            QuantPrecision::F32,
         );
 
         // Assert
         assert!(result.is_ok(), "Should succeed with W512");
         let (max_val, sum_val) = result.unwrap();
-        assert!(max_val.0 < prog.vreg_count(), "max_val should be valid vreg");
-        assert!(sum_val.0 < prog.vreg_count(), "sum_val should be valid vreg");
-        assert!(!prog.instrs.is_empty(), "Should emit instructions with W512");
+        assert!(
+            max_val.0 < prog.vreg_count(),
+            "max_val should be valid vreg"
+        );
+        assert!(
+            sum_val.0 < prog.vreg_count(),
+            "sum_val should be valid vreg"
+        );
+        assert!(
+            !prog.instrs.is_empty(),
+            "Should emit instructions with W512"
+        );
     }
 
     // ── Test 32: emit_normlike_inline with non-broadcast weight and multiple groups ──
@@ -1455,12 +2428,26 @@ mod tests {
 
         // Act: groups_per_row=3, broadcast_weight=false, has_weight=true
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 24, 3, false, NormKind::RmsNorm,
-            SimdWidth::W256, BoundExpr::Const(2),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            &pattern,
+            24,
+            3,
+            false,
+            NormKind::RmsNorm,
+            SimdWidth::W256,
+            BoundExpr::Const(2),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert: non-broadcast weight loads per-group pointer via VRegPlusVReg
-        assert!(result.is_ok(), "Should succeed with non-broadcast weight and multiple groups");
+        assert!(
+            result.is_ok(),
+            "Should succeed with non-broadcast weight and multiple groups"
+        );
         assert!(!prog.instrs.is_empty(), "Should emit instructions");
     }
 
@@ -1476,15 +2463,25 @@ mod tests {
 
         // Act
         let result = emit_softmax_inline(
-            &mut prog, 8, SimdWidth::W256,
-            input_ptr, output_ptr, QuantPrecision::F32,
+            &mut prog,
+            8,
+            SimdWidth::W256,
+            input_ptr,
+            output_ptr,
+            QuantPrecision::F32,
         );
 
         // Assert: no tail path, only vectorized loop iterations
         assert!(result.is_ok(), "Should succeed with aligned feature_dim");
         let (max_val, sum_val) = result.unwrap();
-        assert!(max_val.0 < prog.vreg_count(), "max_val should be valid vreg");
-        assert!(sum_val.0 < prog.vreg_count(), "sum_val should be valid vreg");
+        assert!(
+            max_val.0 < prog.vreg_count(),
+            "max_val should be valid vreg"
+        );
+        assert!(
+            sum_val.0 < prog.vreg_count(),
+            "sum_val should be valid vreg"
+        );
     }
 
     // ── Test 34: emit_layernorm_auto with W128 and non-aligned feature_dim ──
@@ -1500,12 +2497,23 @@ mod tests {
 
         // Act
         let result = emit_layernorm_auto(
-            &mut prog, 7, 1e-5,
-            SimdWidth::W128, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            7,
+            1e-5,
+            SimdWidth::W128,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
-        assert!(result.is_ok(), "Should succeed with W128 and non-aligned feature_dim=7");
+        assert!(
+            result.is_ok(),
+            "Should succeed with W128 and non-aligned feature_dim=7"
+        );
         assert!(!prog.instrs.is_empty(), "Should emit instructions");
     }
 
@@ -1527,7 +2535,10 @@ mod tests {
         emit_softmax_telemetry(&mut prog, max_val, sum_val, telemetry_ptr, width, dtype);
 
         // Assert: should emit telemetry instructions with W128 width
-        assert!(prog.instrs.len() > initial_count, "Should emit telemetry instructions with W128");
+        assert!(
+            prog.instrs.len() > initial_count,
+            "Should emit telemetry instructions with W128"
+        );
     }
 
     // ── Test 36: emit_normlike_inline with feature_dim=1 (single element, pure tail) ──
@@ -1545,13 +2556,27 @@ mod tests {
 
         // Act
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 1, 1, false, NormKind::RmsNorm,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            &pattern,
+            1,
+            1,
+            false,
+            NormKind::RmsNorm,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
         assert!(result.is_ok(), "Should succeed with feature_dim=1");
-        assert!(!prog.instrs.is_empty(), "Should emit scalar-only instructions for feature_dim=1");
+        assert!(
+            !prog.instrs.is_empty(),
+            "Should emit scalar-only instructions for feature_dim=1"
+        );
     }
 
     // ── Test 37: emit_normlike_one_group with BF16 dtype ──
@@ -1578,21 +2603,49 @@ mod tests {
         let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, s1);
         let row_output = prog.alloc_vreg(VRegKind::Ptr, s1);
 
-        let reduce = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let reduce = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
         let finalize = vec![TraceOp::Input(0), TraceOp::Rsqrt(ValueId(0))];
-        let transform = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let transform = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
 
         let initial_count = prog.instrs.len();
 
         // Act: BF16 dtype with vec_count=1, tail=4
         emit_normlike_one_group(
-            &mut prog, &reduce, &finalize, &transform,
-            feature_dim, vec_count, step_bytes, elem, lanes, width,
-            NormKind::RmsNorm, acc, temp, scale, dim_bc,
-            row_input, weight_ptr, row_output, dtype, dtype,);
+            &mut prog,
+            &reduce,
+            &finalize,
+            &transform,
+            feature_dim,
+            vec_count,
+            step_bytes,
+            elem,
+            lanes,
+            width,
+            NormKind::RmsNorm,
+            acc,
+            temp,
+            scale,
+            dim_bc,
+            row_input,
+            weight_ptr,
+            row_output,
+            dtype,
+            dtype,
+        );
 
         // Assert: should emit instructions with BF16 dtype affecting VecLoad/VecStore
-        assert!(prog.instrs.len() > initial_count, "Should emit instructions with BF16 dtype");
+        assert!(
+            prog.instrs.len() > initial_count,
+            "Should emit instructions with BF16 dtype"
+        );
     }
 
     // ── Test 38: emit_softmax_telemetry with BF16 dtype ──
@@ -1613,7 +2666,10 @@ mod tests {
         emit_softmax_telemetry(&mut prog, max_val, sum_val, telemetry_ptr, width, dtype);
 
         // Assert: should emit telemetry instructions with BF16 dtype
-        assert!(prog.instrs.len() > initial_count, "Should emit telemetry instructions with BF16 dtype");
+        assert!(
+            prog.instrs.len() > initial_count,
+            "Should emit telemetry instructions with BF16 dtype"
+        );
     }
 
     // ── Test 39: emit_layernorm_auto with feature_dim=1 (pure scalar tail, no vec loop) ──
@@ -1630,13 +2686,24 @@ mod tests {
 
         // Act
         let result = emit_layernorm_auto(
-            &mut prog, 1, 1e-5,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            1,
+            1e-5,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
         assert!(result.is_ok(), "Should succeed with feature_dim=1");
-        assert!(!prog.instrs.is_empty(), "Should emit scalar-only instructions for feature_dim=1");
+        assert!(
+            !prog.instrs.is_empty(),
+            "Should emit scalar-only instructions for feature_dim=1"
+        );
     }
 
     // ── Test 40: emit_softmax_inline with Scalar width (1 lane) ──
@@ -1652,16 +2719,29 @@ mod tests {
 
         // Act: Scalar width, small feature_dim=4
         let result = emit_softmax_inline(
-            &mut prog, 4, SimdWidth::Scalar,
-            input_ptr, output_ptr, QuantPrecision::F32,
+            &mut prog,
+            4,
+            SimdWidth::Scalar,
+            input_ptr,
+            output_ptr,
+            QuantPrecision::F32,
         );
 
         // Assert
         assert!(result.is_ok(), "Should succeed with Scalar width");
         let (max_val, sum_val) = result.unwrap();
-        assert!(max_val.0 < prog.vreg_count(), "max_val should be a valid vreg");
-        assert!(sum_val.0 < prog.vreg_count(), "sum_val should be a valid vreg");
-        assert!(!prog.instrs.is_empty(), "Should emit instructions with Scalar width");
+        assert!(
+            max_val.0 < prog.vreg_count(),
+            "max_val should be a valid vreg"
+        );
+        assert!(
+            sum_val.0 < prog.vreg_count(),
+            "sum_val should be a valid vreg"
+        );
+        assert!(
+            !prog.instrs.is_empty(),
+            "Should emit instructions with Scalar width"
+        );
     }
 
     // ── Test 41: emit_normlike_one_group without weight and feature_dim < lanes (pure tail, no weight) ──
@@ -1688,21 +2768,49 @@ mod tests {
         let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, s1);
         let row_output = prog.alloc_vreg(VRegKind::Ptr, s1);
 
-        let reduce = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let reduce = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
         let finalize = vec![TraceOp::Input(0), TraceOp::Rsqrt(ValueId(0))];
-        let transform = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let transform = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
 
         let initial_count = prog.instrs.len();
 
         // Act: has_weight=false, vec_count=0, pure tail-only scalar path
         emit_normlike_one_group(
-            &mut prog, &reduce, &finalize, &transform,
-            feature_dim, vec_count, step_bytes, elem, lanes, width,
-            NormKind::ValueNorm, acc, temp, scale, dim_bc,
-            row_input, weight_ptr, row_output, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            &reduce,
+            &finalize,
+            &transform,
+            feature_dim,
+            vec_count,
+            step_bytes,
+            elem,
+            lanes,
+            width,
+            NormKind::ValueNorm,
+            acc,
+            temp,
+            scale,
+            dim_bc,
+            row_input,
+            weight_ptr,
+            row_output,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert: should emit instructions for tail-only phases without weight loads
-        assert!(prog.instrs.len() > initial_count, "Should emit instructions for tail-only no-weight path");
+        assert!(
+            prog.instrs.len() > initial_count,
+            "Should emit instructions for tail-only no-weight path"
+        );
     }
 
     // ── Test 42: emit_layernorm_auto with W512 width ──
@@ -1718,13 +2826,24 @@ mod tests {
 
         // Act: W512 with non-aligned feature_dim exercises both vec loop and tail
         let result = emit_layernorm_auto(
-            &mut prog, 24, 1e-5,
-            SimdWidth::W512, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            24,
+            1e-5,
+            SimdWidth::W512,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
         assert!(result.is_ok(), "Should succeed with W512 width");
-        assert!(!prog.instrs.is_empty(), "Should emit instructions with W512");
+        assert!(
+            !prog.instrs.is_empty(),
+            "Should emit instructions with W512"
+        );
     }
 
     // ── Test 43: emit_normlike_inline groups=1 has_weight=false takes direct path (no group loop) ──
@@ -1743,14 +2862,34 @@ mod tests {
 
         // Act: groups_per_row=1, has_weight=false → direct path, no group loop, no weight loads
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 64, 1, false, NormKind::ValueNorm,
-            SimdWidth::W256, BoundExpr::Const(3),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            &pattern,
+            64,
+            1,
+            false,
+            NormKind::ValueNorm,
+            SimdWidth::W256,
+            BoundExpr::Const(3),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
-        assert!(result.is_ok(), "Should succeed with groups=1, no weight, direct path");
-        assert!(prog.vreg_count() > initial_count, "Should allocate internal vregs");
-        assert!(!prog.instrs.is_empty(), "Should emit instructions for direct path");
+        assert!(
+            result.is_ok(),
+            "Should succeed with groups=1, no weight, direct path"
+        );
+        assert!(
+            prog.vreg_count() > initial_count,
+            "Should allocate internal vregs"
+        );
+        assert!(
+            !prog.instrs.is_empty(),
+            "Should emit instructions for direct path"
+        );
     }
 
     // ── Test 44: emit_softmax_inline with BF16 and non-aligned feature_dim ──
@@ -1766,16 +2905,32 @@ mod tests {
 
         // Act: feature_dim=10 with W256 (8 lanes) => vec_count=1, tail=2, BF16 elem_bytes=2
         let result = emit_softmax_inline(
-            &mut prog, 10, SimdWidth::W256,
-            input_ptr, output_ptr, QuantPrecision::BF16,
+            &mut prog,
+            10,
+            SimdWidth::W256,
+            input_ptr,
+            output_ptr,
+            QuantPrecision::BF16,
         );
 
         // Assert
-        assert!(result.is_ok(), "Should succeed with BF16 and non-aligned feature_dim");
+        assert!(
+            result.is_ok(),
+            "Should succeed with BF16 and non-aligned feature_dim"
+        );
         let (max_val, sum_val) = result.unwrap();
-        assert!(max_val.0 < prog.vreg_count(), "max_val should be valid vreg");
-        assert!(sum_val.0 < prog.vreg_count(), "sum_val should be valid vreg");
-        assert!(!prog.instrs.is_empty(), "Should emit instructions with BF16 non-aligned");
+        assert!(
+            max_val.0 < prog.vreg_count(),
+            "max_val should be valid vreg"
+        );
+        assert!(
+            sum_val.0 < prog.vreg_count(),
+            "sum_val should be valid vreg"
+        );
+        assert!(
+            !prog.instrs.is_empty(),
+            "Should emit instructions with BF16 non-aligned"
+        );
     }
 
     // ── Test 45: emit_softmax_telemetry with Scalar width ──
@@ -1792,10 +2947,20 @@ mod tests {
         let initial_count = prog.instrs.len();
 
         // Act: Scalar width telemetry
-        emit_softmax_telemetry(&mut prog, max_val, sum_val, telemetry_ptr, SimdWidth::Scalar, dtype);
+        emit_softmax_telemetry(
+            &mut prog,
+            max_val,
+            sum_val,
+            telemetry_ptr,
+            SimdWidth::Scalar,
+            dtype,
+        );
 
         // Assert: should emit telemetry instructions at scalar width
-        assert!(prog.instrs.len() > initial_count, "Should emit telemetry instructions at Scalar width");
+        assert!(
+            prog.instrs.len() > initial_count,
+            "Should emit telemetry instructions at Scalar width"
+        );
     }
 
     // ── Test 46: emit_layernorm_auto with BF16 and non-aligned feature_dim ──
@@ -1812,13 +2977,27 @@ mod tests {
 
         // Act: BF16 with non-aligned feature_dim exercises both vec loop and scalar tail with 2-byte elems
         let result = emit_layernorm_auto(
-            &mut prog, 10, 1e-5,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::BF16, QuantPrecision::BF16,);
+            &mut prog,
+            10,
+            1e-5,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+        );
 
         // Assert
-        assert!(result.is_ok(), "Should succeed with BF16 and non-aligned feature_dim");
-        assert!(!prog.instrs.is_empty(), "Should emit instructions for BF16 non-aligned");
+        assert!(
+            result.is_ok(),
+            "Should succeed with BF16 and non-aligned feature_dim"
+        );
+        assert!(
+            !prog.instrs.is_empty(),
+            "Should emit instructions for BF16 non-aligned"
+        );
     }
 
     // ── Test 47: emit_normlike_inline with Symbolic bound and multiple groups ──
@@ -1841,13 +3020,30 @@ mod tests {
 
         // Act: Symbolic outer + 2 groups per row
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 16, 2, false, NormKind::ValueNorm,
-            SimdWidth::W256, sym_bound,
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            &pattern,
+            16,
+            2,
+            false,
+            NormKind::ValueNorm,
+            SimdWidth::W256,
+            sym_bound,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
-        assert!(result.is_ok(), "Should succeed with Symbolic bound and multiple groups");
-        assert!(!prog.instrs.is_empty(), "Should emit nested loop instructions");
+        assert!(
+            result.is_ok(),
+            "Should succeed with Symbolic bound and multiple groups"
+        );
+        assert!(
+            !prog.instrs.is_empty(),
+            "Should emit nested loop instructions"
+        );
     }
 
     // ── Test 48: emit_normlike_inline with broadcast_weight=true and groups=1 ──
@@ -1866,13 +3062,30 @@ mod tests {
 
         // Act: groups=1, broadcast_weight=true, has_weight=true, direct code path
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 32, 1, true, NormKind::HeadRmsNorm,
-            SimdWidth::W256, BoundExpr::Const(2),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            &pattern,
+            32,
+            1,
+            true,
+            NormKind::HeadRmsNorm,
+            SimdWidth::W256,
+            BoundExpr::Const(2),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
-        assert!(result.is_ok(), "Should succeed with broadcast weight and single group");
-        assert!(prog.instrs.len() > initial_count, "Should emit instructions including weight load");
+        assert!(
+            result.is_ok(),
+            "Should succeed with broadcast weight and single group"
+        );
+        assert!(
+            prog.instrs.len() > initial_count,
+            "Should emit instructions including weight load"
+        );
     }
 
     // ── Test 49: emit_normlike_one_group with W128 width ──
@@ -1898,21 +3111,49 @@ mod tests {
         let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, s1);
         let row_output = prog.alloc_vreg(VRegKind::Ptr, s1);
 
-        let reduce = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let reduce = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
         let finalize = vec![TraceOp::Input(0), TraceOp::Rsqrt(ValueId(0))];
-        let transform = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let transform = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
 
         let initial_count = prog.instrs.len();
 
         // Act: W128 width with has_weight=true, exercises 4-lane vectorized loop + scalar tail
         emit_normlike_one_group(
-            &mut prog, &reduce, &finalize, &transform,
-            feature_dim, vec_count, step_bytes, elem, lanes, width,
-            NormKind::RmsNorm, acc, temp, scale, dim_bc,
-            row_input, weight_ptr, row_output, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            &reduce,
+            &finalize,
+            &transform,
+            feature_dim,
+            vec_count,
+            step_bytes,
+            elem,
+            lanes,
+            width,
+            NormKind::RmsNorm,
+            acc,
+            temp,
+            scale,
+            dim_bc,
+            row_input,
+            weight_ptr,
+            row_output,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
-        assert!(prog.instrs.len() > initial_count, "Should emit instructions with W128 width");
+        assert!(
+            prog.instrs.len() > initial_count,
+            "Should emit instructions with W128 width"
+        );
     }
 
     // ── Test 50: emit_softmax_inline with W512 and aligned feature_dim (zero tail) ──
@@ -1928,16 +3169,32 @@ mod tests {
 
         // Act
         let result = emit_softmax_inline(
-            &mut prog, 16, SimdWidth::W512,
-            input_ptr, output_ptr, QuantPrecision::F32,
+            &mut prog,
+            16,
+            SimdWidth::W512,
+            input_ptr,
+            output_ptr,
+            QuantPrecision::F32,
         );
 
         // Assert
-        assert!(result.is_ok(), "Should succeed with W512 and aligned feature_dim=16");
+        assert!(
+            result.is_ok(),
+            "Should succeed with W512 and aligned feature_dim=16"
+        );
         let (max_val, sum_val) = result.unwrap();
-        assert!(max_val.0 < prog.vreg_count(), "max_val should be valid vreg");
-        assert!(sum_val.0 < prog.vreg_count(), "sum_val should be valid vreg");
-        assert!(!prog.instrs.is_empty(), "Should emit vectorized-only instructions");
+        assert!(
+            max_val.0 < prog.vreg_count(),
+            "max_val should be valid vreg"
+        );
+        assert!(
+            sum_val.0 < prog.vreg_count(),
+            "sum_val should be valid vreg"
+        );
+        assert!(
+            !prog.instrs.is_empty(),
+            "Should emit vectorized-only instructions"
+        );
     }
 
     // ── Test 51: emit_softmax_inline with Scalar width and non-aligned feature_dim ──
@@ -1953,16 +3210,32 @@ mod tests {
 
         // Act: Scalar width with feature_dim=3, all elements processed as vec_count=3
         let result = emit_softmax_inline(
-            &mut prog, 3, SimdWidth::Scalar,
-            input_ptr, output_ptr, QuantPrecision::F32,
+            &mut prog,
+            3,
+            SimdWidth::Scalar,
+            input_ptr,
+            output_ptr,
+            QuantPrecision::F32,
         );
 
         // Assert
-        assert!(result.is_ok(), "Should succeed with Scalar width and non-aligned feature_dim");
+        assert!(
+            result.is_ok(),
+            "Should succeed with Scalar width and non-aligned feature_dim"
+        );
         let (max_val, sum_val) = result.unwrap();
-        assert!(max_val.0 < prog.vreg_count(), "max_val should be valid vreg");
-        assert!(sum_val.0 < prog.vreg_count(), "sum_val should be valid vreg");
-        assert!(!prog.instrs.is_empty(), "Should emit scalar-width instructions");
+        assert!(
+            max_val.0 < prog.vreg_count(),
+            "max_val should be valid vreg"
+        );
+        assert!(
+            sum_val.0 < prog.vreg_count(),
+            "sum_val should be valid vreg"
+        );
+        assert!(
+            !prog.instrs.is_empty(),
+            "Should emit scalar-width instructions"
+        );
     }
 
     // ── Test 52: emit_softmax_telemetry with W512 width ──
@@ -1983,7 +3256,10 @@ mod tests {
         emit_softmax_telemetry(&mut prog, max_val, sum_val, telemetry_ptr, width, dtype);
 
         // Assert: should emit telemetry instructions at W512 width
-        assert!(prog.instrs.len() > initial_count, "Should emit telemetry instructions at W512 width");
+        assert!(
+            prog.instrs.len() > initial_count,
+            "Should emit telemetry instructions at W512 width"
+        );
     }
 
     // ── Test 53: emit_layernorm_auto with large feature_dim (256) ──
@@ -2001,14 +3277,28 @@ mod tests {
 
         // Act
         let result = emit_layernorm_auto(
-            &mut prog, 256, 1e-5,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            256,
+            1e-5,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
         assert!(result.is_ok(), "Should succeed with large feature_dim=256");
-        assert!(prog.vreg_count() > initial_count, "Should allocate internal vregs");
-        assert!(!prog.instrs.is_empty(), "Should emit many instructions for large feature_dim");
+        assert!(
+            prog.vreg_count() > initial_count,
+            "Should allocate internal vregs"
+        );
+        assert!(
+            !prog.instrs.is_empty(),
+            "Should emit many instructions for large feature_dim"
+        );
     }
 
     // ── Test 54: emit_layernorm_auto with BF16 and W128 width ──
@@ -2025,13 +3315,24 @@ mod tests {
 
         // Act: BF16 + W128 + non-aligned feature_dim exercises both vec and tail with 2-byte elems
         let result = emit_layernorm_auto(
-            &mut prog, 6, 1e-5,
-            SimdWidth::W128, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::BF16, QuantPrecision::BF16,);
+            &mut prog,
+            6,
+            1e-5,
+            SimdWidth::W128,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+        );
 
         // Assert
         assert!(result.is_ok(), "Should succeed with BF16 and W128");
-        assert!(!prog.instrs.is_empty(), "Should emit instructions with BF16 W128");
+        assert!(
+            !prog.instrs.is_empty(),
+            "Should emit instructions with BF16 W128"
+        );
     }
 
     // ── Test 55: emit_normlike_inline with W512 width ──
@@ -2049,13 +3350,27 @@ mod tests {
 
         // Act
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 24, 1, false, NormKind::RmsNorm,
-            SimdWidth::W512, BoundExpr::Const(2),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            &pattern,
+            24,
+            1,
+            false,
+            NormKind::RmsNorm,
+            SimdWidth::W512,
+            BoundExpr::Const(2),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
         assert!(result.is_ok(), "Should succeed with W512 width");
-        assert!(!prog.instrs.is_empty(), "Should emit instructions with W512");
+        assert!(
+            !prog.instrs.is_empty(),
+            "Should emit instructions with W512"
+        );
     }
 
     // ── Test 56: emit_normlike_inline broadcast_weight=true does not affect has_weight=false path ──
@@ -2074,13 +3389,30 @@ mod tests {
 
         // Act: broadcast_weight=true but has_weight=false, groups=1 direct path
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 16, 1, true, NormKind::ValueNorm,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            &pattern,
+            16,
+            1,
+            true,
+            NormKind::ValueNorm,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert: should succeed and emit instructions without any weight loads
-        assert!(result.is_ok(), "Should succeed when broadcast_weight is ignored (has_weight=false)");
-        assert!(prog.instrs.len() > initial_count, "Should emit instructions without weight loads");
+        assert!(
+            result.is_ok(),
+            "Should succeed when broadcast_weight is ignored (has_weight=false)"
+        );
+        assert!(
+            prog.instrs.len() > initial_count,
+            "Should emit instructions without weight loads"
+        );
     }
 
     // ── Test 57: RmsNorm with hidden_dim<lanes produces pure tail (no inner vec LoopBegin) ──
@@ -2098,12 +3430,28 @@ mod tests {
 
         // Act: feature_dim=3 => vec_count=0, only outer seq loop + scalar tail ops
         emit_normlike_inline(
-            &mut prog, &pattern, 3, 1, false, NormKind::RmsNorm,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,).unwrap();
+            &mut prog,
+            &pattern,
+            3,
+            1,
+            false,
+            NormKind::RmsNorm,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: should have exactly 1 LoopBegin (outer seq loop only, no inner vec loop)
-        let loop_begin_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
+        let loop_begin_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopBegin { .. }))
+            .count();
         assert_eq!(loop_begin_count, 1, "Should have 1 LoopBegin (outer seq loop only) for feature_dim < lanes, got {loop_begin_count}");
     }
 
@@ -2122,39 +3470,85 @@ mod tests {
         let w256 = prog_256.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let o256 = prog_256.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         emit_normlike_inline(
-            &mut prog_256, &pattern, feature_dim, 1, false, NormKind::RmsNorm,
-            SimdWidth::W256, BoundExpr::Const(1),
-            i256, w256, o256, QuantPrecision::F32, QuantPrecision::F32,).unwrap();
+            &mut prog_256,
+            &pattern,
+            feature_dim,
+            1,
+            false,
+            NormKind::RmsNorm,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            i256,
+            w256,
+            o256,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         let mut prog_512 = VmProgram::new();
         let i512 = prog_512.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let w512 = prog_512.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let o512 = prog_512.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         emit_normlike_inline(
-            &mut prog_512, &pattern, feature_dim, 1, false, NormKind::RmsNorm,
-            SimdWidth::W512, BoundExpr::Const(1),
-            i512, w512, o512, QuantPrecision::F32, QuantPrecision::F32,).unwrap();
+            &mut prog_512,
+            &pattern,
+            feature_dim,
+            1,
+            false,
+            NormKind::RmsNorm,
+            SimdWidth::W512,
+            BoundExpr::Const(1),
+            i512,
+            w512,
+            o512,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: W512 should produce inner vec LoopBegin with step_bytes=64 (16 lanes * 4 bytes)
         // and W256 should produce inner vec LoopBegin with step_bytes=32 (8 lanes * 4 bytes).
         // Find the maximum step_bytes among inner vec loops (BoundExpr::Const(vec_count)) in each program.
-        let max_step_256: usize = prog_256.instrs.iter()
+        let max_step_256: usize = prog_256
+            .instrs
+            .iter()
             .filter_map(|i| match i {
-                VmInstr::LoopBegin { offsets, bound: BoundExpr::Const(n), .. } if *n > 1 => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
+                VmInstr::LoopBegin {
+                    offsets,
+                    bound: BoundExpr::Const(n),
+                    ..
+                } if *n > 1 => offsets
+                    .first()
+                    .and_then(|offset| offset.stride.as_fixed_bytes()),
                 _ => None,
             })
             .max()
             .unwrap_or(0);
-        let max_step_512: usize = prog_512.instrs.iter()
+        let max_step_512: usize = prog_512
+            .instrs
+            .iter()
             .filter_map(|i| match i {
-                VmInstr::LoopBegin { offsets, bound: BoundExpr::Const(n), .. } if *n > 1 => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
+                VmInstr::LoopBegin {
+                    offsets,
+                    bound: BoundExpr::Const(n),
+                    ..
+                } if *n > 1 => offsets
+                    .first()
+                    .and_then(|offset| offset.stride.as_fixed_bytes()),
                 _ => None,
             })
             .max()
             .unwrap_or(0);
 
-        assert_eq!(max_step_256, 32, "W256 inner vec loop step_bytes should be 32");
-        assert_eq!(max_step_512, 64, "W512 inner vec loop step_bytes should be 64");
+        assert_eq!(
+            max_step_256, 32,
+            "W256 inner vec loop step_bytes should be 32"
+        );
+        assert_eq!(
+            max_step_512, 64,
+            "W512 inner vec loop step_bytes should be 64"
+        );
     }
 
     // ── Test 59: emit_normlike_inline generated program contains LoopBegin/LoopEnd VmInstr ──
@@ -2171,12 +3565,27 @@ mod tests {
 
         // Act: feature_dim=64, W256 => vec_count=8, requires inner vec loop
         emit_normlike_inline(
-            &mut prog, &pattern, 64, 1, false, NormKind::RmsNorm,
-            SimdWidth::W256, BoundExpr::Const(2),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,).unwrap();
+            &mut prog,
+            &pattern,
+            64,
+            1,
+            false,
+            NormKind::RmsNorm,
+            SimdWidth::W256,
+            BoundExpr::Const(2),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: should contain LoopBegin/LoopEnd pairs
-        let has_loop_begin = prog.instrs.iter().any(|i| matches!(i, VmInstr::LoopBegin { .. }));
+        let has_loop_begin = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::LoopBegin { .. }));
         let has_loop_end = prog.instrs.iter().any(|i| matches!(i, VmInstr::LoopEnd));
         assert!(has_loop_begin, "Should contain LoopBegin instructions");
         assert!(has_loop_end, "Should contain LoopEnd instructions");
@@ -2194,13 +3603,25 @@ mod tests {
 
         // Act: feature_dim=16 with W256 => vec_count=2, exercises both vec loop and HReduce
         emit_softmax_inline(
-            &mut prog, 16, SimdWidth::W256,
-            input_ptr, output_ptr, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            16,
+            SimdWidth::W256,
+            input_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: should contain HReduce instructions for max and sum phases
-        let hreduce_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::HReduce { .. })).count();
-        assert!(hreduce_count >= 2, "Should contain at least 2 HReduce instructions (max + sum), found {hreduce_count}");
+        let hreduce_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::HReduce { .. }))
+            .count();
+        assert!(
+            hreduce_count >= 2,
+            "Should contain at least 2 HReduce instructions (max + sum), found {hreduce_count}"
+        );
     }
 
     // ── Test 61: emit_normlike_inline generated program contains Broadcast VmInstr ──
@@ -2217,13 +3638,32 @@ mod tests {
 
         // Act
         emit_normlike_inline(
-            &mut prog, &pattern, 32, 1, false, NormKind::RmsNorm,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,).unwrap();
+            &mut prog,
+            &pattern,
+            32,
+            1,
+            false,
+            NormKind::RmsNorm,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: should contain Broadcast instructions (for acc=0 init, dim_bc, scale)
-        let broadcast_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::Broadcast { .. })).count();
-        assert!(broadcast_count >= 2, "Should contain at least 2 Broadcast instructions, found {broadcast_count}");
+        let broadcast_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::Broadcast { .. }))
+            .count();
+        assert!(
+            broadcast_count >= 2,
+            "Should contain at least 2 Broadcast instructions, found {broadcast_count}"
+        );
     }
 
     // ── Test 62: BF16 dtype produces VecLoad/VecStore with BF16 dtype field ──
@@ -2240,17 +3680,43 @@ mod tests {
 
         // Act: BF16 dtype with aligned feature_dim=16
         emit_normlike_inline(
-            &mut prog, &pattern, 16, 1, false, NormKind::RmsNorm,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::BF16, QuantPrecision::BF16,).unwrap();
+            &mut prog,
+            &pattern,
+            16,
+            1,
+            false,
+            NormKind::RmsNorm,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+        )
+        .unwrap();
 
         // Assert: should contain VecLoad/VecStore with dtype=BF16
-        let has_bf16_load = prog.instrs.iter().any(|i| matches!(
-            i, VmInstr::VecLoad { dtype: QuantPrecision::BF16, predicate: None, .. }
-        ));
-        let has_bf16_store = prog.instrs.iter().any(|i| matches!(
-            i, VmInstr::VecStore { dtype: QuantPrecision::BF16, predicate: None, .. }
-        ));
+        let has_bf16_load = prog.instrs.iter().any(|i| {
+            matches!(
+                i,
+                VmInstr::VecLoad {
+                    dtype: QuantPrecision::BF16,
+                    predicate: None,
+                    ..
+                }
+            )
+        });
+        let has_bf16_store = prog.instrs.iter().any(|i| {
+            matches!(
+                i,
+                VmInstr::VecStore {
+                    dtype: QuantPrecision::BF16,
+                    predicate: None,
+                    ..
+                }
+            )
+        });
         assert!(has_bf16_load, "Should contain VecLoad with BF16 dtype");
         assert!(has_bf16_store, "Should contain VecStore with BF16 dtype");
     }
@@ -2267,17 +3733,36 @@ mod tests {
 
         // Act: F32 dtype with feature_dim=16
         emit_softmax_inline(
-            &mut prog, 16, SimdWidth::W256,
-            input_ptr, output_ptr, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            16,
+            SimdWidth::W256,
+            input_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: should contain VecLoad/VecStore with dtype=F32
-        let has_f32_load = prog.instrs.iter().any(|i| matches!(
-            i, VmInstr::VecLoad { dtype: QuantPrecision::F32, predicate: None, .. }
-        ));
-        let has_f32_store = prog.instrs.iter().any(|i| matches!(
-            i, VmInstr::VecStore { dtype: QuantPrecision::F32, predicate: None, .. }
-        ));
+        let has_f32_load = prog.instrs.iter().any(|i| {
+            matches!(
+                i,
+                VmInstr::VecLoad {
+                    dtype: QuantPrecision::F32,
+                    predicate: None,
+                    ..
+                }
+            )
+        });
+        let has_f32_store = prog.instrs.iter().any(|i| {
+            matches!(
+                i,
+                VmInstr::VecStore {
+                    dtype: QuantPrecision::F32,
+                    predicate: None,
+                    ..
+                }
+            )
+        });
         assert!(has_f32_load, "Should contain VecLoad with F32 dtype");
         assert!(has_f32_store, "Should contain VecStore with F32 dtype");
     }
@@ -2292,19 +3777,40 @@ mod tests {
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_bound = BoundExpr::Symbolic(SymBound { name: "seq_len".into(), max_alloc: 1024 });
+        let sym_bound = BoundExpr::Symbolic(SymBound {
+            name: "seq_len".into(),
+            max_alloc: 1024,
+        });
 
         // Act
         emit_layernorm_auto(
-            &mut prog, 32, 1e-5,
-            SimdWidth::W256, sym_bound,
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,).unwrap();
+            &mut prog,
+            32,
+            1e-5,
+            SimdWidth::W256,
+            sym_bound,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: should contain at least one LoopBegin with Symbolic bound
-        let has_symbolic_loop = prog.instrs.iter().any(|i| matches!(
-            i, VmInstr::LoopBegin { bound: BoundExpr::Symbolic(_), .. }
-        ));
-        assert!(has_symbolic_loop, "Should contain LoopBegin with Symbolic bound for seq_len");
+        let has_symbolic_loop = prog.instrs.iter().any(|i| {
+            matches!(
+                i,
+                VmInstr::LoopBegin {
+                    bound: BoundExpr::Symbolic(_),
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_symbolic_loop,
+            "Should contain LoopBegin with Symbolic bound for seq_len"
+        );
     }
 
     // ── Test 65: emit_normlike_inline with groups>1 produces nested loops ──
@@ -2321,12 +3827,28 @@ mod tests {
 
         // Act: groups_per_row=3, feature_dim=24, Const(1) seq bound
         emit_normlike_inline(
-            &mut prog, &pattern, 24, 3, false, NormKind::RmsNorm,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,).unwrap();
+            &mut prog,
+            &pattern,
+            24,
+            3,
+            false,
+            NormKind::RmsNorm,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: should have more LoopBegin instructions than groups=1 (outer loop + inner group loop)
-        let loop_begin_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
+        let loop_begin_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopBegin { .. }))
+            .count();
 
         // For comparison, emit with groups=1
         let mut prog_g1 = VmProgram::new();
@@ -2334,10 +3856,26 @@ mod tests {
         let w1 = prog_g1.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let o1 = prog_g1.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         emit_normlike_inline(
-            &mut prog_g1, &pattern, 24, 1, false, NormKind::RmsNorm,
-            SimdWidth::W256, BoundExpr::Const(1),
-            i1, w1, o1, QuantPrecision::F32, QuantPrecision::F32,).unwrap();
-        let loop_begin_count_g1 = prog_g1.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
+            &mut prog_g1,
+            &pattern,
+            24,
+            1,
+            false,
+            NormKind::RmsNorm,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            i1,
+            w1,
+            o1,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        )
+        .unwrap();
+        let loop_begin_count_g1 = prog_g1
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopBegin { .. }))
+            .count();
 
         assert!(loop_begin_count > loop_begin_count_g1,
             "groups=3 should produce more LoopBegin ({loop_begin_count}) than groups=1 ({loop_begin_count_g1})");
@@ -2356,16 +3894,24 @@ mod tests {
 
         // Act: feature_dim=5 with Scalar width => vec_count=5, tail=0
         emit_softmax_inline(
-            &mut prog, 5, SimdWidth::Scalar,
-            input_ptr, output_ptr, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            5,
+            SimdWidth::Scalar,
+            input_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: all VecLoad instructions should use SimdWidth::Scalar (no W256 tail loads)
         let all_scalar_loads = prog.instrs.iter().all(|i| match i {
             VmInstr::VecLoad { width, .. } => *width == SimdWidth::Scalar,
             _ => true,
         });
-        assert!(all_scalar_loads, "All VecLoad instructions should use Scalar width when SimdWidth::Scalar is specified");
+        assert!(
+            all_scalar_loads,
+            "All VecLoad instructions should use Scalar width when SimdWidth::Scalar is specified"
+        );
     }
 
     // ── Test 67: emit_normlike_inline produces Accumulate VmInstr in reduce phase ──
@@ -2384,12 +3930,28 @@ mod tests {
 
         // Act: feature_dim=32, W256 => vec_count=4, tail=0
         emit_normlike_inline(
-            &mut prog, &pattern, 32, 1, false, NormKind::RmsNorm,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,).unwrap();
+            &mut prog,
+            &pattern,
+            32,
+            1,
+            false,
+            NormKind::RmsNorm,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: should contain at least 1 Accumulate instruction from reduce phase
-        let accumulate_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::Accumulate { .. })).count();
+        let accumulate_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::Accumulate { .. }))
+            .count();
         assert!(accumulate_count >= 1, "Should contain at least 1 Accumulate instruction from reduce phase, found {accumulate_count}");
     }
 
@@ -2408,12 +3970,25 @@ mod tests {
 
         // Act: feature_dim=16, W256 => vec_count=2, tail=0
         emit_layernorm_auto(
-            &mut prog, 16, 1e-5,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,).unwrap();
+            &mut prog,
+            16,
+            1e-5,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: LayerNorm has 2 Accumulate in the vec loop body (acc_sum + acc_sq)
-        let accumulate_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::Accumulate { .. })).count();
+        let accumulate_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::Accumulate { .. }))
+            .count();
         assert!(accumulate_count >= 2, "Should contain at least 2 Accumulate instructions (sum_x + sum_sq), found {accumulate_count}");
     }
 
@@ -2430,12 +4005,28 @@ mod tests {
         let mut prog_aligned = VmProgram::new();
         let i_a = prog_aligned.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let o_a = prog_aligned.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        emit_softmax_inline(&mut prog_aligned, 8, SimdWidth::W256, i_a, o_a, QuantPrecision::F32).unwrap();
+        emit_softmax_inline(
+            &mut prog_aligned,
+            8,
+            SimdWidth::W256,
+            i_a,
+            o_a,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         let mut prog_tailed = VmProgram::new();
         let i_t = prog_tailed.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let o_t = prog_tailed.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        emit_softmax_inline(&mut prog_tailed, 10, SimdWidth::W256, i_t, o_t, QuantPrecision::F32).unwrap();
+        emit_softmax_inline(
+            &mut prog_tailed,
+            10,
+            SimdWidth::W256,
+            i_t,
+            o_t,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: non-aligned (tail=2) produces more instructions than aligned (tail=0)
         // because tail elements generate additional scalar VecLoad/VecStore for each of the 3 phases
@@ -2491,21 +4082,49 @@ mod tests {
         let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, s1);
         let row_output = prog.alloc_vreg(VRegKind::Ptr, s1);
 
-        let reduce = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let reduce = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
         let finalize = vec![TraceOp::Input(0), TraceOp::Rsqrt(ValueId(0))];
-        let transform = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let transform = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
 
         let initial_count = prog.instrs.len();
 
         // Act: W512 with has_weight=true, vec_count=1, tail=4
         emit_normlike_one_group(
-            &mut prog, &reduce, &finalize, &transform,
-            feature_dim, vec_count, step_bytes, elem, lanes, width,
-            NormKind::RmsNorm, acc, temp, scale, dim_bc,
-            row_input, weight_ptr, row_output, QuantPrecision::F32, QuantPrecision::F32,);
+            &mut prog,
+            &reduce,
+            &finalize,
+            &transform,
+            feature_dim,
+            vec_count,
+            step_bytes,
+            elem,
+            lanes,
+            width,
+            NormKind::RmsNorm,
+            acc,
+            temp,
+            scale,
+            dim_bc,
+            row_input,
+            weight_ptr,
+            row_output,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert
-        assert!(prog.instrs.len() > initial_count, "Should emit instructions with W512 width");
+        assert!(
+            prog.instrs.len() > initial_count,
+            "Should emit instructions with W512 width"
+        );
     }
 
     // ── Test 72: emit_layernorm_auto with BF16 and W512 combined ──
@@ -2522,9 +4141,17 @@ mod tests {
 
         // Act: combined BF16 + W512 + non-aligned feature_dim
         let result = emit_layernorm_auto(
-            &mut prog, 20, 1e-5,
-            SimdWidth::W512, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::BF16, QuantPrecision::BF16,);
+            &mut prog,
+            20,
+            1e-5,
+            SimdWidth::W512,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+        );
 
         // Assert
         assert!(result.is_ok(), "Should succeed with BF16 + W512 combined");
@@ -2544,12 +4171,21 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         emit_softmax_inline(
-            &mut prog, 16, SimdWidth::W256,
-            input_ptr, output_ptr, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            16,
+            SimdWidth::W256,
+            input_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: should have multiple VecStore instructions (exp writes + normalize writes)
-        let store_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::VecStore { .. })).count();
+        let store_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::VecStore { .. }))
+            .count();
         assert!(store_count >= 2, "Should have multiple VecStore instructions (exp phase + normalize phase), found {store_count}");
     }
 
@@ -2567,12 +4203,28 @@ mod tests {
 
         // Act: groups_per_row=8, feature_dim=64 (8 bytes per group), exercises per-group LoadPtr
         emit_normlike_inline(
-            &mut prog, &pattern, 64, 8, false, NormKind::RmsNorm,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,).unwrap();
+            &mut prog,
+            &pattern,
+            64,
+            8,
+            false,
+            NormKind::RmsNorm,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: should contain LoadPtr instructions for per-group pointer resolution
-        let loadptr_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoadPtr { .. })).count();
+        let loadptr_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoadPtr { .. }))
+            .count();
         assert!(loadptr_count >= 4, "Should contain multiple LoadPtr instructions for group pointers, found {loadptr_count}");
     }
 
@@ -2589,17 +4241,43 @@ mod tests {
 
         // Act: feature_dim=16, W256, Const(1) => one outer row loop with row_bytes step
         emit_layernorm_auto(
-            &mut prog, 16, 1e-5,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,).unwrap();
+            &mut prog,
+            16,
+            1e-5,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: count LoopBegin with row_bytes step (16 * 4 = 64 bytes)
         let row_bytes = 16usize * 4;
-        let outer_loop_count = prog.instrs.iter().filter(|i| match i {
-            VmInstr::LoopBegin { offsets, bound: BoundExpr::Const(1), .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(row_bytes) => true,
-            _ => false,
-        }).count();
-        assert!(outer_loop_count <= 1, "Should have at most 1 outer row loop with row_bytes step, found {outer_loop_count}");
+        let outer_loop_count = prog
+            .instrs
+            .iter()
+            .filter(|i| match i {
+                VmInstr::LoopBegin {
+                    offsets,
+                    bound: BoundExpr::Const(1),
+                    ..
+                } if offsets
+                    .first()
+                    .and_then(|offset| offset.stride.as_fixed_bytes())
+                    == Some(row_bytes) =>
+                {
+                    true
+                }
+                _ => false,
+            })
+            .count();
+        assert!(
+            outer_loop_count <= 1,
+            "Should have at most 1 outer row loop with row_bytes step, found {outer_loop_count}"
+        );
     }
 
     // ── Test 76: emit_softmax_inline with W128 produces VecLoad with W128 width ──
@@ -2614,14 +4292,25 @@ mod tests {
 
         // Act: feature_dim=8, W128 => vec_count=2, tail=0 (perfectly aligned for W128)
         emit_softmax_inline(
-            &mut prog, 8, SimdWidth::W128,
-            input_ptr, output_ptr, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            8,
+            SimdWidth::W128,
+            input_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: should contain VecLoad instructions with W128 width (not Scalar or W256)
-        let has_w128_load = prog.instrs.iter().any(|i| matches!(
-            i, VmInstr::VecLoad { width: SimdWidth::W128, .. }
-        ));
+        let has_w128_load = prog.instrs.iter().any(|i| {
+            matches!(
+                i,
+                VmInstr::VecLoad {
+                    width: SimdWidth::W128,
+                    ..
+                }
+            )
+        });
         assert!(has_w128_load, "Should contain VecLoad with W128 width");
     }
 
@@ -2655,25 +4344,56 @@ mod tests {
         let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, s1);
         let row_output = prog.alloc_vreg(VRegKind::Ptr, s1);
 
-        let reduce = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let reduce = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
         let finalize = vec![TraceOp::Input(0), TraceOp::Rsqrt(ValueId(0))];
-        let transform = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let transform = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
 
         // Act: mixed precision — weight_dtype (BF16) != dtype (F32)
         emit_normlike_one_group(
-            &mut prog, &reduce, &finalize, &transform,
-            feature_dim, vec_count, step_bytes, elem, lanes, width,
-            NormKind::RmsNorm, acc, temp, scale, dim_bc,
-            row_input, weight_ptr, row_output, dtype, weight_dtype,
+            &mut prog,
+            &reduce,
+            &finalize,
+            &transform,
+            feature_dim,
+            vec_count,
+            step_bytes,
+            elem,
+            lanes,
+            width,
+            NormKind::RmsNorm,
+            acc,
+            temp,
+            scale,
+            dim_bc,
+            row_input,
+            weight_ptr,
+            row_output,
+            dtype,
+            weight_dtype,
         );
 
         // Assert: weight VecLoad (dtype=BF16) must use OffsetExpr::Mul(LoopOffset(counter), weight_step_bytes),
         // NOT LoopOffset(byte_off) which advances by input step_bytes (32, wrong for BF16).
-        let weight_loads: Vec<_> = prog.instrs.iter().filter_map(|i| match i {
-            VmInstr::VecLoad { dtype, offset, .. } if *dtype == weight_dtype => Some(offset),
-            _ => None,
-        }).collect();
-        assert!(!weight_loads.is_empty(), "Should emit weight VecLoad with BF16 dtype");
+        let weight_loads: Vec<_> = prog
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                VmInstr::VecLoad { dtype, offset, .. } if *dtype == weight_dtype => Some(offset),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !weight_loads.is_empty(),
+            "Should emit weight VecLoad with BF16 dtype"
+        );
 
         // 每一个 weight VecLoad 的 offset 必须含 Mul(.., weight_step_bytes=16), 不能是 LoopOffset(byte_off)
         // (byte_off 关联 input step_bytes=32, BF16 weight 必须按 16 推进)
@@ -2684,7 +4404,9 @@ mod tests {
                 uses_independent_step && !uses_loop_offset_only,
                 "weight VecLoad offset {:?} must use independent weight_step_bytes={}, \
                  not reuse input byte_off (step_bytes={})",
-                off, weight_step_bytes, step_bytes
+                off,
+                weight_step_bytes,
+                step_bytes
             );
         }
     }
@@ -2720,39 +4442,78 @@ mod tests {
         let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, s1);
         let row_output = prog.alloc_vreg(VRegKind::Ptr, s1);
 
-        let reduce = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let reduce = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
         let finalize = vec![TraceOp::Input(0), TraceOp::Rsqrt(ValueId(0))];
-        let transform = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let transform = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
 
         emit_normlike_one_group(
-            &mut prog, &reduce, &finalize, &transform,
-            feature_dim, vec_count, step_bytes, elem, lanes, width,
-            NormKind::RmsNorm, acc, temp, scale, dim_bc,
-            row_input, weight_ptr, row_output, dtype, weight_dtype,
+            &mut prog,
+            &reduce,
+            &finalize,
+            &transform,
+            feature_dim,
+            vec_count,
+            step_bytes,
+            elem,
+            lanes,
+            width,
+            NormKind::RmsNorm,
+            acc,
+            temp,
+            scale,
+            dim_bc,
+            row_input,
+            weight_ptr,
+            row_output,
+            dtype,
+            weight_dtype,
         );
 
         // Assert: tail weight VecLoad 应使用 Const(weight_tail_off + t*weight_elem)
         // 对 t=0: weight_tail_off + 0 = 16; 对 t=1: 16 + 2 = 18
         // 错误版本会复用 input off (32 + t*4 = 32, 36)
-        let tail_weight_loads: Vec<_> = prog.instrs.iter().filter_map(|i| match i {
-            VmInstr::VecLoad { dtype, offset, width: SimdWidth::Scalar, .. } if *dtype == weight_dtype => {
-                match offset { OffsetExpr::Const(c) => Some(*c), _ => None }
-            }
-            _ => None,
-        }).collect();
-        assert!(!tail_weight_loads.is_empty(), "Should emit scalar tail weight VecLoad");
+        let tail_weight_loads: Vec<_> = prog
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                VmInstr::VecLoad {
+                    dtype,
+                    offset,
+                    width: SimdWidth::Scalar,
+                    ..
+                } if *dtype == weight_dtype => match offset {
+                    OffsetExpr::Const(c) => Some(*c),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !tail_weight_loads.is_empty(),
+            "Should emit scalar tail weight VecLoad"
+        );
         // t=0 weight off = 16
         assert!(
             tail_weight_loads.iter().any(|&c| c == weight_tail_off),
             "tail weight offset t=0 should be {} (weight_tail_off), got {:?}",
-            weight_tail_off, tail_weight_loads
+            weight_tail_off,
+            tail_weight_loads
         );
         // t=1 weight off = 18
         let t1_off = weight_tail_off + weight_elem;
         assert!(
             tail_weight_loads.iter().any(|&c| c == t1_off),
             "tail weight offset t=1 should be {} (weight_tail_off + weight_elem), got {:?}",
-            t1_off, tail_weight_loads
+            t1_off,
+            tail_weight_loads
         );
     }
 
@@ -2770,13 +4531,23 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         let result = emit_layernorm_auto(
-            &mut prog, 16, 1e-5,
-            SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr,
-            QuantPrecision::F32, QuantPrecision::BF16,
+            &mut prog,
+            16,
+            1e-5,
+            SimdWidth::W256,
+            BoundExpr::Const(1),
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            QuantPrecision::F32,
+            QuantPrecision::BF16,
         );
 
-        assert!(result.is_ok(), "layernorm mixed precision should succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "layernorm mixed precision should succeed: {:?}",
+            result
+        );
 
         // Assert: bias_offset = feature_dim × weight_elem = 16×2 = 32 (NOT 16×4=64)
         // weight VecLoad offset must use Mul(.., weight_step_bytes=16)
@@ -2794,14 +4565,30 @@ mod tests {
             }
             _ => false,
         });
-        assert!(has_correct_bias, "bias VecLoad should start at weight_elem-based offset {}", expected_bias_offset);
+        assert!(
+            has_correct_bias,
+            "bias VecLoad should start at weight_elem-based offset {}",
+            expected_bias_offset
+        );
 
         // weight VecLoad (非 bias) offset 必须含 Mul(.., weight_step_bytes)
-        let weight_loads: Vec<_> = prog.instrs.iter().filter_map(|i| match i {
-            VmInstr::VecLoad { dtype, offset, .. } if *dtype == weight_dtype => Some(offset.clone()),
-            _ => None,
-        }).collect();
-        let has_independent_step = weight_loads.iter().any(|off| offset_contains_mul_const(off, weight_step_bytes));
-        assert!(has_independent_step, "weight/bias VecLoad should use Mul(.., {})", weight_step_bytes);
+        let weight_loads: Vec<_> = prog
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                VmInstr::VecLoad { dtype, offset, .. } if *dtype == weight_dtype => {
+                    Some(offset.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let has_independent_step = weight_loads
+            .iter()
+            .any(|off| offset_contains_mul_const(off, weight_step_bytes));
+        assert!(
+            has_independent_step,
+            "weight/bias VecLoad should use Mul(.., {})",
+            weight_step_bytes
+        );
     }
 }

@@ -59,8 +59,8 @@ pub struct GpuLower {
     abi_param_names: Vec<&'static str>,
     /// ISA Lower 独占 scratch 虚拟寄存器名（PTX/HIP 文本 IR 层）。
     /// 这些名字在 emit_prologue 中被显式声明，RegAllocator 用独立编号空间避免冲突。
-    scratch_vec_names: Vec<&'static str>,  // 如 %fs0/%fs1 (f-scratch)
-    scratch_gpr_names: Vec<&'static str>,  // 如 %rs0/%rs1 (r-scratch)
+    scratch_vec_names: Vec<&'static str>, // 如 %fs0/%fs1 (f-scratch)
+    scratch_gpr_names: Vec<&'static str>, // 如 %rs0/%rs1 (r-scratch)
     scratch_pred_names: Vec<&'static str>, // 如 %ps0/%ps1 (p-scratch)
     /// VReg → Kind 映射 (ARCH-GPU-REG-KIND)。
     /// 由 set_vreg_kind_map() 从 VmProgram 提取，使 reg_name 可按 kind 选正确命名空间。

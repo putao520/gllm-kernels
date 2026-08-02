@@ -170,18 +170,15 @@ fn detect_sysfs_topology() -> Option<NumaTopology> {
 
                 // Parse CPU list
                 let cpulist_path = node_path.join("cpulist");
-                let cpus = parse_cpulist(
-                    &fs::read_to_string(cpulist_path).unwrap_or_default(),
-                );
+                let cpus = parse_cpulist(&fs::read_to_string(cpulist_path).unwrap_or_default());
                 if cpus.is_empty() {
                     continue; // Skip nodes with no CPUs (memory-only nodes)
                 }
 
                 // Parse memory total
                 let meminfo_path = node_path.join("meminfo");
-                let mem_total = parse_node_memtotal(
-                    &fs::read_to_string(meminfo_path).unwrap_or_default(),
-                );
+                let mem_total =
+                    parse_node_memtotal(&fs::read_to_string(meminfo_path).unwrap_or_default());
 
                 // Detect per-node L3 cache size from first CPU in this node
                 let l3_size = if let Some(&first_cpu) = cpus.first() {
@@ -259,12 +256,9 @@ fn detect_cpu_l3(cpu: usize) -> usize {
     use std::fs;
     for idx in 0..8 {
         let base = format!("/sys/devices/system/cpu/cpu{cpu}/cache/index{idx}");
-        let level = fs::read_to_string(format!("{base}/level"))
-            .unwrap_or_default();
-        let ctype = fs::read_to_string(format!("{base}/type"))
-            .unwrap_or_default();
-        let size_str = fs::read_to_string(format!("{base}/size"))
-            .unwrap_or_default();
+        let level = fs::read_to_string(format!("{base}/level")).unwrap_or_default();
+        let ctype = fs::read_to_string(format!("{base}/type")).unwrap_or_default();
+        let size_str = fs::read_to_string(format!("{base}/size")).unwrap_or_default();
 
         if level.trim() == "3" && ctype.trim() == "Unified" {
             let size_str = size_str.trim();
@@ -402,7 +396,7 @@ pub fn mbind_interleave(ptr: *mut u8, len: usize) -> Result<(), i32> {
     let max_node = topology().nodes.iter().map(|n| n.id).max().unwrap_or(0);
     let mask_len = (max_node / 8) + 1;
     let mut nodemask = vec![0xFFu8; mask_len.max(8)]; // all nodes
-    // Clear bits beyond max_node
+                                                      // Clear bits beyond max_node
     let last_byte = max_node / 8;
     let last_bit = max_node % 8;
     if last_byte < nodemask.len() {
@@ -477,13 +471,21 @@ impl<T> NumaAlignedVec<T> {
     }
 
     #[inline]
-    pub fn capacity(&self) -> usize { self.cap }
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
     #[inline]
-    pub fn len(&self) -> usize { self.len }
+    pub fn len(&self) -> usize {
+        self.len
+    }
     #[inline]
-    pub fn as_ptr(&self) -> *const T { self.ptr }
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr
+    }
     #[inline]
-    pub fn as_mut_ptr(&mut self) -> *mut T { self.ptr }
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.ptr
+    }
 
     /// Allocate at least `new_cap` elements, preserving existing data.
     /// If a NUMA node is set, binds the new allocation to that node.
@@ -668,13 +670,20 @@ mod tests {
         let topo = topology();
         assert!(!topo.nodes.is_empty(), "must have at least one node");
         assert!(topo.total_cpus() > 0, "must have at least one CPU");
-        eprintln!("NUMA topology: {} nodes, {} total CPUs",
-            topo.num_nodes(), topo.total_cpus());
+        eprintln!(
+            "NUMA topology: {} nodes, {} total CPUs",
+            topo.num_nodes(),
+            topo.total_cpus()
+        );
         for node in &topo.nodes {
-            eprintln!("  Node {}: {} CPUs {:?}, mem={} MB, L3={} KB",
-                node.id, node.cpus.len(), &node.cpus,
+            eprintln!(
+                "  Node {}: {} CPUs {:?}, mem={} MB, L3={} KB",
+                node.id,
+                node.cpus.len(),
+                &node.cpus,
                 node.mem_total / (1024 * 1024),
-                node.l3_size / 1024);
+                node.l3_size / 1024
+            );
         }
         if !topo.distances.is_empty() {
             eprintln!("  Distance matrix: {:?}", topo.distances);
@@ -693,7 +702,11 @@ mod tests {
     fn test_pin_thread() {
         // Should succeed on Linux (pin to all CPUs = no restriction)
         let topo = topology();
-        let all_cpus: Vec<usize> = topo.nodes.iter().flat_map(|n| n.cpus.iter().copied()).collect();
+        let all_cpus: Vec<usize> = topo
+            .nodes
+            .iter()
+            .flat_map(|n| n.cpus.iter().copied())
+            .collect();
         let result = pin_thread_to_cpus(&all_cpus);
         assert!(result.is_ok(), "pin_thread_to_cpus failed: {:?}", result);
     }
@@ -718,7 +731,12 @@ mod tests {
     #[test]
     fn test_nc_for_node_l3_single_node() {
         let topo = NumaTopology {
-            nodes: vec![NumaNode { id: 0, cpus: vec![0, 1], mem_total: 0, l3_size: 8 * 1024 * 1024 }],
+            nodes: vec![NumaNode {
+                id: 0,
+                cpus: vec![0, 1],
+                mem_total: 0,
+                l3_size: 8 * 1024 * 1024,
+            }],
             distances: vec![],
         };
         // Single node: should return None
@@ -729,8 +747,18 @@ mod tests {
     fn test_nc_for_node_l3_multi_node() {
         let topo = NumaTopology {
             nodes: vec![
-                NumaNode { id: 0, cpus: vec![0, 1], mem_total: 0, l3_size: 8 * 1024 * 1024 },
-                NumaNode { id: 1, cpus: vec![2, 3], mem_total: 0, l3_size: 8 * 1024 * 1024 },
+                NumaNode {
+                    id: 0,
+                    cpus: vec![0, 1],
+                    mem_total: 0,
+                    l3_size: 8 * 1024 * 1024,
+                },
+                NumaNode {
+                    id: 1,
+                    cpus: vec![2, 3],
+                    mem_total: 0,
+                    l3_size: 8 * 1024 * 1024,
+                },
             ],
             distances: vec![vec![10, 21], vec![21, 10]],
         };
@@ -746,8 +774,18 @@ mod tests {
         // Arrange: construct a two-node topology
         let topo = NumaTopology {
             nodes: vec![
-                NumaNode { id: 0, cpus: vec![0, 2, 4], mem_total: 0, l3_size: 0 },
-                NumaNode { id: 1, cpus: vec![1, 3, 5], mem_total: 0, l3_size: 0 },
+                NumaNode {
+                    id: 0,
+                    cpus: vec![0, 2, 4],
+                    mem_total: 0,
+                    l3_size: 0,
+                },
+                NumaNode {
+                    id: 1,
+                    cpus: vec![1, 3, 5],
+                    mem_total: 0,
+                    l3_size: 0,
+                },
             ],
             distances: vec![],
         };
@@ -767,8 +805,18 @@ mod tests {
         // Arrange: two nodes, node 0 has known L3, node 1 has l3_size=0
         let topo = NumaTopology {
             nodes: vec![
-                NumaNode { id: 0, cpus: vec![0], mem_total: 0, l3_size: 6 * 1024 * 1024 },
-                NumaNode { id: 1, cpus: vec![1], mem_total: 0, l3_size: 0 },
+                NumaNode {
+                    id: 0,
+                    cpus: vec![0],
+                    mem_total: 0,
+                    l3_size: 6 * 1024 * 1024,
+                },
+                NumaNode {
+                    id: 1,
+                    cpus: vec![1],
+                    mem_total: 0,
+                    l3_size: 0,
+                },
             ],
             distances: vec![],
         };
@@ -791,8 +839,18 @@ mod tests {
         // Arrange: multi-node topology for edge-case testing
         let multi_topo = NumaTopology {
             nodes: vec![
-                NumaNode { id: 0, cpus: vec![0], mem_total: 0, l3_size: 32 * 1024 },
-                NumaNode { id: 1, cpus: vec![1], mem_total: 0, l3_size: 32 * 1024 },
+                NumaNode {
+                    id: 0,
+                    cpus: vec![0],
+                    mem_total: 0,
+                    l3_size: 32 * 1024,
+                },
+                NumaNode {
+                    id: 1,
+                    cpus: vec![1],
+                    mem_total: 0,
+                    l3_size: 32 * 1024,
+                },
             ],
             distances: vec![vec![10, 20], vec![20, 10]],
         };
@@ -807,8 +865,18 @@ mod tests {
         // Arrange: multi-node but l3_size=0
         let zero_l3_topo = NumaTopology {
             nodes: vec![
-                NumaNode { id: 0, cpus: vec![0], mem_total: 0, l3_size: 0 },
-                NumaNode { id: 1, cpus: vec![1], mem_total: 0, l3_size: 0 },
+                NumaNode {
+                    id: 0,
+                    cpus: vec![0],
+                    mem_total: 0,
+                    l3_size: 0,
+                },
+                NumaNode {
+                    id: 1,
+                    cpus: vec![1],
+                    mem_total: 0,
+                    l3_size: 0,
+                },
             ],
             distances: vec![],
         };
@@ -823,8 +891,18 @@ mod tests {
         // Arrange
         let topo = NumaTopology {
             nodes: vec![
-                NumaNode { id: 0, cpus: vec![0, 1, 2], mem_total: 16 * 1024 * 1024 * 1024, l3_size: 8 * 1024 * 1024 },
-                NumaNode { id: 1, cpus: vec![3, 4], mem_total: 8 * 1024 * 1024 * 1024, l3_size: 4 * 1024 * 1024 },
+                NumaNode {
+                    id: 0,
+                    cpus: vec![0, 1, 2],
+                    mem_total: 16 * 1024 * 1024 * 1024,
+                    l3_size: 8 * 1024 * 1024,
+                },
+                NumaNode {
+                    id: 1,
+                    cpus: vec![3, 4],
+                    mem_total: 8 * 1024 * 1024 * 1024,
+                    l3_size: 4 * 1024 * 1024,
+                },
             ],
             distances: vec![vec![10, 21], vec![21, 10]],
         };
@@ -840,9 +918,12 @@ mod tests {
     fn test_single_node_topology_accessors() {
         // Arrange
         let topo = NumaTopology {
-            nodes: vec![
-                NumaNode { id: 0, cpus: vec![0, 1], mem_total: 0, l3_size: 0 },
-            ],
+            nodes: vec![NumaNode {
+                id: 0,
+                cpus: vec![0, 1],
+                mem_total: 0,
+                l3_size: 0,
+            }],
             distances: vec![],
         };
 
@@ -1004,8 +1085,18 @@ mod tests {
         // Arrange: n=8 (very small), nr=4, large L3 so computed nc >> n
         let topo = NumaTopology {
             nodes: vec![
-                NumaNode { id: 0, cpus: vec![0], mem_total: 0, l3_size: 32 * 1024 * 1024 },
-                NumaNode { id: 1, cpus: vec![1], mem_total: 0, l3_size: 32 * 1024 * 1024 },
+                NumaNode {
+                    id: 0,
+                    cpus: vec![0],
+                    mem_total: 0,
+                    l3_size: 32 * 1024 * 1024,
+                },
+                NumaNode {
+                    id: 1,
+                    cpus: vec![1],
+                    mem_total: 0,
+                    l3_size: 32 * 1024 * 1024,
+                },
             ],
             distances: vec![vec![10, 20], vec![20, 10]],
         };
@@ -1053,8 +1144,18 @@ mod tests {
         // Arrange
         let topo = NumaTopology {
             nodes: vec![
-                NumaNode { id: 0, cpus: vec![0], mem_total: 1024, l3_size: 2048 },
-                NumaNode { id: 1, cpus: vec![1], mem_total: 4096, l3_size: 8192 },
+                NumaNode {
+                    id: 0,
+                    cpus: vec![0],
+                    mem_total: 1024,
+                    l3_size: 2048,
+                },
+                NumaNode {
+                    id: 1,
+                    cpus: vec![1],
+                    mem_total: 4096,
+                    l3_size: 8192,
+                },
             ],
             distances: vec![vec![10, 20], vec![20, 10]],
         };
@@ -1145,8 +1246,18 @@ mod tests {
         // Arrange: contrived topology where CPU 2 appears in both nodes
         let topo = NumaTopology {
             nodes: vec![
-                NumaNode { id: 0, cpus: vec![0, 2], mem_total: 0, l3_size: 0 },
-                NumaNode { id: 5, cpus: vec![2, 3], mem_total: 0, l3_size: 0 },
+                NumaNode {
+                    id: 0,
+                    cpus: vec![0, 2],
+                    mem_total: 0,
+                    l3_size: 0,
+                },
+                NumaNode {
+                    id: 5,
+                    cpus: vec![2, 3],
+                    mem_total: 0,
+                    l3_size: 0,
+                },
             ],
             distances: vec![],
         };
@@ -1163,9 +1274,12 @@ mod tests {
     fn test_total_cpus_empty_nodes() {
         // Arrange: topology with a single node but empty CPU list
         let topo = NumaTopology {
-            nodes: vec![
-                NumaNode { id: 0, cpus: vec![], mem_total: 0, l3_size: 0 },
-            ],
+            nodes: vec![NumaNode {
+                id: 0,
+                cpus: vec![],
+                mem_total: 0,
+                l3_size: 0,
+            }],
             distances: vec![],
         };
 
@@ -1182,8 +1296,18 @@ mod tests {
         // nc = (8192 / (4*4)) / 4 * 4 = 512 / 4 * 4 = 512
         let topo = NumaTopology {
             nodes: vec![
-                NumaNode { id: 0, cpus: vec![0], mem_total: 0, l3_size: 8192 },
-                NumaNode { id: 1, cpus: vec![1], mem_total: 0, l3_size: 8192 },
+                NumaNode {
+                    id: 0,
+                    cpus: vec![0],
+                    mem_total: 0,
+                    l3_size: 8192,
+                },
+                NumaNode {
+                    id: 1,
+                    cpus: vec![1],
+                    mem_total: 0,
+                    l3_size: 8192,
+                },
             ],
             distances: vec![vec![10, 20], vec![20, 10]],
         };
@@ -1201,9 +1325,12 @@ mod tests {
     fn test_node_l3_size_single_node_known() {
         // Arrange: single node with known L3
         let topo = NumaTopology {
-            nodes: vec![
-                NumaNode { id: 0, cpus: vec![0, 1], mem_total: 0, l3_size: 12 * 1024 * 1024 },
-            ],
+            nodes: vec![NumaNode {
+                id: 0,
+                cpus: vec![0, 1],
+                mem_total: 0,
+                l3_size: 12 * 1024 * 1024,
+            }],
             distances: vec![],
         };
 
@@ -1222,10 +1349,7 @@ mod tests {
         assert_eq!(parse_cpulist("7"), vec![7]);
 
         // Arrange & Act & Assert: three disjoint ranges
-        assert_eq!(
-            parse_cpulist("0-1,10-11,20-21"),
-            vec![0, 1, 10, 11, 20, 21],
-        );
+        assert_eq!(parse_cpulist("0-1,10-11,20-21"), vec![0, 1, 10, 11, 20, 21],);
 
         // Arrange & Act & Assert: overlapping ranges (parser does not dedup)
         let result = parse_cpulist("0-3,2-5");
@@ -1256,10 +1380,30 @@ mod tests {
         // Arrange: 4-node topology with realistic distance values
         let topo = NumaTopology {
             nodes: vec![
-                NumaNode { id: 0, cpus: vec![0, 1], mem_total: 0, l3_size: 0 },
-                NumaNode { id: 1, cpus: vec![2, 3], mem_total: 0, l3_size: 0 },
-                NumaNode { id: 2, cpus: vec![4, 5], mem_total: 0, l3_size: 0 },
-                NumaNode { id: 3, cpus: vec![6, 7], mem_total: 0, l3_size: 0 },
+                NumaNode {
+                    id: 0,
+                    cpus: vec![0, 1],
+                    mem_total: 0,
+                    l3_size: 0,
+                },
+                NumaNode {
+                    id: 1,
+                    cpus: vec![2, 3],
+                    mem_total: 0,
+                    l3_size: 0,
+                },
+                NumaNode {
+                    id: 2,
+                    cpus: vec![4, 5],
+                    mem_total: 0,
+                    l3_size: 0,
+                },
+                NumaNode {
+                    id: 3,
+                    cpus: vec![6, 7],
+                    mem_total: 0,
+                    l3_size: 0,
+                },
             ],
             distances: vec![
                 vec![10, 21, 28, 28],
@@ -1271,7 +1415,10 @@ mod tests {
 
         // Act & Assert: diagonal is always 10 (local)
         for i in 0..4 {
-            assert_eq!(topo.distances[i][i], 10, "node {i} self-distance should be 10");
+            assert_eq!(
+                topo.distances[i][i], 10,
+                "node {i} self-distance should be 10"
+            );
         }
 
         // Act & Assert: symmetry — distances[i][j] == distances[j][i]
@@ -1316,7 +1463,10 @@ mod tests {
     #[test]
     fn test_numa_topology_debug_format_empty_vs_populated() {
         // Arrange: empty topology
-        let empty = NumaTopology { nodes: vec![], distances: vec![] };
+        let empty = NumaTopology {
+            nodes: vec![],
+            distances: vec![],
+        };
         let empty_debug = format!("{:?}", empty);
 
         // Assert: Debug works on empty state without panic
@@ -1325,7 +1475,12 @@ mod tests {
 
         // Arrange: populated topology
         let populated = NumaTopology {
-            nodes: vec![NumaNode { id: 0, cpus: vec![0], mem_total: 4096, l3_size: 1024 }],
+            nodes: vec![NumaNode {
+                id: 0,
+                cpus: vec![0],
+                mem_total: 4096,
+                l3_size: 1024,
+            }],
             distances: vec![vec![10]],
         };
         let pop_debug = format!("{:?}", populated);
@@ -1378,9 +1533,24 @@ mod tests {
         // Arrange: 3 nodes, 1 CPU each
         let topo = NumaTopology {
             nodes: vec![
-                NumaNode { id: 0, cpus: vec![0], mem_total: 0, l3_size: 0 },
-                NumaNode { id: 1, cpus: vec![1], mem_total: 0, l3_size: 0 },
-                NumaNode { id: 2, cpus: vec![2], mem_total: 0, l3_size: 0 },
+                NumaNode {
+                    id: 0,
+                    cpus: vec![0],
+                    mem_total: 0,
+                    l3_size: 0,
+                },
+                NumaNode {
+                    id: 1,
+                    cpus: vec![1],
+                    mem_total: 0,
+                    l3_size: 0,
+                },
+                NumaNode {
+                    id: 2,
+                    cpus: vec![2],
+                    mem_total: 0,
+                    l3_size: 0,
+                },
             ],
             distances: vec![vec![10, 20, 30], vec![20, 10, 30], vec![30, 30, 10]],
         };
@@ -1401,8 +1571,18 @@ mod tests {
         // Arrange: n=4, nr=4, L3 large enough that nc would exceed n
         let topo = NumaTopology {
             nodes: vec![
-                NumaNode { id: 0, cpus: vec![0], mem_total: 0, l3_size: 1024 * 1024 },
-                NumaNode { id: 1, cpus: vec![1], mem_total: 0, l3_size: 1024 * 1024 },
+                NumaNode {
+                    id: 0,
+                    cpus: vec![0],
+                    mem_total: 0,
+                    l3_size: 1024 * 1024,
+                },
+                NumaNode {
+                    id: 1,
+                    cpus: vec![1],
+                    mem_total: 0,
+                    l3_size: 1024 * 1024,
+                },
             ],
             distances: vec![vec![10, 20], vec![20, 10]],
         };
@@ -1487,9 +1667,24 @@ mod tests {
         // Arrange: nodes with IDs 0, 3, 7 (non-contiguous)
         let topo = NumaTopology {
             nodes: vec![
-                NumaNode { id: 0, cpus: vec![0, 1], mem_total: 8 * 1024 * 1024 * 1024, l3_size: 4 * 1024 * 1024 },
-                NumaNode { id: 3, cpus: vec![4, 5], mem_total: 16 * 1024 * 1024 * 1024, l3_size: 8 * 1024 * 1024 },
-                NumaNode { id: 7, cpus: vec![8, 9], mem_total: 32 * 1024 * 1024 * 1024, l3_size: 12 * 1024 * 1024 },
+                NumaNode {
+                    id: 0,
+                    cpus: vec![0, 1],
+                    mem_total: 8 * 1024 * 1024 * 1024,
+                    l3_size: 4 * 1024 * 1024,
+                },
+                NumaNode {
+                    id: 3,
+                    cpus: vec![4, 5],
+                    mem_total: 16 * 1024 * 1024 * 1024,
+                    l3_size: 8 * 1024 * 1024,
+                },
+                NumaNode {
+                    id: 7,
+                    cpus: vec![8, 9],
+                    mem_total: 32 * 1024 * 1024 * 1024,
+                    l3_size: 12 * 1024 * 1024,
+                },
             ],
             distances: vec![],
         };
@@ -1512,8 +1707,18 @@ mod tests {
         // Arrange: asymmetric topology — node 0 has tiny L3, node 1 has large L3
         let topo = NumaTopology {
             nodes: vec![
-                NumaNode { id: 0, cpus: vec![0], mem_total: 0, l3_size: 256 },
-                NumaNode { id: 1, cpus: vec![1], mem_total: 0, l3_size: 64 * 1024 * 1024 },
+                NumaNode {
+                    id: 0,
+                    cpus: vec![0],
+                    mem_total: 0,
+                    l3_size: 256,
+                },
+                NumaNode {
+                    id: 1,
+                    cpus: vec![1],
+                    mem_total: 0,
+                    l3_size: 64 * 1024 * 1024,
+                },
             ],
             distances: vec![vec![10, 20], vec![20, 10]],
         };
@@ -1524,7 +1729,10 @@ mod tests {
         // Assert: computed from node 0's tiny 256-byte L3, not node 1's large L3
         // nc = (256 / (4*4)) / 4 * 4 = 16 / 4 * 4 = 16, clamped to >= nr=4
         assert_eq!(nc, 16);
-        assert!(nc < 4096, "should be much smaller than n since node 0 L3 is tiny");
+        assert!(
+            nc < 4096,
+            "should be much smaller than n since node 0 L3 is tiny"
+        );
     }
 
     // @trace TEST-NUMA-46 [req:REQ-NUMA] [level:unit]
@@ -1545,8 +1753,12 @@ mod tests {
         // Assert: all data reads back correctly
         unsafe {
             for i in 0..512 {
-                assert_eq!(*v.as_ptr().add(i), (i * 3 + 7) as u32,
-                    "data mismatch at index {}", i);
+                assert_eq!(
+                    *v.as_ptr().add(i),
+                    (i * 3 + 7) as u32,
+                    "data mismatch at index {}",
+                    i
+                );
             }
         }
         assert!(v.capacity() >= 512);
@@ -1559,15 +1771,26 @@ mod tests {
         // Arrange: 3-node topology with realistic distances
         let topo = NumaTopology {
             nodes: vec![
-                NumaNode { id: 0, cpus: vec![0], mem_total: 0, l3_size: 0 },
-                NumaNode { id: 1, cpus: vec![1], mem_total: 0, l3_size: 0 },
-                NumaNode { id: 2, cpus: vec![2], mem_total: 0, l3_size: 0 },
+                NumaNode {
+                    id: 0,
+                    cpus: vec![0],
+                    mem_total: 0,
+                    l3_size: 0,
+                },
+                NumaNode {
+                    id: 1,
+                    cpus: vec![1],
+                    mem_total: 0,
+                    l3_size: 0,
+                },
+                NumaNode {
+                    id: 2,
+                    cpus: vec![2],
+                    mem_total: 0,
+                    l3_size: 0,
+                },
             ],
-            distances: vec![
-                vec![10, 21, 28],
-                vec![21, 10, 25],
-                vec![28, 25, 10],
-            ],
+            distances: vec![vec![10, 21, 28], vec![21, 10, 25], vec![28, 25, 10]],
         };
 
         // Act & Assert: local distance (diagonal) is strictly less than any remote
@@ -1579,7 +1802,10 @@ mod tests {
                     assert!(
                         topo.distances[i][j] > local,
                         "remote distance [{}][{}]={} should exceed local {}",
-                        i, j, topo.distances[i][j], local,
+                        i,
+                        j,
+                        topo.distances[i][j],
+                        local,
                     );
                 }
             }
@@ -1605,9 +1831,24 @@ mod tests {
         // Arrange: 3 nodes with asymmetric CPU counts (4, 2, 8)
         let topo = NumaTopology {
             nodes: vec![
-                NumaNode { id: 0, cpus: vec![0, 1, 2, 3], mem_total: 0, l3_size: 0 },
-                NumaNode { id: 1, cpus: vec![4, 5], mem_total: 0, l3_size: 0 },
-                NumaNode { id: 2, cpus: vec![6, 7, 8, 9, 10, 11, 12, 13], mem_total: 0, l3_size: 0 },
+                NumaNode {
+                    id: 0,
+                    cpus: vec![0, 1, 2, 3],
+                    mem_total: 0,
+                    l3_size: 0,
+                },
+                NumaNode {
+                    id: 1,
+                    cpus: vec![4, 5],
+                    mem_total: 0,
+                    l3_size: 0,
+                },
+                NumaNode {
+                    id: 2,
+                    cpus: vec![6, 7, 8, 9, 10, 11, 12, 13],
+                    mem_total: 0,
+                    l3_size: 0,
+                },
             ],
             distances: vec![],
         };
@@ -1669,9 +1910,12 @@ mod tests {
     fn test_empty_distance_matrix_single_node() {
         // Arrange: single-node topology with empty distances
         let topo = NumaTopology {
-            nodes: vec![
-                NumaNode { id: 0, cpus: vec![0, 1, 2], mem_total: 4096, l3_size: 1024 },
-            ],
+            nodes: vec![NumaNode {
+                id: 0,
+                cpus: vec![0, 1, 2],
+                mem_total: 4096,
+                l3_size: 1024,
+            }],
             distances: vec![],
         };
 

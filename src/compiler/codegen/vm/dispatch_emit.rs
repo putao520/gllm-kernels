@@ -22,7 +22,10 @@ mod tests {
         use std::collections::HashSet;
         let mut set = HashSet::new();
         assert!(set.insert(a));
-        assert!(!set.insert(b), "duplicate VRegId(0) should not be re-inserted");
+        assert!(
+            !set.insert(b),
+            "duplicate VRegId(0) should not be re-inserted"
+        );
         assert!(set.insert(c));
         assert_eq!(set.len(), 2);
     }
@@ -53,7 +56,12 @@ mod tests {
     #[test]
     fn simd_width_bytes_matches_f32_lanes_times_4() {
         // Arrange & Act & Assert
-        for width in [SimdWidth::Scalar, SimdWidth::W128, SimdWidth::W256, SimdWidth::W512] {
+        for width in [
+            SimdWidth::Scalar,
+            SimdWidth::W128,
+            SimdWidth::W256,
+            SimdWidth::W512,
+        ] {
             assert_eq!(width.bytes(), width.f32_lanes() * 4);
         }
         assert_eq!(SimdWidth::Warp(64).bytes(), 64 * 4);
@@ -85,7 +93,10 @@ mod tests {
         let a = BoundExpr::Const(42);
         let b = a.clone();
         let c = BoundExpr::Const(42);
-        let sym = BoundExpr::Symbolic(SymBound { name: "seq_len".into(), max_alloc: 4096 });
+        let sym = BoundExpr::Symbolic(SymBound {
+            name: "seq_len".into(),
+            max_alloc: 4096,
+        });
         let sym2 = sym.clone();
 
         // Act & Assert
@@ -113,8 +124,16 @@ mod tests {
         // Assert: target replaced with Const, other unchanged
         match &result {
             OffsetExpr::Add(a, b) => {
-                assert_eq!(&**a, &OffsetExpr::Const(100), "target LoopOffset should become Const(100)");
-                assert_eq!(&**b, &OffsetExpr::LoopOffset(other), "other LoopOffset should remain unchanged");
+                assert_eq!(
+                    &**a,
+                    &OffsetExpr::Const(100),
+                    "target LoopOffset should become Const(100)"
+                );
+                assert_eq!(
+                    &**b,
+                    &OffsetExpr::LoopOffset(other),
+                    "other LoopOffset should remain unchanged"
+                );
             }
             _ => panic!("expected Add variant"),
         }
@@ -168,7 +187,11 @@ mod tests {
 
         // Assert
         assert_eq!(remapped_vreg, GprOperand::VReg(VRegId(110)));
-        assert_eq!(remapped_imm, GprOperand::Imm(42), "Imm should be unchanged by remap");
+        assert_eq!(
+            remapped_imm,
+            GprOperand::Imm(42),
+            "Imm should be unchanged by remap"
+        );
     }
 
     // ── Test 10: GprOperand::vreg returns Some for VReg, None for Imm ──
@@ -210,8 +233,20 @@ mod tests {
         assert_eq!(BlockUnpackMode::SignedNibbleLow.block_bytes(), 18);
         assert_eq!(BlockUnpackMode::UnsignedNibbleHigh.block_bytes(), 18);
         assert_eq!(BlockUnpackMode::Bitpack2 { bias: 0.0 }.block_bytes(), 8);
-        assert_eq!(BlockUnpackMode::Mxfp4 { scale_src: VRegId(0) }.block_bytes(), 16);
-        assert_eq!(BlockUnpackMode::Nvfp4 { scale_src: VRegId(0) }.block_bytes(), 16);
+        assert_eq!(
+            BlockUnpackMode::Mxfp4 {
+                scale_src: VRegId(0)
+            }
+            .block_bytes(),
+            16
+        );
+        assert_eq!(
+            BlockUnpackMode::Nvfp4 {
+                scale_src: VRegId(0)
+            }
+            .block_bytes(),
+            16
+        );
     }
 
     // ── Test 13: KvLoadMode Default is Direct ──
@@ -254,8 +289,22 @@ mod tests {
         assert_eq!(v1, VRegId(1));
         assert_eq!(prog.vreg_count(), 2);
         assert_eq!(prog.len(), 2);
-        assert!(matches!(prog.instrs[0], VmInstr::DeclareVReg { id: VRegId(0), kind: VRegKind::Ptr, .. }));
-        assert!(matches!(prog.instrs[1], VmInstr::DeclareVReg { id: VRegId(1), kind: VRegKind::Vec, .. }));
+        assert!(matches!(
+            prog.instrs[0],
+            VmInstr::DeclareVReg {
+                id: VRegId(0),
+                kind: VRegKind::Ptr,
+                ..
+            }
+        ));
+        assert!(matches!(
+            prog.instrs[1],
+            VmInstr::DeclareVReg {
+                id: VRegId(1),
+                kind: VRegKind::Vec,
+                ..
+            }
+        ));
     }
 
     // ── Test 16: VmProgram emit_loop produces balanced LoopBegin and LoopEnd ──
@@ -270,7 +319,10 @@ mod tests {
 
         // Assert
         assert!(prog.validate_structure().is_ok());
-        assert!(prog.len() >= 3, "emit_loop should produce at least DeclareVReg*2 + LoopBegin + LoopEnd");
+        assert!(
+            prog.len() >= 3,
+            "emit_loop should produce at least DeclareVReg*2 + LoopBegin + LoopEnd"
+        );
     }
 
     // ── Test 17: VmProgram validate_provenance catches undeclared vreg ──
@@ -287,7 +339,8 @@ mod tests {
             base,
             offset: OffsetExpr::Const(0),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32, predicate: None,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
 
         // Act
@@ -329,7 +382,11 @@ mod tests {
         prog_a.append(prog_b);
 
         // Assert
-        assert_eq!(prog_a.vreg_count(), 3, "should have 3 total vregs after append");
+        assert_eq!(
+            prog_a.vreg_count(),
+            3,
+            "should have 3 total vregs after append"
+        );
         // Original a0 still VRegId(0), prog_b's vregs remapped to VRegId(1) and VRegId(2)
         assert_eq!(a0, VRegId(0));
     }
@@ -356,11 +413,11 @@ mod tests {
     fn vreg_kind_counts_from_mixed_program() {
         // Arrange
         let mut prog = VmProgram::new();
-        prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);      // v0 gpr
-        prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);        // v1 vec
-        prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);  // v2 gpr
-        prog.alloc_vreg(VRegKind::Vec, SimdWidth::W512);        // v3 vec
-        prog.alloc_vreg(VRegKind::Mask, SimdWidth::W256);       // v4 mask
+        prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar); // v0 gpr
+        prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256); // v1 vec
+        prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar); // v2 gpr
+        prog.alloc_vreg(VRegKind::Vec, SimdWidth::W512); // v3 vec
+        prog.alloc_vreg(VRegKind::Mask, SimdWidth::W256); // v4 mask
 
         // Act
         let counts = prog.vreg_counts_by_kind();
@@ -485,7 +542,10 @@ mod tests {
         let b = BoundExpr::DynamicVRegPlusOne(v);
 
         // Act & Assert
-        assert_ne!(a, b, "DynamicVReg and DynamicVRegPlusOne are distinct variants");
+        assert_ne!(
+            a, b,
+            "DynamicVReg and DynamicVRegPlusOne are distinct variants"
+        );
         assert_eq!(a.clone(), a, "DynamicVReg clones as equal");
     }
 
@@ -495,15 +555,29 @@ mod tests {
     fn vec_op_all_variants_distinct() {
         // Arrange
         let ops = [
-            VecOp::Add, VecOp::Sub, VecOp::Mul, VecOp::Div,
-            VecOp::Max, VecOp::Min, VecOp::And, VecOp::Or,
-            VecOp::Xor, VecOp::AndNot, VecOp::Shl, VecOp::Shr, VecOp::Not,
+            VecOp::Add,
+            VecOp::Sub,
+            VecOp::Mul,
+            VecOp::Div,
+            VecOp::Max,
+            VecOp::Min,
+            VecOp::And,
+            VecOp::Or,
+            VecOp::Xor,
+            VecOp::AndNot,
+            VecOp::Shl,
+            VecOp::Shr,
+            VecOp::Not,
         ];
 
         // Act & Assert — all pairwise distinct
         for i in 0..ops.len() {
             for j in (i + 1)..ops.len() {
-                assert_ne!(ops[i], ops[j], "VecOp variants {} and {} should differ", i, j);
+                assert_ne!(
+                    ops[i], ops[j],
+                    "VecOp variants {} and {} should differ",
+                    i, j
+                );
             }
         }
         // Copy works
@@ -528,15 +602,27 @@ mod tests {
     fn vec_unary_op_fp8_conversion_variants() {
         // Arrange
         let ops = [
-            VecUnaryOp::Neg, VecUnaryOp::Abs, VecUnaryOp::Sqrt, VecUnaryOp::Rsqrt,
-            VecUnaryOp::Recip, VecUnaryOp::Floor, VecUnaryOp::Ceil, VecUnaryOp::Round,
-            VecUnaryOp::IntToFloat, VecUnaryOp::Fp8E4M3ToFloat, VecUnaryOp::Fp8E5M2ToFloat,
+            VecUnaryOp::Neg,
+            VecUnaryOp::Abs,
+            VecUnaryOp::Sqrt,
+            VecUnaryOp::Rsqrt,
+            VecUnaryOp::Recip,
+            VecUnaryOp::Floor,
+            VecUnaryOp::Ceil,
+            VecUnaryOp::Round,
+            VecUnaryOp::IntToFloat,
+            VecUnaryOp::Fp8E4M3ToFloat,
+            VecUnaryOp::Fp8E5M2ToFloat,
         ];
 
         // Act & Assert — all pairwise distinct
         for i in 0..ops.len() {
             for j in (i + 1)..ops.len() {
-                assert_ne!(ops[i], ops[j], "VecUnaryOp variants {} and {} should differ", i, j);
+                assert_ne!(
+                    ops[i], ops[j],
+                    "VecUnaryOp variants {} and {} should differ",
+                    i, j
+                );
             }
         }
     }
@@ -546,12 +632,22 @@ mod tests {
     #[test]
     fn reduce_op_all_variants_distinct() {
         // Arrange
-        let ops = [ReduceOp::Sum, ReduceOp::Max, ReduceOp::Min, ReduceOp::Prod, ReduceOp::LogSum];
+        let ops = [
+            ReduceOp::Sum,
+            ReduceOp::Max,
+            ReduceOp::Min,
+            ReduceOp::Prod,
+            ReduceOp::LogSum,
+        ];
 
         // Act & Assert
         for i in 0..ops.len() {
             for j in (i + 1)..ops.len() {
-                assert_ne!(ops[i], ops[j], "ReduceOp variants {} and {} should differ", i, j);
+                assert_ne!(
+                    ops[i], ops[j],
+                    "ReduceOp variants {} and {} should differ",
+                    i, j
+                );
             }
         }
     }
@@ -562,14 +658,20 @@ mod tests {
     fn mem_fence_order_all_variants_distinct() {
         // Arrange
         let orders = [
-            MemFenceOrder::Release, MemFenceOrder::Acquire,
-            MemFenceOrder::AcqRel, MemFenceOrder::SeqCst,
+            MemFenceOrder::Release,
+            MemFenceOrder::Acquire,
+            MemFenceOrder::AcqRel,
+            MemFenceOrder::SeqCst,
         ];
 
         // Act & Assert
         for i in 0..orders.len() {
             for j in (i + 1)..orders.len() {
-                assert_ne!(orders[i], orders[j], "MemFenceOrder {} and {} should differ", i, j);
+                assert_ne!(
+                    orders[i], orders[j],
+                    "MemFenceOrder {} and {} should differ",
+                    i, j
+                );
             }
         }
     }
@@ -580,12 +682,24 @@ mod tests {
     // @trace BCE-X86HW-002-DOTDTYPE-VARIANTS [req:REQ-VR-002] [level:unit]
     fn dot_dtype_all_variants_distinct() {
         // BCE-20260704-X86HW-002: 加入 Bf16xF32, Fp16xF32 混合精度变体。
-        let dtypes = [DotDtype::Bf16, DotDtype::Bf16xF32, DotDtype::Fp16, DotDtype::Fp16xF32, DotDtype::Int8, DotDtype::Int4x8, DotDtype::Fp4];
+        let dtypes = [
+            DotDtype::Bf16,
+            DotDtype::Bf16xF32,
+            DotDtype::Fp16,
+            DotDtype::Fp16xF32,
+            DotDtype::Int8,
+            DotDtype::Int4x8,
+            DotDtype::Fp4,
+        ];
 
         // Act & Assert
         for i in 0..dtypes.len() {
             for j in (i + 1)..dtypes.len() {
-                assert_ne!(dtypes[i], dtypes[j], "DotDtype {} and {} should differ", i, j);
+                assert_ne!(
+                    dtypes[i], dtypes[j],
+                    "DotDtype {} and {} should differ",
+                    i, j
+                );
             }
         }
     }
@@ -608,7 +722,11 @@ mod tests {
     #[test]
     fn scalar_cvt_source_all_variants_distinct() {
         // Arrange
-        let sources = [ScalarCvtSource::F16, ScalarCvtSource::I8, ScalarCvtSource::U8];
+        let sources = [
+            ScalarCvtSource::F16,
+            ScalarCvtSource::I8,
+            ScalarCvtSource::U8,
+        ];
 
         // Act & Assert
         assert_ne!(sources[0], sources[1]);
@@ -645,14 +763,21 @@ mod tests {
     fn mem_ordering_all_variants_distinct() {
         // Arrange
         let orderings = [
-            MemOrdering::Relaxed, MemOrdering::Acquire, MemOrdering::Release,
-            MemOrdering::AcqRel, MemOrdering::SeqCst,
+            MemOrdering::Relaxed,
+            MemOrdering::Acquire,
+            MemOrdering::Release,
+            MemOrdering::AcqRel,
+            MemOrdering::SeqCst,
         ];
 
         // Act & Assert
         for i in 0..orderings.len() {
             for j in (i + 1)..orderings.len() {
-                assert_ne!(orderings[i], orderings[j], "MemOrdering {} and {} should differ", i, j);
+                assert_ne!(
+                    orderings[i], orderings[j],
+                    "MemOrdering {} and {} should differ",
+                    i, j
+                );
             }
         }
     }
@@ -672,7 +797,11 @@ mod tests {
         let debug_a = format!("{:?}", a);
         assert!(debug_a.contains("42"));
         let debug_b = format!("{:?}", b);
-        assert!(debug_b.contains("3735928559"), "ExternalAddr debug: {}", debug_b);
+        assert!(
+            debug_b.contains("3735928559"),
+            "ExternalAddr debug: {}",
+            debug_b
+        );
         match a_clone {
             HotpatchTarget::InstrIndex(n) => assert_eq!(n, 42),
             other => panic!("expected InstrIndex, got {:?}", other),
@@ -684,7 +813,10 @@ mod tests {
     #[test]
     fn jump_target_field_access_and_clone() {
         // Arrange
-        let target = JumpTarget { expert_id: 3, instr_index: 128 };
+        let target = JumpTarget {
+            expert_id: 3,
+            instr_index: 128,
+        };
 
         // Act
         let cloned = target.clone();
@@ -701,13 +833,22 @@ mod tests {
     #[test]
     fn gpr_unary_op_kind_all_variants_distinct() {
         // Arrange
-        let ops = [GprUnaryOpKind::Not, GprUnaryOpKind::Popcount, GprUnaryOpKind::Clz,
-                   GprUnaryOpKind::Bswap, GprUnaryOpKind::Neg];
+        let ops = [
+            GprUnaryOpKind::Not,
+            GprUnaryOpKind::Popcount,
+            GprUnaryOpKind::Clz,
+            GprUnaryOpKind::Bswap,
+            GprUnaryOpKind::Neg,
+        ];
 
         // Act & Assert
         for i in 0..ops.len() {
             for j in (i + 1)..ops.len() {
-                assert_ne!(ops[i], ops[j], "GprUnaryOpKind {} and {} should differ", i, j);
+                assert_ne!(
+                    ops[i], ops[j],
+                    "GprUnaryOpKind {} and {} should differ",
+                    i, j
+                );
             }
         }
     }
@@ -728,7 +869,11 @@ mod tests {
         assert!(format!("{:?}", stack).contains("16"));
         assert!(format!("{:?}", vreg_off).contains("64"));
         assert!(format!("{:?}", named).contains("telemetry"));
-        assert!(format!("{:?}", abs).contains("51966"), "AbsAddr debug: {:?}", abs);
+        assert!(
+            format!("{:?}", abs).contains("51966"),
+            "AbsAddr debug: {:?}",
+            abs
+        );
     }
 
     // ── Test 41: ScalarExpr Debug for all variants ──
@@ -753,13 +898,23 @@ mod tests {
     #[test]
     fn cmp_predicate_all_variants_distinct() {
         // Arrange
-        let preds = [CmpPredicate::Eq, CmpPredicate::Ne, CmpPredicate::Lt,
-                     CmpPredicate::Le, CmpPredicate::Gt, CmpPredicate::Ge];
+        let preds = [
+            CmpPredicate::Eq,
+            CmpPredicate::Ne,
+            CmpPredicate::Lt,
+            CmpPredicate::Le,
+            CmpPredicate::Gt,
+            CmpPredicate::Ge,
+        ];
 
         // Act & Assert
         for i in 0..preds.len() {
             for j in (i + 1)..preds.len() {
-                assert_ne!(preds[i], preds[j], "CmpPredicate {} and {} should differ", i, j);
+                assert_ne!(
+                    preds[i], preds[j],
+                    "CmpPredicate {} and {} should differ",
+                    i, j
+                );
             }
         }
     }
@@ -769,13 +924,22 @@ mod tests {
     #[test]
     fn transcendental_fn_all_variants_distinct() {
         // Arrange
-        let fns = [TranscendentalFn::Exp, TranscendentalFn::Log, TranscendentalFn::Tanh,
-                   TranscendentalFn::Sigmoid, TranscendentalFn::Fwht];
+        let fns = [
+            TranscendentalFn::Exp,
+            TranscendentalFn::Log,
+            TranscendentalFn::Tanh,
+            TranscendentalFn::Sigmoid,
+            TranscendentalFn::Fwht,
+        ];
 
         // Act & Assert
         for i in 0..fns.len() {
             for j in (i + 1)..fns.len() {
-                assert_ne!(fns[i], fns[j], "TranscendentalFn {} and {} should differ", i, j);
+                assert_ne!(
+                    fns[i], fns[j],
+                    "TranscendentalFn {} and {} should differ",
+                    i, j
+                );
             }
         }
     }
@@ -819,13 +983,21 @@ mod tests {
     #[test]
     fn tma_swizzle_all_variants_distinct() {
         // Arrange
-        let modes = [TmaSwizzle::None, TmaSwizzle::Swizzle32,
-                     TmaSwizzle::Swizzle64, TmaSwizzle::Swizzle128];
+        let modes = [
+            TmaSwizzle::None,
+            TmaSwizzle::Swizzle32,
+            TmaSwizzle::Swizzle64,
+            TmaSwizzle::Swizzle128,
+        ];
 
         // Act & Assert
         for i in 0..modes.len() {
             for j in (i + 1)..modes.len() {
-                assert_ne!(modes[i], modes[j], "TmaSwizzle {} and {} should differ", i, j);
+                assert_ne!(
+                    modes[i], modes[j],
+                    "TmaSwizzle {} and {} should differ",
+                    i, j
+                );
             }
         }
     }
@@ -835,9 +1007,18 @@ mod tests {
     #[test]
     fn gpr_op_all_variants_distinct() {
         // Arrange
-        let ops = [GprOp::Add, GprOp::Sub, GprOp::Mul, GprOp::Div,
-                   GprOp::Shl, GprOp::Shr, GprOp::And, GprOp::Or,
-                   GprOp::Xor, GprOp::BitTest];
+        let ops = [
+            GprOp::Add,
+            GprOp::Sub,
+            GprOp::Mul,
+            GprOp::Div,
+            GprOp::Shl,
+            GprOp::Shr,
+            GprOp::And,
+            GprOp::Or,
+            GprOp::Xor,
+            GprOp::BitTest,
+        ];
 
         // Act & Assert
         for i in 0..ops.len() {
@@ -854,13 +1035,22 @@ mod tests {
     #[test]
     fn kv_load_mode_all_variants_distinct() {
         // Arrange
-        let modes = [KvLoadMode::Direct, KvLoadMode::Kivi4, KvLoadMode::Kivi2,
-                     KvLoadMode::Sparse, KvLoadMode::Auto];
+        let modes = [
+            KvLoadMode::Direct,
+            KvLoadMode::Kivi4,
+            KvLoadMode::Kivi2,
+            KvLoadMode::Sparse,
+            KvLoadMode::Auto,
+        ];
 
         // Act & Assert
         for i in 0..modes.len() {
             for j in (i + 1)..modes.len() {
-                assert_ne!(modes[i], modes[j], "KvLoadMode {} and {} should differ", i, j);
+                assert_ne!(
+                    modes[i], modes[j],
+                    "KvLoadMode {} and {} should differ",
+                    i, j
+                );
             }
         }
         assert_eq!(KvLoadMode::default(), KvLoadMode::Direct);
@@ -878,8 +1068,11 @@ mod tests {
         let result = expr.substitute_loop_offset(target, 999);
 
         // Assert
-        assert_eq!(result, OffsetExpr::ScalarVReg(target),
-                   "ScalarVReg should not be affected by substitute_loop_offset");
+        assert_eq!(
+            result,
+            OffsetExpr::ScalarVReg(target),
+            "ScalarVReg should not be affected by substitute_loop_offset"
+        );
     }
 
     // ── Test 50: VmProgram alloc_label increments monotonically ──
@@ -895,7 +1088,11 @@ mod tests {
         let l2 = prog.alloc_label();
 
         // Assert
-        assert!(l0 >= 1000, "first label should start at >= 1000, got {}", l0);
+        assert!(
+            l0 >= 1000,
+            "first label should start at >= 1000, got {}",
+            l0
+        );
         assert_eq!(l1, l0 + 1, "labels should increment by 1");
         assert_eq!(l2, l0 + 2, "labels should increment by 1");
     }
@@ -919,7 +1116,10 @@ mod tests {
         assert!(result.is_ok());
         // Should contain ScopeBegin, DeclareVReg, LoopEnd, ScopeEnd
         assert!(prog.len() >= 4);
-        assert!(matches!(prog.instrs.first(), Some(VmInstr::ScopeBegin { .. })));
+        assert!(matches!(
+            prog.instrs.first(),
+            Some(VmInstr::ScopeBegin { .. })
+        ));
         assert!(matches!(prog.instrs.last(), Some(VmInstr::ScopeEnd { .. })));
     }
 
@@ -929,7 +1129,11 @@ mod tests {
     fn vm_instr_is_meta_classification() {
         // Arrange — meta instructions
         let meta_instrs = vec![
-            VmInstr::DeclareVReg { id: VRegId(0), kind: VRegKind::Ptr, width: SimdWidth::Scalar },
+            VmInstr::DeclareVReg {
+                id: VRegId(0),
+                kind: VRegKind::Ptr,
+                width: SimdWidth::Scalar,
+            },
             VmInstr::ReleaseVReg { id: VRegId(0) },
             VmInstr::MarkLabel { label_id: 0 },
             VmInstr::Comment("test".into()),
@@ -953,15 +1157,17 @@ mod tests {
         let err_msg = "test error";
 
         // Act
-        let result: Result<(), &str> = prog.emit_loop_try(BoundExpr::Const(4), 16, |_p, _ctr, _off| {
-            Err(err_msg)
-        });
+        let result: Result<(), &str> =
+            prog.emit_loop_try(BoundExpr::Const(4), 16, |_p, _ctr, _off| Err(err_msg));
 
         // Assert
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), err_msg);
         // LoopBegin should still have been emitted before the error
-        assert!(prog.len() >= 2, "should have DeclareVReg*2 + LoopBegin before error");
+        assert!(
+            prog.len() >= 2,
+            "should have DeclareVReg*2 + LoopBegin before error"
+        );
     }
 
     // ── Test 54: VRegKind all variants distinct ──
@@ -969,9 +1175,15 @@ mod tests {
     #[test]
     fn vreg_kind_all_variants_distinct() {
         // Arrange
-        let kinds = [VRegKind::Ptr, VRegKind::Vec, VRegKind::Scalar,
-                     VRegKind::Counter, VRegKind::ByteOffset,
-                     VRegKind::Tile, VRegKind::Mask];
+        let kinds = [
+            VRegKind::Ptr,
+            VRegKind::Vec,
+            VRegKind::Scalar,
+            VRegKind::Counter,
+            VRegKind::ByteOffset,
+            VRegKind::Tile,
+            VRegKind::Mask,
+        ];
 
         // Act & Assert
         for i in 0..kinds.len() {
@@ -990,18 +1202,28 @@ mod tests {
         let vec_base = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let vec_dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::VecLoad {
-            dst: vec_dst, base: vec_base,
-            offset: OffsetExpr::Const(0), width: SimdWidth::W256,
-            dtype: QuantPrecision::F32, predicate: None,
+            dst: vec_dst,
+            base: vec_base,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
 
         // Act
         let result = prog.validate_type_consistency();
 
         // Assert
-        assert!(result.is_err(), "Vec-typed base in VecLoad should fail type check");
+        assert!(
+            result.is_err(),
+            "Vec-typed base in VecLoad should fail type check"
+        );
         let err = result.unwrap_err();
-        assert!(err.contains("base") && err.contains("Vec"), "error should mention base and Vec, got: {}", err);
+        assert!(
+            err.contains("base") && err.contains("Vec"),
+            "error should mention base and Vec, got: {}",
+            err
+        );
     }
 
     // ── Test 56: validate_type_consistency rejects GPR-typed operands in Fma ──
@@ -1014,15 +1236,28 @@ mod tests {
         let a = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let b = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        prog.emit(VmInstr::Fma { dst, acc, a, b, dtype: QuantPrecision::F32 });
+        prog.emit(VmInstr::Fma {
+            dst,
+            acc,
+            a,
+            b,
+            dtype: QuantPrecision::F32,
+        });
 
         // Act
         let result = prog.validate_type_consistency();
 
         // Assert
-        assert!(result.is_err(), "GPR-typed acc in Fma should fail type check");
+        assert!(
+            result.is_err(),
+            "GPR-typed acc in Fma should fail type check"
+        );
         let err = result.unwrap_err();
-        assert!(err.contains("acc") || err.contains("Fma"), "error should reference Fma or acc, got: {}", err);
+        assert!(
+            err.contains("acc") || err.contains("Fma"),
+            "error should reference Fma or acc, got: {}",
+            err
+        );
     }
 
     // ── Test 57: validate_width_consistency detects mismatch in Fma operands ──
@@ -1035,7 +1270,13 @@ mod tests {
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W512);
         let a = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let b = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        prog.emit(VmInstr::Fma { dst, acc, a, b, dtype: QuantPrecision::F32 });
+        prog.emit(VmInstr::Fma {
+            dst,
+            acc,
+            a,
+            b,
+            dtype: QuantPrecision::F32,
+        });
 
         // Act
         let result = prog.validate_width_consistency();
@@ -1043,7 +1284,11 @@ mod tests {
         // Assert
         assert!(result.is_err(), "width mismatch in Fma should fail");
         let err = result.unwrap_err();
-        assert!(err.contains("Fma"), "error should reference Fma, got: {}", err);
+        assert!(
+            err.contains("Fma"),
+            "error should reference Fma, got: {}",
+            err
+        );
     }
 
     // ── Test 58: validate_width_consistency passes for consistent VecBinOp program ──
@@ -1055,14 +1300,28 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let a = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let b = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        prog.emit(VmInstr::VecBinOp { dst, a, b, op: VecOp::Add, dtype: QuantPrecision::F32 });
-        prog.emit(VmInstr::VecUnaryOp { dst, a, op: VecUnaryOp::Neg });
+        prog.emit(VmInstr::VecBinOp {
+            dst,
+            a,
+            b,
+            op: VecOp::Add,
+            dtype: QuantPrecision::F32,
+        });
+        prog.emit(VmInstr::VecUnaryOp {
+            dst,
+            a,
+            op: VecUnaryOp::Neg,
+        });
 
         // Act
         let result = prog.validate_width_consistency();
 
         // Assert
-        assert!(result.is_ok(), "uniform-width program should pass width check, got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "uniform-width program should pass width check, got: {:?}",
+            result
+        );
     }
 
     // ── Test 59: validate_declares_before_uses catches late-declared vreg ──
@@ -1074,12 +1333,19 @@ mod tests {
         let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         // Use v99 before declaring it (simulating an opt pass bug)
         prog.emit(VmInstr::VecLoad {
-            dst: VRegId(99), base,
-            offset: OffsetExpr::Const(0), width: SimdWidth::W256,
-            dtype: QuantPrecision::F32, predicate: None,
+            dst: VRegId(99),
+            base,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         // Late declare (should have been before the VecLoad)
-        prog.emit(VmInstr::DeclareVReg { id: VRegId(99), kind: VRegKind::Vec, width: SimdWidth::W256 });
+        prog.emit(VmInstr::DeclareVReg {
+            id: VRegId(99),
+            kind: VRegKind::Vec,
+            width: SimdWidth::W256,
+        });
 
         // Act
         let result = prog.validate_declares_before_uses();
@@ -1087,7 +1353,11 @@ mod tests {
         // Assert
         assert!(result.is_err(), "late DeclareVReg should be caught");
         let err = result.unwrap_err();
-        assert!(err.contains("v99") || err.contains("before"), "error should reference v99 or 'before', got: {}", err);
+        assert!(
+            err.contains("v99") || err.contains("before"),
+            "error should reference v99 or 'before', got: {}",
+            err
+        );
     }
 
     // ── Test 60: validate_value_domains rejects VecData used as VecLoad base ──
@@ -1096,28 +1366,43 @@ mod tests {
     fn validate_value_domains_rejects_vecdata_as_base() {
         // Arrange: emit VecBinOp so v1 gets VecData domain, then use v1 as VecLoad base
         let mut prog = VmProgram::new();
-        let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);    // v0
-        let vec_a = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);    // v1
-        let vec_b = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);    // v2
-        let vec_c = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);    // v3
-        // v1 = v1 + v2 — now v1 has VecData domain
-        prog.emit(VmInstr::VecBinOp { dst: vec_a, a: vec_b, b: vec_c, op: VecOp::Add, dtype: QuantPrecision::F32 });
+        let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar); // v0
+        let vec_a = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256); // v1
+        let vec_b = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256); // v2
+        let vec_c = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256); // v3
+                                                                     // v1 = v1 + v2 — now v1 has VecData domain
+        prog.emit(VmInstr::VecBinOp {
+            dst: vec_a,
+            a: vec_b,
+            b: vec_c,
+            op: VecOp::Add,
+            dtype: QuantPrecision::F32,
+        });
         // Use v1 (VecData) as base for VecLoad — should be rejected
-        let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);      // v4
+        let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256); // v4
         prog.emit(VmInstr::VecLoad {
-            dst, base: vec_a,
-            offset: OffsetExpr::Const(0), width: SimdWidth::W256,
-            dtype: QuantPrecision::F32, predicate: None,
+            dst,
+            base: vec_a,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
 
         // Act
         let result = prog.validate_value_domains();
 
         // Assert
-        assert!(result.is_err(), "VecData domain as VecLoad base should fail");
+        assert!(
+            result.is_err(),
+            "VecData domain as VecLoad base should fail"
+        );
         let err = result.unwrap_err();
-        assert!(err.contains("VecLoad") && err.contains("SIGSEGV"),
-                "error should mention VecLoad and SIGSEGV, got: {}", err);
+        assert!(
+            err.contains("VecLoad") && err.contains("SIGSEGV"),
+            "error should mention VecLoad and SIGSEGV, got: {}",
+            err
+        );
     }
 
     // ── Test 61: validate_structure detects unmatched ScopeEnd ──
@@ -1132,10 +1417,16 @@ mod tests {
         let result = prog.validate_structure();
 
         // Assert
-        assert!(result.is_err(), "unmatched ScopeEnd should fail structure check");
+        assert!(
+            result.is_err(),
+            "unmatched ScopeEnd should fail structure check"
+        );
         let err = result.unwrap_err();
-        assert!(err.contains("ScopeEnd") || err.contains("scope"),
-                "error should reference scope, got: {}", err);
+        assert!(
+            err.contains("ScopeEnd") || err.contains("scope"),
+            "error should reference scope, got: {}",
+            err
+        );
     }
 
     // ── Test 62: append_with_mapping correctly remaps template vregs in VecBinOp ──
@@ -1147,11 +1438,14 @@ mod tests {
         let main_v = prog_alloc_vec(&mut main_prog); // v0
 
         let mut tpl_prog = VmProgram::new();
-        let tpl_v0 = prog_alloc_vec(&mut tpl_prog);  // tpl v0
-        let tpl_v1 = prog_alloc_vec(&mut tpl_prog);  // tpl v1
+        let tpl_v0 = prog_alloc_vec(&mut tpl_prog); // tpl v0
+        let tpl_v1 = prog_alloc_vec(&mut tpl_prog); // tpl v1
         tpl_prog.emit(VmInstr::VecBinOp {
-            dst: tpl_v0, a: tpl_v1, b: tpl_v0,
-            op: VecOp::Mul, dtype: QuantPrecision::F32,
+            dst: tpl_v0,
+            a: tpl_v1,
+            b: tpl_v0,
+            op: VecOp::Mul,
+            dtype: QuantPrecision::F32,
         });
 
         // Act: map tpl_v1 → main_v, tpl_v0 auto-allocated
@@ -1161,7 +1455,9 @@ mod tests {
         // Assert: new instructions appended after existing ones
         assert!(main_prog.len() > pre_len, "instructions should be appended");
         // The appended VecBinOp should use the mapped vreg for tpl_v1
-        let bin_ops: Vec<&VmInstr> = main_prog.instrs.iter()
+        let bin_ops: Vec<&VmInstr> = main_prog
+            .instrs
+            .iter()
             .filter_map(|i| match i {
                 VmInstr::VecBinOp { op: VecOp::Mul, .. } => Some(i),
                 _ => None,
@@ -1179,9 +1475,9 @@ mod tests {
     fn vreg_kind_counts_tile_and_mask_like() {
         // Arrange: program with Tile and Mask vregs
         let mut prog = VmProgram::new();
-        prog.alloc_vreg(VRegKind::Tile, SimdWidth::W256);   // v0
-        prog.alloc_vreg(VRegKind::Tile, SimdWidth::W256);   // v1
-        prog.alloc_vreg(VRegKind::Mask, SimdWidth::W256);   // v2
+        prog.alloc_vreg(VRegKind::Tile, SimdWidth::W256); // v0
+        prog.alloc_vreg(VRegKind::Tile, SimdWidth::W256); // v1
+        prog.alloc_vreg(VRegKind::Mask, SimdWidth::W256); // v2
 
         // Act
         let counts = prog.vreg_counts_by_kind();
@@ -1204,21 +1500,31 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let out_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         prog.emit(VmInstr::VecLoad {
-            dst, base,
-            offset: OffsetExpr::Const(0), width: SimdWidth::W256,
-            dtype: QuantPrecision::F32, predicate: None,
+            dst,
+            base,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
         prog.emit(VmInstr::VecStore {
-            base: out_base, src: dst,
-            offset: OffsetExpr::Const(0), width: SimdWidth::W256,
-            dtype: QuantPrecision::F32, predicate: None,
+            base: out_base,
+            src: dst,
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         });
 
         // Act
         let result = prog.validate_provenance();
 
         // Assert
-        assert!(result.is_ok(), "well-formed program should pass provenance check, got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "well-formed program should pass provenance check, got: {:?}",
+            result
+        );
     }
 
     // Helper: allocate a Vec W256 vreg (reduces boilerplate in tests)
@@ -1235,7 +1541,8 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let src = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W512);
         prog.emit(VmInstr::VecNarrow {
-            dst, src,
+            dst,
+            src,
             dst_dtype: QuantPrecision::BF16,
             src_dtype: QuantPrecision::F32,
             width: SimdWidth::W256,
@@ -1247,7 +1554,11 @@ mod tests {
         // Assert
         assert!(result.is_err(), "width mismatch in VecNarrow should fail");
         let err = result.unwrap_err();
-        assert!(err.contains("VecNarrow"), "error should reference VecNarrow, got: {}", err);
+        assert!(
+            err.contains("VecNarrow"),
+            "error should reference VecNarrow, got: {}",
+            err
+        );
     }
 
     // ── Test 66: VmProgram append_with_mapping with empty map auto-remaps all vregs ──
@@ -1264,8 +1575,11 @@ mod tests {
         let tpl_v1 = prog_alloc_vec(&mut tpl); // tpl v1
         let tpl_v2 = prog_alloc_vec(&mut tpl); // tpl v2
         tpl.emit(VmInstr::VecBinOp {
-            dst: tpl_v2, a: tpl_v0, b: tpl_v1,
-            op: VecOp::Add, dtype: QuantPrecision::F32,
+            dst: tpl_v2,
+            a: tpl_v0,
+            b: tpl_v1,
+            op: VecOp::Add,
+            dtype: QuantPrecision::F32,
         });
 
         // Act: empty mapping -> all template vregs auto-remapped
@@ -1273,10 +1587,15 @@ mod tests {
         main_prog.append_with_mapping(tpl, &[]);
 
         // Assert: total vregs = 2 (main) + 3 (template auto-remapped)
-        assert_eq!(main_prog.vreg_count(), pre_vreg_count + 3,
-                   "should have main + remapped template vregs");
+        assert_eq!(
+            main_prog.vreg_count(),
+            pre_vreg_count + 3,
+            "should have main + remapped template vregs"
+        );
         // The appended VecBinOp should reference remapped vregs, all >= pre_vreg_count
-        let bin_ops: Vec<&VmInstr> = main_prog.instrs.iter()
+        let bin_ops: Vec<&VmInstr> = main_prog
+            .instrs
+            .iter()
             .filter_map(|i| match i {
                 VmInstr::VecBinOp { op: VecOp::Add, .. } => Some(i),
                 _ => None,
@@ -1285,9 +1604,18 @@ mod tests {
         assert_eq!(bin_ops.len(), 1, "should have exactly one Add VecBinOp");
         if let VmInstr::VecBinOp { dst, a, b, .. } = bin_ops[0] {
             // All remapped vregs should be above the original main_prog vregs
-            assert!(a.0 >= pre_vreg_count, "tpl_v0 should be remapped above main vregs");
-            assert!(b.0 >= pre_vreg_count, "tpl_v1 should be remapped above main vregs");
-            assert!(dst.0 >= pre_vreg_count, "tpl_v2 should be remapped above main vregs");
+            assert!(
+                a.0 >= pre_vreg_count,
+                "tpl_v0 should be remapped above main vregs"
+            );
+            assert!(
+                b.0 >= pre_vreg_count,
+                "tpl_v1 should be remapped above main vregs"
+            );
+            assert!(
+                dst.0 >= pre_vreg_count,
+                "tpl_v2 should be remapped above main vregs"
+            );
             // All three should be distinct
             assert_ne!(*a, *b, "remapped a and b should be distinct");
             assert_ne!(*a, *dst, "remapped a and dst should be distinct");
@@ -1307,7 +1635,9 @@ mod tests {
             let result: Result<(), std::convert::Infallible> = p.emit_scope(|inner| {
                 let v = inner.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
                 inner.emit(VmInstr::ScalarStore {
-                    base: v, src: v, offset: OffsetExpr::Const(0),
+                    base: v,
+                    src: v,
+                    offset: OffsetExpr::Const(0),
                 });
                 Ok(())
             });
@@ -1315,8 +1645,12 @@ mod tests {
             let result2: Result<(), std::convert::Infallible> = p.emit_scope(|inner2| {
                 let v2 = inner2.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
                 inner2.emit(VmInstr::VecStore {
-                    base: v2, src: v2, offset: OffsetExpr::Const(0),
-                    width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+                    base: v2,
+                    src: v2,
+                    offset: OffsetExpr::Const(0),
+                    width: SimdWidth::W256,
+                    dtype: QuantPrecision::F32,
+                    predicate: None,
                 });
                 Ok(())
             });
@@ -1324,8 +1658,10 @@ mod tests {
         });
 
         // Assert
-        assert!(prog.validate_structure().is_ok(),
-                "nested scopes inside loop should pass structure validation");
+        assert!(
+            prog.validate_structure().is_ok(),
+            "nested scopes inside loop should pass structure validation"
+        );
         assert!(prog.len() > 10, "should have substantial instruction count");
     }
 
@@ -1353,7 +1689,10 @@ mod tests {
     #[test]
     fn bound_expr_symbolic_symbound_fields_and_clone() {
         // Arrange
-        let sym = SymBound { name: "batch_size".into(), max_alloc: 8192 };
+        let sym = SymBound {
+            name: "batch_size".into(),
+            max_alloc: 8192,
+        };
         let expr = BoundExpr::Symbolic(sym.clone());
 
         // Act
@@ -1383,10 +1722,7 @@ mod tests {
             Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(target)), 4)),
             Box::new(OffsetExpr::LoopOffset(other)),
         );
-        let outer = OffsetExpr::Add(
-            Box::new(OffsetExpr::Const(16)),
-            Box::new(inner),
-        );
+        let outer = OffsetExpr::Add(Box::new(OffsetExpr::Const(16)), Box::new(inner));
 
         // Act: substitute target -> 200
         let result = outer.substitute_loop_offset(target, 200);
@@ -1394,19 +1730,29 @@ mod tests {
         // Assert: inner Mul should become Mul(Const(200), 4), other unchanged
         match &result {
             OffsetExpr::Add(a, b) => {
-                assert_eq!(&**a, &OffsetExpr::Const(16), "outer Const should be unchanged");
+                assert_eq!(
+                    &**a,
+                    &OffsetExpr::Const(16),
+                    "outer Const should be unchanged"
+                );
                 match &**b {
                     OffsetExpr::Add(inner_a, inner_b) => {
                         match &**inner_a {
                             OffsetExpr::Mul(base, scale) => {
-                                assert_eq!(&**base, &OffsetExpr::Const(200),
-                                           "target should be substituted to Const(200)");
+                                assert_eq!(
+                                    &**base,
+                                    &OffsetExpr::Const(200),
+                                    "target should be substituted to Const(200)"
+                                );
                                 assert_eq!(*scale, 4, "scale should be unchanged");
                             }
                             other => panic!("expected Mul, got {:?}", other),
                         }
-                        assert_eq!(&**inner_b, &OffsetExpr::LoopOffset(other),
-                                   "other LoopOffset should be unchanged");
+                        assert_eq!(
+                            &**inner_b,
+                            &OffsetExpr::LoopOffset(other),
+                            "other LoopOffset should be unchanged"
+                        );
                     }
                     other => panic!("expected inner Add, got {:?}", other),
                 }
@@ -1433,10 +1779,16 @@ mod tests {
         let result = prog.validate_type_consistency();
 
         // Assert
-        assert!(result.is_err(), "Mov from Ptr to Vec should fail type check");
+        assert!(
+            result.is_err(),
+            "Mov from Ptr to Vec should fail type check"
+        );
         let err = result.unwrap_err();
-        assert!(err.contains("Mov") || err.contains("src") || err.contains("dst"),
-                "error should reference Mov or operands, got: {}", err);
+        assert!(
+            err.contains("Mov") || err.contains("src") || err.contains("dst"),
+            "error should reference Mov or operands, got: {}",
+            err
+        );
     }
 
     // ── Test 72: VmProgram emit_loop with DynamicVReg bound creates correct structure ──
@@ -1452,20 +1804,34 @@ mod tests {
         prog.emit_loop(dynamic_bound, 32, |p, _ctr, _off| {
             let v = prog_alloc_vec(p);
             p.emit(VmInstr::VecStore {
-                base: v, src: v, offset: OffsetExpr::Const(0),
-                width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+                base: v,
+                src: v,
+                offset: OffsetExpr::Const(0),
+                width: SimdWidth::W256,
+                dtype: QuantPrecision::F32,
+                predicate: None,
             });
         });
 
         // Assert
-        assert!(prog.validate_structure().is_ok(),
-                "loop with DynamicVReg bound should pass structure validation");
+        assert!(
+            prog.validate_structure().is_ok(),
+            "loop with DynamicVReg bound should pass structure validation"
+        );
         // Should contain LoopBegin with DynamicVReg bound
-        let has_dynamic_loop = prog.instrs.iter().any(|i| matches!(
-            i,
-            VmInstr::LoopBegin { bound: BoundExpr::DynamicVReg(_), .. }
-        ));
-        assert!(has_dynamic_loop, "should contain LoopBegin with DynamicVReg bound");
+        let has_dynamic_loop = prog.instrs.iter().any(|i| {
+            matches!(
+                i,
+                VmInstr::LoopBegin {
+                    bound: BoundExpr::DynamicVReg(_),
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_dynamic_loop,
+            "should contain LoopBegin with DynamicVReg bound"
+        );
     }
 
     // ── Test 73: BlockUnpackMode SignedNibble variants have same block_bytes ──
@@ -1481,8 +1847,10 @@ mod tests {
         let high_bytes = high.block_bytes();
 
         // Assert: both nibble variants use the same block size
-        assert_eq!(low_bytes, high_bytes,
-                   "SignedNibbleLow and UnsignedNibbleHigh should have same block_bytes");
+        assert_eq!(
+            low_bytes, high_bytes,
+            "SignedNibbleLow and UnsignedNibbleHigh should have same block_bytes"
+        );
         assert_eq!(low_bytes, 18, "nibble block_bytes should be 18");
     }
 
@@ -1502,9 +1870,12 @@ mod tests {
             bound: BoundExpr::Const(10),
         };
         let vec_load = VmInstr::VecLoad {
-            dst: VRegId(2), base: VRegId(0),
-            offset: OffsetExpr::Const(0), width: SimdWidth::W256,
-            dtype: QuantPrecision::F32, predicate: None,
+            dst: VRegId(2),
+            base: VRegId(0),
+            offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
+            predicate: None,
         };
 
         // Act & Assert
@@ -1522,12 +1893,30 @@ mod tests {
         let prog = VmProgram::new();
 
         // Act & Assert
-        assert!(prog.validate_structure().is_ok(), "empty program should pass structure check");
-        assert!(prog.validate_provenance().is_ok(), "empty program should pass provenance check");
-        assert!(prog.validate_type_consistency().is_ok(), "empty program should pass type check");
-        assert!(prog.validate_width_consistency().is_ok(), "empty program should pass width check");
-        assert!(prog.validate_value_domains().is_ok(), "empty program should pass domain check");
-        assert!(prog.validate_declares_before_uses().is_ok(), "empty program should pass declare check");
+        assert!(
+            prog.validate_structure().is_ok(),
+            "empty program should pass structure check"
+        );
+        assert!(
+            prog.validate_provenance().is_ok(),
+            "empty program should pass provenance check"
+        );
+        assert!(
+            prog.validate_type_consistency().is_ok(),
+            "empty program should pass type check"
+        );
+        assert!(
+            prog.validate_width_consistency().is_ok(),
+            "empty program should pass width check"
+        );
+        assert!(
+            prog.validate_value_domains().is_ok(),
+            "empty program should pass domain check"
+        );
+        assert!(
+            prog.validate_declares_before_uses().is_ok(),
+            "empty program should pass declare check"
+        );
     }
 
     // ── Test 76: VmProgram emit_loop body instructions appear between LoopBegin and LoopEnd ──
@@ -1542,22 +1931,34 @@ mod tests {
         // Act
         prog.emit_loop(BoundExpr::Const(8), 32, |p, _ctr, _off| {
             p.emit(VmInstr::VecStore {
-                base, src,
+                base,
+                src,
                 offset: OffsetExpr::Const(0),
                 width: SimdWidth::W256,
-                dtype: QuantPrecision::F32, predicate: None,
+                dtype: QuantPrecision::F32,
+                predicate: None,
             });
         });
 
         // Assert: VecStore appears between LoopBegin and LoopEnd
-        let begin_idx = prog.instrs.iter().position(|i| matches!(i, VmInstr::LoopBegin { .. }))
+        let begin_idx = prog
+            .instrs
+            .iter()
+            .position(|i| matches!(i, VmInstr::LoopBegin { .. }))
             .expect("should have LoopBegin");
-        let end_idx = prog.instrs.iter().rposition(|i| matches!(i, VmInstr::LoopEnd))
+        let end_idx = prog
+            .instrs
+            .iter()
+            .rposition(|i| matches!(i, VmInstr::LoopEnd))
             .expect("should have LoopEnd");
         assert!(begin_idx < end_idx, "LoopBegin should come before LoopEnd");
-        let has_store = prog.instrs[begin_idx + 1..end_idx].iter()
+        let has_store = prog.instrs[begin_idx + 1..end_idx]
+            .iter()
             .any(|i| matches!(i, VmInstr::VecStore { .. }));
-        assert!(has_store, "VecStore should appear between LoopBegin and LoopEnd");
+        assert!(
+            has_store,
+            "VecStore should appear between LoopBegin and LoopEnd"
+        );
     }
 
     // ── Test 77: OffsetExpr::Const is unchanged by substitute_loop_offset ──
@@ -1572,8 +1973,11 @@ mod tests {
         let result = expr.substitute_loop_offset(target, 100);
 
         // Assert
-        assert_eq!(result, OffsetExpr::Const(42),
-            "Const should be unchanged by substitute_loop_offset");
+        assert_eq!(
+            result,
+            OffsetExpr::Const(42),
+            "Const should be unchanged by substitute_loop_offset"
+        );
     }
 
     // ── Test 78: BoundExpr::Const Debug format contains the value ──
@@ -1587,8 +1991,11 @@ mod tests {
         let debug = format!("{:?}", expr);
 
         // Assert
-        assert!(debug.contains("12345"),
-            "Debug should contain the const value, got: {}", debug);
+        assert!(
+            debug.contains("12345"),
+            "Debug should contain the const value, got: {}",
+            debug
+        );
     }
 
     // ── Test 79: VmProgram alloc_vreg preserves width information ──
@@ -1624,16 +2031,25 @@ mod tests {
         // Arrange
         let compute_instrs: Vec<VmInstr> = vec![
             VmInstr::VecBinOp {
-                dst: VRegId(0), a: VRegId(1), b: VRegId(2),
-                op: VecOp::Add, dtype: QuantPrecision::F32,
+                dst: VRegId(0),
+                a: VRegId(1),
+                b: VRegId(2),
+                op: VecOp::Add,
+                dtype: QuantPrecision::F32,
             },
             VmInstr::VecLoad {
-                dst: VRegId(0), base: VRegId(1),
-                offset: OffsetExpr::Const(0), width: SimdWidth::W256,
-                dtype: QuantPrecision::F32, predicate: None,
+                dst: VRegId(0),
+                base: VRegId(1),
+                offset: OffsetExpr::Const(0),
+                width: SimdWidth::W256,
+                dtype: QuantPrecision::F32,
+                predicate: None,
             },
             VmInstr::Fma {
-                dst: VRegId(0), acc: VRegId(1), a: VRegId(2), b: VRegId(3),
+                dst: VRegId(0),
+                acc: VRegId(1),
+                a: VRegId(2),
+                b: VRegId(3),
                 dtype: QuantPrecision::F32,
             },
         ];
@@ -1673,8 +2089,11 @@ mod tests {
         // Assert
         match &result {
             OffsetExpr::Mul(inner, scale) => {
-                assert_eq!(&**inner, &OffsetExpr::LoopOffset(other),
-                    "non-matching LoopOffset should be unchanged");
+                assert_eq!(
+                    &**inner,
+                    &OffsetExpr::LoopOffset(other),
+                    "non-matching LoopOffset should be unchanged"
+                );
                 assert_eq!(*scale, 8, "scale should be unchanged");
             }
             other_variant => panic!("expected Mul, got {:?}", other_variant),
@@ -1687,20 +2106,29 @@ mod tests {
     fn vm_program_emit_loop_symbolic_bound_passes_validation() {
         // Arrange
         let mut prog = VmProgram::new();
-        let sym_bound = BoundExpr::Symbolic(SymBound { name: "tokens".into(), max_alloc: 2048 });
+        let sym_bound = BoundExpr::Symbolic(SymBound {
+            name: "tokens".into(),
+            max_alloc: 2048,
+        });
 
         // Act
         prog.emit_loop(sym_bound, 16, |p, _ctr, _off| {
             let v = prog_alloc_vec(p);
             p.emit(VmInstr::VecStore {
-                base: v, src: v, offset: OffsetExpr::Const(0),
-                width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+                base: v,
+                src: v,
+                offset: OffsetExpr::Const(0),
+                width: SimdWidth::W256,
+                dtype: QuantPrecision::F32,
+                predicate: None,
             });
         });
 
         // Assert
-        assert!(prog.validate_structure().is_ok(),
-            "loop with Symbolic bound should pass structure validation");
+        assert!(
+            prog.validate_structure().is_ok(),
+            "loop with Symbolic bound should pass structure validation"
+        );
     }
 
     // ── Test 84: VmProgram sequential loops pass structure validation ──
@@ -1714,23 +2142,41 @@ mod tests {
         prog.emit_loop(BoundExpr::Const(4), 32, |p, _ctr, _off| {
             let v = prog_alloc_vec(p);
             p.emit(VmInstr::VecLoad {
-                dst: v, base: v, offset: OffsetExpr::Const(0),
-                width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+                dst: v,
+                base: v,
+                offset: OffsetExpr::Const(0),
+                width: SimdWidth::W256,
+                dtype: QuantPrecision::F32,
+                predicate: None,
             });
         });
         prog.emit_loop(BoundExpr::Const(8), 64, |p, _ctr, _off| {
             let v = prog_alloc_vec(p);
             p.emit(VmInstr::VecStore {
-                base: v, src: v, offset: OffsetExpr::Const(0),
-                width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+                base: v,
+                src: v,
+                offset: OffsetExpr::Const(0),
+                width: SimdWidth::W256,
+                dtype: QuantPrecision::F32,
+                predicate: None,
             });
         });
 
         // Assert
-        assert!(prog.validate_structure().is_ok(),
-            "two sequential loops should pass structure validation");
-        let begins = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
-        let ends = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopEnd)).count();
+        assert!(
+            prog.validate_structure().is_ok(),
+            "two sequential loops should pass structure validation"
+        );
+        let begins = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopBegin { .. }))
+            .count();
+        let ends = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopEnd))
+            .count();
         assert_eq!(begins, 2, "should have 2 LoopBegin");
         assert_eq!(ends, 2, "should have 2 LoopEnd");
     }
@@ -1751,10 +2197,17 @@ mod tests {
         });
 
         // Assert: instruction present and fields correct
-        let instr = prog.instrs.iter().find(|i| matches!(i, VmInstr::GprCondAction { .. }));
+        let instr = prog
+            .instrs
+            .iter()
+            .find(|i| matches!(i, VmInstr::GprCondAction { .. }));
         assert!(instr.is_some(), "should contain GprCondAction");
         if let Some(VmInstr::GprCondAction { cond, action }) = instr {
-            assert_eq!(cond.vregs(), vec![cb_table], "condition should reference cb_table vreg");
+            assert_eq!(
+                cond.vregs(),
+                vec![cb_table],
+                "condition should reference cb_table vreg"
+            );
             match action {
                 GprBranchAction::Skip(n) => assert_eq!(*n, 4, "should skip 4 instructions"),
                 other => panic!("expected Skip action, got {:?}", other),
@@ -1780,18 +2233,26 @@ mod tests {
         });
 
         // Assert: instruction present with correct fields
-        let instr = prog.instrs.iter().find(|i| matches!(i, VmInstr::GprCondAction { .. }));
+        let instr = prog
+            .instrs
+            .iter()
+            .find(|i| matches!(i, VmInstr::GprCondAction { .. }));
         assert!(instr.is_some(), "should contain GprCondAction");
         if let Some(VmInstr::GprCondAction { cond, action }) = instr {
             match cond {
                 GprCondition::CmpEq(v, val) => {
                     assert_eq!(*v, layer_ctr, "condition should reference layer counter");
-                    assert_eq!(*val, anchor_layer, "condition should compare against anchor_layer");
+                    assert_eq!(
+                        *val, anchor_layer,
+                        "condition should compare against anchor_layer"
+                    );
                 }
                 other => panic!("expected CmpEq condition, got {:?}", other),
             }
             match action {
-                GprBranchAction::Exit(v) => assert_eq!(*v, output_ptr, "exit should use output_ptr"),
+                GprBranchAction::Exit(v) => {
+                    assert_eq!(*v, output_ptr, "exit should use output_ptr")
+                }
                 other => panic!("expected Exit action, got {:?}", other),
             }
         }
@@ -1806,9 +2267,18 @@ mod tests {
         let mut prog = VmProgram::new();
         let mode_reg = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         let targets = vec![
-            JumpTarget { expert_id: 0, instr_index: 0 },
-            JumpTarget { expert_id: 1, instr_index: 0 },
-            JumpTarget { expert_id: 2, instr_index: 0 },
+            JumpTarget {
+                expert_id: 0,
+                instr_index: 0,
+            },
+            JumpTarget {
+                expert_id: 1,
+                instr_index: 0,
+            },
+            JumpTarget {
+                expert_id: 2,
+                instr_index: 0,
+            },
         ];
 
         // Act
@@ -1818,7 +2288,10 @@ mod tests {
         });
 
         // Assert
-        let instr = prog.instrs.iter().find(|i| matches!(i, VmInstr::IndirectJump { .. }));
+        let instr = prog
+            .instrs
+            .iter()
+            .find(|i| matches!(i, VmInstr::IndirectJump { .. }));
         assert!(instr.is_some(), "should contain IndirectJump");
         if let Some(VmInstr::IndirectJump { index, targets: t }) = instr {
             assert_eq!(*index, mode_reg, "index should be mode_reg");
@@ -1839,14 +2312,22 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
 
         prog.emit(VmInstr::Argmax {
-            dst, logits_ptr, vocab_bytes: 32000 * 4, width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            dst,
+            logits_ptr,
+            vocab_bytes: 32000 * 4,
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
         });
 
         // Act
         let result = prog.validate_type_consistency();
 
         // Assert: well-typed Argmax should pass
-        assert!(result.is_ok(), "Argmax with correct types should pass, got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Argmax with correct types should pass, got: {:?}",
+            result
+        );
     }
 
     // ── Test 89: Argmax rejects Vec-typed logits_ptr ──
@@ -1859,17 +2340,27 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
 
         prog.emit(VmInstr::Argmax {
-            dst, logits_ptr: bad_logits_ptr, vocab_bytes: 256, width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            dst,
+            logits_ptr: bad_logits_ptr,
+            vocab_bytes: 256,
+            width: SimdWidth::W256,
+            dtype: QuantPrecision::F32,
         });
 
         // Act
         let result = prog.validate_type_consistency();
 
         // Assert
-        assert!(result.is_err(), "Argmax with Vec logits_ptr should fail type check");
+        assert!(
+            result.is_err(),
+            "Argmax with Vec logits_ptr should fail type check"
+        );
         let err = result.unwrap_err();
-        assert!(err.contains("Argmax") && err.contains("logits_ptr"),
-                "error should mention Argmax and logits_ptr, got: {}", err);
+        assert!(
+            err.contains("Argmax") && err.contains("logits_ptr"),
+            "error should mention Argmax and logits_ptr, got: {}",
+            err
+        );
     }
 
     // ── Test 90: StoreToken instruction type consistency validation ──
@@ -1886,14 +2377,22 @@ mod tests {
         let prompt_len_bytes = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         prog.emit(VmInstr::StoreToken {
-            token_id, output_buf, counter, input_ids_ptr, prompt_len_bytes,
+            token_id,
+            output_buf,
+            counter,
+            input_ids_ptr,
+            prompt_len_bytes,
         });
 
         // Act
         let result = prog.validate_type_consistency();
 
         // Assert: well-typed StoreToken should pass
-        assert!(result.is_ok(), "StoreToken with correct types should pass, got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "StoreToken with correct types should pass, got: {:?}",
+            result
+        );
     }
 
     // ── Test 91: CheckStopCondition instruction type consistency validation ──
@@ -1909,14 +2408,21 @@ mod tests {
         let max_tokens_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         prog.emit(VmInstr::CheckStopCondition {
-            token_id, counter, eos_ptr, max_tokens_ptr,
+            token_id,
+            counter,
+            eos_ptr,
+            max_tokens_ptr,
         });
 
         // Act
         let result = prog.validate_type_consistency();
 
         // Assert: well-typed CheckStopCondition should pass
-        assert!(result.is_ok(), "CheckStopCondition with correct types should pass, got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "CheckStopCondition with correct types should pass, got: {:?}",
+            result
+        );
     }
 
     // ── Test 92: CheckStopCondition rejects Vec-typed eos_ptr ──
@@ -1931,17 +2437,26 @@ mod tests {
         let max_tokens_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         prog.emit(VmInstr::CheckStopCondition {
-            token_id, counter, eos_ptr: bad_eos_ptr, max_tokens_ptr,
+            token_id,
+            counter,
+            eos_ptr: bad_eos_ptr,
+            max_tokens_ptr,
         });
 
         // Act
         let result = prog.validate_type_consistency();
 
         // Assert
-        assert!(result.is_err(), "CheckStopCondition with Vec eos_ptr should fail type check");
+        assert!(
+            result.is_err(),
+            "CheckStopCondition with Vec eos_ptr should fail type check"
+        );
         let err = result.unwrap_err();
-        assert!(err.contains("eos_ptr"),
-                "error should mention eos_ptr, got: {}", err);
+        assert!(
+            err.contains("eos_ptr"),
+            "error should mention eos_ptr, got: {}",
+            err
+        );
     }
 
     // ── Test 93: ConditionalSkip emission and provenance validation ──
@@ -1954,20 +2469,46 @@ mod tests {
         let mask = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
         // Act: emit a gate-skip pattern (ConditionalSkip + some body + more)
-        prog.emit(VmInstr::ConditionalSkip { mask, skip_count: 2 });
+        prog.emit(VmInstr::ConditionalSkip {
+            mask,
+            skip_count: 2,
+        });
         // Simulated body that would be skipped (2 instructions)
         let v = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        prog.emit(VmInstr::VecBinOp { dst: v, a: v, b: v, op: VecOp::Add, dtype: QuantPrecision::F32 });
-        prog.emit(VmInstr::VecBinOp { dst: v, a: v, b: v, op: VecOp::Mul, dtype: QuantPrecision::F32 });
+        prog.emit(VmInstr::VecBinOp {
+            dst: v,
+            a: v,
+            b: v,
+            op: VecOp::Add,
+            dtype: QuantPrecision::F32,
+        });
+        prog.emit(VmInstr::VecBinOp {
+            dst: v,
+            a: v,
+            b: v,
+            op: VecOp::Mul,
+            dtype: QuantPrecision::F32,
+        });
 
         // Assert: provenance check passes
         let result = prog.validate_provenance();
-        assert!(result.is_ok(), "ConditionalSkip with declared mask should pass provenance, got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "ConditionalSkip with declared mask should pass provenance, got: {:?}",
+            result
+        );
 
         // Verify the ConditionalSkip instruction is present with correct skip_count
-        let skip_instr = prog.instrs.iter().find(|i| matches!(i, VmInstr::ConditionalSkip { .. }));
+        let skip_instr = prog
+            .instrs
+            .iter()
+            .find(|i| matches!(i, VmInstr::ConditionalSkip { .. }));
         assert!(skip_instr.is_some(), "should contain ConditionalSkip");
-        if let Some(VmInstr::ConditionalSkip { mask: m, skip_count }) = skip_instr {
+        if let Some(VmInstr::ConditionalSkip {
+            mask: m,
+            skip_count,
+        }) = skip_instr
+        {
             assert_eq!(*m, mask, "mask should be the declared Vec vreg");
             assert_eq!(*skip_count, 2, "should skip 2 instructions");
         }
@@ -1990,18 +2531,25 @@ mod tests {
         let remapped_action = action.clone().remap(|v| VRegId(v.0 + 100));
 
         // Assert: remapping propagates to inner VRegIds
-        assert_eq!(remapped_cond.vregs(), vec![VRegId(105)],
-                   "IsNull condition vreg should be remapped");
+        assert_eq!(
+            remapped_cond.vregs(),
+            vec![VRegId(105)],
+            "IsNull condition vreg should be remapped"
+        );
         match remapped_action {
-            GprBranchAction::Exit(v) => assert_eq!(v, VRegId(110),
-                "Exit action vreg should be remapped"),
+            GprBranchAction::Exit(v) => {
+                assert_eq!(v, VRegId(110), "Exit action vreg should be remapped")
+            }
             other => panic!("expected Exit, got {:?}", other),
         }
 
         // Original Skip action has no vregs to remap
         let skip_action = GprBranchAction::Skip(3);
-        assert_eq!(skip_action.vregs(), Vec::<VRegId>::new(),
-                   "Skip action has no vreg references");
+        assert_eq!(
+            skip_action.vregs(),
+            Vec::<VRegId>::new(),
+            "Skip action has no vreg references"
+        );
         let remapped_skip = skip_action.clone().remap(|v| VRegId(v.0 + 100));
         match remapped_skip {
             GprBranchAction::Skip(n) => assert_eq!(n, 3, "Skip count unchanged by remap"),
@@ -2032,29 +2580,52 @@ mod tests {
         });
 
         // Assert: both HotpatchSlot instructions present with correct slot IDs
-        let hotpatches: Vec<&VmInstr> = prog.instrs.iter()
+        let hotpatches: Vec<&VmInstr> = prog
+            .instrs
+            .iter()
             .filter_map(|i| match i {
                 VmInstr::HotpatchSlot { .. } => Some(i),
                 _ => None,
             })
             .collect();
-        assert_eq!(hotpatches.len(), 2, "should have 2 HotpatchSlot instructions");
+        assert_eq!(
+            hotpatches.len(),
+            2,
+            "should have 2 HotpatchSlot instructions"
+        );
 
-        if let VmInstr::HotpatchSlot { slot_id, initial_target, alternatives } = hotpatches[0] {
+        if let VmInstr::HotpatchSlot {
+            slot_id,
+            initial_target,
+            alternatives,
+        } = hotpatches[0]
+        {
             assert_eq!(*slot_id, 0, "first hotpatch should use slot 0");
             match initial_target {
                 HotpatchTarget::InstrIndex(idx) => assert_eq!(*idx, 42),
                 other => panic!("expected InstrIndex, got {:?}", other),
             }
-            assert!(alternatives.is_empty(), "first slot should have no alternatives");
+            assert!(
+                alternatives.is_empty(),
+                "first slot should have no alternatives"
+            );
         }
-        if let VmInstr::HotpatchSlot { slot_id, initial_target, alternatives } = hotpatches[1] {
+        if let VmInstr::HotpatchSlot {
+            slot_id,
+            initial_target,
+            alternatives,
+        } = hotpatches[1]
+        {
             assert_eq!(*slot_id, 1, "second hotpatch should use slot 1");
             match initial_target {
                 HotpatchTarget::InstrIndex(idx) => assert_eq!(*idx, 100),
                 other => panic!("expected InstrIndex, got {:?}", other),
             }
-            assert_eq!(alternatives.len(), 1, "second slot should have 1 alternative");
+            assert_eq!(
+                alternatives.len(),
+                1,
+                "second slot should have 1 alternative"
+            );
             match &alternatives[0] {
                 HotpatchTarget::ExternalAddr(addr) => assert_eq!(*addr, 0x1000),
                 other => panic!("expected ExternalAddr, got {:?}", other),
@@ -2101,7 +2672,10 @@ mod tests {
         // Arrange: minimal dispatch table with just one target
         let mut prog = VmProgram::new();
         let index_reg = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        let single_target = vec![JumpTarget { expert_id: 0, instr_index: 256 }];
+        let single_target = vec![JumpTarget {
+            expert_id: 0,
+            instr_index: 256,
+        }];
 
         // Act
         prog.emit(VmInstr::IndirectJump {
@@ -2110,7 +2684,10 @@ mod tests {
         });
 
         // Assert
-        let instr = prog.instrs.iter().find(|i| matches!(i, VmInstr::IndirectJump { .. }));
+        let instr = prog
+            .instrs
+            .iter()
+            .find(|i| matches!(i, VmInstr::IndirectJump { .. }));
         assert!(instr.is_some(), "should contain IndirectJump");
         if let Some(VmInstr::IndirectJump { index, targets }) = instr {
             assert_eq!(*index, index_reg);
@@ -2126,9 +2703,18 @@ mod tests {
         // Arrange: JumpTarget is used in IndirectJump dispatch tables.
         // expert_id identifies the dispatch target (e.g., MoE expert, kernel variant).
         // instr_index is the instruction offset within that target's code.
-        let t1 = JumpTarget { expert_id: 0, instr_index: 100 };
-        let t2 = JumpTarget { expert_id: 0, instr_index: 200 }; // same expert, different offset
-        let t3 = JumpTarget { expert_id: 1, instr_index: 100 }; // different expert, same offset
+        let t1 = JumpTarget {
+            expert_id: 0,
+            instr_index: 100,
+        };
+        let t2 = JumpTarget {
+            expert_id: 0,
+            instr_index: 200,
+        }; // same expert, different offset
+        let t3 = JumpTarget {
+            expert_id: 1,
+            instr_index: 100,
+        }; // different expert, same offset
 
         // Act & Assert: verify field independence through direct field access
         assert_eq!(t1.expert_id, t2.expert_id, "same expert_id");
@@ -2159,7 +2745,10 @@ mod tests {
         });
 
         // Assert
-        let instr = prog.instrs.iter().find(|i| matches!(i, VmInstr::GprCondAction { .. }));
+        let instr = prog
+            .instrs
+            .iter()
+            .find(|i| matches!(i, VmInstr::GprCondAction { .. }));
         assert!(instr.is_some());
         if let Some(VmInstr::GprCondAction { cond, action }) = instr {
             match cond {
@@ -2193,7 +2782,10 @@ mod tests {
         });
 
         // Assert
-        let instr = prog.instrs.iter().find(|i| matches!(i, VmInstr::GprCondAction { .. }));
+        let instr = prog
+            .instrs
+            .iter()
+            .find(|i| matches!(i, VmInstr::GprCondAction { .. }));
         assert!(instr.is_some());
         if let Some(VmInstr::GprCondAction { cond, action }) = instr {
             match cond {
@@ -2228,7 +2820,10 @@ mod tests {
         });
 
         // Assert
-        let instr = prog.instrs.iter().find(|i| matches!(i, VmInstr::GprCondAction { .. }));
+        let instr = prog
+            .instrs
+            .iter()
+            .find(|i| matches!(i, VmInstr::GprCondAction { .. }));
         assert!(instr.is_some());
         if let Some(VmInstr::GprCondAction { cond, action }) = instr {
             match cond {
@@ -2261,13 +2856,23 @@ mod tests {
 
         // Assert: provenance should pass since mask is declared
         let result = prog.validate_provenance();
-        assert!(result.is_ok(),
-                "ConditionalSkip with declared mask should pass provenance, got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "ConditionalSkip with declared mask should pass provenance, got: {:?}",
+            result
+        );
 
         // Verify instruction was emitted correctly
-        let instr = prog.instrs.iter().find(|i| matches!(i, VmInstr::ConditionalSkip { .. }));
+        let instr = prog
+            .instrs
+            .iter()
+            .find(|i| matches!(i, VmInstr::ConditionalSkip { .. }));
         assert!(instr.is_some());
-        if let Some(VmInstr::ConditionalSkip { mask: m, skip_count }) = instr {
+        if let Some(VmInstr::ConditionalSkip {
+            mask: m,
+            skip_count,
+        }) = instr
+        {
             assert_eq!(*m, mask);
             assert_eq!(*skip_count, 2);
         }
@@ -2281,8 +2886,14 @@ mod tests {
         let mut prog = VmProgram::new();
         let valid_index = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         let targets = vec![
-            JumpTarget { expert_id: 0, instr_index: 0 },
-            JumpTarget { expert_id: 1, instr_index: 64 },
+            JumpTarget {
+                expert_id: 0,
+                instr_index: 0,
+            },
+            JumpTarget {
+                expert_id: 1,
+                instr_index: 64,
+            },
         ];
 
         // Act
@@ -2293,8 +2904,11 @@ mod tests {
 
         // Assert: provenance passes with declared index
         let result = prog.validate_provenance();
-        assert!(result.is_ok(),
-                "IndirectJump with declared index should pass provenance, got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "IndirectJump with declared index should pass provenance, got: {:?}",
+            result
+        );
     }
 
     // ── Test 104: IndirectJump with multi-expert dispatch table preserves order ──
@@ -2306,10 +2920,22 @@ mod tests {
         let mut prog = VmProgram::new();
         let index_reg = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         let targets = vec![
-            JumpTarget { expert_id: 0, instr_index: 10 },
-            JumpTarget { expert_id: 1, instr_index: 20 },
-            JumpTarget { expert_id: 2, instr_index: 30 },
-            JumpTarget { expert_id: 3, instr_index: 40 },
+            JumpTarget {
+                expert_id: 0,
+                instr_index: 10,
+            },
+            JumpTarget {
+                expert_id: 1,
+                instr_index: 20,
+            },
+            JumpTarget {
+                expert_id: 2,
+                instr_index: 30,
+            },
+            JumpTarget {
+                expert_id: 3,
+                instr_index: 40,
+            },
         ];
 
         // Act
@@ -2319,17 +2945,28 @@ mod tests {
         });
 
         // Assert: targets preserved in insertion order
-        let instr = prog.instrs.iter().find(|i| matches!(i, VmInstr::IndirectJump { .. }));
+        let instr = prog
+            .instrs
+            .iter()
+            .find(|i| matches!(i, VmInstr::IndirectJump { .. }));
         assert!(instr.is_some());
         if let Some(VmInstr::IndirectJump { index, targets: t }) = instr {
             assert_eq!(*index, index_reg);
             assert_eq!(t.len(), 4, "should have 4 targets");
             // Verify order is preserved
             for (i, target) in t.iter().enumerate() {
-                assert_eq!(target.expert_id, i,
-                           "expert_id at position {} should be {}", i, i);
-                assert_eq!(target.instr_index, (i + 1) * 10,
-                           "instr_index at position {} should be {}", i, (i + 1) * 10);
+                assert_eq!(
+                    target.expert_id, i,
+                    "expert_id at position {} should be {}",
+                    i, i
+                );
+                assert_eq!(
+                    target.instr_index,
+                    (i + 1) * 10,
+                    "instr_index at position {} should be {}",
+                    i,
+                    (i + 1) * 10
+                );
             }
         }
     }
@@ -2363,13 +3000,24 @@ mod tests {
 
         // Assert: provenance passes with declared dst + layer_idx_reg
         let result = prog.validate_provenance();
-        assert!(result.is_ok(),
-                "LoadLayerWeightOffset with declared vregs should pass provenance, got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "LoadLayerWeightOffset with declared vregs should pass provenance, got: {:?}",
+            result
+        );
 
         // Assert: fields round-trip
-        let instr = prog.instrs.iter().find(|i| matches!(i, VmInstr::LoadLayerWeightOffset { .. }));
+        let instr = prog
+            .instrs
+            .iter()
+            .find(|i| matches!(i, VmInstr::LoadLayerWeightOffset { .. }));
         assert!(instr.is_some(), "LoadLayerWeightOffset must be emitted");
-        if let Some(VmInstr::LoadLayerWeightOffset { dst: d, offset_table: t, layer_idx_reg: li }) = instr {
+        if let Some(VmInstr::LoadLayerWeightOffset {
+            dst: d,
+            offset_table: t,
+            layer_idx_reg: li,
+        }) = instr
+        {
             assert_eq!(*d, dst, "dst must round-trip");
             assert_eq!(*li, layer_idx, "layer_idx_reg must round-trip");
             assert_eq!(t, &offset_table, "offset_table must round-trip");
@@ -2393,11 +3041,21 @@ mod tests {
             offset_table: vec![0, 200, 380, 580],
             layer_idx_reg: layer_idx,
         });
-        let instr = prog.instrs.iter().find(|i| matches!(i, VmInstr::LoadLayerWeightOffset { .. })).unwrap();
+        let instr = prog
+            .instrs
+            .iter()
+            .find(|i| matches!(i, VmInstr::LoadLayerWeightOffset { .. }))
+            .unwrap();
         let vregs = RegAllocator::referenced_vregs(instr);
-        assert!(vregs.contains(&layer_idx),
-                "LoadLayerWeightOffset must read layer_idx_reg, vregs={:?}", vregs);
-        assert!(vregs.contains(&dst),
-                "LoadLayerWeightOffset must write dst, vregs={:?}", vregs);
+        assert!(
+            vregs.contains(&layer_idx),
+            "LoadLayerWeightOffset must read layer_idx_reg, vregs={:?}",
+            vregs
+        );
+        assert!(
+            vregs.contains(&dst),
+            "LoadLayerWeightOffset must write dst, vregs={:?}",
+            vregs
+        );
     }
 }

@@ -65,7 +65,10 @@ impl JitSourceMap {
             let label = e.source.debug_label.as_deref().unwrap_or("?");
             let phase = &e.source.phase;
             let op = e.source.op_label.as_deref().unwrap_or("-");
-            out.push_str(&format!("0x{:06x}  [{:>12}]  {}  ({})\n", e.code_offset, phase, label, op));
+            out.push_str(&format!(
+                "0x{:06x}  [{:>12}]  {}  ({})\n",
+                e.code_offset, phase, label, op
+            ));
         }
         out
     }
@@ -120,7 +123,9 @@ impl VmInstrOffsetMap {
     /// 用于崩溃诊断: 已知崩溃 RIP 相对偏移 → 查此 map → 定位崩溃 VmInstr。
     pub fn lookup_byte_offset(&self, byte_off: u32) -> Option<usize> {
         // entries 按 start_byte_off 排序, 二分找最后一个 start_byte_off <= byte_off 的 entry。
-        let idx = self.entries.partition_point(|e| e.start_byte_off <= byte_off);
+        let idx = self
+            .entries
+            .partition_point(|e| e.start_byte_off <= byte_off);
         if idx == 0 {
             return None;
         }
@@ -192,9 +197,13 @@ impl ConstPoolAudit {
 
     /// 序列化为人类可读的文本格式 (诊断 dump 用)。
     pub fn to_text(&self) -> String {
-        let mut out = String::with_capacity(512 + self.entries.len() * 64 + self.rip_refs.len() * 80);
-        out.push_str(&format!("=== ConstPool/DataTables Audit ({} entries, {} rip-refs) ===\n",
-            self.entries.len(), self.rip_refs.len()));
+        let mut out =
+            String::with_capacity(512 + self.entries.len() * 64 + self.rip_refs.len() * 80);
+        out.push_str(&format!(
+            "=== ConstPool/DataTables Audit ({} entries, {} rip-refs) ===\n",
+            self.entries.len(),
+            self.rip_refs.len()
+        ));
         for e in &self.entries {
             out.push_str(&format!(
                 "  [{}:{}] offset=0x{:06x} size={}\n",
@@ -289,9 +298,15 @@ mod tests {
         let text = map.to_text();
 
         assert!(text.contains("0x0000ab"), "hex offset formatted: {text}");
-        assert!(text.contains("[     prefill]"), "phase right-aligned in 12-char field: {text}");
+        assert!(
+            text.contains("[     prefill]"),
+            "phase right-aligned in 12-char field: {text}"
+        );
         assert!(text.contains("q_proj"), "debug label present: {text}");
-        assert!(text.contains("(-)"), "op_label None renders as dash: {text}");
+        assert!(
+            text.contains("(-)"),
+            "op_label None renders as dash: {text}"
+        );
         assert!(text.ends_with('\n'), "line ends with newline: {text}");
     }
 
@@ -414,7 +429,10 @@ mod tests {
         });
 
         let text = map.to_text();
-        assert!(text.contains("L0.q_proj"), "op_label should appear in text output");
+        assert!(
+            text.contains("L0.q_proj"),
+            "op_label should appear in text output"
+        );
         assert!(text.contains("bp_rope"), "debug_label should appear");
     }
 
@@ -428,9 +446,18 @@ mod tests {
         map.sort_by_offset();
 
         // Verify data integrity after sort
-        assert_eq!(map.entries[0].source.debug_label.as_deref(), Some("first_entry"));
-        assert_eq!(map.entries[1].source.debug_label.as_deref(), Some("second_entry"));
-        assert_eq!(map.entries[2].source.debug_label.as_deref(), Some("third_entry"));
+        assert_eq!(
+            map.entries[0].source.debug_label.as_deref(),
+            Some("first_entry")
+        );
+        assert_eq!(
+            map.entries[1].source.debug_label.as_deref(),
+            Some("second_entry")
+        );
+        assert_eq!(
+            map.entries[2].source.debug_label.as_deref(),
+            Some("third_entry")
+        );
     }
 
     #[test]
@@ -472,7 +499,10 @@ mod tests {
         // debug_label None => "?", op_label None => "-"
         assert!(text.contains("?"), "None debug_label renders as ?");
         assert!(text.contains("(-)"), "None op_label renders as -");
-        assert!(text.contains("[        init]"), "phase 'init' in 12-char field");
+        assert!(
+            text.contains("[        init]"),
+            "phase 'init' in 12-char field"
+        );
     }
 
     #[test]
@@ -620,9 +650,18 @@ mod tests {
 
         let text = map.to_text();
 
-        assert!(text.contains("VmInstr[  42]"), "vm_instr_index formatted: {text}");
-        assert!(text.contains("0x001a3f-0x001a4c"), "byte range formatted: {text}");
-        assert!(text.contains("Q5KDecodeStep"), "instr_debug present: {text}");
+        assert!(
+            text.contains("VmInstr[  42]"),
+            "vm_instr_index formatted: {text}"
+        );
+        assert!(
+            text.contains("0x001a3f-0x001a4c"),
+            "byte range formatted: {text}"
+        );
+        assert!(
+            text.contains("Q5KDecodeStep"),
+            "instr_debug present: {text}"
+        );
     }
 
     #[test]
@@ -673,12 +712,18 @@ mod tests {
 
         let text = audit.to_text();
 
-        assert!(text.contains("ConstPool/DataTables Audit"), "header present: {text}");
+        assert!(
+            text.contains("ConstPool/DataTables Audit"),
+            "header present: {text}"
+        );
         assert!(text.contains("1 entries"), "entry count: {text}");
         assert!(text.contains("1 rip-refs"), "rip-ref count: {text}");
         assert!(text.contains("const_pool:0"), "table kind+index: {text}");
         assert!(text.contains("offset=0x001000"), "entry offset: {text}");
-        assert!(text.contains("instr@0x000500"), "rip-ref instr offset: {text}");
+        assert!(
+            text.contains("instr@0x000500"),
+            "rip-ref instr offset: {text}"
+        );
         assert!(text.contains("target=0x001000"), "rip-ref target: {text}");
     }
 

@@ -3,8 +3,8 @@
 //! 提供 side-channel copy、SIMD injection、logit write-back 等
 //! 常见模式的符号化构造方法，消除手工 VmInstr 序列中的计算错误。
 
-use super::instr::*;
 use super::auto_select;
+use super::instr::*;
 use crate::compiler::trace::{QuantPrecision, TraceOp, ValueId};
 use crate::types::CompilerError;
 
@@ -41,18 +41,23 @@ impl StructuralOpBuilder {
         });
         let vec = prog.alloc_vreg(VRegKind::Vec, width);
         prog.emit(VmInstr::VecLoad {
-            dst: vec, base: src_base,
-            offset: OffsetExpr::LoopOffset(byte_off), width,
-            dtype, predicate: None,
+            dst: vec,
+            base: src_base,
+            offset: OffsetExpr::LoopOffset(byte_off),
+            width,
+            dtype,
+            predicate: None,
         });
         prog.emit(VmInstr::VecStore {
-            base: dst_base, src: vec,
+            base: dst_base,
+            src: vec,
             offset: OffsetExpr::Add(
                 Box::new(OffsetExpr::Const(dst_offset * elem_bytes)),
                 Box::new(OffsetExpr::LoopOffset(byte_off)),
             ),
             width,
-            dtype, predicate: None,
+            dtype,
+            predicate: None,
         });
         prog.emit(VmInstr::LoopEnd);
         Ok(())
@@ -87,13 +92,15 @@ impl StructuralOpBuilder {
         // Load knowledge_vector
         let kv_vec = prog.alloc_vreg(VRegKind::Vec, width);
         prog.emit(VmInstr::VecLoad {
-            dst: kv_vec, base: knowledge_base,
+            dst: kv_vec,
+            base: knowledge_base,
             offset: OffsetExpr::Add(
                 Box::new(OffsetExpr::Const(kv_offset)),
                 Box::new(OffsetExpr::LoopOffset(byte_off)),
             ),
             width,
-            dtype, predicate: None,
+            dtype,
+            predicate: None,
         });
         // Broadcast confidence
         let conf_bc = prog.alloc_vreg(VRegKind::Vec, width);
@@ -106,26 +113,39 @@ impl StructuralOpBuilder {
         // conf * kv + hidden (FMA via auto_lower_trace_raw)
         let hidden_vec = prog.alloc_vreg(VRegKind::Vec, width);
         prog.emit(VmInstr::VecLoad {
-            dst: hidden_vec, base: hidden_base,
-            offset: OffsetExpr::LoopOffset(byte_off), width,
-            dtype, predicate: None,
+            dst: hidden_vec,
+            base: hidden_base,
+            offset: OffsetExpr::LoopOffset(byte_off),
+            width,
+            dtype,
+            predicate: None,
         });
         let fma_body = [
-            TraceOp::Input(0),  // conf_bc (slot 0)
-            TraceOp::Input(1),  // kv_vec (slot 1)
+            TraceOp::Input(0),                    // conf_bc (slot 0)
+            TraceOp::Input(1),                    // kv_vec (slot 1)
             TraceOp::Mul(ValueId(0), ValueId(1)), // slot 2 = conf * kv
-            TraceOp::Input(2),  // hidden_vec (slot 3)
+            TraceOp::Input(2),                    // hidden_vec (slot 3)
             TraceOp::Add(ValueId(2), ValueId(3)), // slot 4 = hidden + conf*kv
         ];
         let fma_slots = auto_select::auto_lower_trace_raw(
-            prog, &fma_body, &[conf_bc, kv_vec, hidden_vec], width, dtype)?;
-        let result = *fma_slots.last().ok_or_else(|| CompilerError::CodegenViolation(
-            "emit_simd_injection: auto_lower_trace_raw returned empty".into(),
-        ))?;
+            prog,
+            &fma_body,
+            &[conf_bc, kv_vec, hidden_vec],
+            width,
+            dtype,
+        )?;
+        let result = *fma_slots.last().ok_or_else(|| {
+            CompilerError::CodegenViolation(
+                "emit_simd_injection: auto_lower_trace_raw returned empty".into(),
+            )
+        })?;
         prog.emit(VmInstr::VecStore {
-            base: hidden_base, src: result,
-            offset: OffsetExpr::LoopOffset(byte_off), width,
-            dtype, predicate: None,
+            base: hidden_base,
+            src: result,
+            offset: OffsetExpr::LoopOffset(byte_off),
+            width,
+            dtype,
+            predicate: None,
         });
         prog.emit(VmInstr::LoopEnd);
         Ok(())
@@ -144,11 +164,13 @@ impl StructuralOpBuilder {
             let out_byte_offset = i * 4;
             let logit_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
             prog.emit(VmInstr::ScalarLoad {
-                dst: logit_val, base: logits_base,
+                dst: logit_val,
+                base: logits_base,
                 offset: OffsetExpr::Const(byte_offset),
             });
             prog.emit(VmInstr::ScalarStore {
-                base: output_base, src: logit_val,
+                base: output_base,
+                src: logit_val,
                 offset: OffsetExpr::Const(out_byte_offset),
             });
         }
@@ -225,9 +247,7 @@ impl StructuralOpBuilder {
         });
         // Step 3: side-channel copy src → dst (hidden_dim elements)
         eprintln!("[CAP-EMIT] emit_layer_capture_copy: src_ptr={:?} capture_base={:?} counter={:?} stride={} hidden={}", src_ptr, capture_base, layer_loop_counter, per_layer_stride, hidden_dim);
-        Self::emit_side_channel_copy(
-            prog, src_ptr, dst_ptr, 0, hidden_dim, width, dtype,
-        )?;
+        Self::emit_side_channel_copy(prog, src_ptr, dst_ptr, 0, hidden_dim, width, dtype)?;
         Ok(())
     }
 }
@@ -246,13 +266,29 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog, src, dst, 0, 16, SimdWidth::W256, QuantPrecision::F32
-        ).unwrap();
+            &mut prog,
+            src,
+            dst,
+            0,
+            16,
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Should have: LoopBegin, VecLoad, VecStore, LoopEnd
-        let has_loop_begin = prog.instrs.iter().any(|i| matches!(i, VmInstr::LoopBegin { .. }));
-        let has_vec_load = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecLoad { .. }));
-        let has_vec_store = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecStore { .. }));
+        let has_loop_begin = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::LoopBegin { .. }));
+        let has_vec_load = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecLoad { .. }));
+        let has_vec_store = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecStore { .. }));
         let has_loop_end = prog.instrs.iter().any(|i| matches!(i, VmInstr::LoopEnd));
 
         assert!(has_loop_begin, "should emit LoopBegin");
@@ -270,14 +306,28 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog, src, dst, 4096, 32, SimdWidth::W256, QuantPrecision::F32
-        ).unwrap();
+            &mut prog,
+            src,
+            dst,
+            4096,
+            32,
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
-        let store = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::VecStore { offset, .. } => Some(offset.clone()),
-            _ => None,
-        }).expect("should have VecStore");
-        assert!(matches!(store, OffsetExpr::Add(_, _)), "store offset should be Add(Const, LoopOffset)");
+        let store = prog
+            .instrs
+            .iter()
+            .find_map(|i| match i {
+                VmInstr::VecStore { offset, .. } => Some(offset.clone()),
+                _ => None,
+            })
+            .expect("should have VecStore");
+        assert!(
+            matches!(store, OffsetExpr::Add(_, _)),
+            "store offset should be Add(Const, LoopOffset)"
+        );
     }
 
     // ── 3. emit_side_channel_copy hidden_dim=1 scalar ────────────────
@@ -289,11 +339,21 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog, src, dst, 0, 1, SimdWidth::Scalar, QuantPrecision::F32
-        ).unwrap();
+            &mut prog,
+            src,
+            dst,
+            0,
+            1,
+            SimdWidth::Scalar,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // 1 element with scalar width = 1 iteration
-        assert!(prog.instrs.len() >= 4, "should have at least 4 instructions for single element copy");
+        assert!(
+            prog.instrs.len() >= 4,
+            "should have at least 4 instructions for single element copy"
+        );
     }
 
     // ── 4. emit_simd_injection basic structure ────────────────────────
@@ -305,11 +365,25 @@ mod tests {
         let knowledge = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_simd_injection(
-            &mut prog, hidden, knowledge, 0, 0, 8, SimdWidth::W256, QuantPrecision::F32
-        ).unwrap();
+            &mut prog,
+            hidden,
+            knowledge,
+            0,
+            0,
+            8,
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
-        let has_broadcast = prog.instrs.iter().any(|i| matches!(i, VmInstr::Broadcast { .. }));
-        let has_loop = prog.instrs.iter().any(|i| matches!(i, VmInstr::LoopBegin { .. }));
+        let has_broadcast = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::Broadcast { .. }));
+        let has_loop = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::LoopBegin { .. }));
         assert!(has_broadcast, "should emit Broadcast for confidence");
         assert!(has_loop, "should emit loop for hidden_dim iteration");
     }
@@ -323,15 +397,29 @@ mod tests {
         let knowledge = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_simd_injection(
-            &mut prog, hidden, knowledge, 1024, 2048, 16, SimdWidth::W256, QuantPrecision::F32
-        ).unwrap();
+            &mut prog,
+            hidden,
+            knowledge,
+            1024,
+            2048,
+            16,
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // At least one VecLoad should use an Add offset (for knowledge vector)
         let has_add_offset = prog.instrs.iter().any(|i| match i {
-            VmInstr::VecLoad { offset: OffsetExpr::Add(_, _), .. } => true,
+            VmInstr::VecLoad {
+                offset: OffsetExpr::Add(_, _),
+                ..
+            } => true,
             _ => false,
         });
-        assert!(has_add_offset, "knowledge vector load should use Add offset");
+        assert!(
+            has_add_offset,
+            "knowledge vector load should use Add offset"
+        );
     }
 
     // ── 6. emit_scalar_writeback empty indices ────────────────────────
@@ -345,7 +433,11 @@ mod tests {
 
         StructuralOpBuilder::emit_scalar_writeback(&mut prog, logits, output, &[]).unwrap();
 
-        assert_eq!(prog.instrs.len(), baseline, "empty indices should emit no new instructions");
+        assert_eq!(
+            prog.instrs.len(),
+            baseline,
+            "empty indices should emit no new instructions"
+        );
     }
 
     // ── 7. emit_scalar_writeback single index ─────────────────────────
@@ -359,10 +451,24 @@ mod tests {
         StructuralOpBuilder::emit_scalar_writeback(&mut prog, logits, output, &[42]).unwrap();
 
         // Should contain ScalarLoad with offset=42*4 and ScalarStore with offset=0
-        let has_load = prog.instrs.iter().any(|i| matches!(i,
-            VmInstr::ScalarLoad { offset: OffsetExpr::Const(168), .. }));
-        let has_store = prog.instrs.iter().any(|i| matches!(i,
-            VmInstr::ScalarStore { offset: OffsetExpr::Const(0), .. }));
+        let has_load = prog.instrs.iter().any(|i| {
+            matches!(
+                i,
+                VmInstr::ScalarLoad {
+                    offset: OffsetExpr::Const(168),
+                    ..
+                }
+            )
+        });
+        let has_store = prog.instrs.iter().any(|i| {
+            matches!(
+                i,
+                VmInstr::ScalarStore {
+                    offset: OffsetExpr::Const(0),
+                    ..
+                }
+            )
+        });
         assert!(has_load, "should have ScalarLoad at offset 168 (=42*4)");
         assert!(has_store, "should have ScalarStore at offset 0");
     }
@@ -375,19 +481,32 @@ mod tests {
         let logits = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
-        StructuralOpBuilder::emit_scalar_writeback(
-            &mut prog, logits, output, &[0, 100, 999],
-        ).unwrap();
+        StructuralOpBuilder::emit_scalar_writeback(&mut prog, logits, output, &[0, 100, 999])
+            .unwrap();
 
         // 3 ScalarLoad + 3 ScalarStore = 6 new instrs (plus DeclareVReg for logit_val)
-        let scalar_loads: Vec<_> = prog.instrs.iter().filter_map(|i| match i {
-            VmInstr::ScalarLoad { offset: OffsetExpr::Const(off), .. } => Some(*off),
-            _ => None,
-        }).collect();
-        let scalar_stores: Vec<_> = prog.instrs.iter().filter_map(|i| match i {
-            VmInstr::ScalarStore { offset: OffsetExpr::Const(off), .. } => Some(*off),
-            _ => None,
-        }).collect();
+        let scalar_loads: Vec<_> = prog
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                VmInstr::ScalarLoad {
+                    offset: OffsetExpr::Const(off),
+                    ..
+                } => Some(*off),
+                _ => None,
+            })
+            .collect();
+        let scalar_stores: Vec<_> = prog
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                VmInstr::ScalarStore {
+                    offset: OffsetExpr::Const(off),
+                    ..
+                } => Some(*off),
+                _ => None,
+            })
+            .collect();
 
         assert_eq!(scalar_loads.len(), 3, "should have 3 ScalarLoad");
         assert_eq!(scalar_stores.len(), 3, "should have 3 ScalarStore");
@@ -402,13 +521,21 @@ mod tests {
         let scratch = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let victim = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
-        StructuralOpBuilder::emit_conditional_guard(
-            &mut prog, scratch, 512, victim,
-        ).unwrap();
+        StructuralOpBuilder::emit_conditional_guard(&mut prog, scratch, 512, victim).unwrap();
 
-        let has_load = prog.instrs.iter().any(|i| matches!(i,
-            VmInstr::ScalarLoad { offset: OffsetExpr::Const(512), .. }));
-        let has_exit = prog.instrs.iter().any(|i| matches!(i, VmInstr::ConditionalExit { .. }));
+        let has_load = prog.instrs.iter().any(|i| {
+            matches!(
+                i,
+                VmInstr::ScalarLoad {
+                    offset: OffsetExpr::Const(512),
+                    ..
+                }
+            )
+        });
+        let has_exit = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::ConditionalExit { .. }));
 
         assert!(has_load, "should have ScalarLoad at probe_offset 512");
         assert!(has_exit, "should have ConditionalExit");
@@ -422,12 +549,17 @@ mod tests {
         let scratch = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let victim = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
-        StructuralOpBuilder::emit_conditional_guard(
-            &mut prog, scratch, 0, victim,
-        ).unwrap();
+        StructuralOpBuilder::emit_conditional_guard(&mut prog, scratch, 0, victim).unwrap();
 
-        let has_zero_load = prog.instrs.iter().any(|i| matches!(i,
-            VmInstr::ScalarLoad { offset: OffsetExpr::Const(0), .. }));
+        let has_zero_load = prog.instrs.iter().any(|i| {
+            matches!(
+                i,
+                VmInstr::ScalarLoad {
+                    offset: OffsetExpr::Const(0),
+                    ..
+                }
+            )
+        });
         assert!(has_zero_load, "should have ScalarLoad at offset 0");
     }
 
@@ -452,15 +584,32 @@ mod tests {
         let dst5 = prog_w512.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog_w256, src2, dst2, 0, 64, SimdWidth::W256, QuantPrecision::F32
-        ).unwrap();
+            &mut prog_w256,
+            src2,
+            dst2,
+            0,
+            64,
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog_w512, src5, dst5, 0, 64, SimdWidth::W512, QuantPrecision::F32
-        ).unwrap();
+            &mut prog_w512,
+            src5,
+            dst5,
+            0,
+            64,
+            SimdWidth::W512,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Same instruction count (only loop bound differs)
-        assert_eq!(prog_w256.instrs.len(), prog_w512.instrs.len(),
-            "both should have same instruction count, just different loop bounds");
+        assert_eq!(
+            prog_w256.instrs.len(),
+            prog_w512.instrs.len(),
+            "both should have same instruction count, just different loop bounds"
+        );
     }
 
     // ── 13. emit_scalar_writeback large_index_correct_offset ──────────
@@ -471,14 +620,17 @@ mod tests {
         let logits = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
-        StructuralOpBuilder::emit_scalar_writeback(
-            &mut prog, logits, output, &[u32::MAX],
-        ).unwrap();
+        StructuralOpBuilder::emit_scalar_writeback(&mut prog, logits, output, &[u32::MAX]).unwrap();
 
         let expected_offset = u32::MAX as usize * 4;
-        let has_load = prog.instrs.iter().any(|i| matches!(i,
-            VmInstr::ScalarLoad { offset: OffsetExpr::Const(off), .. } if *off == expected_offset));
-        assert!(has_load, "should have ScalarLoad at byte offset u32::MAX * 4");
+        let has_load = prog.instrs.iter().any(|i| {
+            matches!(i,
+            VmInstr::ScalarLoad { offset: OffsetExpr::Const(off), .. } if *off == expected_offset)
+        });
+        assert!(
+            has_load,
+            "should have ScalarLoad at byte offset u32::MAX * 4"
+        );
     }
 
     // ── 14. emit_side_channel_copy loop bound varies with width ──────────
@@ -495,23 +647,57 @@ mod tests {
 
         // hidden_dim=16: W128 (4 lanes) => 4 iterations, W256 (8 lanes) => 2 iterations
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog_w128, src1, dst1, 0, 16, SimdWidth::W128, QuantPrecision::F32
-        ).unwrap();
+            &mut prog_w128,
+            src1,
+            dst1,
+            0,
+            16,
+            SimdWidth::W128,
+            QuantPrecision::F32,
+        )
+        .unwrap();
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog_w256, src2, dst2, 0, 16, SimdWidth::W256, QuantPrecision::F32
-        ).unwrap();
+            &mut prog_w256,
+            src2,
+            dst2,
+            0,
+            16,
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
-        let bound_w128 = prog_w128.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(n), .. } => Some(*n),
-            _ => None,
-        }).expect("should have LoopBegin with Const bound");
-        let bound_w256 = prog_w256.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(n), .. } => Some(*n),
-            _ => None,
-        }).expect("should have LoopBegin with Const bound");
+        let bound_w128 = prog_w128
+            .instrs
+            .iter()
+            .find_map(|i| match i {
+                VmInstr::LoopBegin {
+                    bound: BoundExpr::Const(n),
+                    ..
+                } => Some(*n),
+                _ => None,
+            })
+            .expect("should have LoopBegin with Const bound");
+        let bound_w256 = prog_w256
+            .instrs
+            .iter()
+            .find_map(|i| match i {
+                VmInstr::LoopBegin {
+                    bound: BoundExpr::Const(n),
+                    ..
+                } => Some(*n),
+                _ => None,
+            })
+            .expect("should have LoopBegin with Const bound");
 
-        assert_eq!(bound_w128, 4, "W128 with dim=16 should have 4 iterations (16/4)");
-        assert_eq!(bound_w256, 2, "W256 with dim=16 should have 2 iterations (16/8)");
+        assert_eq!(
+            bound_w128, 4,
+            "W128 with dim=16 should have 4 iterations (16/4)"
+        );
+        assert_eq!(
+            bound_w256, 2,
+            "W256 with dim=16 should have 2 iterations (16/8)"
+        );
     }
 
     // ── 15. emit_side_channel_copy zero offset uses LoopOffset directly ───
@@ -523,18 +709,31 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog, src, dst, 0, 8, SimdWidth::W256, QuantPrecision::F32
-        ).unwrap();
+            &mut prog,
+            src,
+            dst,
+            0,
+            8,
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // When dst_offset=0, the store offset should be Add(Const(0), LoopOffset(_))
-        let store_offset = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::VecStore { offset, .. } => Some(offset.clone()),
-            _ => None,
-        }).expect("should have VecStore");
+        let store_offset = prog
+            .instrs
+            .iter()
+            .find_map(|i| match i {
+                VmInstr::VecStore { offset, .. } => Some(offset.clone()),
+                _ => None,
+            })
+            .expect("should have VecStore");
 
         // With dst_offset=0, it's Add(Const(0), LoopOffset(_))
-        assert!(matches!(store_offset, OffsetExpr::Add(_, _)),
-            "store offset should be Add expression even with zero dst_offset");
+        assert!(
+            matches!(store_offset, OffsetExpr::Add(_, _)),
+            "store offset should be Add expression even with zero dst_offset"
+        );
     }
 
     // ── 16. emit_simd_injection produces VecStore result ─────────────────
@@ -546,15 +745,26 @@ mod tests {
         let knowledge = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_simd_injection(
-            &mut prog, hidden, knowledge, 0, 0, 8, SimdWidth::W256, QuantPrecision::F32
-        ).unwrap();
+            &mut prog,
+            hidden,
+            knowledge,
+            0,
+            0,
+            8,
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // The final VecStore should write back to hidden_base
         let has_store_to_hidden = prog.instrs.iter().any(|i| match i {
             VmInstr::VecStore { base, .. } if *base == hidden => true,
             _ => false,
         });
-        assert!(has_store_to_hidden, "should have VecStore writing back to hidden_base");
+        assert!(
+            has_store_to_hidden,
+            "should have VecStore writing back to hidden_base"
+        );
     }
 
     // ── 17. emit_simd_injection scalar width produces correct iterations ──
@@ -567,13 +777,28 @@ mod tests {
 
         // hidden_dim=1 with Scalar width => 1 iteration
         StructuralOpBuilder::emit_simd_injection(
-            &mut prog, hidden, knowledge, 0, 0, 1, SimdWidth::Scalar, QuantPrecision::F32
-        ).unwrap();
+            &mut prog,
+            hidden,
+            knowledge,
+            0,
+            0,
+            1,
+            SimdWidth::Scalar,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
-        let bound = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(n), .. } => Some(*n),
-            _ => None,
-        }).expect("should have LoopBegin");
+        let bound = prog
+            .instrs
+            .iter()
+            .find_map(|i| match i {
+                VmInstr::LoopBegin {
+                    bound: BoundExpr::Const(n),
+                    ..
+                } => Some(*n),
+                _ => None,
+            })
+            .expect("should have LoopBegin");
         assert_eq!(bound, 1, "Scalar width with dim=1 should have 1 iteration");
     }
 
@@ -585,23 +810,35 @@ mod tests {
         let scratch = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let victim = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
-        StructuralOpBuilder::emit_conditional_guard(
-            &mut prog, scratch, 256, victim,
-        ).unwrap();
+        StructuralOpBuilder::emit_conditional_guard(&mut prog, scratch, 256, victim).unwrap();
 
         // ScalarLoad should use scratch as base
-        let load_base = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::ScalarLoad { base, .. } => Some(*base),
-            _ => None,
-        }).expect("should have ScalarLoad");
-        assert_eq!(load_base, scratch, "ScalarLoad should read from scratch_base");
+        let load_base = prog
+            .instrs
+            .iter()
+            .find_map(|i| match i {
+                VmInstr::ScalarLoad { base, .. } => Some(*base),
+                _ => None,
+            })
+            .expect("should have ScalarLoad");
+        assert_eq!(
+            load_base, scratch,
+            "ScalarLoad should read from scratch_base"
+        );
 
         // ConditionalExit should use victim as output
-        let exit_output = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::ConditionalExit { output, .. } => Some(*output),
-            _ => None,
-        }).expect("should have ConditionalExit");
-        assert_eq!(exit_output, victim, "ConditionalExit should use victim as output");
+        let exit_output = prog
+            .instrs
+            .iter()
+            .find_map(|i| match i {
+                VmInstr::ConditionalExit { output, .. } => Some(*output),
+                _ => None,
+            })
+            .expect("should have ConditionalExit");
+        assert_eq!(
+            exit_output, victim,
+            "ConditionalExit should use victim as output"
+        );
     }
 
     // ── 19. emit_side_channel_copy step_bytes matches width ──────────────
@@ -614,14 +851,30 @@ mod tests {
 
         // W512 = 16 f32 lanes = 64 bytes per step
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog, src, dst, 0, 64, SimdWidth::W512, QuantPrecision::F32
-        ).unwrap();
+            &mut prog,
+            src,
+            dst,
+            0,
+            64,
+            SimdWidth::W512,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
-        let step_bytes = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { offsets, .. } => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
-            _ => None,
-        }).expect("should have LoopBegin");
-        assert_eq!(step_bytes, 64, "W512 step_bytes should be 64 (16 lanes * 4 bytes)");
+        let step_bytes = prog
+            .instrs
+            .iter()
+            .find_map(|i| match i {
+                VmInstr::LoopBegin { offsets, .. } => offsets
+                    .first()
+                    .and_then(|offset| offset.stride.as_fixed_bytes()),
+                _ => None,
+            })
+            .expect("should have LoopBegin");
+        assert_eq!(
+            step_bytes, 64,
+            "W512 step_bytes should be 64 (16 lanes * 4 bytes)"
+        );
     }
 
     // ── 20. emit_scalar_writeback index_zero_correct_offsets ─────────────
@@ -633,17 +886,25 @@ mod tests {
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         // Index 0: load from logits+0, store to output+0
-        StructuralOpBuilder::emit_scalar_writeback(
-            &mut prog, logits, output, &[0],
-        ).unwrap();
+        StructuralOpBuilder::emit_scalar_writeback(&mut prog, logits, output, &[0]).unwrap();
 
-        let has_load_at_zero = prog.instrs.iter().any(|i| matches!(i,
-            VmInstr::ScalarLoad { base, offset: OffsetExpr::Const(0), .. } if *base == logits));
-        let has_store_at_zero = prog.instrs.iter().any(|i| matches!(i,
-            VmInstr::ScalarStore { base, offset: OffsetExpr::Const(0), .. } if *base == output));
+        let has_load_at_zero = prog.instrs.iter().any(|i| {
+            matches!(i,
+            VmInstr::ScalarLoad { base, offset: OffsetExpr::Const(0), .. } if *base == logits)
+        });
+        let has_store_at_zero = prog.instrs.iter().any(|i| {
+            matches!(i,
+            VmInstr::ScalarStore { base, offset: OffsetExpr::Const(0), .. } if *base == output)
+        });
 
-        assert!(has_load_at_zero, "should have ScalarLoad from logits at offset 0");
-        assert!(has_store_at_zero, "should have ScalarStore to output at offset 0");
+        assert!(
+            has_load_at_zero,
+            "should have ScalarLoad from logits at offset 0"
+        );
+        assert!(
+            has_store_at_zero,
+            "should have ScalarStore to output at offset 0"
+        );
     }
 
     // ── 21. emit_side_channel_copy allocates_counter_and_byte_offset ─────
@@ -655,17 +916,41 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog, src, dst, 0, 8, SimdWidth::W256, QuantPrecision::F32
-        ).unwrap();
+            &mut prog,
+            src,
+            dst,
+            0,
+            8,
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Should have DeclareVReg for Counter and ByteOffset kinds
-        let has_counter = prog.instrs.iter().any(|i| matches!(i,
-            VmInstr::DeclareVReg { kind: VRegKind::Counter, .. }));
-        let has_byte_offset = prog.instrs.iter().any(|i| matches!(i,
-            VmInstr::DeclareVReg { kind: VRegKind::ByteOffset, .. }));
+        let has_counter = prog.instrs.iter().any(|i| {
+            matches!(
+                i,
+                VmInstr::DeclareVReg {
+                    kind: VRegKind::Counter,
+                    ..
+                }
+            )
+        });
+        let has_byte_offset = prog.instrs.iter().any(|i| {
+            matches!(
+                i,
+                VmInstr::DeclareVReg {
+                    kind: VRegKind::ByteOffset,
+                    ..
+                }
+            )
+        });
 
         assert!(has_counter, "should declare a Counter VReg for the loop");
-        assert!(has_byte_offset, "should declare a ByteOffset VReg for the loop");
+        assert!(
+            has_byte_offset,
+            "should declare a ByteOffset VReg for the loop"
+        );
     }
 
     // ── 22. emit_simd_injection loop_end_present ─────────────────────────
@@ -677,20 +962,41 @@ mod tests {
         let knowledge = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_simd_injection(
-            &mut prog, hidden, knowledge, 0, 0, 8, SimdWidth::W256, QuantPrecision::F32
-        ).unwrap();
+            &mut prog,
+            hidden,
+            knowledge,
+            0,
+            0,
+            8,
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Should end with LoopEnd
         let has_loop_end = prog.instrs.iter().any(|i| matches!(i, VmInstr::LoopEnd));
-        assert!(has_loop_end, "should have LoopEnd closing the injection loop");
+        assert!(
+            has_loop_end,
+            "should have LoopEnd closing the injection loop"
+        );
 
         // Verify LoopBegin comes before LoopEnd
-        let loop_begin_idx = prog.instrs.iter().position(|i| matches!(i, VmInstr::LoopBegin { .. }));
-        let loop_end_idx = prog.instrs.iter().position(|i| matches!(i, VmInstr::LoopEnd));
-        assert!(loop_begin_idx.is_some() && loop_end_idx.is_some(),
-            "both LoopBegin and LoopEnd should exist");
-        assert!(loop_begin_idx.unwrap() < loop_end_idx.unwrap(),
-            "LoopBegin should come before LoopEnd");
+        let loop_begin_idx = prog
+            .instrs
+            .iter()
+            .position(|i| matches!(i, VmInstr::LoopBegin { .. }));
+        let loop_end_idx = prog
+            .instrs
+            .iter()
+            .position(|i| matches!(i, VmInstr::LoopEnd));
+        assert!(
+            loop_begin_idx.is_some() && loop_end_idx.is_some(),
+            "both LoopBegin and LoopEnd should exist"
+        );
+        assert!(
+            loop_begin_idx.unwrap() < loop_end_idx.unwrap(),
+            "LoopBegin should come before LoopEnd"
+        );
     }
 
     // ── 23. emit_conditional_guard emits_exactly_two_instrs ──────────────
@@ -702,13 +1008,12 @@ mod tests {
         let victim = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let baseline = prog.instrs.len();
 
-        StructuralOpBuilder::emit_conditional_guard(
-            &mut prog, scratch, 128, victim,
-        ).unwrap();
+        StructuralOpBuilder::emit_conditional_guard(&mut prog, scratch, 128, victim).unwrap();
 
         // Should emit: DeclareVReg(flag) + ScalarLoad + ConditionalExit
         // Non-DeclareVReg instructions = 2 (ScalarLoad + ConditionalExit)
-        let non_declare_count = prog.instrs[baseline..].iter()
+        let non_declare_count = prog.instrs[baseline..]
+            .iter()
             .filter(|i| !matches!(i, VmInstr::DeclareVReg { .. }))
             .count();
         assert_eq!(non_declare_count, 2,
@@ -725,13 +1030,27 @@ mod tests {
 
         // hidden_dim=9 with W128 (4 lanes) => ceil(9/4) = 3 iterations
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog, src, dst, 0, 9, SimdWidth::W128, QuantPrecision::F32
-        ).unwrap();
+            &mut prog,
+            src,
+            dst,
+            0,
+            9,
+            SimdWidth::W128,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
-        let bound = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(n), .. } => Some(*n),
-            _ => None,
-        }).expect("should have LoopBegin");
+        let bound = prog
+            .instrs
+            .iter()
+            .find_map(|i| match i {
+                VmInstr::LoopBegin {
+                    bound: BoundExpr::Const(n),
+                    ..
+                } => Some(*n),
+                _ => None,
+            })
+            .expect("should have LoopBegin");
         assert_eq!(bound, 3, "ceil(9/4) should be 3 iterations");
     }
 
@@ -745,13 +1064,28 @@ mod tests {
 
         // hidden_dim=17 with W128 (4 lanes) => ceil(17/4) = 5 iterations
         StructuralOpBuilder::emit_simd_injection(
-            &mut prog, hidden, knowledge, 0, 0, 17, SimdWidth::W128, QuantPrecision::F32
-        ).unwrap();
+            &mut prog,
+            hidden,
+            knowledge,
+            0,
+            0,
+            17,
+            SimdWidth::W128,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
-        let bound = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { bound: BoundExpr::Const(n), .. } => Some(*n),
-            _ => None,
-        }).expect("should have LoopBegin");
+        let bound = prog
+            .instrs
+            .iter()
+            .find_map(|i| match i {
+                VmInstr::LoopBegin {
+                    bound: BoundExpr::Const(n),
+                    ..
+                } => Some(*n),
+                _ => None,
+            })
+            .expect("should have LoopBegin");
         assert_eq!(bound, 5, "ceil(17/4) should be 5 iterations");
     }
 
@@ -763,17 +1097,26 @@ mod tests {
         let logits = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
-        StructuralOpBuilder::emit_scalar_writeback(
-            &mut prog, logits, output, &[10, 20, 30],
-        ).unwrap();
+        StructuralOpBuilder::emit_scalar_writeback(&mut prog, logits, output, &[10, 20, 30])
+            .unwrap();
 
-        let store_offsets: Vec<usize> = prog.instrs.iter().filter_map(|i| match i {
-            VmInstr::ScalarStore { offset: OffsetExpr::Const(off), .. } => Some(*off),
-            _ => None,
-        }).collect();
+        let store_offsets: Vec<usize> = prog
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                VmInstr::ScalarStore {
+                    offset: OffsetExpr::Const(off),
+                    ..
+                } => Some(*off),
+                _ => None,
+            })
+            .collect();
 
-        assert_eq!(store_offsets, vec![0, 4, 8],
-            "output offsets should be 0, 4, 8 for 3 sequential outputs");
+        assert_eq!(
+            store_offsets,
+            vec![0, 4, 8],
+            "output offsets should be 0, 4, 8 for 3 sequential outputs"
+        );
     }
 
     // ── 27. emit_side_channel_copy_vec_load_src_base ────────────────────────
@@ -785,19 +1128,34 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog, src, dst, 0, 8, SimdWidth::W256, QuantPrecision::F32
-        ).unwrap();
+            &mut prog,
+            src,
+            dst,
+            0,
+            8,
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
-        let load_base = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::VecLoad { base, .. } => Some(*base),
-            _ => None,
-        }).expect("should have VecLoad");
+        let load_base = prog
+            .instrs
+            .iter()
+            .find_map(|i| match i {
+                VmInstr::VecLoad { base, .. } => Some(*base),
+                _ => None,
+            })
+            .expect("should have VecLoad");
         assert_eq!(load_base, src, "VecLoad should read from src_base");
 
-        let store_base = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::VecStore { base, .. } => Some(*base),
-            _ => None,
-        }).expect("should have VecStore");
+        let store_base = prog
+            .instrs
+            .iter()
+            .find_map(|i| match i {
+                VmInstr::VecStore { base, .. } => Some(*base),
+                _ => None,
+            })
+            .expect("should have VecStore");
         assert_eq!(store_base, dst, "VecStore should write to dst_base");
     }
 
@@ -810,17 +1168,29 @@ mod tests {
         let knowledge = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_simd_injection(
-            &mut prog, hidden, knowledge, 512, 1024, 8, SimdWidth::W256, QuantPrecision::F32
-        ).unwrap();
+            &mut prog,
+            hidden,
+            knowledge,
+            512,
+            1024,
+            8,
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Broadcast should load confidence from knowledge_base at conf_offset
         let broadcast_src = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::Broadcast { src: ScalarExpr::MemLoad(base, OffsetExpr::Const(off)), .. }
-                if *off == 512 => Some(*base),
+            VmInstr::Broadcast {
+                src: ScalarExpr::MemLoad(base, OffsetExpr::Const(off)),
+                ..
+            } if *off == 512 => Some(*base),
             _ => None,
         });
-        assert!(broadcast_src.is_some(),
-            "Broadcast should load confidence from knowledge_base at conf_offset 512");
+        assert!(
+            broadcast_src.is_some(),
+            "Broadcast should load confidence from knowledge_base at conf_offset 512"
+        );
     }
 
     // ── 29. emit_side_channel_copy_w512_step_bytes ──────────────────────────
@@ -832,13 +1202,26 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog, src, dst, 0, 32, SimdWidth::W512, QuantPrecision::F32
-        ).unwrap();
+            &mut prog,
+            src,
+            dst,
+            0,
+            32,
+            SimdWidth::W512,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
-        let step_bytes = prog.instrs.iter().find_map(|i| match i {
-            VmInstr::LoopBegin { offsets, .. } => offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()),
-            _ => None,
-        }).expect("should have LoopBegin with step_bytes");
+        let step_bytes = prog
+            .instrs
+            .iter()
+            .find_map(|i| match i {
+                VmInstr::LoopBegin { offsets, .. } => offsets
+                    .first()
+                    .and_then(|offset| offset.stride.as_fixed_bytes()),
+                _ => None,
+            })
+            .expect("should have LoopBegin with step_bytes");
 
         // W512 = 16 f32 lanes * 4 bytes = 64
         assert_eq!(step_bytes, 64, "W512 step_bytes must be 64");
@@ -852,16 +1235,20 @@ mod tests {
         let scratch = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let victim = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
-        StructuralOpBuilder::emit_conditional_guard(
-            &mut prog, scratch, 64, victim,
-        ).unwrap();
+        StructuralOpBuilder::emit_conditional_guard(&mut prog, scratch, 64, victim).unwrap();
 
         let has_scalar_declare = prog.instrs.iter().any(|i| match i {
-            VmInstr::DeclareVReg { kind: VRegKind::Scalar, width: SimdWidth::Scalar, .. } => true,
+            VmInstr::DeclareVReg {
+                kind: VRegKind::Scalar,
+                width: SimdWidth::Scalar,
+                ..
+            } => true,
             _ => false,
         });
-        assert!(has_scalar_declare,
-            "conditional_guard should declare a Scalar vreg for the flag");
+        assert!(
+            has_scalar_declare,
+            "conditional_guard should declare a Scalar vreg for the flag"
+        );
     }
 
     // ── 31. emit_scalar_writeback_two_indices_correct_load_offsets ──────────
@@ -872,17 +1259,25 @@ mod tests {
         let logits = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
-        StructuralOpBuilder::emit_scalar_writeback(
-            &mut prog, logits, output, &[7, 13],
-        ).unwrap();
+        StructuralOpBuilder::emit_scalar_writeback(&mut prog, logits, output, &[7, 13]).unwrap();
 
-        let load_offsets: Vec<usize> = prog.instrs.iter().filter_map(|i| match i {
-            VmInstr::ScalarLoad { offset: OffsetExpr::Const(off), .. } => Some(*off),
-            _ => None,
-        }).collect();
+        let load_offsets: Vec<usize> = prog
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                VmInstr::ScalarLoad {
+                    offset: OffsetExpr::Const(off),
+                    ..
+                } => Some(*off),
+                _ => None,
+            })
+            .collect();
 
-        assert_eq!(load_offsets, vec![28, 52],
-            "load offsets should be 7*4=28 and 13*4=52");
+        assert_eq!(
+            load_offsets,
+            vec![28, 52],
+            "load offsets should be 7*4=28 and 13*4=52"
+        );
     }
 
     // ── 32. emit_side_channel_copy_loop_body_instruction_order ─────────────
@@ -894,8 +1289,15 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog, src, dst, 0, 8, SimdWidth::W256, QuantPrecision::F32
-        ).unwrap();
+            &mut prog,
+            src,
+            dst,
+            0,
+            8,
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Find positions: LoopBegin, first VecLoad, first VecStore, LoopEnd
         let pos = |instrs: &[VmInstr], pred: &dyn Fn(&VmInstr) -> bool| -> Option<usize> {

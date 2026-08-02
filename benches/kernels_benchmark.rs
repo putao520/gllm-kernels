@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use gllm_kernels::cpu_kernels::CpuKernels;
 use gllm_kernels::traits::Kernels;
 use half::f16;
@@ -11,7 +11,9 @@ fn rand_vec(n: usize) -> Vec<f32> {
 
 fn rand_vec_f16(n: usize) -> Vec<f16> {
     let mut rng = rand::thread_rng();
-    (0..n).map(|_| f16::from_f32(rng.gen::<f32>() * 2.0 - 1.0)).collect()
+    (0..n)
+        .map(|_| f16::from_f32(rng.gen::<f32>() * 2.0 - 1.0))
+        .collect()
 }
 
 // ============================================================
@@ -25,10 +27,10 @@ fn bench_gemv(c: &mut Criterion) {
     // Llama-7B: hidden=4096, ffn=11008
     // Llama-13B: hidden=5120, ffn=13824
     for &(m, k) in &[
-        (4096, 4096),   // Q/K/V projection
-        (4096, 11008),  // gate/up projection
-        (11008, 4096),  // down projection
-        (5120, 13824),  // Llama-13B gate/up
+        (4096, 4096),  // Q/K/V projection
+        (4096, 11008), // gate/up projection
+        (11008, 4096), // down projection
+        (5120, 13824), // Llama-13B gate/up
     ] {
         let mat = rand_vec(m * k);
         let x = rand_vec(k);
@@ -53,12 +55,12 @@ fn bench_skinny_gemm(c: &mut Criterion) {
 
     // Prefill: small batch of tokens through weight matrices
     for &(m, n, k) in &[
-        (4, 4096, 4096),    // 4-token prefill, Q projection
-        (8, 4096, 4096),    // 8-token prefill
-        (16, 4096, 4096),   // 16-token prefill
-        (32, 4096, 4096),   // 32-token prefill
-        (16, 11008, 4096),  // 16-token gate/up
-        (32, 11008, 4096),  // 32-token gate/up
+        (4, 4096, 4096),   // 4-token prefill, Q projection
+        (8, 4096, 4096),   // 8-token prefill
+        (16, 4096, 4096),  // 16-token prefill
+        (32, 4096, 4096),  // 32-token prefill
+        (16, 11008, 4096), // 16-token gate/up
+        (32, 11008, 4096), // 32-token gate/up
     ] {
         let a = rand_vec(m * k);
         let b = rand_vec(k * n);
@@ -100,11 +102,14 @@ fn bench_skinny_gemm_bt(c: &mut Criterion) {
         }
         let mut out = vec![0.0f32; m * n];
         group.throughput(Throughput::Elements((2 * m * n * k) as u64));
-        group.bench_function(BenchmarkId::new("gemm_bt", format!("{m}x{n}x{k}")), |bench| {
-            bench.iter(|| {
-                kernels.gemm_bt(black_box(&a), black_box(&b_t), black_box(&mut out), m, n, k);
-            })
-        });
+        group.bench_function(
+            BenchmarkId::new("gemm_bt", format!("{m}x{n}x{k}")),
+            |bench| {
+                bench.iter(|| {
+                    kernels.gemm_bt(black_box(&a), black_box(&b_t), black_box(&mut out), m, n, k);
+                })
+            },
+        );
     }
     group.finish();
 }
@@ -164,11 +169,14 @@ fn bench_skinny_gemm_bt_f16(c: &mut Criterion) {
         }
         let mut out = vec![f16::ZERO; m * n];
         group.throughput(Throughput::Elements((2 * m * n * k) as u64));
-        group.bench_function(BenchmarkId::new("gemm_bt", format!("{m}x{n}x{k}")), |bench| {
-            bench.iter(|| {
-                kernels.gemm_bt(black_box(&a), black_box(&b_t), black_box(&mut out), m, n, k);
-            })
-        });
+        group.bench_function(
+            BenchmarkId::new("gemm_bt", format!("{m}x{n}x{k}")),
+            |bench| {
+                bench.iter(|| {
+                    kernels.gemm_bt(black_box(&a), black_box(&b_t), black_box(&mut out), m, n, k);
+                })
+            },
+        );
     }
     group.finish();
 }
@@ -185,8 +193,8 @@ fn bench_large_gemm(c: &mut Criterion) {
         (512, 512, 512),
         (1024, 1024, 1024),
         (2048, 2048, 2048),
-        (128, 4096, 4096),   // 128-token prefill
-        (256, 4096, 4096),   // 256-token prefill
+        (128, 4096, 4096), // 128-token prefill
+        (256, 4096, 4096), // 256-token prefill
     ] {
         let a = rand_vec(m * k);
         let b = rand_vec(k * n);
@@ -200,13 +208,21 @@ fn bench_large_gemm(c: &mut Criterion) {
 
         // Prepacked variant
         let packed_b = kernels.pack_b(&b, n, k);
-        group.bench_function(BenchmarkId::new("prepacked", format!("{m}x{n}x{k}")), |bench| {
-            bench.iter(|| {
-                kernels.gemm_prepacked(
-                    black_box(&a), black_box(&packed_b), black_box(&mut out), m, n, k,
-                );
-            })
-        });
+        group.bench_function(
+            BenchmarkId::new("prepacked", format!("{m}x{n}x{k}")),
+            |bench| {
+                bench.iter(|| {
+                    kernels.gemm_prepacked(
+                        black_box(&a),
+                        black_box(&packed_b),
+                        black_box(&mut out),
+                        m,
+                        n,
+                        k,
+                    );
+                })
+            },
+        );
     }
     group.finish();
 }
@@ -230,9 +246,7 @@ fn bench_quant_gemv(c: &mut Criterion) {
         let x = rand_vec(n);
         group.throughput(Throughput::Elements((2 * n) as u64));
         group.bench_function(BenchmarkId::new("q4k_dot", n), |bench| {
-            bench.iter(|| {
-                black_box(kernels.gemv_q4(black_box(&weight), black_box(&x), 1.0, n))
-            })
+            bench.iter(|| black_box(kernels.gemv_q4(black_box(&weight), black_box(&x), 1.0, n)))
         });
     }
 
@@ -255,9 +269,7 @@ fn bench_quant_gemv(c: &mut Criterion) {
         let x = rand_vec(n);
         group.throughput(Throughput::Elements((2 * n) as u64));
         group.bench_function(BenchmarkId::new("q8k_dot", n), |bench| {
-            bench.iter(|| {
-                black_box(kernels.gemv_q8(black_box(weight), black_box(&x), 1.0, n))
-            })
+            bench.iter(|| black_box(kernels.gemv_q8(black_box(weight), black_box(&x), 1.0, n)))
         });
     }
 
@@ -284,8 +296,13 @@ fn bench_quant_gemv(c: &mut Criterion) {
             |bench| {
                 bench.iter(|| {
                     kernels.kquant_matmul(
-                        black_box(&weight_raw), black_box(&input), black_box(&mut output),
-                        gllm_kernels::quant::QuantType::Q8K, m, n, k,
+                        black_box(&weight_raw),
+                        black_box(&input),
+                        black_box(&mut output),
+                        gllm_kernels::quant::QuantType::Q8K,
+                        m,
+                        n,
+                        k,
                     );
                 })
             },
@@ -313,8 +330,13 @@ fn bench_quant_gemv(c: &mut Criterion) {
             |bench| {
                 bench.iter(|| {
                     kernels.kquant_matmul(
-                        black_box(&weight_raw), black_box(&input), black_box(&mut output),
-                        gllm_kernels::quant::QuantType::Q4K, m, n, k,
+                        black_box(&weight_raw),
+                        black_box(&input),
+                        black_box(&mut output),
+                        gllm_kernels::quant::QuantType::Q4K,
+                        m,
+                        n,
+                        k,
                     );
                 })
             },
@@ -377,8 +399,10 @@ fn bench_rms_norm(c: &mut Criterion) {
         group.bench_function(BenchmarkId::from_parameter(n), |bench| {
             bench.iter(|| {
                 kernels.rms_norm(
-                    black_box(&input), black_box(&weight),
-                    black_box(&mut out), 1e-5,
+                    black_box(&input),
+                    black_box(&weight),
+                    black_box(&mut out),
+                    1e-5,
                 );
             })
         });
@@ -394,9 +418,9 @@ fn bench_rope(c: &mut Criterion) {
     let mut group = c.benchmark_group("rope_llm");
 
     for &(seq_len, num_heads, head_dim) in &[
-        (1, 32, 128),    // single-token decode
-        (32, 32, 128),   // short prefill
-        (512, 32, 128),  // long prefill
+        (1, 32, 128),   // single-token decode
+        (32, 32, 128),  // short prefill
+        (512, 32, 128), // long prefill
     ] {
         let total = seq_len * num_heads * head_dim;
         let mut qk = rand_vec(total);
@@ -411,8 +435,10 @@ fn bench_rope(c: &mut Criterion) {
                 bench.iter(|| {
                     kernels.rope(
                         black_box(&mut qk),
-                        black_box(&cos), black_box(&sin),
-                        head_dim, false,
+                        black_box(&cos),
+                        black_box(&sin),
+                        head_dim,
+                        false,
                     );
                 })
             },

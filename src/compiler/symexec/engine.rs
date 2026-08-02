@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-use super::sym_value::{SymValue, LibmFn, SelectKind};
+use super::sym_value::{LibmFn, SelectKind, SymValue};
 use crate::compiler::trace::{TraceOp, ValueId};
+use std::collections::HashMap;
 
 #[derive(Debug)]
 pub enum SymExecError {
@@ -42,7 +42,9 @@ pub struct SymbolicExecutor {
 }
 
 #[cfg(target_arch = "x86_64")]
-const FLOAT_ARG_REGS: &[&str] = &["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"];
+const FLOAT_ARG_REGS: &[&str] = &[
+    "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+];
 #[cfg(target_arch = "x86_64")]
 const PTR_ARG_REGS: &[&str] = &["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
 
@@ -599,9 +601,10 @@ impl SymbolicExecutor {
                 self.set(operands[0], f(src1, src2));
                 Ok(())
             }
-            _ => Err(SymExecError::UnsupportedInstruction(
-                format!("unexpected operand count: {}", operands.len()),
-            )),
+            _ => Err(SymExecError::UnsupportedInstruction(format!(
+                "unexpected operand count: {}",
+                operands.len()
+            ))),
         }
     }
 
@@ -613,9 +616,10 @@ impl SymbolicExecutor {
         f: impl FnOnce(SymValue, SymValue, SymValue) -> SymValue,
     ) -> Result<(), SymExecError> {
         if operands.len() != 3 {
-            return Err(SymExecError::UnsupportedInstruction(
-                format!("FMA expects 3 operands, got {}", operands.len()),
-            ));
+            return Err(SymExecError::UnsupportedInstruction(format!(
+                "FMA expects 3 operands, got {}",
+                operands.len()
+            )));
         }
         let dst_val = self.resolve(operands[0]);
         let src1 = self.resolve(operands[1]);
@@ -630,7 +634,11 @@ impl SymbolicExecutor {
         }
         let dst = operands[0];
         // For VEX 3-operand movss (vmovss xmm1, xmm2, xmm3), use last as src.
-        let src = if operands.len() == 3 { operands[2] } else { operands[1] };
+        let src = if operands.len() == 3 {
+            operands[2]
+        } else {
+            operands[1]
+        };
 
         // Store to stack: movss [rsp+X], xmmN
         if is_memory_operand(dst) {
@@ -672,7 +680,11 @@ impl SymbolicExecutor {
             if let Some(addr) = parse_rip_addr(src) {
                 if let Some(&cval) = self.constants.get(&addr) {
                     if is_sign_mask_f32(cval) {
-                        let val = self.resolve(if operands.len() == 3 { operands[1] } else { dst });
+                        let val = self.resolve(if operands.len() == 3 {
+                            operands[1]
+                        } else {
+                            dst
+                        });
                         self.set(dst, SymValue::Neg(Box::new(val)));
                         return Ok(());
                     }
@@ -683,7 +695,11 @@ impl SymbolicExecutor {
         let src_val = self.resolve(src);
         if let SymValue::Const(v) = &src_val {
             if is_sign_mask_f32(*v as f32) {
-                let base = self.resolve(if operands.len() == 3 { operands[1] } else { dst });
+                let base = self.resolve(if operands.len() == 3 {
+                    operands[1]
+                } else {
+                    dst
+                });
                 self.set(dst, SymValue::Neg(Box::new(base)));
                 return Ok(());
             }
@@ -720,7 +736,11 @@ impl SymbolicExecutor {
 
     fn bitwise_generic_op(&mut self, operands: &[&str], name: &str) -> Result<(), SymExecError> {
         if !operands.is_empty() && is_xmm_reg(operands[0]) {
-            let desc = operands.iter().map(|o| o.to_string()).collect::<Vec<_>>().join(", ");
+            let desc = operands
+                .iter()
+                .map(|o| o.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
             self.set(operands[0], SymValue::Unknown(format!("{name}({desc})")));
         }
         Ok(())
@@ -757,7 +777,10 @@ impl SymbolicExecutor {
     /// Return (arg_reg, ret_reg) for float function calls per platform ABI.
     fn float_call_regs(&self) -> (&'static str, &'static str) {
         // Check if we have AArch64 float regs in state
-        if self.regs.contains_key("s0") || self.regs.contains_key("d0") || self.regs.contains_key("v0") {
+        if self.regs.contains_key("s0")
+            || self.regs.contains_key("d0")
+            || self.regs.contains_key("v0")
+        {
             ("s0", "s0")
         } else {
             ("xmm0", "xmm0")
@@ -992,41 +1015,44 @@ fn linearize(
             ops.push(TraceOp::Rsqrt(ai));
             i
         }
-        SymValue::Call(func, args) => {
-            match func {
-                LibmFn::Expf => {
-                    let ai = linearize(&args[0], ops, cache);
-                    let i = ValueId(ops.len() as u32);
-                    ops.push(TraceOp::Exp(ai));
-                    i
-                }
-                LibmFn::Tanhf => {
-                    let ai = linearize(&args[0], ops, cache);
-                    let i = ValueId(ops.len() as u32);
-                    ops.push(TraceOp::Tanh(ai));
-                    i
-                }
-                LibmFn::Sqrtf => {
-                    let ai = linearize(&args[0], ops, cache);
-                    let i = ValueId(ops.len() as u32);
-                    ops.push(TraceOp::Sqrt(ai));
-                    i
-                }
-                LibmFn::Fabsf => {
-                    let ai = linearize(&args[0], ops, cache);
-                    let i = ValueId(ops.len() as u32);
-                    ops.push(TraceOp::Abs(ai));
-                    i
-                }
-                LibmFn::Logf => {
-                    let ai = linearize(&args[0], ops, cache);
-                    let i = ValueId(ops.len() as u32);
-                    ops.push(TraceOp::Log(ai));
-                    i
-                }
+        SymValue::Call(func, args) => match func {
+            LibmFn::Expf => {
+                let ai = linearize(&args[0], ops, cache);
+                let i = ValueId(ops.len() as u32);
+                ops.push(TraceOp::Exp(ai));
+                i
             }
-        }
-        SymValue::Select { kind, true_val, false_val, .. } => {
+            LibmFn::Tanhf => {
+                let ai = linearize(&args[0], ops, cache);
+                let i = ValueId(ops.len() as u32);
+                ops.push(TraceOp::Tanh(ai));
+                i
+            }
+            LibmFn::Sqrtf => {
+                let ai = linearize(&args[0], ops, cache);
+                let i = ValueId(ops.len() as u32);
+                ops.push(TraceOp::Sqrt(ai));
+                i
+            }
+            LibmFn::Fabsf => {
+                let ai = linearize(&args[0], ops, cache);
+                let i = ValueId(ops.len() as u32);
+                ops.push(TraceOp::Abs(ai));
+                i
+            }
+            LibmFn::Logf => {
+                let ai = linearize(&args[0], ops, cache);
+                let i = ValueId(ops.len() as u32);
+                ops.push(TraceOp::Log(ai));
+                i
+            }
+        },
+        SymValue::Select {
+            kind,
+            true_val,
+            false_val,
+            ..
+        } => {
             // Select that survived simplification — linearize as Max/Min
             // based on the comparison kind, or fall back to true_val.
             let ti = linearize(true_val, ops, cache);
@@ -1346,10 +1372,7 @@ mod tests {
         let x = SymValue::Param(0);
         let neg_x = SymValue::Neg(Box::new(x.clone()));
         let exp_neg_x = SymValue::Call(LibmFn::Expf, vec![neg_x]);
-        let one_plus = SymValue::Add(
-            Box::new(exp_neg_x),
-            Box::new(SymValue::Const(1.0)),
-        );
+        let one_plus = SymValue::Add(Box::new(exp_neg_x), Box::new(SymValue::Const(1.0)));
         let silu = SymValue::Div(Box::new(x), Box::new(one_plus));
         exec.set("xmm0", silu);
 
@@ -1358,13 +1381,22 @@ mod tests {
         for (i, op) in trace.iter().enumerate() {
             match op {
                 TraceOp::Input(_) | TraceOp::Const(_) => {}
-                TraceOp::Neg(a) | TraceOp::Exp(a) | TraceOp::Abs(a)
-                | TraceOp::Sqrt(a) | TraceOp::Rsqrt(a) | TraceOp::Tanh(a)
-                | TraceOp::Recip(a) | TraceOp::Log(a) => {
+                TraceOp::Neg(a)
+                | TraceOp::Exp(a)
+                | TraceOp::Abs(a)
+                | TraceOp::Sqrt(a)
+                | TraceOp::Rsqrt(a)
+                | TraceOp::Tanh(a)
+                | TraceOp::Recip(a)
+                | TraceOp::Log(a) => {
                     assert!((a.0 as usize) < i, "SSA violation at {i}");
                 }
-                TraceOp::Add(a, b) | TraceOp::Sub(a, b) | TraceOp::Mul(a, b)
-                | TraceOp::Div(a, b) | TraceOp::Max(a, b) | TraceOp::Min(a, b) => {
+                TraceOp::Add(a, b)
+                | TraceOp::Sub(a, b)
+                | TraceOp::Mul(a, b)
+                | TraceOp::Div(a, b)
+                | TraceOp::Max(a, b)
+                | TraceOp::Min(a, b) => {
                     assert!((a.0 as usize) < i, "SSA violation at {i}");
                     assert!((b.0 as usize) < i, "SSA violation at {i}");
                 }
@@ -1414,7 +1446,10 @@ mod tests {
         exec.step("addss", &["xmm0", "xmm0"]).unwrap();
 
         let trace = exec.extract_trace().unwrap();
-        let input_count = trace.iter().filter(|op| matches!(op, TraceOp::Input(0))).count();
+        let input_count = trace
+            .iter()
+            .filter(|op| matches!(op, TraceOp::Input(0)))
+            .count();
         assert_eq!(input_count, 1, "Input(0) should be deduplicated");
         // Expected: [Input(0), Add(0, 0)]
         assert_eq!(trace.len(), 2);
@@ -1449,9 +1484,10 @@ mod tests {
     #[test]
     fn test_noop_instructions_dont_fail() {
         let mut exec = SymbolicExecutor::new(1, 0);
-        for instr in &["ret", "push", "pop", "endbr64", "nop", "lea", "mov",
-                       "sub", "add", "cmp", "test", "je", "jne", "jmp",
-                       "cvtss2si", "cvtsi2ss", "cmova", "seta"] {
+        for instr in &[
+            "ret", "push", "pop", "endbr64", "nop", "lea", "mov", "sub", "add", "cmp", "test",
+            "je", "jne", "jmp", "cvtss2si", "cvtsi2ss", "cmova", "seta",
+        ] {
             exec.step(instr, &["rax", "rbx"]).unwrap();
         }
         // xmm0 should still be param(0)
@@ -1536,8 +1572,14 @@ mod tests {
         let ret = exec.return_value().unwrap();
         let s = format!("{ret}");
         // Should be param(0) + 1.0, not 0.0 or param(1)*param(1)
-        assert!(s.contains("param(0)"), "spilled value should reference param(0)");
-        assert!(s.contains("1.0"), "spilled value should reference constant 1.0");
+        assert!(
+            s.contains("param(0)"),
+            "spilled value should reference param(0)"
+        );
+        assert!(
+            s.contains("1.0"),
+            "spilled value should reference constant 1.0"
+        );
     }
 
     #[test]
@@ -1546,36 +1588,69 @@ mod tests {
 
         // vfmadd132ss xmm0, xmm1, xmm2 -> dst = dst * src2 + src1
         let mut exec132 = SymbolicExecutor::new(3, 0);
-        exec132.step("vfmadd132ss", &["xmm0", "xmm1", "xmm2"]).unwrap();
+        exec132
+            .step("vfmadd132ss", &["xmm0", "xmm1", "xmm2"])
+            .unwrap();
         let ret132 = exec132.return_value().unwrap();
         if let SymValue::Fma(a, b, c) = &ret132 {
-            assert!(matches!(**a, SymValue::Param(0)), "132: a should be dst=param(0)");
-            assert!(matches!(**b, SymValue::Param(2)), "132: b should be src2=param(2)");
-            assert!(matches!(**c, SymValue::Param(1)), "132: c should be src1=param(1)");
+            assert!(
+                matches!(**a, SymValue::Param(0)),
+                "132: a should be dst=param(0)"
+            );
+            assert!(
+                matches!(**b, SymValue::Param(2)),
+                "132: b should be src2=param(2)"
+            );
+            assert!(
+                matches!(**c, SymValue::Param(1)),
+                "132: c should be src1=param(1)"
+            );
         } else {
             panic!("vfmadd132ss should produce Fma, got: {ret132:?}");
         }
 
         // vfmadd213ss xmm0, xmm1, xmm2 -> dst = src1 * dst + src2
         let mut exec213 = SymbolicExecutor::new(3, 0);
-        exec213.step("vfmadd213ss", &["xmm0", "xmm1", "xmm2"]).unwrap();
+        exec213
+            .step("vfmadd213ss", &["xmm0", "xmm1", "xmm2"])
+            .unwrap();
         let ret213 = exec213.return_value().unwrap();
         if let SymValue::Fma(a, b, c) = &ret213 {
-            assert!(matches!(**a, SymValue::Param(1)), "213: a should be src1=param(1)");
-            assert!(matches!(**b, SymValue::Param(0)), "213: b should be dst=param(0)");
-            assert!(matches!(**c, SymValue::Param(2)), "213: c should be src2=param(2)");
+            assert!(
+                matches!(**a, SymValue::Param(1)),
+                "213: a should be src1=param(1)"
+            );
+            assert!(
+                matches!(**b, SymValue::Param(0)),
+                "213: b should be dst=param(0)"
+            );
+            assert!(
+                matches!(**c, SymValue::Param(2)),
+                "213: c should be src2=param(2)"
+            );
         } else {
             panic!("vfmadd213ss should produce Fma, got: {ret213:?}");
         }
 
         // vfmadd231ss xmm0, xmm1, xmm2 -> dst = src1 * src2 + dst
         let mut exec231 = SymbolicExecutor::new(3, 0);
-        exec231.step("vfmadd231ss", &["xmm0", "xmm1", "xmm2"]).unwrap();
+        exec231
+            .step("vfmadd231ss", &["xmm0", "xmm1", "xmm2"])
+            .unwrap();
         let ret231 = exec231.return_value().unwrap();
         if let SymValue::Fma(a, b, c) = &ret231 {
-            assert!(matches!(**a, SymValue::Param(1)), "231: a should be src1=param(1)");
-            assert!(matches!(**b, SymValue::Param(2)), "231: b should be src2=param(2)");
-            assert!(matches!(**c, SymValue::Param(0)), "231: c should be dst=param(0)");
+            assert!(
+                matches!(**a, SymValue::Param(1)),
+                "231: a should be src1=param(1)"
+            );
+            assert!(
+                matches!(**b, SymValue::Param(2)),
+                "231: b should be src2=param(2)"
+            );
+            assert!(
+                matches!(**c, SymValue::Param(0)),
+                "231: c should be dst=param(0)"
+            );
         } else {
             panic!("vfmadd231ss should produce Fma, got: {ret231:?}");
         }
@@ -1585,23 +1660,27 @@ mod tests {
     fn test_linearize_dedup() {
         // Build (x+1) * (x+1) — the shared sub-expression (x+1) should be emitted once
         let mut exec = SymbolicExecutor::new(1, 0);
-        let x_plus_1 = SymValue::Add(
-            Box::new(SymValue::Param(0)),
-            Box::new(SymValue::Const(1.0)),
-        );
-        let product = SymValue::Mul(
-            Box::new(x_plus_1.clone()),
-            Box::new(x_plus_1),
-        );
+        let x_plus_1 = SymValue::Add(Box::new(SymValue::Param(0)), Box::new(SymValue::Const(1.0)));
+        let product = SymValue::Mul(Box::new(x_plus_1.clone()), Box::new(x_plus_1));
         exec.set("xmm0", product);
 
         let trace = exec.extract_trace().unwrap();
         // Expected: [Input(0), Const(1.0), Add(0,1), Mul(2,2)]
         // The Add should appear only once due to dedup
-        let add_count = trace.iter().filter(|op| matches!(op, TraceOp::Add(_, _))).count();
-        assert_eq!(add_count, 1, "shared (x+1) sub-expression should be deduplicated");
+        let add_count = trace
+            .iter()
+            .filter(|op| matches!(op, TraceOp::Add(_, _)))
+            .count();
+        assert_eq!(
+            add_count, 1,
+            "shared (x+1) sub-expression should be deduplicated"
+        );
         assert_eq!(trace.len(), 4, "expected 4 ops: Input, Const, Add, Mul");
-        assert_eq!(trace[3], TraceOp::Mul(ValueId(2), ValueId(2)), "Mul should reference the same Add index twice");
+        assert_eq!(
+            trace[3],
+            TraceOp::Mul(ValueId(2), ValueId(2)),
+            "Mul should reference the same Add index twice"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1616,11 +1695,21 @@ mod tests {
         let err3 = SymExecError::NoReturnValue;
 
         // Assert: Display produces expected prefix strings
-        assert!(err1.to_string().starts_with("disassembly failed:"), "DisassemblyFailed display");
+        assert!(
+            err1.to_string().starts_with("disassembly failed:"),
+            "DisassemblyFailed display"
+        );
         assert!(err1.to_string().contains("bad bytes"));
-        assert!(err2.to_string().starts_with("unsupported instruction:"), "UnsupportedInstruction display");
+        assert!(
+            err2.to_string().starts_with("unsupported instruction:"),
+            "UnsupportedInstruction display"
+        );
         assert!(err2.to_string().contains("fancy_op"));
-        assert_eq!(err3.to_string(), "no return value found", "NoReturnValue display");
+        assert_eq!(
+            err3.to_string(),
+            "no return value found",
+            "NoReturnValue display"
+        );
     }
 
     #[test]
@@ -1640,8 +1729,16 @@ mod tests {
         assert_eq!(parse_stack_offset("[rsp-0x8]"), Some(-8));
         assert_eq!(parse_stack_offset("[rsp+16]"), Some(16));
         assert_eq!(parse_stack_offset("[rsp-4]"), Some(-4));
-        assert_eq!(parse_stack_offset("[rax+0x10]"), None, "non-rsp base should return None");
-        assert_eq!(parse_stack_offset("rsp+0x10]"), None, "missing opening bracket");
+        assert_eq!(
+            parse_stack_offset("[rax+0x10]"),
+            None,
+            "non-rsp base should return None"
+        );
+        assert_eq!(
+            parse_stack_offset("rsp+0x10]"),
+            None,
+            "missing opening bracket"
+        );
     }
 
     #[test]
@@ -1650,7 +1747,11 @@ mod tests {
         // Act & Assert
         assert_eq!(parse_rip_addr("[rip+0x1234]"), Some(0x1234));
         assert_eq!(parse_rip_addr("[0x7f000000]"), Some(0x7f000000));
-        assert_eq!(parse_rip_addr("[rsp+0x10]"), None, "non-rip non-absolute should return None");
+        assert_eq!(
+            parse_rip_addr("[rsp+0x10]"),
+            None,
+            "non-rip non-absolute should return None"
+        );
         assert_eq!(parse_rip_addr("rip+0x10]"), None, "missing opening bracket");
     }
 
@@ -1668,12 +1769,21 @@ mod tests {
         let xmm2 = exec.get_value("xmm2");
 
         // Assert: float args mapped to Param(0..1), ptr args to Param(2..4)
-        assert!(matches!(xmm0, SymValue::Param(0)), "xmm0 should be Param(0)");
-        assert!(matches!(xmm1, SymValue::Param(1)), "xmm1 should be Param(1)");
+        assert!(
+            matches!(xmm0, SymValue::Param(0)),
+            "xmm0 should be Param(0)"
+        );
+        assert!(
+            matches!(xmm1, SymValue::Param(1)),
+            "xmm1 should be Param(1)"
+        );
         assert!(matches!(rdi, SymValue::Param(2)), "rdi should be Param(2)");
         assert!(matches!(rsi, SymValue::Param(3)), "rsi should be Param(3)");
         assert!(matches!(rdx, SymValue::Param(4)), "rdx should be Param(4)");
-        assert!(matches!(xmm2, SymValue::Unknown(_)), "xmm2 should be Unknown");
+        assert!(
+            matches!(xmm2, SymValue::Unknown(_)),
+            "xmm2 should be Unknown"
+        );
     }
 
     #[test]
@@ -1691,9 +1801,18 @@ mod tests {
         // Assert: restored state has the multiplication result
         let ret = exec.return_value().unwrap();
         let s = format!("{ret}");
-        assert!(s.contains("param(0)"), "restored state should have param(0)");
-        assert!(s.contains("param(1)"), "restored state should have param(1)");
-        assert!(s.contains("*"), "restored state should contain multiplication");
+        assert!(
+            s.contains("param(0)"),
+            "restored state should have param(0)"
+        );
+        assert!(
+            s.contains("param(1)"),
+            "restored state should have param(1)"
+        );
+        assert!(
+            s.contains("*"),
+            "restored state should contain multiplication"
+        );
     }
 
     #[test]
@@ -1749,7 +1868,10 @@ mod tests {
         // Assert: should return NoReturnValue error
         assert!(result.is_err(), "empty executor should fail return_value");
         let err = result.unwrap_err();
-        assert!(matches!(err, SymExecError::NoReturnValue), "error should be NoReturnValue");
+        assert!(
+            matches!(err, SymExecError::NoReturnValue),
+            "error should be NoReturnValue"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1770,9 +1892,18 @@ mod tests {
         let v1 = exec.get_value("xmm1");
         let v2 = exec.get_value("xmm2");
         let v3 = exec.get_value("xmm3");
-        assert!(matches!(v1, SymValue::Rsqrt(_)), "rsqrtss should produce Rsqrt");
-        assert!(matches!(v2, SymValue::Sqrt(_)), "sqrtss should produce Sqrt");
-        assert!(matches!(v3, SymValue::Recip(_)), "rcpss should produce Recip");
+        assert!(
+            matches!(v1, SymValue::Rsqrt(_)),
+            "rsqrtss should produce Rsqrt"
+        );
+        assert!(
+            matches!(v2, SymValue::Sqrt(_)),
+            "sqrtss should produce Sqrt"
+        );
+        assert!(
+            matches!(v3, SymValue::Recip(_)),
+            "rcpss should produce Recip"
+        );
     }
 
     #[test]
@@ -1785,7 +1916,10 @@ mod tests {
 
         // Assert
         let ret = exec.return_value().unwrap();
-        assert!(matches!(ret, SymValue::Min(_, _)), "minss should produce Min");
+        assert!(
+            matches!(ret, SymValue::Min(_, _)),
+            "minss should produce Min"
+        );
         let s = format!("{ret}");
         assert!(s.contains("param(0)") && s.contains("param(1)"));
     }
@@ -1800,7 +1934,10 @@ mod tests {
 
         // Assert: xmm0 should hold Neg(param(0))
         let ret = exec.return_value().unwrap();
-        assert!(matches!(ret, SymValue::Neg(_)), "neg_float should produce Neg");
+        assert!(
+            matches!(ret, SymValue::Neg(_)),
+            "neg_float should produce Neg"
+        );
     }
 
     #[test]
@@ -1813,7 +1950,10 @@ mod tests {
 
         // Assert: result should be Sub(Mul(...), ...)
         let ret = exec.return_value().unwrap();
-        assert!(matches!(ret, SymValue::Sub(_, _)), "vfmsub should produce Sub");
+        assert!(
+            matches!(ret, SymValue::Sub(_, _)),
+            "vfmsub should produce Sub"
+        );
         let s = format!("{ret}");
         assert!(s.contains("param(1)"), "should reference src1 (param(1))");
         assert!(s.contains("param(2)"), "should reference src2 (param(2))");
@@ -1825,11 +1965,15 @@ mod tests {
         let mut exec = SymbolicExecutor::new(3, 0);
 
         // Act: vfnmadd231ss xmm0, xmm1, xmm2 → xmm0 = xmm0 - xmm1*xmm2
-        exec.step("vfnmadd231ss", &["xmm0", "xmm1", "xmm2"]).unwrap();
+        exec.step("vfnmadd231ss", &["xmm0", "xmm1", "xmm2"])
+            .unwrap();
 
         // Assert: result should be Sub(param(0), Mul(param(1), param(2)))
         let ret = exec.return_value().unwrap();
-        assert!(matches!(ret, SymValue::Sub(_, _)), "vfnmadd should produce Sub");
+        assert!(
+            matches!(ret, SymValue::Sub(_, _)),
+            "vfnmadd should produce Sub"
+        );
     }
 
     #[test]
@@ -1840,20 +1984,26 @@ mod tests {
         let mut exec_sqrt = SymbolicExecutor::new(1, 0);
         exec_sqrt.step("call", &["sqrtf@PLT"]).unwrap();
         let trace_sqrt = exec_sqrt.extract_trace().unwrap();
-        assert!(trace_sqrt.iter().any(|op| matches!(op, TraceOp::Sqrt(_))),
-            "call sqrtf should extract to TraceOp::Sqrt");
+        assert!(
+            trace_sqrt.iter().any(|op| matches!(op, TraceOp::Sqrt(_))),
+            "call sqrtf should extract to TraceOp::Sqrt"
+        );
 
         let mut exec_tanh = SymbolicExecutor::new(1, 0);
         exec_tanh.step("call", &["tanhf@PLT"]).unwrap();
         let trace_tanh = exec_tanh.extract_trace().unwrap();
-        assert!(trace_tanh.iter().any(|op| matches!(op, TraceOp::Tanh(_))),
-            "call tanhf should extract to TraceOp::Tanh");
+        assert!(
+            trace_tanh.iter().any(|op| matches!(op, TraceOp::Tanh(_))),
+            "call tanhf should extract to TraceOp::Tanh"
+        );
 
         let mut exec_fabs = SymbolicExecutor::new(1, 0);
         exec_fabs.step("call", &["fabsf@PLT"]).unwrap();
         let trace_fabs = exec_fabs.extract_trace().unwrap();
-        assert!(trace_fabs.iter().any(|op| matches!(op, TraceOp::Abs(_))),
-            "call fabsf should extract to TraceOp::Abs");
+        assert!(
+            trace_fabs.iter().any(|op| matches!(op, TraceOp::Abs(_))),
+            "call fabsf should extract to TraceOp::Abs"
+        );
     }
 
     #[test]
@@ -1867,7 +2017,10 @@ mod tests {
         // Assert: return value should be Unknown containing function name
         let ret = exec.return_value().unwrap();
         let s = format!("{ret}");
-        assert!(s.contains("call:custom_func"), "unknown function should produce Unknown with call: prefix");
+        assert!(
+            s.contains("call:custom_func"),
+            "unknown function should produce Unknown with call: prefix"
+        );
     }
 
     #[test]
@@ -1876,15 +2029,24 @@ mod tests {
         let mut exec = SymbolicExecutor::new(2, 0);
 
         // Act: perform comparison, then read flags
-        assert!(exec.get_flags().is_none(), "flags should be None before comparison");
+        assert!(
+            exec.get_flags().is_none(),
+            "flags should be None before comparison"
+        );
         exec.step("ucomiss", &["xmm0", "xmm1"]).unwrap();
         let flags = exec.get_flags();
 
         // Assert: flags should contain (param(0), param(1))
         assert!(flags.is_some(), "flags should be set after ucomiss");
         let (lhs, rhs) = flags.unwrap();
-        assert!(matches!(lhs, SymValue::Param(0)), "flag lhs should be param(0)");
-        assert!(matches!(rhs, SymValue::Param(1)), "flag rhs should be param(1)");
+        assert!(
+            matches!(lhs, SymValue::Param(0)),
+            "flag lhs should be param(0)"
+        );
+        assert!(
+            matches!(rhs, SymValue::Param(1)),
+            "flag rhs should be param(1)"
+        );
     }
 
     #[test]
@@ -1901,7 +2063,10 @@ mod tests {
 
         // Assert: result should be Abs(param(0)) because src1 is abs mask
         let v = exec.get_value("xmm1");
-        assert!(matches!(v, SymValue::Abs(_)), "andps with abs mask in src1 should produce Abs");
+        assert!(
+            matches!(v, SymValue::Abs(_)),
+            "andps with abs mask in src1 should produce Abs"
+        );
     }
 
     #[test]
@@ -1915,8 +2080,10 @@ mod tests {
         // Assert: xmm0 should now be Unknown("cvtsi2ss")
         let ret = exec.return_value().unwrap();
         match &ret {
-            SymValue::Unknown(s) => assert!(s.contains("cvtsi2ss"),
-                "cvtsi2ss should set Unknown with cvtsi2ss label, got: {s}"),
+            SymValue::Unknown(s) => assert!(
+                s.contains("cvtsi2ss"),
+                "cvtsi2ss should set Unknown with cvtsi2ss label, got: {s}"
+            ),
             other => panic!("expected Unknown, got: {other:?}"),
         }
     }
@@ -1955,7 +2122,10 @@ mod tests {
 
         // Assert: xmm2 should be Abs(param(0))
         let v = exec.get_value("xmm2");
-        assert!(matches!(v, SymValue::Abs(_)), "vandps with abs mask in src2 should produce Abs");
+        assert!(
+            matches!(v, SymValue::Abs(_)),
+            "vandps with abs mask in src2 should produce Abs"
+        );
     }
 
     #[test]
@@ -1969,8 +2139,10 @@ mod tests {
         // Assert: result should be Unknown containing "or"
         let ret = exec.return_value().unwrap();
         match &ret {
-            SymValue::Unknown(s) => assert!(s.contains("or"),
-                "orps should produce Unknown with 'or' label, got: {s}"),
+            SymValue::Unknown(s) => assert!(
+                s.contains("or"),
+                "orps should produce Unknown with 'or' label, got: {s}"
+            ),
             other => panic!("expected Unknown from orps, got: {other:?}"),
         }
     }
@@ -1986,8 +2158,10 @@ mod tests {
         // Assert: result should be Unknown containing "andnot"
         let ret = exec.return_value().unwrap();
         match &ret {
-            SymValue::Unknown(s) => assert!(s.contains("andnot"),
-                "andnps should produce Unknown with 'andnot' label, got: {s}"),
+            SymValue::Unknown(s) => assert!(
+                s.contains("andnot"),
+                "andnps should produce Unknown with 'andnot' label, got: {s}"
+            ),
             other => panic!("expected Unknown from andnps, got: {other:?}"),
         }
     }
@@ -2003,10 +2177,14 @@ mod tests {
         // Assert: should return UnsupportedInstruction error
         assert!(result.is_err(), "bin_op with 4 operands should fail");
         let err = result.unwrap_err();
-        assert!(matches!(err, SymExecError::UnsupportedInstruction(_)),
-            "error should be UnsupportedInstruction");
-        assert!(err.to_string().contains("unexpected operand count"),
-            "error message should mention operand count");
+        assert!(
+            matches!(err, SymExecError::UnsupportedInstruction(_)),
+            "error should be UnsupportedInstruction"
+        );
+        assert!(
+            err.to_string().contains("unexpected operand count"),
+            "error message should mention operand count"
+        );
     }
 
     #[test]
@@ -2021,8 +2199,10 @@ mod tests {
         assert!(result.is_err(), "FMA with 2 operands should fail");
         let err = result.unwrap_err();
         assert!(matches!(err, SymExecError::UnsupportedInstruction(_)));
-        assert!(err.to_string().contains("3 operands"),
-            "error should mention FMA requires 3 operands");
+        assert!(
+            err.to_string().contains("3 operands"),
+            "error should mention FMA requires 3 operands"
+        );
     }
 
     #[test]
@@ -2031,7 +2211,10 @@ mod tests {
         let mut exec = SymbolicExecutor::new(2, 0);
         exec.register_constant(0xABCD, 3.14);
         exec.step("ucomiss", &["xmm0", "xmm1"]).unwrap();
-        assert!(exec.get_flags().is_some(), "flags should be set before snapshot");
+        assert!(
+            exec.get_flags().is_some(),
+            "flags should be set before snapshot"
+        );
         let snap = exec.snapshot();
 
         // Act: clobber constants and flags by creating a fresh executor and restoring
@@ -2058,8 +2241,10 @@ mod tests {
         // Assert: should resolve to Unknown with mem: prefix
         let ret = exec.return_value().unwrap();
         match &ret {
-            SymValue::Unknown(s) => assert!(s.contains("mem:"),
-                "load from unknown stack should produce Unknown with mem: prefix, got: {s}"),
+            SymValue::Unknown(s) => assert!(
+                s.contains("mem:"),
+                "load from unknown stack should produce Unknown with mem: prefix, got: {s}"
+            ),
             other => panic!("expected Unknown, got: {other:?}"),
         }
     }
@@ -2075,11 +2260,15 @@ mod tests {
 
         // Assert: xmm0 is unchanged (not clobbered by the store)
         let ret = exec.return_value().unwrap();
-        assert!(matches!(ret, SymValue::Param(0)),
-            "xmm0 should still be param(0) after store to non-stack memory");
+        assert!(
+            matches!(ret, SymValue::Param(0)),
+            "xmm0 should still be param(0) after store to non-stack memory"
+        );
         // Stack should be empty (store didn't go to [rsp+...] slot)
-        assert!(exec.stack_state().is_empty(),
-            "stack should be empty after store to non-stack memory");
+        assert!(
+            exec.stack_state().is_empty(),
+            "stack should be empty after store to non-stack memory"
+        );
     }
 
     #[test]

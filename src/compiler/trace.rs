@@ -103,9 +103,16 @@ pub fn classify_pattern(body: &[TraceOp]) -> ComputePattern {
         };
     }
 
-    let max_input = body.iter().filter_map(|op| {
-        if let TraceOp::Input(idx) = op { Some(*idx) } else { None }
-    }).max();
+    let max_input = body
+        .iter()
+        .filter_map(|op| {
+            if let TraceOp::Input(idx) = op {
+                Some(*idx)
+            } else {
+                None
+            }
+        })
+        .max();
 
     let num_inputs = match max_input {
         Some(idx) => (idx + 1) as usize,
@@ -113,8 +120,12 @@ pub fn classify_pattern(body: &[TraceOp]) -> ComputePattern {
     };
 
     match num_inputs {
-        0 | 1 => ComputePattern::Elementwise { body: body.to_vec() },
-        2 => ComputePattern::BinaryElementwise { body: body.to_vec() },
+        0 | 1 => ComputePattern::Elementwise {
+            body: body.to_vec(),
+        },
+        2 => ComputePattern::BinaryElementwise {
+            body: body.to_vec(),
+        },
         _ => ComputePattern::Injective {
             body: body.to_vec(),
             num_inputs,
@@ -152,17 +163,25 @@ pub struct ValueId(pub u32);
 
 impl ValueId {
     pub const NONE: ValueId = ValueId(u32::MAX);
-    pub fn is_some(self) -> bool { self.0 != u32::MAX }
-    pub fn saturating_sub(self, n: u32) -> ValueId { ValueId(self.0.saturating_sub(n)) }
+    pub fn is_some(self) -> bool {
+        self.0 != u32::MAX
+    }
+    pub fn saturating_sub(self, n: u32) -> ValueId {
+        ValueId(self.0.saturating_sub(n))
+    }
 }
 
 impl std::fmt::Display for ValueId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "v{}", self.0) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "v{}", self.0)
+    }
 }
 
 impl std::ops::Sub<u32> for ValueId {
     type Output = ValueId;
-    fn sub(self, rhs: u32) -> ValueId { ValueId(self.0 - rhs) }
+    fn sub(self, rhs: u32) -> ValueId {
+        ValueId(self.0 - rhs)
+    }
 }
 
 /// SSA-form computation operation.
@@ -211,7 +230,6 @@ pub enum TraceOp {
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     // ── 量化混合精度 (§11 TurboQuant / §13.12 硬件拓扑) ──
-
     /// 混合精度 FMA: 不同位宽的 act × weight 累加到 acc。
     /// 后端映射: gfx950 mfma_scale / SM100 tcgen05 / AMX-FP8 TDPFP8PS
     QuantFma {
@@ -239,7 +257,6 @@ pub enum TraceOp {
     },
 
     // ── 水平归约 (§13 Epilogue 白嫖) ──
-
     /// 水平归约: 将向量寄存器归约为标量。
     /// 后端映射: x86 shuffle+hadd / ARM faddp+addv / GPU shfl.sync warp reduce
     // @trace REQ-AIS-004 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/hreduce]
@@ -249,7 +266,6 @@ pub enum TraceOp {
     },
 
     // ── 内存层级控制 (§13.2 质心预取 / §11 TurboQuant) ──
-
     /// Prefetch hint: 预取到指定缓存层级。
     /// 后端映射: prefetcht0/t1/nta / prfm pldl1keep / prefetch.global.L2
     Prefetch {
@@ -261,7 +277,6 @@ pub enum TraceOp {
     NonTemporalStore,
 
     // ── 位操作 (量化解包) ──
-
     BitExtract {
         src: ValueId,
         offset: u32,
@@ -276,7 +291,6 @@ pub enum TraceOp {
     },
 
     // ── 比较和掩码 (§13.1 Gate-First / §13.3 残差旁路) ──
-
     /// 比较生成掩码: 逐元素比较 a 和 b。
     /// 后端自动选择: AVX-512 k-mask / SVE predicate / GPU predicate
     // @trace REQ-AIS-003 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/compare]
@@ -293,7 +307,6 @@ pub enum TraceOp {
     },
 
     // ── 原子操作 (§13.6 MoE 命中计数) ──
-
     /// 原子加: addr[0] += val。用于 MoE expert 命中计数等。
     /// 后端映射: lock xadd / ldadd / atomicAdd
     AtomicAdd {
@@ -302,7 +315,6 @@ pub enum TraceOp {
     },
 
     // ── 信号处理 (§11.1 TurboQuant FWHT) ──
-
     /// Fast Walsh-Hadamard Transform: 在线旋转变换。
     /// 就地变换 dim 个元素。O(d log d) 复杂度。
     /// 后端映射: 展开的 butterfly 加减指令序列
@@ -316,7 +328,6 @@ pub enum TraceOp {
     // Gather/Attention/MoE 等结构型算子的索引内存访问语义。
     // 不再绕过 auto_select 走手写 lower_*，全部纳入自动指令选择。
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
     /// 标量内存加载: 从 base_ptr + byte_offset 读取一个值。
     /// 用于 Gather 中从 input_ids 读取 token index。
     /// 后端映射: vmovss + vmovd (x86) / ldr w-reg (ARM)
@@ -359,19 +370,22 @@ pub enum TraceOp {
     },
 
     // ── 向量广播 + 逐元素条件 (GateMask / EntropyGate) ──
-
     /// 标量广播到向量: 将 src 的 lane 0 值复制到所有 lane。
     /// 用于 GateMask（threshold 广播到所有 hidden dim）。
     /// 后端映射: x86 vbroadcastss / ARM dup
-    BroadcastScalar { src: ValueId },
+    BroadcastScalar {
+        src: ValueId,
+    },
 
     /// 从内存加载标量并广播到向量: 从 base[offset] 加载 1 个元素,
     /// 复制到向量所有 lane。用于 GEMM A 矩阵行加载 (broadcast a scalar to all lanes)。
     /// 后端映射: x86 vbroadcastss (m32) / ARM ld1r
-    BroadcastLoad { base: ValueId, offset: ValueId },
+    BroadcastLoad {
+        base: ValueId,
+        offset: ValueId,
+    },
 
     // ── 向量索引内存操作 (Gather / Scatter) ──
-
     /// 向量索引加载: 从 base + indices[i]*stride 加载元素到向量。
     /// 后端映射: x86 vgatherdps / ARM scalar loop (ld1 per element)
     GatherLoad {
@@ -390,7 +404,6 @@ pub enum TraceOp {
     },
 
     // ── 查表操作 (embedding lookup 通用表达) ──
-
     /// 行查表: 从 base_ptr + row_index * row_bytes 加载一行（SIMD 向量宽度）。
     /// 等价于 StrideMul(row_index, row_bytes) + PtrAdd(base, offset) + VecLoadIndexed(base, offset)
     /// 后端映射: 组合 IntMulStride + LoadPtr(VRegPlusVReg) + VecLoad
@@ -401,7 +414,6 @@ pub enum TraceOp {
     },
 
     // ── 量化解量化 (MoE expert FFN) ──
-
     /// MXFP4 解量化: packed 4-bit blocks → f32 values × per-block scale。
     /// 用于 MoE DispatchPacked 中 gate_up/down 权重解量化。
     /// 后端映射: VmInstr::QuantBlockLoad { unpack: Mxfp4 } (x86 AVX2 LUT + vcvtdq2ps + vmulps)
@@ -430,34 +442,49 @@ pub enum TraceOp {
     // 供 DecodeTraceBuilder 生成 GGUF 量化格式的硬件无关 SSA 解码序列。
     // 全部 14 个变体按字母序排列。
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
     /// 位与: result = lhs & rhs (整数逐位，用于 nibble 掩码)。
     /// 后端映射: VmInstr::VecBinOp { op: VecOp::And, dtype: I32 } (REQ-VR-004 §1.4.1)
-    QuantBitAnd { lhs: ValueId, rhs: ValueId },
+    QuantBitAnd {
+        lhs: ValueId,
+        rhs: ValueId,
+    },
 
     /// 位或: result = lhs | rhs (整数逐位，用于合并 high-bit 平面)。
     /// 后端映射: VmInstr::VecBinOp { op: VecOp::Or, dtype: I32 } (REQ-VR-004 §1.4.1)
-    QuantBitOr { lhs: ValueId, rhs: ValueId },
+    QuantBitOr {
+        lhs: ValueId,
+        rhs: ValueId,
+    },
 
     /// 标量广播: 将 src 的 lane 0 值广播到 lanes 个 lane。
     /// 用于将单个 f32 scale 广播到整个解码向量。
     /// 后端映射: VmInstr::Broadcast { dtype: F32 } (REQ-VR-004 §1.4.1)
-    QuantBroadcast { src: ValueId, lanes: usize },
+    QuantBroadcast {
+        src: ValueId,
+        lanes: usize,
+    },
 
     /// f16 → f32 类型转换: result = (f32) src。
     /// 用于将 GGUF block 头的 f16 scale 转换为 f32。
     /// 后端映射: VmInstr::VecCast { from_bits: 16, to_bits: 32 } (REQ-VR-004 §1.4.1)
-    QuantCastF16toF32 { src: ValueId },
+    QuantCastF16toF32 {
+        src: ValueId,
+    },
 
     /// i8 → f32 类型转换: result = (f32) src (K-quant sub-block scale)。
     /// 后端映射: VmInstr::VecUnaryOp { op: VecUnaryOp::IntToFloat } (REQ-VR-004 §1.4.1)
-    QuantCastI8toF32 { src: ValueId },
+    QuantCastI8toF32 {
+        src: ValueId,
+    },
 
     /// FP8 → F32 float-to-float conversion: result = fp8_to_f32(src).
     /// Unlike QuantCastI8toF32 (integer→float), this performs proper FP8 IEEE decode.
     /// `format`: E4M3 (bias=7, 3 mantissa bits) or E5M2 (bias=15, 2 mantissa bits).
     /// 后端映射: VmInstr::VecUnaryOp { op: Fp8E4M3ToFloat / Fp8E5M2ToFloat }
-    QuantCastFp8toF32 { src: ValueId, format: Fp8Format },
+    QuantCastFp8toF32 {
+        src: ValueId,
+        format: Fp8Format,
+    },
 
     /// Codebook 查表: indices → f32 values via static codebook。
     /// 用于 IQ 系列 (IQ4_NL 等) 的 codebook 反量化。
@@ -473,48 +500,77 @@ pub enum TraceOp {
     /// 位域提取: result = (src >> bit_offset) & ((1 << bit_width) - 1)。
     /// 用于从 packed 字节流中提取 index_bits 宽的 codebook 索引。
     /// 后端映射: VmInstr::QuantExtractBits
-    QuantExtractBits { src: ValueId, bit_offset: u32, bit_width: u8 },
+    QuantExtractBits {
+        src: ValueId,
+        bit_offset: u32,
+        bit_width: u8,
+    },
 
     /// 解码 FMA: acc += a * b (全 f32)。
     /// 用于最终反量化的 unpacked * scale + zero 计算。
     /// 与已有 QuantFma (混合精度 TurboQuant) 不同，这里全部是 f32 dequant 代数。
     /// 后端映射: VmInstr::Fma (REQ-VR-004 §1.4.1)
-    QuantDequantFma { acc: ValueId, a: ValueId, b: ValueId },
+    QuantDequantFma {
+        acc: ValueId,
+        a: ValueId,
+        b: ValueId,
+    },
 
     /// 整数除以编译时常量: result = src / divisor (截断)。
     /// 用于计算 sub_block_idx = lane_offset / sub_block_elements。
     /// 后端映射: VmInstr::GprBinOp { op: GprOp::Div, b: GprOperand::Imm(divisor) }
-    QuantIntDivConst { src: ValueId, divisor: i64 },
+    QuantIntDivConst {
+        src: ValueId,
+        divisor: i64,
+    },
 
     /// 整数乘以编译时常量: result = src * factor。
     /// 用于计算字节偏移 (sub_block_idx * scale_entry_bytes)。
     /// 后端映射: VmInstr::GprBinOp { op: GprOp::Mul, b: GprOperand::Imm(factor) }
-    QuantIntMul { src: ValueId, factor: i64 },
+    QuantIntMul {
+        src: ValueId,
+        factor: i64,
+    },
 
     /// 交叉合并两个半宽向量: result = interleave(lo, hi)。
     /// 用于 PackedNibbles: 将 lo nibbles 和 hi nibbles 合并为 lanes 个元素。
     /// 后端映射: VmInstr::QuantInterleave
-    QuantInterleave { lo: ValueId, hi: ValueId },
+    QuantInterleave {
+        lo: ValueId,
+        hi: ValueId,
+    },
 
     /// 顺序拼接两个半宽向量: result = [lo[0..N/2], hi[0..N/2]]。
     /// 用于 PackedNibbles 的 QuantGather 路径: 元素顺序必须为 [0,1,...,15,16,17,...,31]
     /// 而非交错 [0,16,1,17,...] (QuantInterleave)。
     /// 后端映射: VmInstr::QuantConcatSeq
-    QuantConcatSeq { lo: ValueId, hi: ValueId },
+    QuantConcatSeq {
+        lo: ValueId,
+        hi: ValueId,
+    },
 
     /// 指针算术 (不读内存): result = base_ptr + offset_bytes。
     /// 用于计算 block 内子数组的起始地址。
     /// 后端映射: VmInstr::AddPtr
-    QuantPtrAddOffset { base: ValueId, offset_bytes: i64 },
+    QuantPtrAddOffset {
+        base: ValueId,
+        offset_bytes: i64,
+    },
 
     /// 指针算术 (不读内存): result = base_ptr + index_slot。
     /// 用于计算动态偏移地址 (base + sub_block_idx)。
     /// 后端映射: VmInstr::GprBinOp { op: GprOp::Add }
-    QuantPtrAddDynamic { base: ValueId, index: ValueId },
+    QuantPtrAddDynamic {
+        base: ValueId,
+        index: ValueId,
+    },
 
     /// 整数按位 AND 常量掩码: result = lhs_i32 & mask。
     /// 在整数域操作 (vpand with integer-broadcasted mask), 不经过 f32 broadcast。
-    QuantAndMask { src: ValueId, mask: u64 },
+    QuantAndMask {
+        src: ValueId,
+        mask: u64,
+    },
 
     /// K-Quant (Q3_K/Q4_K/Q5_K) packed 6-bit scale/min lookup for one sub-block.
     /// Decodes the packed scale from `scales[12]` array indexed by sub_block_idx.
@@ -536,17 +592,26 @@ pub enum TraceOp {
     /// 标量内存加载 (带字节偏移): result = *(f16_or_i8*)(base_ptr + offset_bytes)。
     /// 用于读取 block 内固定偏移处的 scale/min/zero 字段。
     /// 后端映射: VmInstr::ScalarLoad + VmInstr::Broadcast (REQ-VR-004 §1.4.1)
-    QuantScalarLoad { ptr: ValueId, offset_bytes: i64 },
+    QuantScalarLoad {
+        ptr: ValueId,
+        offset_bytes: i64,
+    },
 
     /// f16 标量内存加载 + 转 f32: result = (f32)*(f16*)(base_ptr + offset_bytes)。
     /// 单指令完成加载和类型转换，避免 QuantScalarLoad + QuantCastF16toF32 的双重加载。
     /// 后端映射: VmInstr::QuantScalarCvtLoad { src_dtype: ScalarCvtSource::F16 } (REQ-VR-004 §1.4.2)
-    QuantLoadF16toF32 { ptr: ValueId, offset_bytes: i64 },
+    QuantLoadF16toF32 {
+        ptr: ValueId,
+        offset_bytes: i64,
+    },
 
     /// i8 标量内存加载 + 转 f32: result = (f32)*(i8*)(base_ptr + offset_bytes)。
     /// 单指令完成加载和类型转换，避免 QuantScalarLoad + QuantCastI8toF32 的双重加载。
     /// 后端映射: VmInstr::QuantScalarCvtLoad { src_dtype: ScalarCvtSource::I8 } (REQ-VR-004 §1.4.2)
-    QuantLoadI8toF32 { ptr: ValueId, offset_bytes: i64 },
+    QuantLoadI8toF32 {
+        ptr: ValueId,
+        offset_bytes: i64,
+    },
 
     /// 多字节内存加载为 i32 向量 (零扩展，不转 float):
     /// 从 `base_ptr + offset_bytes` 加载 `count` 字节，零扩展为 `count` 个 i32。
@@ -554,17 +619,28 @@ pub enum TraceOp {
     /// 后端映射: VmInstr::QuantLoadBytesVec
     /// 加载多个字节到向量寄存器 (每个字节零扩展/符号扩展为 i32)。
     /// signed=true 时使用 vpmovsxbd (符号扩展); signed=false 时使用 vpmovzxbd (零扩展)。
-    QuantLoadBytesVec { ptr: ValueId, offset_bytes: i64, count: usize, signed: bool },
+    QuantLoadBytesVec {
+        ptr: ValueId,
+        offset_bytes: i64,
+        count: usize,
+        signed: bool,
+    },
 
     /// 整数向量左移: result = src << amount (逐元素)。
     /// 用于将 high-bit 平面左移后与低 nibbles 合并 (NibbleWithHighBits)。
     /// 后端映射: VmInstr::VecShiftImm { op: VecShiftDir::Left } (REQ-VR-004 §1.4.1)
-    QuantShiftLeft { src: ValueId, amount: u32 },
+    QuantShiftLeft {
+        src: ValueId,
+        amount: u32,
+    },
 
     /// 整数向量右移: result = src >> amount (逐元素，逻辑右移)。
     /// 用于从 packed byte 中提取高 nibble。
     /// 后端映射: VmInstr::VecShiftImm { op: VecShiftDir::Right } (REQ-VR-004 §1.4.1)
-    QuantShiftRight { src: ValueId, amount: u32 },
+    QuantShiftRight {
+        src: ValueId,
+        amount: u32,
+    },
 
     /// E2M1 LUT decode: loads packed nibbles from data_ptr, decodes via E2M1 lookup table,
     /// multiplies by scale, outputs F32 SIMD vector.
@@ -730,7 +806,6 @@ pub enum TraceOp {
     // SPEC 24-QUANT-PIPELINE-JIT §1.3: QuantGather/QuantGemm structural trace ops
     // Marker ops in the trace — auto_select expands to full emit_*_inline logic.
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
     /// Quantized embedding lookup: decode quant blocks on-the-fly for indexed rows.
     /// The 3 preceding Input ops provide: indices_ptr, embed_ptr, output_ptr.
     /// auto_select mapping: emit_quant_gather_inline → VmInstr (seq loop → block decode → store)
@@ -754,7 +829,6 @@ pub enum TraceOp {
     // SPEC 27 REQ-AT-002: TraceOp structural extensions
     // Loop / panel / softmax / GPU / tile — produced by template interpreter
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
     /// Structured loop: iterate `bound` times with `step_bytes` stride.
     /// auto_select maps: LoopBegin + body + LoopEnd VmInstr sequence.
     Loop {
@@ -819,34 +893,52 @@ pub enum TraceOp {
     },
 
     /// Wait for async operation group (GPU).
-    AsyncWaitGroup { n: u32 },
+    AsyncWaitGroup {
+        n: u32,
+    },
 
     /// Synchronization barrier (GPU).
-    SyncBarrier { name: String },
+    SyncBarrier {
+        name: String,
+    },
 
     /// Configure hardware tile register (AMX/SME2).
-    TileConfig { rows: usize, cols: usize },
+    TileConfig {
+        rows: usize,
+        cols: usize,
+    },
 
     /// Tile matrix multiply-accumulate: c += a × b (AMX/SME2/GPU).
     /// shape: a=m×k, b=k×n, c=m×n (CR-TIER-SOVEREIGNTY-004, 透传给 VmInstr::TileMma)。
     /// dtype 由 auto_select 从 graph tensor 推断注入 VmInstr (同 TileConfig 模式)。
-    TileMma { c: ValueId, a: ValueId, b: ValueId, m: usize, n: usize, k: usize },
+    TileMma {
+        c: ValueId,
+        a: ValueId,
+        b: ValueId,
+        m: usize,
+        n: usize,
+        k: usize,
+    },
 
     /// Release hardware tile resources.
     TileRelease,
 
     /// Softmax: reduce_max → exp(x-max) → sum → normalize.
     /// auto_select expands: HReduce(Max) → Sub → Exp → HReduce(Sum) → Div.
-    Softmax { src: ValueId, dst: ValueId },
+    Softmax {
+        src: ValueId,
+        dst: ValueId,
+    },
 
     /// Epilogue chain: apply a sequence of post-GEMM operations.
-    EpilogueChain { ops: Vec<crate::compiler::codegen::vm::algo_template::EpilogueOp> },
+    EpilogueChain {
+        ops: Vec<crate::compiler::codegen::vm::algo_template::EpilogueOp>,
+    },
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // MTP Draft (MTP-001): Multi-Token Prediction structural trace op.
     // auto_select expands to depth × (GEMV + argmax + store) loop nest.
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
     /// Multi-Token Prediction draft candidate generation.
     /// Expands to: depth iterations of hidden→vocab GEMV + argmax + store.
     /// Preceding Input ops: [hidden_ptr, weight_ptr, output_tokens_ptr].
@@ -861,7 +953,6 @@ pub enum TraceOp {
     // MLA (Multi-head Latent Attention) — DeepSeek V3/R1, Kimi-K2
     // Structural TraceOp for MlaAttention and MlaRopeMerge.
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
     /// MLA Attention score computation in compressed d_c space.
     /// Per-head: Q_absorbed[h] × key^T → softmax → weighted V restore.
     /// auto_select mapping: emit_mla_attn_score_inline → VmInstr loop nest.
@@ -884,7 +975,6 @@ pub enum TraceOp {
     // SPEC 37 REQ-HWACC-007: Dynamic Precision Hot-Switch
     // GEMM prologue 分析 weight/activation 统计量 → 运行时选择 FP16/FP8/NVFP4 kernel
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
     /// 动态精度选择：分析 tensor 统计量选择最优计算精度。
     /// GEMM prologue 使用：测量 weight/activation 的 max 值 → 选择 FP16/FP8/NVFP4。
     ///
@@ -937,16 +1027,16 @@ pub enum DTypeKind {
     F32,
     F16,
     BF16,
-    TF32,                // Intel AMX-TF32
-    FP8E4M3,             // NVIDIA/AMD standard FP8
-    FP8E5M2,             // NVIDIA/AMD alternate FP8
-    FP6E2M3,             // AMD CDNA4
-    FP6E3M2,             // AMD CDNA4
-    FP4E2M1,             // AMD CDNA4 / NVIDIA Blackwell
+    TF32,    // Intel AMX-TF32
+    FP8E4M3, // NVIDIA/AMD standard FP8
+    FP8E5M2, // NVIDIA/AMD alternate FP8
+    FP6E2M3, // AMD CDNA4
+    FP6E3M2, // AMD CDNA4
+    FP4E2M1, // AMD CDNA4 / NVIDIA Blackwell
     INT8,
     INT4,
     INT2,
-    INT1,                // QJL 1-bit (§11.5 双轨池)
+    INT1, // QJL 1-bit (§11.5 双轨池)
 }
 
 /// 存储打包方式 — 量化格式的打包策略 (REQ-DTYPE-001)。
@@ -971,12 +1061,23 @@ pub enum PackingFormat {
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GgmlType {
-    Q4_0, Q4_1, Q5_0, Q5_1, Q8_0,
-    Q2_K, Q3_K_S, Q3_K_M, Q3_K_L,
-    Q4_K_S, Q4_K_M,
-    Q5_K_S, Q5_K_M,
+    Q4_0,
+    Q4_1,
+    Q5_0,
+    Q5_1,
+    Q8_0,
+    Q2_K,
+    Q3_K_S,
+    Q3_K_M,
+    Q3_K_L,
+    Q4_K_S,
+    Q4_K_M,
+    Q5_K_S,
+    Q5_K_M,
     Q6_K,
-    IQ2_XXS, IQ2_XS, IQ3_XXS,
+    IQ2_XXS,
+    IQ2_XS,
+    IQ3_XXS,
 }
 
 impl GgmlType {
@@ -1096,26 +1197,101 @@ pub struct TypedSlot {
 impl QuantPrecision {
     // ── 便利常量 (向后兼容) ──
 
-    pub const F32: Self = Self { kind: DTypeKind::F32, packing: PackingFormat::Plain, block_size: 0, group_size: 0 };
-    pub const F16: Self = Self { kind: DTypeKind::F16, packing: PackingFormat::Plain, block_size: 0, group_size: 0 };
-    pub const BF16: Self = Self { kind: DTypeKind::BF16, packing: PackingFormat::Plain, block_size: 0, group_size: 0 };
-    pub const TF32: Self = Self { kind: DTypeKind::TF32, packing: PackingFormat::Plain, block_size: 0, group_size: 0 };
-    pub const FP8E4M3: Self = Self { kind: DTypeKind::FP8E4M3, packing: PackingFormat::Plain, block_size: 0, group_size: 0 };
-    pub const FP8E5M2: Self = Self { kind: DTypeKind::FP8E5M2, packing: PackingFormat::Plain, block_size: 0, group_size: 0 };
-    pub const FP6E2M3: Self = Self { kind: DTypeKind::FP6E2M3, packing: PackingFormat::Plain, block_size: 0, group_size: 0 };
-    pub const FP6E3M2: Self = Self { kind: DTypeKind::FP6E3M2, packing: PackingFormat::Plain, block_size: 0, group_size: 0 };
-    pub const FP4E2M1: Self = Self { kind: DTypeKind::FP4E2M1, packing: PackingFormat::Plain, block_size: 0, group_size: 0 };
-    pub const INT8: Self = Self { kind: DTypeKind::INT8, packing: PackingFormat::Plain, block_size: 0, group_size: 0 };
-    pub const INT4: Self = Self { kind: DTypeKind::INT4, packing: PackingFormat::Plain, block_size: 0, group_size: 0 };
-    pub const INT2: Self = Self { kind: DTypeKind::INT2, packing: PackingFormat::Plain, block_size: 0, group_size: 0 };
-    pub const INT1: Self = Self { kind: DTypeKind::INT1, packing: PackingFormat::Plain, block_size: 0, group_size: 0 };
+    pub const F32: Self = Self {
+        kind: DTypeKind::F32,
+        packing: PackingFormat::Plain,
+        block_size: 0,
+        group_size: 0,
+    };
+    pub const F16: Self = Self {
+        kind: DTypeKind::F16,
+        packing: PackingFormat::Plain,
+        block_size: 0,
+        group_size: 0,
+    };
+    pub const BF16: Self = Self {
+        kind: DTypeKind::BF16,
+        packing: PackingFormat::Plain,
+        block_size: 0,
+        group_size: 0,
+    };
+    pub const TF32: Self = Self {
+        kind: DTypeKind::TF32,
+        packing: PackingFormat::Plain,
+        block_size: 0,
+        group_size: 0,
+    };
+    pub const FP8E4M3: Self = Self {
+        kind: DTypeKind::FP8E4M3,
+        packing: PackingFormat::Plain,
+        block_size: 0,
+        group_size: 0,
+    };
+    pub const FP8E5M2: Self = Self {
+        kind: DTypeKind::FP8E5M2,
+        packing: PackingFormat::Plain,
+        block_size: 0,
+        group_size: 0,
+    };
+    pub const FP6E2M3: Self = Self {
+        kind: DTypeKind::FP6E2M3,
+        packing: PackingFormat::Plain,
+        block_size: 0,
+        group_size: 0,
+    };
+    pub const FP6E3M2: Self = Self {
+        kind: DTypeKind::FP6E3M2,
+        packing: PackingFormat::Plain,
+        block_size: 0,
+        group_size: 0,
+    };
+    pub const FP4E2M1: Self = Self {
+        kind: DTypeKind::FP4E2M1,
+        packing: PackingFormat::Plain,
+        block_size: 0,
+        group_size: 0,
+    };
+    pub const INT8: Self = Self {
+        kind: DTypeKind::INT8,
+        packing: PackingFormat::Plain,
+        block_size: 0,
+        group_size: 0,
+    };
+    pub const INT4: Self = Self {
+        kind: DTypeKind::INT4,
+        packing: PackingFormat::Plain,
+        block_size: 0,
+        group_size: 0,
+    };
+    pub const INT2: Self = Self {
+        kind: DTypeKind::INT2,
+        packing: PackingFormat::Plain,
+        block_size: 0,
+        group_size: 0,
+    };
+    pub const INT1: Self = Self {
+        kind: DTypeKind::INT1,
+        packing: PackingFormat::Plain,
+        block_size: 0,
+        group_size: 0,
+    };
 
     /// MXFP4: FP4E2M1 + MXBlock packing, block_size=32
-    pub const MXFP4_32: Self = Self { kind: DTypeKind::FP4E2M1, packing: PackingFormat::MXBlock, block_size: 32, group_size: 0 };
+    pub const MXFP4_32: Self = Self {
+        kind: DTypeKind::FP4E2M1,
+        packing: PackingFormat::MXBlock,
+        block_size: 32,
+        group_size: 0,
+    };
 
     /// 从 GgmlType 构建 QuantPrecision
     pub const fn ggml(ty: GgmlType) -> Self {
-        Self { kind: DTypeKind::INT4, packing: PackingFormat::GGML(ty), block_size: 0, group_size: 0 }
+        Self {
+            kind: DTypeKind::INT4,
+            packing: PackingFormat::GGML(ty),
+            block_size: 0,
+            group_size: 0,
+        }
     }
 
     /// 是否为打包量化格式 (非 Plain)
@@ -1129,8 +1305,12 @@ impl QuantPrecision {
             DTypeKind::F32 | DTypeKind::TF32 => 4,
             DTypeKind::BF16 | DTypeKind::F16 => 2,
             DTypeKind::FP8E4M3 | DTypeKind::FP8E5M2 | DTypeKind::INT8 => 1,
-            DTypeKind::FP6E2M3 | DTypeKind::FP6E3M2 | DTypeKind::FP4E2M1
-            | DTypeKind::INT4 | DTypeKind::INT2 | DTypeKind::INT1 => 0,
+            DTypeKind::FP6E2M3
+            | DTypeKind::FP6E3M2
+            | DTypeKind::FP4E2M1
+            | DTypeKind::INT4
+            | DTypeKind::INT2
+            | DTypeKind::INT1 => 0,
         }
     }
 
@@ -1151,7 +1331,9 @@ impl QuantPrecision {
     pub fn accumulator_dtype(&self) -> QuantPrecision {
         match self.x86_elem_strategy() {
             X86ElemStrategy::Native => *self,
-            X86ElemStrategy::WidenCompute | X86ElemStrategy::DequantCompute(_) => QuantPrecision::F32,
+            X86ElemStrategy::WidenCompute | X86ElemStrategy::DequantCompute(_) => {
+                QuantPrecision::F32
+            }
         }
     }
 
@@ -1190,14 +1372,20 @@ impl QuantPrecision {
                 DTypeKind::F32 | DTypeKind::TF32 => X86ElemStrategy::Native,
                 DTypeKind::BF16 | DTypeKind::F16 => X86ElemStrategy::WidenCompute,
                 DTypeKind::INT8 => X86ElemStrategy::DequantCompute(DequantMethod::VNNI),
-                DTypeKind::INT4 | DTypeKind::INT2 | DTypeKind::INT1
-                | DTypeKind::FP8E4M3 | DTypeKind::FP8E5M2
-                | DTypeKind::FP6E2M3 | DTypeKind::FP6E3M2 | DTypeKind::FP4E2M1
-                => X86ElemStrategy::DequantCompute(DequantMethod::ScalarLUT),
+                DTypeKind::INT4
+                | DTypeKind::INT2
+                | DTypeKind::INT1
+                | DTypeKind::FP8E4M3
+                | DTypeKind::FP8E5M2
+                | DTypeKind::FP6E2M3
+                | DTypeKind::FP6E3M2
+                | DTypeKind::FP4E2M1 => X86ElemStrategy::DequantCompute(DequantMethod::ScalarLUT),
             },
             PackingFormat::MXBlock => X86ElemStrategy::DequantCompute(DequantMethod::BlockScale),
             PackingFormat::GGML(_) => X86ElemStrategy::DequantCompute(DequantMethod::ScalarLUT),
-            PackingFormat::GPTQ | PackingFormat::AWQ => X86ElemStrategy::DequantCompute(DequantMethod::ScalarLUT),
+            PackingFormat::GPTQ | PackingFormat::AWQ => {
+                X86ElemStrategy::DequantCompute(DequantMethod::ScalarLUT)
+            }
             PackingFormat::Bitnet => X86ElemStrategy::DequantCompute(DequantMethod::ScalarLUT),
         }
     }
@@ -1215,10 +1403,14 @@ impl QuantPrecision {
                 DTypeKind::BF16 => AArch64ElemStrategy::Native,
                 DTypeKind::F16 => AArch64ElemStrategy::Native,
                 DTypeKind::INT8 => AArch64ElemStrategy::Native,
-                DTypeKind::INT4 | DTypeKind::INT2 | DTypeKind::INT1
-                | DTypeKind::FP8E4M3 | DTypeKind::FP8E5M2
-                | DTypeKind::FP6E2M3 | DTypeKind::FP6E3M2 | DTypeKind::FP4E2M1
-                => AArch64ElemStrategy::WidenCompute,
+                DTypeKind::INT4
+                | DTypeKind::INT2
+                | DTypeKind::INT1
+                | DTypeKind::FP8E4M3
+                | DTypeKind::FP8E5M2
+                | DTypeKind::FP6E2M3
+                | DTypeKind::FP6E3M2
+                | DTypeKind::FP4E2M1 => AArch64ElemStrategy::WidenCompute,
             },
             PackingFormat::MXBlock => AArch64ElemStrategy::DequantCompute,
             PackingFormat::GGML(_) => AArch64ElemStrategy::DequantCompute,
@@ -1241,9 +1433,11 @@ impl QuantPrecision {
                 DTypeKind::INT8 => GpuElemStrategy::Native,
                 DTypeKind::FP8E4M3 | DTypeKind::FP8E5M2 => GpuElemStrategy::Native,
                 DTypeKind::FP4E2M1 => GpuElemStrategy::Native,
-                DTypeKind::INT4 | DTypeKind::INT2 | DTypeKind::INT1
-                | DTypeKind::FP6E2M3 | DTypeKind::FP6E3M2
-                => GpuElemStrategy::WidenCompute,
+                DTypeKind::INT4
+                | DTypeKind::INT2
+                | DTypeKind::INT1
+                | DTypeKind::FP6E2M3
+                | DTypeKind::FP6E3M2 => GpuElemStrategy::WidenCompute,
             },
             PackingFormat::MXBlock => GpuElemStrategy::DequantCompute,
             PackingFormat::GGML(_) => GpuElemStrategy::DequantCompute,
@@ -1318,14 +1512,18 @@ impl QuantPrecision {
 
 /// 类型提升规则 (SPEC 00-PHILOSOPHY §4.2)。
 pub fn promote(a: QuantPrecision, b: QuantPrecision) -> QuantPrecision {
-    if a == b { return a; }
+    if a == b {
+        return a;
+    }
     // 打包格式不同 → 提升 F32
     if a.packing != b.packing || a.kind != b.kind {
         return QuantPrecision::F32;
     }
     match (a.kind, b.kind) {
         _ if a == QuantPrecision::F32 || b == QuantPrecision::F32 => QuantPrecision::F32,
-        (DTypeKind::BF16, DTypeKind::F16) | (DTypeKind::F16, DTypeKind::BF16) => QuantPrecision::F32,
+        (DTypeKind::BF16, DTypeKind::F16) | (DTypeKind::F16, DTypeKind::BF16) => {
+            QuantPrecision::F32
+        }
         _ => QuantPrecision::F32,
     }
 }
@@ -1333,21 +1531,42 @@ pub fn promote(a: QuantPrecision, b: QuantPrecision) -> QuantPrecision {
 /// 根据 TraceOp 语义自动推断结果 dtype (SPEC 00-PHILOSOPHY §4.1)。
 pub fn infer_result_dtype(op: &TraceOp, slots: &[TypedSlot]) -> QuantPrecision {
     fn slot_dtype(slots: &[TypedSlot], idx: ValueId) -> QuantPrecision {
-        slots.get(idx.0 as usize).map(|s| s.dtype).unwrap_or(QuantPrecision::F32)
+        slots
+            .get(idx.0 as usize)
+            .map(|s| s.dtype)
+            .unwrap_or(QuantPrecision::F32)
     }
     match op {
-        TraceOp::Input(n) => slots.get(*n as usize).map(|s| s.dtype).unwrap_or(QuantPrecision::F32),
+        TraceOp::Input(n) => slots
+            .get(*n as usize)
+            .map(|s| s.dtype)
+            .unwrap_or(QuantPrecision::F32),
         TraceOp::Const(_) => QuantPrecision::F32,
-        TraceOp::Add(a, b) | TraceOp::Sub(a, b) | TraceOp::Mul(a, b) | TraceOp::Div(a, b)
+        TraceOp::Add(a, b)
+        | TraceOp::Sub(a, b)
+        | TraceOp::Mul(a, b)
+        | TraceOp::Div(a, b)
         | TraceOp::Pow(a, b)
-        | TraceOp::Max(a, b) | TraceOp::Min(a, b) => promote(slot_dtype(slots, *a), slot_dtype(slots, *b)),
-        TraceOp::Fma(a, b, c) => promote(promote(slot_dtype(slots, *a), slot_dtype(slots, *b)), slot_dtype(slots, *c)),
-        TraceOp::Neg(a) | TraceOp::Abs(a) | TraceOp::Sqrt(a) | TraceOp::Rsqrt(a) | TraceOp::Recip(a) => slot_dtype(slots, *a),
-        TraceOp::Exp(_) | TraceOp::Log(_) | TraceOp::Sigmoid(_) | TraceOp::Tanh(_) => QuantPrecision::F32,
+        | TraceOp::Max(a, b)
+        | TraceOp::Min(a, b) => promote(slot_dtype(slots, *a), slot_dtype(slots, *b)),
+        TraceOp::Fma(a, b, c) => promote(
+            promote(slot_dtype(slots, *a), slot_dtype(slots, *b)),
+            slot_dtype(slots, *c),
+        ),
+        TraceOp::Neg(a)
+        | TraceOp::Abs(a)
+        | TraceOp::Sqrt(a)
+        | TraceOp::Rsqrt(a)
+        | TraceOp::Recip(a) => slot_dtype(slots, *a),
+        TraceOp::Exp(_) | TraceOp::Log(_) | TraceOp::Sigmoid(_) | TraceOp::Tanh(_) => {
+            QuantPrecision::F32
+        }
         TraceOp::Cast { to, .. } => *to,
         TraceOp::HReduce { .. } | TraceOp::Compare { .. } => QuantPrecision::F32,
         TraceOp::QuantFma { .. } | TraceOp::Mxfp4Dequant { .. } => QuantPrecision::F32,
-        TraceOp::BroadcastScalar { .. } | TraceOp::BroadcastLoad { .. } | TraceOp::ConditionalBranch(..) => QuantPrecision::F32,
+        TraceOp::BroadcastScalar { .. }
+        | TraceOp::BroadcastLoad { .. }
+        | TraceOp::ConditionalBranch(..) => QuantPrecision::F32,
         TraceOp::BlockScale { data, .. } => slot_dtype(slots, *data),
         TraceOp::Prefetch { .. } | TraceOp::NonTemporalStore => QuantPrecision::F32,
         TraceOp::BitExtract { src, .. } => slot_dtype(slots, *src),
@@ -1375,8 +1594,17 @@ pub fn infer_result_dtype(op: &TraceOp, slots: &[TypedSlot]) -> QuantPrecision {
         TraceOp::QuantDequantFma { acc, .. } => slot_dtype(slots, *acc),
         TraceOp::QuantIntDivConst { .. } => QuantPrecision::F32,
         TraceOp::QuantIntMul { .. } => QuantPrecision::F32,
-        TraceOp::QuantInterleave { lo, .. } | TraceOp::QuantConcatSeq { lo, .. } => slot_dtype(slots, *lo),
-        TraceOp::QuantPtrAddOffset { .. } | TraceOp::QuantPtrAddDynamic { .. } | TraceOp::QuantScalarLoad { .. } | TraceOp::QuantLoadF16toF32 { .. } | TraceOp::QuantLoadI8toF32 { .. } | TraceOp::QuantLoadBytesVec { .. } | TraceOp::QuantAndMask { .. } | TraceOp::QuantKQuantPackedScaleLookup { .. } => QuantPrecision::F32,
+        TraceOp::QuantInterleave { lo, .. } | TraceOp::QuantConcatSeq { lo, .. } => {
+            slot_dtype(slots, *lo)
+        }
+        TraceOp::QuantPtrAddOffset { .. }
+        | TraceOp::QuantPtrAddDynamic { .. }
+        | TraceOp::QuantScalarLoad { .. }
+        | TraceOp::QuantLoadF16toF32 { .. }
+        | TraceOp::QuantLoadI8toF32 { .. }
+        | TraceOp::QuantLoadBytesVec { .. }
+        | TraceOp::QuantAndMask { .. }
+        | TraceOp::QuantKQuantPackedScaleLookup { .. } => QuantPrecision::F32,
         TraceOp::QuantShiftLeft { src, .. } => slot_dtype(slots, *src),
         TraceOp::QuantShiftRight { src, .. } => slot_dtype(slots, *src),
         TraceOp::QuantE2m1LutDecode { .. } => QuantPrecision::F32,
@@ -1410,9 +1638,9 @@ pub fn infer_result_dtype(op: &TraceOp, slots: &[TypedSlot]) -> QuantPrecision {
         TraceOp::TileRelease => QuantPrecision::F32,
         TraceOp::Softmax { .. } => QuantPrecision::F32,
         TraceOp::EpilogueChain { .. } => QuantPrecision::F32,
-        TraceOp::MtpDraft { .. }
-        | TraceOp::MlaAttnScore { .. }
-        | TraceOp::MlaRopeMerge { .. } => QuantPrecision::F32,
+        TraceOp::MtpDraft { .. } | TraceOp::MlaAttnScore { .. } | TraceOp::MlaRopeMerge { .. } => {
+            QuantPrecision::F32
+        }
         // ── SPEC 37 REQ-HWACC-007: DynamicPrecisionSelect ──
         // 返回第一个候选精度（最高精度），作为默认计算精度。
         // 后续 GEMM 根据实际选择的精度索引调整。
@@ -1433,20 +1661,30 @@ impl TraceOp {
     fn visit_value_ids_inner<F: FnMut(ValueId)>(&self, f: &mut F) {
         match self {
             // No ValueId fields
-            TraceOp::Input(_) | TraceOp::Const(_) | TraceOp::Prefetch { .. }
-            | TraceOp::NonTemporalStore | TraceOp::SharedMemDeclare { .. }
-            | TraceOp::AsyncWaitGroup { .. } | TraceOp::SyncBarrier { .. }
-            | TraceOp::TileConfig { .. } | TraceOp::TileRelease
+            TraceOp::Input(_)
+            | TraceOp::Const(_)
+            | TraceOp::Prefetch { .. }
+            | TraceOp::NonTemporalStore
+            | TraceOp::SharedMemDeclare { .. }
+            | TraceOp::AsyncWaitGroup { .. }
+            | TraceOp::SyncBarrier { .. }
+            | TraceOp::TileConfig { .. }
+            | TraceOp::TileRelease
             | TraceOp::EpilogueChain { .. }
-            | TraceOp::QuantGather { .. } | TraceOp::QuantGemm { .. }
+            | TraceOp::QuantGather { .. }
+            | TraceOp::QuantGemm { .. }
             | TraceOp::MtpDraft { .. }
             | TraceOp::MlaAttnScore { .. }
             | TraceOp::MlaRopeMerge { .. } => {}
 
             // Binary (2 ValueId)
-            TraceOp::Add(a, b) | TraceOp::Sub(a, b) | TraceOp::Mul(a, b)
-            | TraceOp::Div(a, b) | TraceOp::Pow(a, b)
-            | TraceOp::Max(a, b) | TraceOp::Min(a, b)
+            TraceOp::Add(a, b)
+            | TraceOp::Sub(a, b)
+            | TraceOp::Mul(a, b)
+            | TraceOp::Div(a, b)
+            | TraceOp::Pow(a, b)
+            | TraceOp::Max(a, b)
+            | TraceOp::Min(a, b)
             | TraceOp::BitAnd(a, b)
             | TraceOp::QuantBitAnd { lhs: a, rhs: b }
             | TraceOp::QuantBitOr { lhs: a, rhs: b }
@@ -1455,53 +1693,128 @@ impl TraceOp {
             | TraceOp::Permute { src: a, indices: b }
             | TraceOp::AtomicAdd { addr: a, val: b }
             | TraceOp::Compare { a, b, .. }
-            | TraceOp::BlockScale { data: a, scale: b, .. }
+            | TraceOp::BlockScale {
+                data: a, scale: b, ..
+            }
             | TraceOp::QuantPtrAddDynamic { base: a, index: b }
             | TraceOp::PackBuffer { src: a, dst: b, .. }
             | TraceOp::Softmax { src: a, dst: b }
-            | TraceOp::GatherLoad { base: a, indices: b, .. }
-            | TraceOp::ScatterStore { base: a, indices: b, .. }
-            | TraceOp::TableLookup { base: a, row_index: b, .. }
-            | TraceOp::QuantKQuantPackedScaleLookup { scales_base: a, sub_block_idx: b, .. }
-            | TraceOp::QuantCodebookDequant { indices: a, codebook_ptr: b, .. } => {
-                f(*a); f(*b);
+            | TraceOp::GatherLoad {
+                base: a,
+                indices: b,
+                ..
+            }
+            | TraceOp::ScatterStore {
+                base: a,
+                indices: b,
+                ..
+            }
+            | TraceOp::TableLookup {
+                base: a,
+                row_index: b,
+                ..
+            }
+            | TraceOp::QuantKQuantPackedScaleLookup {
+                scales_base: a,
+                sub_block_idx: b,
+                ..
+            }
+            | TraceOp::QuantCodebookDequant {
+                indices: a,
+                codebook_ptr: b,
+                ..
+            } => {
+                f(*a);
+                f(*b);
             }
 
-            TraceOp::QuantQ3KDecode { block_base: a, lane_offset: b, d_slot: c, .. } => {
-                f(*a); f(*b); f(*c);
+            TraceOp::QuantQ3KDecode {
+                block_base: a,
+                lane_offset: b,
+                d_slot: c,
+                ..
+            } => {
+                f(*a);
+                f(*b);
+                f(*c);
             }
-            TraceOp::QuantQ6KDecode { block_base: a, lane_offset: b, d_slot: c, .. } => {
-                f(*a); f(*b); f(*c);
+            TraceOp::QuantQ6KDecode {
+                block_base: a,
+                lane_offset: b,
+                d_slot: c,
+                ..
+            } => {
+                f(*a);
+                f(*b);
+                f(*c);
             }
-            TraceOp::QuantQ5Decode { block_base: a, lane_offset: b, d_slot: c, .. } => {
-                f(*a); f(*b); f(*c);
+            TraceOp::QuantQ5Decode {
+                block_base: a,
+                lane_offset: b,
+                d_slot: c,
+                ..
+            } => {
+                f(*a);
+                f(*b);
+                f(*c);
             }
-            TraceOp::QuantQ5KDecode { block_base: a, lane_offset: b, d_slot: c, .. } => {
-                f(*a); f(*b); f(*c);
+            TraceOp::QuantQ5KDecode {
+                block_base: a,
+                lane_offset: b,
+                d_slot: c,
+                ..
+            } => {
+                f(*a);
+                f(*b);
+                f(*c);
             }
-            TraceOp::QuantQ4KDecode { block_base: a, lane_offset: b, d_slot: c, .. } => {
-                f(*a); f(*b); f(*c);
+            TraceOp::QuantQ4KDecode {
+                block_base: a,
+                lane_offset: b,
+                d_slot: c,
+                ..
+            } => {
+                f(*a);
+                f(*b);
+                f(*c);
             }
 
             // Ternary (3 ValueId)
             TraceOp::Fma(a, b, c)
             | TraceOp::ConditionalBranch(a, b, c)
             | TraceOp::QuantDequantFma { acc: a, a: b, b: c }
-            | TraceOp::TileMma { c: a, a: b, b: c, m: _, n: _, k: _ } => {
-                f(*a); f(*b); f(*c);
+            | TraceOp::TileMma {
+                c: a,
+                a: b,
+                b: c,
+                m: _,
+                n: _,
+                k: _,
+            } => {
+                f(*a);
+                f(*b);
+                f(*c);
             }
 
             // Unary (1 ValueId)
-            TraceOp::Neg(a) | TraceOp::Abs(a) | TraceOp::Exp(a)
-            | TraceOp::Sqrt(a) | TraceOp::Rsqrt(a) | TraceOp::Recip(a)
-            | TraceOp::Log(a) | TraceOp::Sigmoid(a) | TraceOp::Tanh(a)
+            TraceOp::Neg(a)
+            | TraceOp::Abs(a)
+            | TraceOp::Exp(a)
+            | TraceOp::Sqrt(a)
+            | TraceOp::Rsqrt(a)
+            | TraceOp::Recip(a)
+            | TraceOp::Log(a)
+            | TraceOp::Sigmoid(a)
+            | TraceOp::Tanh(a)
             | TraceOp::HReduce { src: a, .. }
             | TraceOp::BitExtract { src: a, .. }
             | TraceOp::FWHT { src: a, .. }
             | TraceOp::BroadcastScalar { src: a }
             | TraceOp::Cast { src: a, .. }
             | TraceOp::StrideMul { value: a, .. }
-            | TraceOp::QuantFma { acc: a, .. } => { f(*a); }
+            | TraceOp::QuantFma { acc: a, .. } => {
+                f(*a);
+            }
 
             TraceOp::QuantBroadcast { src: a, .. }
             | TraceOp::QuantCastF16toF32 { src: a }
@@ -1518,36 +1831,72 @@ impl TraceOp {
             | TraceOp::QuantPtrAddOffset { base: a, .. }
             | TraceOp::QuantExtractBits { src: a, .. }
             | TraceOp::QuantCodebookLookup { indices: a, .. }
-            | TraceOp::QuantAndMask { src: a, .. } => { f(*a); }
+            | TraceOp::QuantAndMask { src: a, .. } => {
+                f(*a);
+            }
 
             // QuantXxxLoad (1 ValueId: source)
             TraceOp::QuantScaleLoad { source: a, .. }
             | TraceOp::QuantDataLoad { source: a, .. }
             | TraceOp::QuantZeroLoad { source: a, .. }
             | TraceOp::QuantSubScaleLoad { block_ptr: a, .. }
-            | TraceOp::QuantHighBitsLoad { block_ptr: a, .. } => { f(*a); }
+            | TraceOp::QuantHighBitsLoad { block_ptr: a, .. } => {
+                f(*a);
+            }
 
             // Dual ValueId (base + offset / base + value)
             TraceOp::ScalarLoad { base: a, offset: b }
             | TraceOp::PtrAdd { base: a, offset: b }
             | TraceOp::VecLoadIndexed { base: a, offset: b }
             | TraceOp::BroadcastLoad { base: a, offset: b }
-            | TraceOp::PanelLoad { base: a, offset: b, .. }
-            | TraceOp::PanelStore { base: a, offset: b, .. } => { f(*a); f(*b); }
-
-            TraceOp::VecStoreIndexed { base: a, offset: b, value: c } => {
-                f(*a); f(*b); f(*c);
+            | TraceOp::PanelLoad {
+                base: a, offset: b, ..
+            }
+            | TraceOp::PanelStore {
+                base: a, offset: b, ..
+            } => {
+                f(*a);
+                f(*b);
             }
 
-            TraceOp::QuantE2m1LutDecode { packed_data_ptr: a, scale_byte: b, .. } => {
-                f(*a); f(*b);
+            TraceOp::VecStoreIndexed {
+                base: a,
+                offset: b,
+                value: c,
+            } => {
+                f(*a);
+                f(*b);
+                f(*c);
             }
 
-            TraceOp::Mxfp4Dequant { data, scales, off_a, off_b, off_c, .. } => {
-                f(*data); f(*scales);
-                if let Some(a) = off_a { f(*a); }
-                if let Some(b) = off_b { f(*b); }
-                if let Some(c) = off_c { f(*c); }
+            TraceOp::QuantE2m1LutDecode {
+                packed_data_ptr: a,
+                scale_byte: b,
+                ..
+            } => {
+                f(*a);
+                f(*b);
+            }
+
+            TraceOp::Mxfp4Dequant {
+                data,
+                scales,
+                off_a,
+                off_b,
+                off_c,
+                ..
+            } => {
+                f(*data);
+                f(*scales);
+                if let Some(a) = off_a {
+                    f(*a);
+                }
+                if let Some(b) = off_b {
+                    f(*b);
+                }
+                if let Some(c) = off_c {
+                    f(*c);
+                }
             }
 
             TraceOp::MaskedOp { op, mask } => {
@@ -1555,15 +1904,26 @@ impl TraceOp {
                 f(*mask);
             }
 
-            TraceOp::AsyncCopyToShared { src_offset, .. } => { f(*src_offset); }
-
-            TraceOp::Tma2DCopy { coord_x, coord_y, .. } => { f(*coord_x); f(*coord_y); }
-
-            TraceOp::Loop { body: inner, .. } => {
-                for op in inner { op.visit_value_ids_inner(f); }
+            TraceOp::AsyncCopyToShared { src_offset, .. } => {
+                f(*src_offset);
             }
 
-            TraceOp::DynamicPrecisionSelect { tensor, .. } => { f(*tensor); }
+            TraceOp::Tma2DCopy {
+                coord_x, coord_y, ..
+            } => {
+                f(*coord_x);
+                f(*coord_y);
+            }
+
+            TraceOp::Loop { body: inner, .. } => {
+                for op in inner {
+                    op.visit_value_ids_inner(f);
+                }
+            }
+
+            TraceOp::DynamicPrecisionSelect { tensor, .. } => {
+                f(*tensor);
+            }
         }
     }
 
@@ -1609,153 +1969,554 @@ impl TraceOp {
             TraceOp::Tanh(a) => TraceOp::Tanh(m(a)),
 
             // Extended §12+§14
-            TraceOp::QuantFma { acc, act, weight, act_dtype, weight_dtype } =>
-                TraceOp::QuantFma { acc: m(acc), act: m(act), weight: m(weight), act_dtype, weight_dtype },
-            TraceOp::BlockScale { data, scale, block_size } =>
-                TraceOp::BlockScale { data: m(data), scale: m(scale), block_size },
-            TraceOp::Cast { src, from, to } => TraceOp::Cast { src: m(src), from, to },
+            TraceOp::QuantFma {
+                acc,
+                act,
+                weight,
+                act_dtype,
+                weight_dtype,
+            } => TraceOp::QuantFma {
+                acc: m(acc),
+                act: m(act),
+                weight: m(weight),
+                act_dtype,
+                weight_dtype,
+            },
+            TraceOp::BlockScale {
+                data,
+                scale,
+                block_size,
+            } => TraceOp::BlockScale {
+                data: m(data),
+                scale: m(scale),
+                block_size,
+            },
+            TraceOp::Cast { src, from, to } => TraceOp::Cast {
+                src: m(src),
+                from,
+                to,
+            },
             TraceOp::HReduce { src, op } => TraceOp::HReduce { src: m(src), op },
-            TraceOp::Compare { a, b, op } => TraceOp::Compare { a: m(a), b: m(b), op },
-            TraceOp::MaskedOp { op, mask } => TraceOp::MaskedOp { op: Box::new(op.map_value_ids(map_fn)), mask: m(mask) },
-            TraceOp::BitExtract { src, offset, width } => TraceOp::BitExtract { src: m(src), offset, width },
-            TraceOp::Permute { src, indices } => TraceOp::Permute { src: m(src), indices: m(indices) },
-            TraceOp::AtomicAdd { addr, val } => TraceOp::AtomicAdd { addr: m(addr), val: m(val) },
+            TraceOp::Compare { a, b, op } => TraceOp::Compare {
+                a: m(a),
+                b: m(b),
+                op,
+            },
+            TraceOp::MaskedOp { op, mask } => TraceOp::MaskedOp {
+                op: Box::new(op.map_value_ids(map_fn)),
+                mask: m(mask),
+            },
+            TraceOp::BitExtract { src, offset, width } => TraceOp::BitExtract {
+                src: m(src),
+                offset,
+                width,
+            },
+            TraceOp::Permute { src, indices } => TraceOp::Permute {
+                src: m(src),
+                indices: m(indices),
+            },
+            TraceOp::AtomicAdd { addr, val } => TraceOp::AtomicAdd {
+                addr: m(addr),
+                val: m(val),
+            },
             TraceOp::FWHT { src, dim } => TraceOp::FWHT { src: m(src), dim },
-            TraceOp::ScalarLoad { base, offset } => TraceOp::ScalarLoad { base: m(base), offset: m(offset) },
-            TraceOp::StrideMul { value, stride } => TraceOp::StrideMul { value: m(value), stride },
-            TraceOp::PtrAdd { base, offset } => TraceOp::PtrAdd { base: m(base), offset: m(offset) },
-            TraceOp::VecLoadIndexed { base, offset } => TraceOp::VecLoadIndexed { base: m(base), offset: m(offset) },
-            TraceOp::VecStoreIndexed { base, offset, value } =>
-                TraceOp::VecStoreIndexed { base: m(base), offset: m(offset), value: m(value) },
+            TraceOp::ScalarLoad { base, offset } => TraceOp::ScalarLoad {
+                base: m(base),
+                offset: m(offset),
+            },
+            TraceOp::StrideMul { value, stride } => TraceOp::StrideMul {
+                value: m(value),
+                stride,
+            },
+            TraceOp::PtrAdd { base, offset } => TraceOp::PtrAdd {
+                base: m(base),
+                offset: m(offset),
+            },
+            TraceOp::VecLoadIndexed { base, offset } => TraceOp::VecLoadIndexed {
+                base: m(base),
+                offset: m(offset),
+            },
+            TraceOp::VecStoreIndexed {
+                base,
+                offset,
+                value,
+            } => TraceOp::VecStoreIndexed {
+                base: m(base),
+                offset: m(offset),
+                value: m(value),
+            },
             TraceOp::BroadcastScalar { src } => TraceOp::BroadcastScalar { src: m(src) },
-            TraceOp::BroadcastLoad { base, offset } => TraceOp::BroadcastLoad { base: m(base), offset: m(offset) },
-            TraceOp::GatherLoad { base, indices, stride } => TraceOp::GatherLoad { base: m(base), indices: m(indices), stride },
-            TraceOp::ScatterStore { base, indices, value, stride } =>
-                TraceOp::ScatterStore { base: m(base), indices: m(indices), value: m(value), stride },
-            TraceOp::TableLookup { base, row_index, row_bytes } =>
-                TraceOp::TableLookup { base: m(base), row_index: m(row_index), row_bytes },
-            TraceOp::Mxfp4Dequant { data, scales, off_a, stride_a, off_b, stride_b, off_c, const_off, block_size } =>
-                TraceOp::Mxfp4Dequant {
-                    data: m(data), scales: m(scales),
-                    off_a: off_a.map(&m), stride_a, off_b: off_b.map(&m), stride_b,
-                    off_c: off_c.map(&m), const_off, block_size,
-                },
+            TraceOp::BroadcastLoad { base, offset } => TraceOp::BroadcastLoad {
+                base: m(base),
+                offset: m(offset),
+            },
+            TraceOp::GatherLoad {
+                base,
+                indices,
+                stride,
+            } => TraceOp::GatherLoad {
+                base: m(base),
+                indices: m(indices),
+                stride,
+            },
+            TraceOp::ScatterStore {
+                base,
+                indices,
+                value,
+                stride,
+            } => TraceOp::ScatterStore {
+                base: m(base),
+                indices: m(indices),
+                value: m(value),
+                stride,
+            },
+            TraceOp::TableLookup {
+                base,
+                row_index,
+                row_bytes,
+            } => TraceOp::TableLookup {
+                base: m(base),
+                row_index: m(row_index),
+                row_bytes,
+            },
+            TraceOp::Mxfp4Dequant {
+                data,
+                scales,
+                off_a,
+                stride_a,
+                off_b,
+                stride_b,
+                off_c,
+                const_off,
+                block_size,
+            } => TraceOp::Mxfp4Dequant {
+                data: m(data),
+                scales: m(scales),
+                off_a: off_a.map(&m),
+                stride_a,
+                off_b: off_b.map(&m),
+                stride_b,
+                off_c: off_c.map(&m),
+                const_off,
+                block_size,
+            },
 
             // SPEC 23 Quant* decode
-            TraceOp::QuantBitAnd { lhs, rhs } => TraceOp::QuantBitAnd { lhs: m(lhs), rhs: m(rhs) },
-            TraceOp::QuantBitOr { lhs, rhs } => TraceOp::QuantBitOr { lhs: m(lhs), rhs: m(rhs) },
-            TraceOp::QuantBroadcast { src, lanes } => TraceOp::QuantBroadcast { src: m(src), lanes },
+            TraceOp::QuantBitAnd { lhs, rhs } => TraceOp::QuantBitAnd {
+                lhs: m(lhs),
+                rhs: m(rhs),
+            },
+            TraceOp::QuantBitOr { lhs, rhs } => TraceOp::QuantBitOr {
+                lhs: m(lhs),
+                rhs: m(rhs),
+            },
+            TraceOp::QuantBroadcast { src, lanes } => {
+                TraceOp::QuantBroadcast { src: m(src), lanes }
+            }
             TraceOp::QuantCastF16toF32 { src } => TraceOp::QuantCastF16toF32 { src: m(src) },
             TraceOp::QuantCastI8toF32 { src } => TraceOp::QuantCastI8toF32 { src: m(src) },
-            TraceOp::QuantCastFp8toF32 { src, format } => TraceOp::QuantCastFp8toF32 { src: m(src), format },
-            TraceOp::QuantCodebookLookup { indices, codebook_data, vector_size, bits_per_entry } =>
-                TraceOp::QuantCodebookLookup { indices: m(indices), codebook_data, vector_size, bits_per_entry },
-            TraceOp::QuantExtractBits { src, bit_offset, bit_width } =>
-                TraceOp::QuantExtractBits { src: m(src), bit_offset, bit_width },
-            TraceOp::QuantDequantFma { acc, a, b } => TraceOp::QuantDequantFma { acc: m(acc), a: m(a), b: m(b) },
-            TraceOp::QuantIntDivConst { src, divisor } => TraceOp::QuantIntDivConst { src: m(src), divisor },
-            TraceOp::QuantIntMul { src, factor } => TraceOp::QuantIntMul { src: m(src), factor },
-            TraceOp::QuantInterleave { lo, hi } => TraceOp::QuantInterleave { lo: m(lo), hi: m(hi) },
-            TraceOp::QuantConcatSeq { lo, hi } => TraceOp::QuantConcatSeq { lo: m(lo), hi: m(hi) },
-            TraceOp::QuantPtrAddOffset { base, offset_bytes } => TraceOp::QuantPtrAddOffset { base: m(base), offset_bytes },
-            TraceOp::QuantPtrAddDynamic { base, index } => TraceOp::QuantPtrAddDynamic { base: m(base), index: m(index) },
+            TraceOp::QuantCastFp8toF32 { src, format } => TraceOp::QuantCastFp8toF32 {
+                src: m(src),
+                format,
+            },
+            TraceOp::QuantCodebookLookup {
+                indices,
+                codebook_data,
+                vector_size,
+                bits_per_entry,
+            } => TraceOp::QuantCodebookLookup {
+                indices: m(indices),
+                codebook_data,
+                vector_size,
+                bits_per_entry,
+            },
+            TraceOp::QuantExtractBits {
+                src,
+                bit_offset,
+                bit_width,
+            } => TraceOp::QuantExtractBits {
+                src: m(src),
+                bit_offset,
+                bit_width,
+            },
+            TraceOp::QuantDequantFma { acc, a, b } => TraceOp::QuantDequantFma {
+                acc: m(acc),
+                a: m(a),
+                b: m(b),
+            },
+            TraceOp::QuantIntDivConst { src, divisor } => TraceOp::QuantIntDivConst {
+                src: m(src),
+                divisor,
+            },
+            TraceOp::QuantIntMul { src, factor } => TraceOp::QuantIntMul {
+                src: m(src),
+                factor,
+            },
+            TraceOp::QuantInterleave { lo, hi } => TraceOp::QuantInterleave {
+                lo: m(lo),
+                hi: m(hi),
+            },
+            TraceOp::QuantConcatSeq { lo, hi } => TraceOp::QuantConcatSeq {
+                lo: m(lo),
+                hi: m(hi),
+            },
+            TraceOp::QuantPtrAddOffset { base, offset_bytes } => TraceOp::QuantPtrAddOffset {
+                base: m(base),
+                offset_bytes,
+            },
+            TraceOp::QuantPtrAddDynamic { base, index } => TraceOp::QuantPtrAddDynamic {
+                base: m(base),
+                index: m(index),
+            },
             TraceOp::QuantAndMask { src, mask } => TraceOp::QuantAndMask { src: m(src), mask },
-            TraceOp::QuantKQuantPackedScaleLookup { scales_base, sub_block_idx, scale_algo, selector } =>
-                TraceOp::QuantKQuantPackedScaleLookup { scales_base: m(scales_base), sub_block_idx: m(sub_block_idx), scale_algo, selector },
-            TraceOp::QuantScalarLoad { ptr, offset_bytes } => TraceOp::QuantScalarLoad { ptr: m(ptr), offset_bytes },
-            TraceOp::QuantLoadF16toF32 { ptr, offset_bytes } => TraceOp::QuantLoadF16toF32 { ptr: m(ptr), offset_bytes },
-            TraceOp::QuantLoadI8toF32 { ptr, offset_bytes } => TraceOp::QuantLoadI8toF32 { ptr: m(ptr), offset_bytes },
-            TraceOp::QuantLoadBytesVec { ptr, offset_bytes, count, signed } =>
-                TraceOp::QuantLoadBytesVec { ptr: m(ptr), offset_bytes, count, signed },
-            TraceOp::QuantShiftLeft { src, amount } => TraceOp::QuantShiftLeft { src: m(src), amount },
-            TraceOp::QuantShiftRight { src, amount } => TraceOp::QuantShiftRight { src: m(src), amount },
-            TraceOp::QuantE2m1LutDecode { packed_data_ptr, scale_byte, nvfp4_mode } =>
-                TraceOp::QuantE2m1LutDecode { packed_data_ptr: m(packed_data_ptr), scale_byte: m(scale_byte), nvfp4_mode },
-            TraceOp::QuantQ3KDecode { block_base, lane_offset, d_slot, qs_offset, hmask_offset } =>
-                TraceOp::QuantQ3KDecode { block_base: m(block_base), lane_offset: m(lane_offset), d_slot: m(d_slot), qs_offset, hmask_offset },
-            TraceOp::QuantQ6KDecode { block_base, lane_offset, d_slot, qs_offset, qh_offset } =>
-                TraceOp::QuantQ6KDecode { block_base: m(block_base), lane_offset: m(lane_offset), d_slot: m(d_slot), qs_offset, qh_offset },
-            TraceOp::QuantQ5Decode { block_base, lane_offset, d_slot, qs_offset, qh_offset, has_min } =>
-                TraceOp::QuantQ5Decode { block_base: m(block_base), lane_offset: m(lane_offset), d_slot: m(d_slot), qs_offset, qh_offset, has_min },
-            TraceOp::QuantQ5KDecode { block_base, lane_offset, d_slot, qs_offset, qh_offset } =>
-                TraceOp::QuantQ5KDecode { block_base: m(block_base), lane_offset: m(lane_offset), d_slot: m(d_slot), qs_offset, qh_offset },
-            TraceOp::QuantQ4KDecode { block_base, lane_offset, d_slot, qs_offset } =>
-                TraceOp::QuantQ4KDecode { block_base: m(block_base), lane_offset: m(lane_offset), d_slot: m(d_slot), qs_offset },
+            TraceOp::QuantKQuantPackedScaleLookup {
+                scales_base,
+                sub_block_idx,
+                scale_algo,
+                selector,
+            } => TraceOp::QuantKQuantPackedScaleLookup {
+                scales_base: m(scales_base),
+                sub_block_idx: m(sub_block_idx),
+                scale_algo,
+                selector,
+            },
+            TraceOp::QuantScalarLoad { ptr, offset_bytes } => TraceOp::QuantScalarLoad {
+                ptr: m(ptr),
+                offset_bytes,
+            },
+            TraceOp::QuantLoadF16toF32 { ptr, offset_bytes } => TraceOp::QuantLoadF16toF32 {
+                ptr: m(ptr),
+                offset_bytes,
+            },
+            TraceOp::QuantLoadI8toF32 { ptr, offset_bytes } => TraceOp::QuantLoadI8toF32 {
+                ptr: m(ptr),
+                offset_bytes,
+            },
+            TraceOp::QuantLoadBytesVec {
+                ptr,
+                offset_bytes,
+                count,
+                signed,
+            } => TraceOp::QuantLoadBytesVec {
+                ptr: m(ptr),
+                offset_bytes,
+                count,
+                signed,
+            },
+            TraceOp::QuantShiftLeft { src, amount } => TraceOp::QuantShiftLeft {
+                src: m(src),
+                amount,
+            },
+            TraceOp::QuantShiftRight { src, amount } => TraceOp::QuantShiftRight {
+                src: m(src),
+                amount,
+            },
+            TraceOp::QuantE2m1LutDecode {
+                packed_data_ptr,
+                scale_byte,
+                nvfp4_mode,
+            } => TraceOp::QuantE2m1LutDecode {
+                packed_data_ptr: m(packed_data_ptr),
+                scale_byte: m(scale_byte),
+                nvfp4_mode,
+            },
+            TraceOp::QuantQ3KDecode {
+                block_base,
+                lane_offset,
+                d_slot,
+                qs_offset,
+                hmask_offset,
+            } => TraceOp::QuantQ3KDecode {
+                block_base: m(block_base),
+                lane_offset: m(lane_offset),
+                d_slot: m(d_slot),
+                qs_offset,
+                hmask_offset,
+            },
+            TraceOp::QuantQ6KDecode {
+                block_base,
+                lane_offset,
+                d_slot,
+                qs_offset,
+                qh_offset,
+            } => TraceOp::QuantQ6KDecode {
+                block_base: m(block_base),
+                lane_offset: m(lane_offset),
+                d_slot: m(d_slot),
+                qs_offset,
+                qh_offset,
+            },
+            TraceOp::QuantQ5Decode {
+                block_base,
+                lane_offset,
+                d_slot,
+                qs_offset,
+                qh_offset,
+                has_min,
+            } => TraceOp::QuantQ5Decode {
+                block_base: m(block_base),
+                lane_offset: m(lane_offset),
+                d_slot: m(d_slot),
+                qs_offset,
+                qh_offset,
+                has_min,
+            },
+            TraceOp::QuantQ5KDecode {
+                block_base,
+                lane_offset,
+                d_slot,
+                qs_offset,
+                qh_offset,
+            } => TraceOp::QuantQ5KDecode {
+                block_base: m(block_base),
+                lane_offset: m(lane_offset),
+                d_slot: m(d_slot),
+                qs_offset,
+                qh_offset,
+            },
+            TraceOp::QuantQ4KDecode {
+                block_base,
+                lane_offset,
+                d_slot,
+                qs_offset,
+            } => TraceOp::QuantQ4KDecode {
+                block_base: m(block_base),
+                lane_offset: m(lane_offset),
+                d_slot: m(d_slot),
+                qs_offset,
+            },
             // SPEC 24 QuantGather/QuantGemm pipeline
-            TraceOp::QuantScaleLoad { source, offset, dtype } =>
-                TraceOp::QuantScaleLoad { source: m(source), offset, dtype },
-            TraceOp::QuantDataLoad { source, offset, quant_type, block_size } =>
-                TraceOp::QuantDataLoad { source: m(source), offset, quant_type, block_size },
-            TraceOp::QuantZeroLoad { source, offset, zp_type } =>
-                TraceOp::QuantZeroLoad { source: m(source), offset, zp_type },
-            TraceOp::QuantSubScaleLoad { block_ptr, byte_offset, bits, sub_block_size } =>
-                TraceOp::QuantSubScaleLoad { block_ptr: m(block_ptr), byte_offset, bits, sub_block_size },
-            TraceOp::QuantHighBitsLoad { block_ptr, byte_offset, bits_per_elem } =>
-                TraceOp::QuantHighBitsLoad { block_ptr: m(block_ptr), byte_offset, bits_per_elem },
-            TraceOp::QuantCodebookDequant { indices, codebook_ptr, vector_size, bits_per_entry } =>
-                TraceOp::QuantCodebookDequant { indices: m(indices), codebook_ptr: m(codebook_ptr), vector_size, bits_per_entry },
+            TraceOp::QuantScaleLoad {
+                source,
+                offset,
+                dtype,
+            } => TraceOp::QuantScaleLoad {
+                source: m(source),
+                offset,
+                dtype,
+            },
+            TraceOp::QuantDataLoad {
+                source,
+                offset,
+                quant_type,
+                block_size,
+            } => TraceOp::QuantDataLoad {
+                source: m(source),
+                offset,
+                quant_type,
+                block_size,
+            },
+            TraceOp::QuantZeroLoad {
+                source,
+                offset,
+                zp_type,
+            } => TraceOp::QuantZeroLoad {
+                source: m(source),
+                offset,
+                zp_type,
+            },
+            TraceOp::QuantSubScaleLoad {
+                block_ptr,
+                byte_offset,
+                bits,
+                sub_block_size,
+            } => TraceOp::QuantSubScaleLoad {
+                block_ptr: m(block_ptr),
+                byte_offset,
+                bits,
+                sub_block_size,
+            },
+            TraceOp::QuantHighBitsLoad {
+                block_ptr,
+                byte_offset,
+                bits_per_elem,
+            } => TraceOp::QuantHighBitsLoad {
+                block_ptr: m(block_ptr),
+                byte_offset,
+                bits_per_elem,
+            },
+            TraceOp::QuantCodebookDequant {
+                indices,
+                codebook_ptr,
+                vector_size,
+                bits_per_entry,
+            } => TraceOp::QuantCodebookDequant {
+                indices: m(indices),
+                codebook_ptr: m(codebook_ptr),
+                vector_size,
+                bits_per_entry,
+            },
 
             // SPEC 24 QuantGather/QuantGemm structural (no ValueId fields)
-            TraceOp::QuantGather { quant_type, vocab_size, hidden_dim } =>
-                TraceOp::QuantGather { quant_type, vocab_size, hidden_dim },
-            TraceOp::QuantGemm { quant_type, m: m_val, n, k } =>
-                TraceOp::QuantGemm { quant_type, m: m_val, n, k },
+            TraceOp::QuantGather {
+                quant_type,
+                vocab_size,
+                hidden_dim,
+            } => TraceOp::QuantGather {
+                quant_type,
+                vocab_size,
+                hidden_dim,
+            },
+            TraceOp::QuantGemm {
+                quant_type,
+                m: m_val,
+                n,
+                k,
+            } => TraceOp::QuantGemm {
+                quant_type,
+                m: m_val,
+                n,
+                k,
+            },
 
             // SPEC 27 Structural
-            TraceOp::Loop { bound, step_bytes, body } =>
-                TraceOp::Loop { bound, step_bytes, body: body.into_iter().map(|op| op.map_value_ids(map_fn)).collect() },
-            TraceOp::PanelLoad { base, offset, rows, cols } =>
-                TraceOp::PanelLoad { base: m(base), offset: m(offset), rows, cols },
-            TraceOp::PanelStore { base, offset, rows, cols } =>
-                TraceOp::PanelStore { base: m(base), offset: m(offset), rows, cols },
-            TraceOp::PackBuffer { src, dst, rows, cols, layout } =>
-                TraceOp::PackBuffer { src: m(src), dst: m(dst), rows, cols, layout },
-            TraceOp::AsyncCopyToShared { name, src_offset, bytes } =>
-                TraceOp::AsyncCopyToShared { name, src_offset: m(src_offset), bytes },
-            TraceOp::Tma2DCopy { desc, coord_x, coord_y, bytes } =>
-                TraceOp::Tma2DCopy { desc, coord_x: m(coord_x), coord_y: m(coord_y), bytes },
-            TraceOp::TileMma { c, a, b, m: mm, n: nn, k: kk } =>
-                TraceOp::TileMma { c: m(c), a: m(a), b: m(b), m: mm, n: nn, k: kk },
-            TraceOp::Softmax { src, dst } => TraceOp::Softmax { src: m(src), dst: m(dst) },
+            TraceOp::Loop {
+                bound,
+                step_bytes,
+                body,
+            } => TraceOp::Loop {
+                bound,
+                step_bytes,
+                body: body
+                    .into_iter()
+                    .map(|op| op.map_value_ids(map_fn))
+                    .collect(),
+            },
+            TraceOp::PanelLoad {
+                base,
+                offset,
+                rows,
+                cols,
+            } => TraceOp::PanelLoad {
+                base: m(base),
+                offset: m(offset),
+                rows,
+                cols,
+            },
+            TraceOp::PanelStore {
+                base,
+                offset,
+                rows,
+                cols,
+            } => TraceOp::PanelStore {
+                base: m(base),
+                offset: m(offset),
+                rows,
+                cols,
+            },
+            TraceOp::PackBuffer {
+                src,
+                dst,
+                rows,
+                cols,
+                layout,
+            } => TraceOp::PackBuffer {
+                src: m(src),
+                dst: m(dst),
+                rows,
+                cols,
+                layout,
+            },
+            TraceOp::AsyncCopyToShared {
+                name,
+                src_offset,
+                bytes,
+            } => TraceOp::AsyncCopyToShared {
+                name,
+                src_offset: m(src_offset),
+                bytes,
+            },
+            TraceOp::Tma2DCopy {
+                desc,
+                coord_x,
+                coord_y,
+                bytes,
+            } => TraceOp::Tma2DCopy {
+                desc,
+                coord_x: m(coord_x),
+                coord_y: m(coord_y),
+                bytes,
+            },
+            TraceOp::TileMma {
+                c,
+                a,
+                b,
+                m: mm,
+                n: nn,
+                k: kk,
+            } => TraceOp::TileMma {
+                c: m(c),
+                a: m(a),
+                b: m(b),
+                m: mm,
+                n: nn,
+                k: kk,
+            },
+            TraceOp::Softmax { src, dst } => TraceOp::Softmax {
+                src: m(src),
+                dst: m(dst),
+            },
 
             // MTP Draft structural (no ValueId fields)
-            TraceOp::MtpDraft { depth, hidden_size, vocab_size } =>
-                TraceOp::MtpDraft { depth, hidden_size, vocab_size },
-            TraceOp::MlaAttnScore { num_heads, head_dim, d_c, d_rope } =>
-                TraceOp::MlaAttnScore { num_heads, head_dim, d_c, d_rope },
-            TraceOp::MlaRopeMerge { d_c, d_rope } =>
-                TraceOp::MlaRopeMerge { d_c, d_rope },
+            TraceOp::MtpDraft {
+                depth,
+                hidden_size,
+                vocab_size,
+            } => TraceOp::MtpDraft {
+                depth,
+                hidden_size,
+                vocab_size,
+            },
+            TraceOp::MlaAttnScore {
+                num_heads,
+                head_dim,
+                d_c,
+                d_rope,
+            } => TraceOp::MlaAttnScore {
+                num_heads,
+                head_dim,
+                d_c,
+                d_rope,
+            },
+            TraceOp::MlaRopeMerge { d_c, d_rope } => TraceOp::MlaRopeMerge { d_c, d_rope },
 
             // SPEC 37 REQ-HWACC-007: DynamicPrecisionSelect
-            TraceOp::DynamicPrecisionSelect { tensor, candidates, thresholds } =>
-                TraceOp::DynamicPrecisionSelect { tensor: m(tensor), candidates, thresholds },
+            TraceOp::DynamicPrecisionSelect {
+                tensor,
+                candidates,
+                thresholds,
+            } => TraceOp::DynamicPrecisionSelect {
+                tensor: m(tensor),
+                candidates,
+                thresholds,
+            },
         }
     }
 
     /// Whether this op has observable side effects (cannot be DCE'd).
     pub fn has_side_effects(&self) -> bool {
-        matches!(self,
+        matches!(
+            self,
             TraceOp::VecStoreIndexed { .. }
-            | TraceOp::ScatterStore { .. }
-            | TraceOp::AtomicAdd { .. }
-            | TraceOp::NonTemporalStore
-            | TraceOp::PanelStore { .. }
-            | TraceOp::Softmax { .. }
-            | TraceOp::Loop { .. }
-            | TraceOp::SyncBarrier { .. }
-            | TraceOp::AsyncCopyToShared { .. }
-            | TraceOp::Tma2DCopy { .. }
-            | TraceOp::EpilogueChain { .. }
-            | TraceOp::QuantGather { .. }
-            | TraceOp::QuantGemm { .. }
-            | TraceOp::MtpDraft { .. }
+                | TraceOp::ScatterStore { .. }
+                | TraceOp::AtomicAdd { .. }
+                | TraceOp::NonTemporalStore
+                | TraceOp::PanelStore { .. }
+                | TraceOp::Softmax { .. }
+                | TraceOp::Loop { .. }
+                | TraceOp::SyncBarrier { .. }
+                | TraceOp::AsyncCopyToShared { .. }
+                | TraceOp::Tma2DCopy { .. }
+                | TraceOp::EpilogueChain { .. }
+                | TraceOp::QuantGather { .. }
+                | TraceOp::QuantGemm { .. }
+                | TraceOp::MtpDraft { .. }
         )
     }
 
     /// Whether this op is pure (no side effects, safe for CSE).
     pub fn is_pure(&self) -> bool {
-        !self.has_side_effects()
-            && !matches!(self, TraceOp::Input(_) | TraceOp::Const(_))
+        !self.has_side_effects() && !matches!(self, TraceOp::Input(_) | TraceOp::Const(_))
     }
 }
 
@@ -1766,9 +2527,9 @@ pub enum ReduceKind {
     Max,
     Min,
     Prod,
-    Count,    // count(predicate == true)
-    ArgMax,   // index of max element (§13.2 centroid)
-    LogSum,   // log(sum(exp(x))) — softmax 分母 (数值稳定: max + log(sum(exp(x-max))))
+    Count,  // count(predicate == true)
+    ArgMax, // index of max element (§13.2 centroid)
+    LogSum, // log(sum(exp(x))) — softmax 分母 (数值稳定: max + log(sum(exp(x-max))))
 }
 
 /// 缓存层级
@@ -1857,12 +2618,7 @@ pub fn build_quant_gather_trace(
 ///
 /// The QuantGemm marker is expanded by auto_select into the full
 /// emit_quant_gemm_inline tiled loop nest with block decode + FMA.
-pub fn build_quant_gemm_trace(
-    quant_type: QuantType,
-    m: usize,
-    n: usize,
-    k: usize,
-) -> Vec<TraceOp> {
+pub fn build_quant_gemm_trace(quant_type: QuantType, m: usize, n: usize, k: usize) -> Vec<TraceOp> {
     vec![
         TraceOp::Input(0), // input_ptr
         TraceOp::Input(1), // weight_ptr
@@ -1883,10 +2639,10 @@ mod tests {
     #[test]
     fn trace_silu_body_is_valid_ssa() {
         let body = vec![
-            TraceOp::Input(0),              // [0] v
-            TraceOp::Neg(ValueId(0)),       // [1] -v
-            TraceOp::Exp(ValueId(1)),       // [2] exp(-v)
-            TraceOp::Const(1.0),            // [3] 1.0
+            TraceOp::Input(0),                    // [0] v
+            TraceOp::Neg(ValueId(0)),             // [1] -v
+            TraceOp::Exp(ValueId(1)),             // [2] exp(-v)
+            TraceOp::Const(1.0),                  // [3] 1.0
             TraceOp::Add(ValueId(2), ValueId(3)), // [4] 1 + exp(-v)
             TraceOp::Div(ValueId(0), ValueId(4)), // [5] v / (1 + exp(-v))
         ];
@@ -1895,20 +2651,34 @@ mod tests {
             pattern: ComputePattern::Elementwise { body: body.clone() },
             signature: ScalarFnSignature {
                 fn_ptr: std::ptr::null(),
-                params: vec![ScalarParam::InputPtr, ScalarParam::OutputPtr, ScalarParam::Dim(0)],
+                params: vec![
+                    ScalarParam::InputPtr,
+                    ScalarParam::OutputPtr,
+                    ScalarParam::Dim(0),
+                ],
             },
         };
 
         for (i, op) in body.iter().enumerate() {
             match op {
                 TraceOp::Input(_) | TraceOp::Const(_) => {}
-                TraceOp::Neg(a) | TraceOp::Abs(a) | TraceOp::Exp(a)
-                | TraceOp::Sqrt(a) | TraceOp::Rsqrt(a) | TraceOp::Tanh(a)
-                | TraceOp::Recip(a) | TraceOp::Log(a) | TraceOp::Sigmoid(a) => {
+                TraceOp::Neg(a)
+                | TraceOp::Abs(a)
+                | TraceOp::Exp(a)
+                | TraceOp::Sqrt(a)
+                | TraceOp::Rsqrt(a)
+                | TraceOp::Tanh(a)
+                | TraceOp::Recip(a)
+                | TraceOp::Log(a)
+                | TraceOp::Sigmoid(a) => {
                     assert!(a.0 < i as u32, "SSA violation at index {i}: operand {a}");
                 }
-                TraceOp::Add(a, b) | TraceOp::Sub(a, b) | TraceOp::Mul(a, b)
-                | TraceOp::Div(a, b) | TraceOp::Max(a, b) | TraceOp::Min(a, b) => {
+                TraceOp::Add(a, b)
+                | TraceOp::Sub(a, b)
+                | TraceOp::Mul(a, b)
+                | TraceOp::Div(a, b)
+                | TraceOp::Max(a, b)
+                | TraceOp::Min(a, b) => {
                     assert!(a.0 < i as u32, "SSA violation at index {i}: operand {a}");
                     assert!(b.0 < i as u32, "SSA violation at index {i}: operand {b}");
                 }
@@ -1918,9 +2688,18 @@ mod tests {
                     assert!(c.0 < i as u32, "SSA violation at index {i}: operand {c}");
                 }
                 TraceOp::ConditionalBranch(mask, t_val, f_val) => {
-                    assert!(mask.0 < i as u32, "SSA violation at index {i}: operand {mask}");
-                    assert!(t_val.0 < i as u32, "SSA violation at index {i}: operand {t_val}");
-                    assert!(f_val.0 < i as u32, "SSA violation at index {i}: operand {f_val}");
+                    assert!(
+                        mask.0 < i as u32,
+                        "SSA violation at index {i}: operand {mask}"
+                    );
+                    assert!(
+                        t_val.0 < i as u32,
+                        "SSA violation at index {i}: operand {t_val}"
+                    );
+                    assert!(
+                        f_val.0 < i as u32,
+                        "SSA violation at index {i}: operand {f_val}"
+                    );
                 }
                 // Extended §12+§14 variants: SSA validation for these is handled
                 // per-variant in their own tests; skip here to keep this test focused.
@@ -1934,20 +2713,20 @@ mod tests {
     #[test]
     fn trace_gelu_body_is_valid_ssa() {
         let body = vec![
-            TraceOp::Input(0),                              // [0] x
-            TraceOp::Mul(ValueId(0), ValueId(0)),           // [1] x^2
-            TraceOp::Mul(ValueId(1), ValueId(0)),           // [2] x^3
-            TraceOp::Const(0.044715),                       // [3] 0.044715
-            TraceOp::Mul(ValueId(3), ValueId(2)),           // [4] 0.044715 * x^3
-            TraceOp::Add(ValueId(0), ValueId(4)),           // [5] x + 0.044715 * x^3
-            TraceOp::Const(0.7978845608),                   // [6] sqrt(2/pi)
-            TraceOp::Mul(ValueId(6), ValueId(5)),           // [7] sqrt(2/pi) * (x + 0.044715*x^3)
-            TraceOp::Tanh(ValueId(7)),                      // [8] tanh(...)
-            TraceOp::Const(1.0),                            // [9] 1.0
-            TraceOp::Add(ValueId(9), ValueId(8)),           // [10] 1 + tanh(...)
-            TraceOp::Const(0.5),                            // [11] 0.5
-            TraceOp::Mul(ValueId(11), ValueId(0)),          // [12] 0.5 * x
-            TraceOp::Mul(ValueId(12), ValueId(10)),         // [13] 0.5 * x * (1 + tanh(...))
+            TraceOp::Input(0),                      // [0] x
+            TraceOp::Mul(ValueId(0), ValueId(0)),   // [1] x^2
+            TraceOp::Mul(ValueId(1), ValueId(0)),   // [2] x^3
+            TraceOp::Const(0.044715),               // [3] 0.044715
+            TraceOp::Mul(ValueId(3), ValueId(2)),   // [4] 0.044715 * x^3
+            TraceOp::Add(ValueId(0), ValueId(4)),   // [5] x + 0.044715 * x^3
+            TraceOp::Const(0.7978845608),           // [6] sqrt(2/pi)
+            TraceOp::Mul(ValueId(6), ValueId(5)),   // [7] sqrt(2/pi) * (x + 0.044715*x^3)
+            TraceOp::Tanh(ValueId(7)),              // [8] tanh(...)
+            TraceOp::Const(1.0),                    // [9] 1.0
+            TraceOp::Add(ValueId(9), ValueId(8)),   // [10] 1 + tanh(...)
+            TraceOp::Const(0.5),                    // [11] 0.5
+            TraceOp::Mul(ValueId(11), ValueId(0)),  // [12] 0.5 * x
+            TraceOp::Mul(ValueId(12), ValueId(10)), // [13] 0.5 * x * (1 + tanh(...))
         ];
 
         for (i, op) in body.iter().enumerate() {
@@ -1968,35 +2747,39 @@ mod tests {
     #[test]
     fn trace_rms_norm_pattern() {
         let reduce = vec![
-            TraceOp::Input(0),                          // [0] x
-            TraceOp::Mul(ValueId(0), ValueId(0)),       // [1] x^2
+            TraceOp::Input(0),                    // [0] x
+            TraceOp::Mul(ValueId(0), ValueId(0)), // [1] x^2
         ];
         let finalize = vec![
-            TraceOp::Input(0),                          // [0] sum_sq (reduction result)
-            TraceOp::Input(1),                          // [1] n (dimension)
-            TraceOp::Div(ValueId(0), ValueId(1)),       // [2] mean = sum_sq / n
-            TraceOp::Const(1e-5),                       // [3] eps
-            TraceOp::Add(ValueId(2), ValueId(3)),       // [4] mean + eps
-            TraceOp::Rsqrt(ValueId(4)),                 // [5] rsqrt(mean + eps)
+            TraceOp::Input(0),                    // [0] sum_sq (reduction result)
+            TraceOp::Input(1),                    // [1] n (dimension)
+            TraceOp::Div(ValueId(0), ValueId(1)), // [2] mean = sum_sq / n
+            TraceOp::Const(1e-5),                 // [3] eps
+            TraceOp::Add(ValueId(2), ValueId(3)), // [4] mean + eps
+            TraceOp::Rsqrt(ValueId(4)),           // [5] rsqrt(mean + eps)
         ];
         let transform = vec![
-            TraceOp::Input(0),                          // [0] x
-            TraceOp::Input(1),                          // [1] scale (from finalize)
-            TraceOp::Input(2),                          // [2] weight
-            TraceOp::Mul(ValueId(0), ValueId(1)),       // [3] x * scale
-            TraceOp::Mul(ValueId(3), ValueId(2)),       // [4] x * scale * weight
+            TraceOp::Input(0),                    // [0] x
+            TraceOp::Input(1),                    // [1] scale (from finalize)
+            TraceOp::Input(2),                    // [2] weight
+            TraceOp::Mul(ValueId(0), ValueId(1)), // [3] x * scale
+            TraceOp::Mul(ValueId(3), ValueId(2)), // [4] x * scale * weight
         ];
 
-        let pattern = ComputePattern::NormLike { reduce, finalize, transform };
+        let pattern = ComputePattern::NormLike {
+            reduce,
+            finalize,
+            transform,
+        };
         assert!(matches!(pattern, ComputePattern::NormLike { .. }));
     }
 
     #[test]
     fn trace_binary_elementwise_add() {
         let body = vec![
-            TraceOp::Input(0),                          // [0] a
-            TraceOp::Input(1),                          // [1] b
-            TraceOp::Add(ValueId(0), ValueId(1)),       // [2] a + b
+            TraceOp::Input(0),                    // [0] a
+            TraceOp::Input(1),                    // [1] b
+            TraceOp::Add(ValueId(0), ValueId(1)), // [2] a + b
         ];
         let pattern = ComputePattern::BinaryElementwise { body };
         assert!(matches!(pattern, ComputePattern::BinaryElementwise { .. }));
@@ -2065,15 +2848,15 @@ mod tests {
     fn classify_empty_body_is_injective() {
         let body: Vec<TraceOp> = vec![];
         let pattern = classify_pattern(&body);
-        assert!(matches!(pattern, ComputePattern::Injective { num_inputs: 0, .. }));
+        assert!(matches!(
+            pattern,
+            ComputePattern::Injective { num_inputs: 0, .. }
+        ));
     }
 
     #[test]
     fn classify_single_input_is_elementwise() {
-        let body = vec![
-            TraceOp::Input(0),
-            TraceOp::Exp(ValueId(0)),
-        ];
+        let body = vec![TraceOp::Input(0), TraceOp::Exp(ValueId(0))];
         let pattern = classify_pattern(&body);
         assert!(matches!(pattern, ComputePattern::Elementwise { .. }));
     }
@@ -2098,7 +2881,10 @@ mod tests {
             TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2)),
         ];
         let pattern = classify_pattern(&body);
-        assert!(matches!(pattern, ComputePattern::Injective { num_inputs: 3, .. }));
+        assert!(matches!(
+            pattern,
+            ComputePattern::Injective { num_inputs: 3, .. }
+        ));
     }
 
     // ── ComputePattern::body ──
@@ -2110,7 +2896,9 @@ mod tests {
 
     #[test]
     fn compute_pattern_elementwise_body_is_some() {
-        let pattern = ComputePattern::Elementwise { body: vec![TraceOp::Input(0)] };
+        let pattern = ComputePattern::Elementwise {
+            body: vec![TraceOp::Input(0)],
+        };
         assert!(pattern.body().is_some());
     }
 
@@ -2146,16 +2934,29 @@ mod tests {
     fn packing_format_equality() {
         assert_eq!(PackingFormat::Plain, PackingFormat::Plain);
         assert_ne!(PackingFormat::Plain, PackingFormat::MXBlock);
-        assert_eq!(PackingFormat::GGML(GgmlType::Q4_0), PackingFormat::GGML(GgmlType::Q4_0));
-        assert_ne!(PackingFormat::GGML(GgmlType::Q4_0), PackingFormat::GGML(GgmlType::Q8_0));
+        assert_eq!(
+            PackingFormat::GGML(GgmlType::Q4_0),
+            PackingFormat::GGML(GgmlType::Q4_0)
+        );
+        assert_ne!(
+            PackingFormat::GGML(GgmlType::Q4_0),
+            PackingFormat::GGML(GgmlType::Q8_0)
+        );
     }
 
     // ── ReduceKind / CacheLevel / CmpOp ──
 
     #[test]
     fn reduce_kind_variants() {
-        let kinds = [ReduceKind::Sum, ReduceKind::Max, ReduceKind::Min,
-                     ReduceKind::Prod, ReduceKind::Count, ReduceKind::ArgMax, ReduceKind::LogSum];
+        let kinds = [
+            ReduceKind::Sum,
+            ReduceKind::Max,
+            ReduceKind::Min,
+            ReduceKind::Prod,
+            ReduceKind::Count,
+            ReduceKind::ArgMax,
+            ReduceKind::LogSum,
+        ];
         assert_eq!(kinds.len(), 7);
     }
 
@@ -2296,7 +3097,9 @@ mod tests {
     fn trace_op_mul_visits_two_ids() {
         let op = TraceOp::Mul(ValueId(5), ValueId(7));
         let count = std::sync::atomic::AtomicU32::new(0);
-        op.visit_value_ids(|_| { count.fetch_add(1, std::sync::atomic::Ordering::Relaxed); });
+        op.visit_value_ids(|_| {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
         assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
@@ -2304,7 +3107,9 @@ mod tests {
     fn trace_op_neg_visits_one_id() {
         let op = TraceOp::Neg(ValueId(3));
         let count = std::sync::atomic::AtomicU32::new(0);
-        op.visit_value_ids(|_| { count.fetch_add(1, std::sync::atomic::Ordering::Relaxed); });
+        op.visit_value_ids(|_| {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
         assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
@@ -2367,7 +3172,9 @@ mod tests {
     fn trace_op_const_has_no_visited_ids() {
         let op = TraceOp::Const(3.14);
         let count = std::sync::atomic::AtomicU32::new(0);
-        op.visit_value_ids(|_| { count.fetch_add(1, std::sync::atomic::Ordering::Relaxed); });
+        op.visit_value_ids(|_| {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
         assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
@@ -2375,7 +3182,9 @@ mod tests {
     fn trace_op_div_visits_two_ids() {
         let op = TraceOp::Div(ValueId(10), ValueId(20));
         let count = std::sync::atomic::AtomicU32::new(0);
-        op.visit_value_ids(|_| { count.fetch_add(1, std::sync::atomic::Ordering::Relaxed); });
+        op.visit_value_ids(|_| {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
         assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
@@ -2383,7 +3192,9 @@ mod tests {
     fn trace_op_sub_visits_two_ids() {
         let op = TraceOp::Sub(ValueId(1), ValueId(2));
         let count = std::sync::atomic::AtomicU32::new(0);
-        op.visit_value_ids(|_| { count.fetch_add(1, std::sync::atomic::Ordering::Relaxed); });
+        op.visit_value_ids(|_| {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
         assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
@@ -2413,7 +3224,11 @@ mod tests {
     #[test]
     fn compute_pattern_injective_body_is_some() {
         let pattern = ComputePattern::Injective {
-            body: vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Add(ValueId(0), ValueId(1))],
+            body: vec![
+                TraceOp::Input(0),
+                TraceOp::Input(1),
+                TraceOp::Add(ValueId(0), ValueId(1)),
+            ],
             num_inputs: 2,
             num_outputs: 1,
         };
@@ -2432,7 +3247,10 @@ mod tests {
     #[test]
     fn quant_precision_bf16_elem_bytes_and_strategy() {
         assert_eq!(QuantPrecision::BF16.elem_bytes(), 2);
-        assert_eq!(QuantPrecision::BF16.x86_elem_strategy(), X86ElemStrategy::WidenCompute);
+        assert_eq!(
+            QuantPrecision::BF16.x86_elem_strategy(),
+            X86ElemStrategy::WidenCompute
+        );
     }
 
     #[test]
@@ -2487,7 +3305,10 @@ mod tests {
                 params: vec![ScalarParam::InputPtr, ScalarParam::OutputPtr],
             },
         };
-        assert!(matches!(trace.pattern, ComputePattern::Injective { num_inputs: 0, .. }));
+        assert!(matches!(
+            trace.pattern,
+            ComputePattern::Injective { num_inputs: 0, .. }
+        ));
         assert_eq!(trace.signature.params.len(), 2);
     }
 
@@ -2539,8 +3360,18 @@ mod tests {
 
     #[test]
     fn promote_different_packings_yields_f32() {
-        let a = QuantPrecision { kind: DTypeKind::F32, packing: PackingFormat::Plain, block_size: 0, group_size: 0 };
-        let b = QuantPrecision { kind: DTypeKind::F32, packing: PackingFormat::MXBlock, block_size: 32, group_size: 0 };
+        let a = QuantPrecision {
+            kind: DTypeKind::F32,
+            packing: PackingFormat::Plain,
+            block_size: 0,
+            group_size: 0,
+        };
+        let b = QuantPrecision {
+            kind: DTypeKind::F32,
+            packing: PackingFormat::MXBlock,
+            block_size: 32,
+            group_size: 0,
+        };
         assert_eq!(promote(a, b), QuantPrecision::F32);
     }
 
@@ -2554,7 +3385,10 @@ mod tests {
     fn trace_op_map_conditional_branch_offsets_ids() {
         let op = TraceOp::ConditionalBranch(ValueId(0), ValueId(1), ValueId(2));
         let mapped = op.map_value_ids(&|id| ValueId(id.0 + 5));
-        assert_eq!(mapped, TraceOp::ConditionalBranch(ValueId(5), ValueId(6), ValueId(7)));
+        assert_eq!(
+            mapped,
+            TraceOp::ConditionalBranch(ValueId(5), ValueId(6), ValueId(7))
+        );
     }
 
     #[test]
@@ -2630,7 +3464,10 @@ mod tests {
             combine: vec![TraceOp::Max(ValueId(0), ValueId(1))],
             second_pass: Some(Box::new(ReductionSecondPass {
                 identity: 0.0,
-                element_transform: vec![TraceOp::Sub(ValueId(0), ValueId(1)), TraceOp::Exp(ValueId(2))],
+                element_transform: vec![
+                    TraceOp::Sub(ValueId(0), ValueId(1)),
+                    TraceOp::Exp(ValueId(2)),
+                ],
                 combine: vec![TraceOp::Add(ValueId(0), ValueId(1))],
             })),
             normalize: Some(vec![TraceOp::Div(ValueId(0), ValueId(1))]),
@@ -2642,12 +3479,20 @@ mod tests {
     #[test]
     fn op_trace_pattern_and_signature_correspond() {
         // Arrange: construct OpTrace with pattern and signature
-        let body = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let body = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
         let trace = OpTrace {
             pattern: ComputePattern::BinaryElementwise { body: body.clone() },
             signature: ScalarFnSignature {
                 fn_ptr: std::ptr::null(),
-                params: vec![ScalarParam::InputPtr, ScalarParam::OutputPtr, ScalarParam::Dim(4)],
+                params: vec![
+                    ScalarParam::InputPtr,
+                    ScalarParam::OutputPtr,
+                    ScalarParam::Dim(4),
+                ],
             },
         };
         // Act & Assert: pattern has 3 ops, signature has 3 params
@@ -2659,7 +3504,10 @@ mod tests {
     fn typed_slot_dtype_preserved() {
         // Arrange: construct TypedSlot with BF16 dtype
         use crate::compiler::codegen::vm::instr::VRegId;
-        let slot = TypedSlot { vreg: VRegId(5), dtype: QuantPrecision::BF16 };
+        let slot = TypedSlot {
+            vreg: VRegId(5),
+            dtype: QuantPrecision::BF16,
+        };
         // Act & Assert: dtype field is BF16, elem_bytes is 2
         assert_eq!(slot.dtype, QuantPrecision::BF16);
         assert_eq!(slot.dtype.elem_bytes(), 2);
@@ -2668,7 +3516,11 @@ mod tests {
     #[test]
     fn infer_result_dtype_cast_returns_target() {
         // Arrange: Cast from BF16 to F32 with empty slot list
-        let op = TraceOp::Cast { src: ValueId(0), from: QuantPrecision::BF16, to: QuantPrecision::F32 };
+        let op = TraceOp::Cast {
+            src: ValueId(0),
+            from: QuantPrecision::BF16,
+            to: QuantPrecision::F32,
+        };
         let slots: Vec<TypedSlot> = vec![];
         // Act: infer result dtype from Cast
         let result = infer_result_dtype(&op, &slots);
@@ -2681,8 +3533,14 @@ mod tests {
         // Arrange: Add with BF16 slot at index 0 and F32 slot at index 1
         use crate::compiler::codegen::vm::instr::VRegId;
         let slots = vec![
-            TypedSlot { vreg: VRegId(0), dtype: QuantPrecision::BF16 },
-            TypedSlot { vreg: VRegId(1), dtype: QuantPrecision::F32 },
+            TypedSlot {
+                vreg: VRegId(0),
+                dtype: QuantPrecision::BF16,
+            },
+            TypedSlot {
+                vreg: VRegId(1),
+                dtype: QuantPrecision::F32,
+            },
         ];
         let op = TraceOp::Add(ValueId(0), ValueId(1));
         // Act: infer result dtype for Add(BF16, F32)
@@ -2714,28 +3572,40 @@ mod tests {
     /// GPU: BF16 → F32 tensor core accumulation
     #[test]
     fn gpu_accumulator_dtype_bf16_is_f32() {
-        assert_eq!(QuantPrecision::BF16.gpu_accumulator_dtype(), QuantPrecision::F32);
+        assert_eq!(
+            QuantPrecision::BF16.gpu_accumulator_dtype(),
+            QuantPrecision::F32
+        );
     }
 
     /// @trace TEST-DTYPE-005-2 [req:REQ-DTYPE-005] [level:unit]
     /// GPU: F16 → F32 accumulation (HMMA.16816.F32)
     #[test]
     fn gpu_accumulator_dtype_f16_is_f32() {
-        assert_eq!(QuantPrecision::F16.gpu_accumulator_dtype(), QuantPrecision::F32);
+        assert_eq!(
+            QuantPrecision::F16.gpu_accumulator_dtype(),
+            QuantPrecision::F32
+        );
     }
 
     /// @trace TEST-DTYPE-005-3 [req:REQ-DTYPE-005] [level:unit]
     /// GPU: F32 → F32 accumulation (identity)
     #[test]
     fn gpu_accumulator_dtype_f32_is_f32() {
-        assert_eq!(QuantPrecision::F32.gpu_accumulator_dtype(), QuantPrecision::F32);
+        assert_eq!(
+            QuantPrecision::F32.gpu_accumulator_dtype(),
+            QuantPrecision::F32
+        );
     }
 
     /// @trace TEST-DTYPE-005-4 [req:REQ-DTYPE-005] [level:unit]
     /// GPU: x86 accumulator_dtype for BF16 is F32 (WidenCompute)
     #[test]
     fn x86_accumulator_dtype_bf16_is_f32() {
-        assert_eq!(QuantPrecision::BF16.accumulator_dtype(), QuantPrecision::F32);
+        assert_eq!(
+            QuantPrecision::BF16.accumulator_dtype(),
+            QuantPrecision::F32
+        );
     }
 
     /// @trace TEST-DTYPE-005-5 [req:REQ-DTYPE-005] [level:unit]

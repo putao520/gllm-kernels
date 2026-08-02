@@ -5,9 +5,9 @@ use super::lower;
 use super::plan_lower::LoweringContext;
 use super::plan_lower::SymDimSlotMap;
 use super::telemetry_emit::emit_gemm_row_stats_telemetry;
-use crate::compiler::trace::{QuantPrecision, TraceOp, ValueId};
 use crate::compiler::graph::SymDim;
 use crate::compiler::pain_point::ExecPattern;
+use crate::compiler::trace::{QuantPrecision, TraceOp, ValueId};
 use crate::types::CompilerError;
 
 /// Tile GEMM lowering — 把完整 tile 数据流 (TileLoad/TileMma/TileStore) 提回 VmInstr IR。
@@ -34,9 +34,16 @@ use crate::types::CompilerError;
 /// @trace REQ-HW-TIER-008 [req:VmInstr-TileMma-Shape] TileMma 携带 shape
 /// @trace REQ-HW-TIER-009 [req:VmInstr-TileStore] tile 结果写回进 IR
 pub(crate) fn emit_tile_gemm(
-    prog: &mut VmProgram, width: SimdWidth,
-    rows: usize, cols: usize, kd: usize, k: usize, dt: crate::types::DType,
-    a_ptr: VRegId, b_ptr: VRegId, c_ptr: VRegId,
+    prog: &mut VmProgram,
+    width: SimdWidth,
+    rows: usize,
+    cols: usize,
+    kd: usize,
+    k: usize,
+    dt: crate::types::DType,
+    a_ptr: VRegId,
+    b_ptr: VRegId,
+    c_ptr: VRegId,
 ) -> Result<(), CompilerError> {
     let tile_c = prog.alloc_vreg(VRegKind::Tile, width);
     let tile_a = prog.alloc_vreg(VRegKind::Tile, width);
@@ -47,11 +54,15 @@ pub(crate) fn emit_tile_gemm(
     //   A: rows×k  → 行跨 = k*elem (非 kd*elem; tile 是 rows×kd 的子块, 行跨沿用全 K 行跨)
     //   B: k×cols  → 行跨 = cols*elem
     //   C: rows×cols → 行跨 = cols*elem
-    let a_row_stride = k * dt.size_bytes();      // A: rows×k, 行跨 = k*elem
-    let b_row_stride = cols * dt.size_bytes();   // B: kd×cols 子块, 行跨 = cols*elem
-    let c_row_stride = cols * dt.size_bytes();   // C: rows×cols, 行跨 = cols*elem
+    let a_row_stride = k * dt.size_bytes(); // A: rows×k, 行跨 = k*elem
+    let b_row_stride = cols * dt.size_bytes(); // B: kd×cols 子块, 行跨 = cols*elem
+    let c_row_stride = cols * dt.size_bytes(); // C: rows×cols, 行跨 = cols*elem
 
-    prog.emit(VmInstr::TileConfig { rows, cols, dtype: dt });
+    prog.emit(VmInstr::TileConfig {
+        rows,
+        cols,
+        dtype: dt,
+    });
 
     let k_tiles = (k + kd - 1) / kd;
     // K 循环: byte_offset (a_off) 按 kd*elem 推进 (A 的 K 维连续, 因 A 行优先 K 在尾维)。
@@ -71,28 +82,51 @@ pub(crate) fn emit_tile_gemm(
             });
             // A tile: rows×kd, 从 a_ptr + a_off 加载 (K 维推进, 行跨 = k*elem)。
             prog.emit(VmInstr::TileLoad {
-                dst_tile: tile_a, base_ptr: a_ptr, k_offset: a_off,
-                row_stride: a_row_stride, rows, cols: kd, dtype: dt,
+                dst_tile: tile_a,
+                base_ptr: a_ptr,
+                k_offset: a_off,
+                row_stride: a_row_stride,
+                rows,
+                cols: kd,
+                dtype: dt,
             });
             // B tile: kd×cols, 从 b_ptr + b_off 加载 (K 维推进, 行跨 = cols*elem)。
             prog.emit(VmInstr::TileLoad {
-                dst_tile: tile_b, base_ptr: b_ptr, k_offset: b_off,
-                row_stride: b_row_stride, rows: kd, cols, dtype: dt,
+                dst_tile: tile_b,
+                base_ptr: b_ptr,
+                k_offset: b_off,
+                row_stride: b_row_stride,
+                rows: kd,
+                cols,
+                dtype: dt,
             });
             // c += a × b  (a: rows×kd, b: kd×cols, c: rows×cols)
             prog.emit(VmInstr::TileMma {
-                c: tile_c, a: tile_a, b: tile_b,
-                m: rows, n: cols, k: kd, dtype: dt,
+                c: tile_c,
+                a: tile_a,
+                b: tile_b,
+                m: rows,
+                n: cols,
+                k: kd,
+                dtype: dt,
             });
         },
     );
 
     // C tile 写回: 单 tile, out_offset = 0 (M/N 外层循环不在本函数, 由调用方按需复制 tile)。
     let c_off = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprLoadImm { dst: c_off, value: 0 });
+    prog.emit(VmInstr::GprLoadImm {
+        dst: c_off,
+        value: 0,
+    });
     prog.emit(VmInstr::TileStore {
-        src_tile: tile_c, base_ptr: c_ptr, out_offset: c_off,
-        row_stride: c_row_stride, rows, cols, dtype: dt,
+        src_tile: tile_c,
+        base_ptr: c_ptr,
+        out_offset: c_off,
+        row_stride: c_row_stride,
+        rows,
+        cols,
+        dtype: dt,
     });
     prog.emit(VmInstr::TileRelease);
     Ok(())
@@ -100,14 +134,20 @@ pub(crate) fn emit_tile_gemm(
 
 pub(crate) fn emit_gemm_inline_with_hook<'a>(
     prog: &mut VmProgram,
-    m_dim: &SymDim, n: usize, k: usize,
+    m_dim: &SymDim,
+    n: usize,
+    k: usize,
     ctx: &LoweringContext<'a>,
-    a_ptr: VRegId, b_ptr: VRegId, c_ptr: VRegId,
+    a_ptr: VRegId,
+    b_ptr: VRegId,
+    c_ptr: VRegId,
     seq_bound_override: Option<&BoundExpr>,
     gemm_op_id: Option<crate::compiler::graph::OpId>,
     pack_map: Option<&'a crate::compiler::pack_map::PackMap>,
     trans_b: bool,
-    a_dtype: QuantPrecision, b_dtype: QuantPrecision, c_dtype: QuantPrecision,
+    a_dtype: QuantPrecision,
+    b_dtype: QuantPrecision,
+    c_dtype: QuantPrecision,
 ) -> Result<(), CompilerError> {
     let width = ctx.session.width;
     let sym_map = &ctx.session.sym_map;
@@ -115,21 +155,29 @@ pub(crate) fn emit_gemm_inline_with_hook<'a>(
     let k_unroll = gemm_op_id
         .and_then(|id| ctx.parallelism_for_op(id))
         .map(|pd| match pd {
-            super::super::super::pain_point::ParallelismDesc::SimdVectorize { unroll_factor, .. } => unroll_factor,
+            super::super::super::pain_point::ParallelismDesc::SimdVectorize {
+                unroll_factor,
+                ..
+            } => unroll_factor,
             _ => 1,
         })
         .unwrap_or_else(|| {
             ctx.parallelism
                 .as_ref()
                 .map(|pd| match pd {
-                    super::super::super::pain_point::ParallelismDesc::SimdVectorize { unroll_factor, .. } => *unroll_factor,
+                    super::super::super::pain_point::ParallelismDesc::SimdVectorize {
+                        unroll_factor,
+                        ..
+                    } => *unroll_factor,
                     _ => 1,
                 })
                 .unwrap_or(1)
         });
-    let hook = ctx.session.hook.ok_or_else(|| CompilerError::CodegenViolation(
-        "emit_gemm_inline_with_hook: IsaHook is mandatory (ARCH-ISA-HOOK-MANDATORY)".into(),
-    ))?;
+    let hook = ctx.session.hook.ok_or_else(|| {
+        CompilerError::CodegenViolation(
+            "emit_gemm_inline_with_hook: IsaHook is mandatory (ARCH-ISA-HOOK-MANDATORY)".into(),
+        )
+    })?;
     // ARCH-SYMDIM-NO-CONST-DEGRADE (BCE-20260702-GPU-OOM 根治):
     // 禁止把 Symbolic M 降级为 max_value 后喂给 GPU tiled/pipelined GEMM 的 Rust
     // `for i_cta in (0..m).step_by(cta_m)` 循环 —— 那会把单模板展开成 m/cta_m 份
@@ -142,13 +190,16 @@ pub(crate) fn emit_gemm_inline_with_hook<'a>(
     // M 循环本身在 Symbolic 时绝不使用 m_concrete 作 Rust for 上界。
     let m_concrete = match m_dim {
         SymDim::Concrete(v) => *v,
-        SymDim::Symbolic { max_value, .. } => max_value
-            .expect("ARCH-SYMDIM: GEMM M Symbolic must have max_value"),
+        SymDim::Symbolic { max_value, .. } => {
+            max_value.expect("ARCH-SYMDIM: GEMM M Symbolic must have max_value")
+        }
     };
     // @trace ARCH-SYMDIM-THREADING: m_bound 从 seq_bound_override 或 sym_map 派生,
     // 禁止退化为 max_value (SIGSEGV/OOM 根因修复)。Symbolic → BoundExpr::Symbolic
     // (运行时从 .param 读 seq_len)；Concrete → Const。
-    let m_bound: BoundExpr = seq_bound_override.cloned().unwrap_or_else(|| sym_map.to_bound(m_dim));
+    let m_bound: BoundExpr = seq_bound_override
+        .cloned()
+        .unwrap_or_else(|| sym_map.to_bound(m_dim));
     let m_symbolic = m_dim.is_symbolic();
 
     // §0.2.9 ExecPattern 感知策略选择:
@@ -159,17 +210,47 @@ pub(crate) fn emit_gemm_inline_with_hook<'a>(
 
     match &effective_exec_pattern {
         Some(ExecPattern::ScalarLoop) => {
-            return emit_gemm_inline_with_epilogue(prog, m_dim, n, k, width, a_ptr, b_ptr, c_ptr, &[], sym_map, false, seq_bound_override, a_dtype, b_dtype, c_dtype, trans_b, super::isa_hook::EpiloguePlace::OnAccumulators);
+            return emit_gemm_inline_with_epilogue(
+                prog,
+                m_dim,
+                n,
+                k,
+                width,
+                a_ptr,
+                b_ptr,
+                c_ptr,
+                &[],
+                sym_map,
+                false,
+                seq_bound_override,
+                a_dtype,
+                b_dtype,
+                c_dtype,
+                trans_b,
+                super::isa_hook::EpiloguePlace::OnAccumulators,
+            );
         }
         Some(ExecPattern::SharedMemTile { .. }) => {
             let (mr, nr) = hook.gemm_microkernel_shape();
             let lanes = width.f32_lanes().max(1);
-            let can_blis = !trans_b && !m_dim.is_symbolic() && m_concrete >= mr && n >= nr * lanes && k >= 16;
+            let can_blis =
+                !trans_b && !m_dim.is_symbolic() && m_concrete >= mr && n >= nr * lanes && k >= 16;
             if can_blis {
-                return emit_gemm_blis_inline(prog, m_concrete, n, k, width, a_ptr, b_ptr, c_ptr, mr, nr, pack_map, k_unroll, a_dtype, b_dtype, c_dtype, trans_b);
+                return emit_gemm_blis_inline(
+                    prog, m_concrete, n, k, width, a_ptr, b_ptr, c_ptr, mr, nr, pack_map, k_unroll,
+                    a_dtype, b_dtype, c_dtype, trans_b,
+                );
             }
         }
-        Some(ExecPattern::TileGemm { tile_m, tile_n, tile_k, warp_m, warp_n, mma_k, pipeline_depth }) => {
+        Some(ExecPattern::TileGemm {
+            tile_m,
+            tile_n,
+            tile_k,
+            warp_m,
+            warp_n,
+            mma_k,
+            pipeline_depth,
+        }) => {
             // §0.2.9: ExecPattern::TileGemm 指导微核形状 — 优先使用 ExecPattern 的 tile 参数
             let is_gpu = matches!(width, SimdWidth::Warp(_));
             if is_gpu {
@@ -180,7 +261,8 @@ pub(crate) fn emit_gemm_inline_with_hook<'a>(
                 use crate::dispatch::DeviceProfile;
                 let dp = DeviceProfile::detect();
                 let hw = HardwareProfile::detect(&dp);
-                let (hw_cta_m, hw_cta_n, hw_cta_k, hw_warp_m, hw_warp_n, hw_mma_k) = hw.gpu_gemm_tiles();
+                let (hw_cta_m, hw_cta_n, hw_cta_k, hw_warp_m, hw_warp_n, hw_mma_k) =
+                    hw.gpu_gemm_tiles();
                 let hw_pipe = hw.gpu_pipeline_depth();
 
                 // 如果 ExecPattern 已有 GPU 参数 (warp_m > 0)，优先使用；否则用 HardwareProfile 默认值
@@ -192,40 +274,86 @@ pub(crate) fn emit_gemm_inline_with_hook<'a>(
                     // HardwareProfile 也没有 GPU 参数 → 不是 GPU 设备，fall through 到 CPU
                     (*tile_m, *tile_n, *tile_k)
                 };
-                let (w_m, w_n, mk) = if *warp_m > 0 { (*warp_m, *warp_n, *mma_k) } else { (hw_warp_m, hw_warp_n, hw_mma_k) };
-                let pipe_depth = if *pipeline_depth > 0 { *pipeline_depth } else { hw_pipe };
+                let (w_m, w_n, mk) = if *warp_m > 0 {
+                    (*warp_m, *warp_n, *mma_k)
+                } else {
+                    (hw_warp_m, hw_warp_n, hw_mma_k)
+                };
+                let pipe_depth = if *pipeline_depth > 0 {
+                    *pipeline_depth
+                } else {
+                    hw_pipe
+                };
 
                 if w_m > 0 || w_n > 0 {
                     if pipe_depth >= 2 {
-                        return emit_gemm_gpu_pipelined(prog, m_concrete, n, k, width, a_ptr, b_ptr, c_ptr,
-                            cta_m, cta_n, cta_k, w_m, w_n, mk, pipe_depth, a_dtype, b_dtype, c_dtype, trans_b,
-                            hw.has_tma(), m_symbolic, &m_bound);
+                        return emit_gemm_gpu_pipelined(
+                            prog,
+                            m_concrete,
+                            n,
+                            k,
+                            width,
+                            a_ptr,
+                            b_ptr,
+                            c_ptr,
+                            cta_m,
+                            cta_n,
+                            cta_k,
+                            w_m,
+                            w_n,
+                            mk,
+                            pipe_depth,
+                            a_dtype,
+                            b_dtype,
+                            c_dtype,
+                            trans_b,
+                            hw.has_tma(),
+                            m_symbolic,
+                            &m_bound,
+                        );
                     }
-                    return emit_gemm_gpu_tiled_inline(prog, m_concrete, n, k, width, a_ptr, b_ptr, c_ptr,
-                        cta_m, cta_n, cta_k, w_m, w_n, mk, a_dtype, b_dtype, c_dtype, trans_b, m_symbolic, &m_bound);
+                    return emit_gemm_gpu_tiled_inline(
+                        prog, m_concrete, n, k, width, a_ptr, b_ptr, c_ptr, cta_m, cta_n, cta_k,
+                        w_m, w_n, mk, a_dtype, b_dtype, c_dtype, trans_b, m_symbolic, &m_bound,
+                    );
                 }
             }
             let (default_mr, default_nr) = hook.gemm_microkernel_shape();
             let mr = *tile_m;
             let nr = *tile_n;
             let lanes = width.f32_lanes().max(1);
-            let can_blis = !trans_b && !m_dim.is_symbolic() && m_concrete >= mr && n >= nr * lanes && k >= 16;
+            let can_blis =
+                !trans_b && !m_dim.is_symbolic() && m_concrete >= mr && n >= nr * lanes && k >= 16;
             if can_blis {
-                return emit_gemm_blis_inline(prog, m_concrete, n, k, width, a_ptr, b_ptr, c_ptr, mr, nr, pack_map, k_unroll, a_dtype, b_dtype, c_dtype, trans_b);
+                return emit_gemm_blis_inline(
+                    prog, m_concrete, n, k, width, a_ptr, b_ptr, c_ptr, mr, nr, pack_map, k_unroll,
+                    a_dtype, b_dtype, c_dtype, trans_b,
+                );
             }
             // TileGemm 参数不兼容 BLIS → fallback 到默认微核形状
-            let can_blis_default = !trans_b && !m_dim.is_symbolic() && m_concrete >= default_mr && n >= default_nr * lanes && k >= 16;
+            let can_blis_default = !trans_b
+                && !m_dim.is_symbolic()
+                && m_concrete >= default_mr
+                && n >= default_nr * lanes
+                && k >= 16;
             if can_blis_default {
-                return emit_gemm_blis_inline(prog, m_concrete, n, k, width, a_ptr, b_ptr, c_ptr, default_mr, default_nr, pack_map, k_unroll, a_dtype, b_dtype, c_dtype, trans_b);
+                return emit_gemm_blis_inline(
+                    prog, m_concrete, n, k, width, a_ptr, b_ptr, c_ptr, default_mr, default_nr,
+                    pack_map, k_unroll, a_dtype, b_dtype, c_dtype, trans_b,
+                );
             }
         }
         Some(ExecPattern::AsyncPipeline) => {
             // §0.2.9: AsyncPipeline → BLIS + prefetch hint（减少缓存未命中）
             let (mr, nr) = hook.gemm_microkernel_shape();
             let lanes = width.f32_lanes().max(1);
-            let can_blis = !trans_b && !m_dim.is_symbolic() && m_concrete >= mr && n >= nr * lanes && k >= 16;
+            let can_blis =
+                !trans_b && !m_dim.is_symbolic() && m_concrete >= mr && n >= nr * lanes && k >= 16;
             if can_blis {
-                return emit_gemm_blis_inline(prog, m_concrete, n, k, width, a_ptr, b_ptr, c_ptr, mr, nr, pack_map, k_unroll, a_dtype, b_dtype, c_dtype, trans_b);
+                return emit_gemm_blis_inline(
+                    prog, m_concrete, n, k, width, a_ptr, b_ptr, c_ptr, mr, nr, pack_map, k_unroll,
+                    a_dtype, b_dtype, c_dtype, trans_b,
+                );
             }
         }
         None => {}
@@ -238,20 +366,30 @@ pub(crate) fn emit_gemm_inline_with_hook<'a>(
     // m_bound 已在函数顶部计算 (seq_bound_override 优先, 否则 sym_map.to_bound),
     // 不再在此重复声明 (BCE-20260702-GPU-OOM: 旧重复 let m_bound 已删)。
     let layout = super::op_impl::GemmOpLayout {
-        m: m_concrete, n, k,
+        m: m_concrete,
+        n,
+        k,
         m_bound,
         dtype: a_dtype,
-        a_dtype, b_dtype, c_dtype,
+        a_dtype,
+        b_dtype,
+        c_dtype,
         trans_b,
-        mr, nr,
-        a_ptr, b_ptr, c_ptr,
+        mr,
+        nr,
+        a_ptr,
+        b_ptr,
+        c_ptr,
         epilogue: super::isa_hook::EpiloguePlace::OnAccumulators,
         tile: resolve_tile_shape(&feats, a_dtype, m_concrete, n, k),
     };
     let im = super::gemm_impls::select_gemm_impl(feats, a_dtype, (m_concrete, n, k));
     let mut ectx = super::op_impl::EmitCtx {
-        prog, width,
-        pack_map, k_unroll, debug_jit: ctx.session.debug_jit,
+        prog,
+        width,
+        pack_map,
+        k_unroll,
+        debug_jit: ctx.session.debug_jit,
     };
     im.emit(&mut ectx, &layout)
 }
@@ -263,7 +401,9 @@ pub(crate) fn emit_gemm_inline_with_hook<'a>(
 fn resolve_tile_shape(
     feats: &super::op_impl::FeatureSet,
     dtype: QuantPrecision,
-    m: usize, n: usize, _k: usize,
+    m: usize,
+    n: usize,
+    _k: usize,
 ) -> Option<super::op_impl::TileShape> {
     use super::op_impl::FeatureSet;
     // AMX/SME/TC tile 路径才需要 tile 形状。
@@ -276,9 +416,15 @@ fn resolve_tile_shape(
         if m < 16 || n < 16 {
             return None;
         }
-        let k_depth = if feats.contains(FeatureSet::AMX_FP8) { 64 } else { 32 };
+        let k_depth = if feats.contains(FeatureSet::AMX_FP8) {
+            64
+        } else {
+            32
+        };
         Some(super::op_impl::TileShape {
-            rows: 16, cols: 16, k_depth,
+            rows: 16,
+            cols: 16,
+            k_depth,
             dtype,
         })
     } else {
@@ -293,13 +439,20 @@ fn resolve_tile_shape(
 /// 当前 B-matrix 始终按 row-major stride (n * elem_bytes) 寻址。
 pub(crate) fn emit_gemm_blis_inline(
     prog: &mut VmProgram,
-    m: usize, n: usize, k: usize,
+    m: usize,
+    n: usize,
+    k: usize,
     width: SimdWidth,
-    a_ptr: VRegId, b_ptr: VRegId, c_ptr: VRegId,
-    mr: usize, nr: usize,
+    a_ptr: VRegId,
+    b_ptr: VRegId,
+    c_ptr: VRegId,
+    mr: usize,
+    nr: usize,
     pack_map: Option<&crate::compiler::pack_map::PackMap>,
     unroll_factor: usize,
-    a_dtype: QuantPrecision, b_dtype: QuantPrecision, c_dtype: QuantPrecision,
+    a_dtype: QuantPrecision,
+    b_dtype: QuantPrecision,
+    c_dtype: QuantPrecision,
     trans_b: bool,
 ) -> Result<(), CompilerError> {
     let lanes = width.f32_lanes().max(1);
@@ -331,7 +484,12 @@ pub(crate) fn emit_gemm_blis_inline(
             let nr_actual = nr.min((n - j_block + lanes - 1) / lanes);
 
             for a in &accs[..mr_actual * nr_actual] {
-                prog.emit(VmInstr::Broadcast { dst: *a, src: ScalarExpr::Const(0.0), width, dtype: acc_dtype });
+                prog.emit(VmInstr::Broadcast {
+                    dst: *a,
+                    src: ScalarExpr::Const(0.0),
+                    width,
+                    dtype: acc_dtype,
+                });
             }
 
             let k_unroll = unroll_factor.max(1).min(k);
@@ -352,8 +510,12 @@ pub(crate) fn emit_gemm_blis_inline(
                         let a_off = (i_block + r) * k * a_elem + u_byte_off;
                         prog.emit(VmInstr::Broadcast {
                             dst: a_broadcast,
-                            src: ScalarExpr::MemLoad(a_ptr, OffsetExpr::loop_plus_const(k_off, a_off)),
-                            width, dtype: a_dtype,
+                            src: ScalarExpr::MemLoad(
+                                a_ptr,
+                                OffsetExpr::loop_plus_const(k_off, a_off),
+                            ),
+                            width,
+                            dtype: a_dtype,
                         });
                         for c in 0..nr_actual {
                             let b_off = j_block * b_col_stride + c * lanes * b_col_stride;
@@ -361,15 +523,21 @@ pub(crate) fn emit_gemm_blis_inline(
                             // BCE-20260702-GPU-ACC-GUARD: acc_idx ∈ 0..(mr_actual*nr_actual) ≤ mr*nr == accs.len()
                             // (r < mr_actual, c < nr_actual), 守卫恒真 → 删除 (NO_SILENT_FALLBACK 根治)
                             prog.emit(VmInstr::VecLoad {
-                                dst: b_vec, base: b_ptr,
+                                dst: b_vec,
+                                base: b_ptr,
                                 offset: OffsetExpr::Add(
                                     Box::new(OffsetExpr::Add(
-                                        Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(k_ctr)), b_row_stride * k_unroll)),
+                                        Box::new(OffsetExpr::Mul(
+                                            Box::new(OffsetExpr::LoopOffset(k_ctr)),
+                                            b_row_stride * k_unroll,
+                                        )),
                                         Box::new(OffsetExpr::Const(b_k_off)),
                                     )),
                                     Box::new(OffsetExpr::Const(b_off)),
                                 ),
-                                width, dtype: b_dtype, predicate: None,
+                                width,
+                                dtype: b_dtype,
+                                predicate: None,
                             });
                             // Direct FMA: dst = acc + a * b (in-place accumulate, F32 accumulator)
                             prog.emit(VmInstr::Fma {
@@ -392,14 +560,24 @@ pub(crate) fn emit_gemm_blis_inline(
                     let c_off = (i_block + r) * n * c_elem + (j_block + c * lanes) * c_elem;
                     let store_src = if needs_narrow {
                         let narrowed = prog.alloc_vreg(VRegKind::Vec, width);
-                        prog.emit(VmInstr::VecNarrow { dst: narrowed, src: accs[acc_idx], dst_dtype: c_dtype, src_dtype: acc_dtype, width });
+                        prog.emit(VmInstr::VecNarrow {
+                            dst: narrowed,
+                            src: accs[acc_idx],
+                            dst_dtype: c_dtype,
+                            src_dtype: acc_dtype,
+                            width,
+                        });
                         narrowed
                     } else {
                         accs[acc_idx]
                     };
                     prog.emit(VmInstr::VecStore {
-                        base: c_ptr, offset: OffsetExpr::Const(c_off), src: store_src, width,
-                        dtype: c_dtype, predicate: None,
+                        base: c_ptr,
+                        offset: OffsetExpr::Const(c_off),
+                        src: store_src,
+                        width,
+                        dtype: c_dtype,
+                        predicate: None,
                     });
                 }
             }
@@ -414,12 +592,22 @@ pub(crate) fn emit_gemm_blis_inline(
 /// 最内层 MMA 指令维度 mma_k.
 pub(crate) fn emit_gemm_gpu_tiled_inline(
     prog: &mut VmProgram,
-    m: usize, n: usize, k: usize,
+    m: usize,
+    n: usize,
+    k: usize,
     width: SimdWidth,
-    a_ptr: VRegId, b_ptr: VRegId, c_ptr: VRegId,
-    cta_m: usize, cta_n: usize, cta_k: usize,
-    warp_m: usize, warp_n: usize, mma_k: usize,
-    a_dtype: QuantPrecision, b_dtype: QuantPrecision, c_dtype: QuantPrecision,
+    a_ptr: VRegId,
+    b_ptr: VRegId,
+    c_ptr: VRegId,
+    cta_m: usize,
+    cta_n: usize,
+    cta_k: usize,
+    warp_m: usize,
+    warp_n: usize,
+    mma_k: usize,
+    a_dtype: QuantPrecision,
+    b_dtype: QuantPrecision,
+    c_dtype: QuantPrecision,
     _trans_b: bool,
     m_symbolic: bool,
     m_bound: &BoundExpr,
@@ -484,164 +672,200 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
             // step=1, bound = n/cta_n (CTA tile 数, e.g. 49152/128=384)。j_off = CTA tile 索引 (0..384)。
             // j_cta = j_off * cta_n; j_cta 字节偏移 = j_off * cta_n * elem (via OffsetExpr::Mul)。
             let n_tiles = (n + cta_n - 1) / cta_n; // 向上取整 (full tile 假设下 == n/cta_n)
-            prog.emit_loop_try::<CompilerError>(BoundExpr::Const(n_tiles), 1, |prog, _j_ctr, j_off| {
-                // j_off = 当前 CTA tile 的 N tile 索引 (counter, step=1)。
-                let nj = cta_n; // full tile 假设 (部分 tile 见上方注释)
+            prog.emit_loop_try::<CompilerError>(
+                BoundExpr::Const(n_tiles),
+                1,
+                |prog, _j_ctr, j_off| {
+                    // j_off = 当前 CTA tile 的 N tile 索引 (counter, step=1)。
+                    let nj = cta_n; // full tile 假设 (部分 tile 见上方注释)
 
-                // 清零累加器
-                for acc in &accs {
-                    prog.emit(VmInstr::Broadcast { dst: *acc, src: ScalarExpr::Const(0.0), width, dtype: acc_dtype });
-                }
+                    // 清零累加器
+                    for acc in &accs {
+                        prog.emit(VmInstr::Broadcast {
+                            dst: *acc,
+                            src: ScalarExpr::Const(0.0),
+                            width,
+                            dtype: acc_dtype,
+                        });
+                    }
 
-                // K 维度循环: k=576 (Concrete 但中等) → emit_loop 避免 18 份展开。
-                // step=1, bound = k/cta_k (K tile 数, e.g. 576/32=18)。k_ctr = K tile 索引 (0..18)。
-                let k_tiles = (k + cta_k - 1) / cta_k;
-                prog.emit_loop_try::<CompilerError>(BoundExpr::Const(k_tiles), 1, |prog, k_ctr, _k_off| {
-                    // k_ctr = 当前 K tile 索引 (counter, step=1)。k_tile = k_ctr * cta_k。
-                    // kk = cta_k (full tile 假设)。
+                    // K 维度循环: k=576 (Concrete 但中等) → emit_loop 避免 18 份展开。
+                    // step=1, bound = k/cta_k (K tile 数, e.g. 576/32=18)。k_ctr = K tile 索引 (0..18)。
+                    let k_tiles = (k + cta_k - 1) / cta_k;
+                    prog.emit_loop_try::<CompilerError>(
+                        BoundExpr::Const(k_tiles),
+                        1,
+                        |prog, k_ctr, _k_off| {
+                            // k_ctr = 当前 K tile 索引 (counter, step=1)。k_tile = k_ctr * cta_k。
+                            // kk = cta_k (full tile 假设)。
 
-                    // Warp 级循环: micro-dim (warp_m/warp_n) → Rust for (例外)。
-                    for i_warp in (0..cta_m).step_by(warp_m) {
-                        let wi = warp_m.min(cta_m - i_warp);
-                        for j_warp in (0..nj).step_by(warp_n) {
-                            let wj = warp_n.min(nj - j_warp);
+                            // Warp 级循环: micro-dim (warp_m/warp_n) → Rust for (例外)。
+                            for i_warp in (0..cta_m).step_by(warp_m) {
+                                let wi = warp_m.min(cta_m - i_warp);
+                                for j_warp in (0..nj).step_by(warp_n) {
+                                    let wj = warp_n.min(nj - j_warp);
 
-                            // MMA 内层 K 循环: micro-dim (mma_k) → Rust for (例外)。kk=cta_k (full)。
-                            for k_inner in (0..cta_k).step_by(mma_k) {
-                                // A off = a_row_base + i_warp*k*a_elem + k_tile*a_elem + k_inner*a_elem
-                                //   k_tile VReg 部分: Mul(LoopOffset(k_ctr), cta_k*a_elem) (k_tile=k_ctr*cta_k)
-                                //   i_warp/k_inner: Const
-                                let k_tile_byte = OffsetExpr::Mul(
-                                    Box::new(OffsetExpr::LoopOffset(k_ctr)), cta_k * a_elem);
-                                let a_off = OffsetExpr::Add(
-                                    Box::new(OffsetExpr::Add(
-                                        Box::new(OffsetExpr::Add(
-                                            Box::new(a_row_base.clone()),
-                                            Box::new(OffsetExpr::Const(i_warp * k * a_elem)),
-                                        )),
-                                        Box::new(k_tile_byte),
-                                    )),
-                                    Box::new(OffsetExpr::Const(k_inner * a_elem)),
-                                );
-                                // B off = ((k_tile+k_inner)*n + j_cta+j_warp) * b_elem
-                                //   k_tile VReg: Mul(LoopOffset(k_ctr), cta_k*n*b_elem)
-                                //   j_cta VReg: Mul(LoopOffset(j_off), cta_n*b_elem) (j_cta=j_off*cta_n)
-                                //   k_inner/j_warp: Const
-                                let j_cta_byte_b = OffsetExpr::Mul(
-                                    Box::new(OffsetExpr::LoopOffset(j_off)), cta_n * b_elem);
-                                let k_tile_byte_b = OffsetExpr::Mul(
-                                    Box::new(OffsetExpr::LoopOffset(k_ctr)), cta_k * n * b_elem);
-                                let b_off = OffsetExpr::Add(
-                                    Box::new(OffsetExpr::Add(
-                                        Box::new(k_tile_byte_b),
-                                        Box::new(OffsetExpr::Const(k_inner * n * b_elem)),
-                                    )),
-                                    Box::new(OffsetExpr::Add(
-                                        Box::new(j_cta_byte_b),
-                                        Box::new(OffsetExpr::Const(j_warp * b_elem)),
-                                    )),
-                                );
-
-                                // row/col 循环: thread tile (tm×tn, micro-dim ≤64) → Rust for (NO-LOOP-UNROLL 例外)。
-                                // accs 尺寸 = tm*tn, acc_idx = row*tn + col ∈ 0..(tm*tn) == accs.len()，
-                                // 守卫天然恒真 → 删除 `if acc_idx < accs.len()` (NO_SILENT_FALLBACK 根治)。
-                                // 每 lane 的输出行/列基偏移由 ThreadOffset(Lane, scale) 注入 (SIMT 并行)。
-                                // A 行偏移: lane_row_byte_offset(k*a_elem) + thread_row*k*a_elem
-                                let lane_a_row = thread_tile.lane_row_byte_offset(k * a_elem);
-                                for row in 0..tm {
-                                    let a_row_off = OffsetExpr::Add(
-                                        Box::new(OffsetExpr::Add(
-                                            Box::new(a_off.clone()),
-                                            Box::new(lane_a_row.clone()),
-                                        )),
-                                        Box::new(OffsetExpr::Const(row * k * a_elem)),
-                                    );
-                                    let a_vec = prog.alloc_vreg(VRegKind::Vec, width);
-                                    prog.emit(VmInstr::VecLoad {
-                                        dst: a_vec, base: a_ptr,
-                                        offset: a_row_off,
-                                        width, dtype: a_dtype, predicate: None,
-                                    });
-
-                                    for col in 0..tn {
-                                        // B 列偏移: lane_col_byte_offset(b_elem) + thread_col*b_elem
-                                        let lane_b_col = thread_tile.lane_col_byte_offset(b_elem);
-                                        let b_col_off = OffsetExpr::Add(
-                                            Box::new(OffsetExpr::Add(
-                                                Box::new(b_off.clone()),
-                                                Box::new(lane_b_col.clone()),
-                                            )),
-                                            Box::new(OffsetExpr::Const(col * b_elem)),
+                                    // MMA 内层 K 循环: micro-dim (mma_k) → Rust for (例外)。kk=cta_k (full)。
+                                    for k_inner in (0..cta_k).step_by(mma_k) {
+                                        // A off = a_row_base + i_warp*k*a_elem + k_tile*a_elem + k_inner*a_elem
+                                        //   k_tile VReg 部分: Mul(LoopOffset(k_ctr), cta_k*a_elem) (k_tile=k_ctr*cta_k)
+                                        //   i_warp/k_inner: Const
+                                        let k_tile_byte = OffsetExpr::Mul(
+                                            Box::new(OffsetExpr::LoopOffset(k_ctr)),
+                                            cta_k * a_elem,
                                         );
-                                        let b_vec = prog.alloc_vreg(VRegKind::Vec, width);
-                                        prog.emit(VmInstr::VecLoad {
-                                            dst: b_vec, base: b_ptr,
-                                            offset: b_col_off,
-                                            width, dtype: b_dtype, predicate: None,
-                                        });
+                                        let a_off = OffsetExpr::Add(
+                                            Box::new(OffsetExpr::Add(
+                                                Box::new(OffsetExpr::Add(
+                                                    Box::new(a_row_base.clone()),
+                                                    Box::new(OffsetExpr::Const(
+                                                        i_warp * k * a_elem,
+                                                    )),
+                                                )),
+                                                Box::new(k_tile_byte),
+                                            )),
+                                            Box::new(OffsetExpr::Const(k_inner * a_elem)),
+                                        );
+                                        // B off = ((k_tile+k_inner)*n + j_cta+j_warp) * b_elem
+                                        //   k_tile VReg: Mul(LoopOffset(k_ctr), cta_k*n*b_elem)
+                                        //   j_cta VReg: Mul(LoopOffset(j_off), cta_n*b_elem) (j_cta=j_off*cta_n)
+                                        //   k_inner/j_warp: Const
+                                        let j_cta_byte_b = OffsetExpr::Mul(
+                                            Box::new(OffsetExpr::LoopOffset(j_off)),
+                                            cta_n * b_elem,
+                                        );
+                                        let k_tile_byte_b = OffsetExpr::Mul(
+                                            Box::new(OffsetExpr::LoopOffset(k_ctr)),
+                                            cta_k * n * b_elem,
+                                        );
+                                        let b_off = OffsetExpr::Add(
+                                            Box::new(OffsetExpr::Add(
+                                                Box::new(k_tile_byte_b),
+                                                Box::new(OffsetExpr::Const(k_inner * n * b_elem)),
+                                            )),
+                                            Box::new(OffsetExpr::Add(
+                                                Box::new(j_cta_byte_b),
+                                                Box::new(OffsetExpr::Const(j_warp * b_elem)),
+                                            )),
+                                        );
 
-                                        let acc_idx = row * tn + col;
-                                        // acc_idx < accs.len() 恒真 (tm*tn == accs.len()) → 守卫删除
-                                        prog.emit(VmInstr::Fma {
-                                            dst: accs[acc_idx],
-                                            acc: accs[acc_idx],
-                                            a: a_vec,
-                                            b: b_vec,
-                                            dtype: acc_dtype,
-                                        });
+                                        // row/col 循环: thread tile (tm×tn, micro-dim ≤64) → Rust for (NO-LOOP-UNROLL 例外)。
+                                        // accs 尺寸 = tm*tn, acc_idx = row*tn + col ∈ 0..(tm*tn) == accs.len()，
+                                        // 守卫天然恒真 → 删除 `if acc_idx < accs.len()` (NO_SILENT_FALLBACK 根治)。
+                                        // 每 lane 的输出行/列基偏移由 ThreadOffset(Lane, scale) 注入 (SIMT 并行)。
+                                        // A 行偏移: lane_row_byte_offset(k*a_elem) + thread_row*k*a_elem
+                                        let lane_a_row =
+                                            thread_tile.lane_row_byte_offset(k * a_elem);
+                                        for row in 0..tm {
+                                            let a_row_off = OffsetExpr::Add(
+                                                Box::new(OffsetExpr::Add(
+                                                    Box::new(a_off.clone()),
+                                                    Box::new(lane_a_row.clone()),
+                                                )),
+                                                Box::new(OffsetExpr::Const(row * k * a_elem)),
+                                            );
+                                            let a_vec = prog.alloc_vreg(VRegKind::Vec, width);
+                                            prog.emit(VmInstr::VecLoad {
+                                                dst: a_vec,
+                                                base: a_ptr,
+                                                offset: a_row_off,
+                                                width,
+                                                dtype: a_dtype,
+                                                predicate: None,
+                                            });
+
+                                            for col in 0..tn {
+                                                // B 列偏移: lane_col_byte_offset(b_elem) + thread_col*b_elem
+                                                let lane_b_col =
+                                                    thread_tile.lane_col_byte_offset(b_elem);
+                                                let b_col_off = OffsetExpr::Add(
+                                                    Box::new(OffsetExpr::Add(
+                                                        Box::new(b_off.clone()),
+                                                        Box::new(lane_b_col.clone()),
+                                                    )),
+                                                    Box::new(OffsetExpr::Const(col * b_elem)),
+                                                );
+                                                let b_vec = prog.alloc_vreg(VRegKind::Vec, width);
+                                                prog.emit(VmInstr::VecLoad {
+                                                    dst: b_vec,
+                                                    base: b_ptr,
+                                                    offset: b_col_off,
+                                                    width,
+                                                    dtype: b_dtype,
+                                                    predicate: None,
+                                                });
+
+                                                let acc_idx = row * tn + col;
+                                                // acc_idx < accs.len() 恒真 (tm*tn == accs.len()) → 守卫删除
+                                                prog.emit(VmInstr::Fma {
+                                                    dst: accs[acc_idx],
+                                                    acc: accs[acc_idx],
+                                                    a: a_vec,
+                                                    b: b_vec,
+                                                    dtype: acc_dtype,
+                                                });
+                                            }
+                                        }
                                     }
                                 }
                             }
+                            Ok(())
+                        },
+                    )?;
+
+                    // 写回 C tile: c_row_base + lane_row_byte_offset(n*c_elem) + row*n*c_elem
+                    //                + j_cta_byte_c_wb + lane_col_byte_offset(c_elem) + col*c_elem
+                    //   j_cta VReg 部分: Mul(LoopOffset(j_off), cta_n*c_elem)
+                    let j_cta_byte_c_wb =
+                        OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(j_off)), cta_n * c_elem);
+                    let lane_c_row = thread_tile.lane_row_byte_offset(n * c_elem);
+                    let lane_c_col = thread_tile.lane_col_byte_offset(c_elem);
+                    for row in 0..tm {
+                        for col in 0..tn {
+                            let acc_idx = row * tn + col;
+                            // acc_idx < accs.len() 恒真 → 守卫删除 (NO_SILENT_FALLBACK 根治)
+                            let c_off = OffsetExpr::Add(
+                                Box::new(OffsetExpr::Add(
+                                    Box::new(OffsetExpr::Add(
+                                        Box::new(c_row_base.clone()),
+                                        Box::new(lane_c_row.clone()),
+                                    )),
+                                    Box::new(OffsetExpr::Const(row * n * c_elem)),
+                                )),
+                                Box::new(OffsetExpr::Add(
+                                    Box::new(OffsetExpr::Add(
+                                        Box::new(j_cta_byte_c_wb.clone()),
+                                        Box::new(lane_c_col.clone()),
+                                    )),
+                                    Box::new(OffsetExpr::Const(col * c_elem)),
+                                )),
+                            );
+                            let store_src = if needs_narrow {
+                                let narrowed = prog.alloc_vreg(VRegKind::Vec, width);
+                                prog.emit(VmInstr::VecNarrow {
+                                    dst: narrowed,
+                                    src: accs[acc_idx],
+                                    dst_dtype: c_dtype,
+                                    src_dtype: acc_dtype,
+                                    width,
+                                });
+                                narrowed
+                            } else {
+                                accs[acc_idx]
+                            };
+                            prog.emit(VmInstr::VecStore {
+                                base: c_ptr,
+                                offset: c_off,
+                                src: store_src,
+                                width,
+                                dtype: c_dtype,
+                                predicate: None,
+                            });
                         }
                     }
                     Ok(())
-                })?;
-
-                // 写回 C tile: c_row_base + lane_row_byte_offset(n*c_elem) + row*n*c_elem
-                //                + j_cta_byte_c_wb + lane_col_byte_offset(c_elem) + col*c_elem
-                //   j_cta VReg 部分: Mul(LoopOffset(j_off), cta_n*c_elem)
-                let j_cta_byte_c_wb = OffsetExpr::Mul(
-                    Box::new(OffsetExpr::LoopOffset(j_off)), cta_n * c_elem);
-                let lane_c_row = thread_tile.lane_row_byte_offset(n * c_elem);
-                let lane_c_col = thread_tile.lane_col_byte_offset(c_elem);
-                for row in 0..tm {
-                    for col in 0..tn {
-                        let acc_idx = row * tn + col;
-                        // acc_idx < accs.len() 恒真 → 守卫删除 (NO_SILENT_FALLBACK 根治)
-                        let c_off = OffsetExpr::Add(
-                            Box::new(OffsetExpr::Add(
-                                Box::new(OffsetExpr::Add(
-                                    Box::new(c_row_base.clone()),
-                                    Box::new(lane_c_row.clone()),
-                                )),
-                                Box::new(OffsetExpr::Const(row * n * c_elem)),
-                            )),
-                            Box::new(OffsetExpr::Add(
-                                Box::new(OffsetExpr::Add(
-                                    Box::new(j_cta_byte_c_wb.clone()),
-                                    Box::new(lane_c_col.clone()),
-                                )),
-                                Box::new(OffsetExpr::Const(col * c_elem)),
-                            )),
-                        );
-                        let store_src = if needs_narrow {
-                            let narrowed = prog.alloc_vreg(VRegKind::Vec, width);
-                            prog.emit(VmInstr::VecNarrow { dst: narrowed, src: accs[acc_idx], dst_dtype: c_dtype, src_dtype: acc_dtype, width });
-                            narrowed
-                        } else {
-                            accs[acc_idx]
-                        };
-                        prog.emit(VmInstr::VecStore {
-                            base: c_ptr,
-                            offset: c_off,
-                            src: store_src,
-                            width,
-                            dtype: c_dtype, predicate: None,
-                        });
-                    }
-                }
-                Ok(())
-            })?;
+                },
+            )?;
             Ok(())
         })?;
         return Ok(());
@@ -658,7 +882,12 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
 
             // 清零累加器
             for acc in &accs {
-                prog.emit(VmInstr::Broadcast { dst: *acc, src: ScalarExpr::Const(0.0), width, dtype: acc_dtype });
+                prog.emit(VmInstr::Broadcast {
+                    dst: *acc,
+                    src: ScalarExpr::Const(0.0),
+                    width,
+                    dtype: acc_dtype,
+                });
             }
 
             // K 维度循环
@@ -694,9 +923,12 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
                                 );
                                 let a_vec = prog.alloc_vreg(VRegKind::Vec, width);
                                 prog.emit(VmInstr::VecLoad {
-                                    dst: a_vec, base: a_ptr,
+                                    dst: a_vec,
+                                    base: a_ptr,
                                     offset: a_row_off,
-                                    width, dtype: a_dtype, predicate: None,
+                                    width,
+                                    dtype: a_dtype,
+                                    predicate: None,
                                 });
 
                                 for col in 0..tn {
@@ -709,9 +941,12 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
                                     );
                                     let b_vec = prog.alloc_vreg(VRegKind::Vec, width);
                                     prog.emit(VmInstr::VecLoad {
-                                        dst: b_vec, base: b_ptr,
+                                        dst: b_vec,
+                                        base: b_ptr,
                                         offset: b_col_off,
-                                        width, dtype: b_dtype, predicate: None,
+                                        width,
+                                        dtype: b_dtype,
+                                        predicate: None,
                                     });
 
                                     // FMA: acc[row * tn + col] += a_vec * b_vec (F32 accumulator)
@@ -755,7 +990,13 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
                     );
                     let store_src = if needs_narrow {
                         let narrowed = prog.alloc_vreg(VRegKind::Vec, width);
-                        prog.emit(VmInstr::VecNarrow { dst: narrowed, src: accs[acc_idx], dst_dtype: c_dtype, src_dtype: acc_dtype, width });
+                        prog.emit(VmInstr::VecNarrow {
+                            dst: narrowed,
+                            src: accs[acc_idx],
+                            dst_dtype: c_dtype,
+                            src_dtype: acc_dtype,
+                            width,
+                        });
                         narrowed
                     } else {
                         accs[acc_idx]
@@ -765,7 +1006,8 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
                         offset: c_off,
                         src: store_src,
                         width,
-                        dtype: c_dtype, predicate: None,
+                        dtype: c_dtype,
+                        predicate: None,
                     });
                 }
             }
@@ -791,13 +1033,23 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
 /// SM90+: TMA cp.async.bulk + mbarrier.try_wait
 pub(crate) fn emit_gemm_gpu_pipelined(
     prog: &mut VmProgram,
-    m: usize, n: usize, k: usize,
+    m: usize,
+    n: usize,
+    k: usize,
     width: SimdWidth,
-    a_ptr: VRegId, b_ptr: VRegId, c_ptr: VRegId,
-    cta_m: usize, cta_n: usize, cta_k: usize,
-    warp_m: usize, warp_n: usize, mma_k: usize,
+    a_ptr: VRegId,
+    b_ptr: VRegId,
+    c_ptr: VRegId,
+    cta_m: usize,
+    cta_n: usize,
+    cta_k: usize,
+    warp_m: usize,
+    warp_n: usize,
+    mma_k: usize,
     pipeline_depth: usize,
-    a_dtype: QuantPrecision, b_dtype: QuantPrecision, c_dtype: QuantPrecision,
+    a_dtype: QuantPrecision,
+    b_dtype: QuantPrecision,
+    c_dtype: QuantPrecision,
     _trans_b: bool,
     use_tma: bool,
     m_symbolic: bool,
@@ -811,9 +1063,10 @@ pub(crate) fn emit_gemm_gpu_pipelined(
     // OffsetExpr 偏移分层)。数值正确 (K-reduction 顺序不变, 仅失去双缓冲流水线
     // 加速), 不 OOM, NO-SILENT-FALLBACK 安全。Concrete M 保留 pipelined 双缓冲。
     if m_symbolic {
-        return emit_gemm_gpu_tiled_inline(prog, m, n, k, width, a_ptr, b_ptr, c_ptr,
-            cta_m, cta_n, cta_k, warp_m, warp_n, mma_k, a_dtype, b_dtype, c_dtype, _trans_b,
-            true, m_bound);
+        return emit_gemm_gpu_tiled_inline(
+            prog, m, n, k, width, a_ptr, b_ptr, c_ptr, cta_m, cta_n, cta_k, warp_m, warp_n, mma_k,
+            a_dtype, b_dtype, c_dtype, _trans_b, true, m_bound,
+        );
     }
     // BCE-20260702-GPU-ACC-GUARD (NO_SILENT_FALLBACK 根治): pipelined 路径的
     // emit_mma_on_smem 尚未引入 thread-tile 模型 (accs 用 .min(16) + 守卫)。
@@ -821,9 +1074,10 @@ pub(crate) fn emit_gemm_gpu_pipelined(
     // 禁止 pipelined 路径静默跳过输出单元。pipelined 双缓冲加速仅对 small
     // warp tile (acc_count ≤ 64) 保留, 数值正确不损。
     if warp_m * warp_n > 64 {
-        return emit_gemm_gpu_tiled_inline(prog, m, n, k, width, a_ptr, b_ptr, c_ptr,
-            cta_m, cta_n, cta_k, warp_m, warp_n, mma_k, a_dtype, b_dtype, c_dtype, _trans_b,
-            false, m_bound);
+        return emit_gemm_gpu_tiled_inline(
+            prog, m, n, k, width, a_ptr, b_ptr, c_ptr, cta_m, cta_n, cta_k, warp_m, warp_n, mma_k,
+            a_dtype, b_dtype, c_dtype, _trans_b, false, m_bound,
+        );
     }
     // BCE-20260630-MIXED-P0.5: per-matrix dtype (ARCH-DTYPE-MIXED-PRECISION).
     // 三段式 dtype 感知：A-tile load=a_dtype, B-tile load=b_dtype, C-store=c_dtype;
@@ -903,7 +1157,12 @@ pub(crate) fn emit_gemm_gpu_pipelined(
 
             // Zero accumulators
             for acc in &accs {
-                prog.emit(VmInstr::Broadcast { dst: *acc, src: ScalarExpr::Const(0.0), width, dtype: acc_dtype });
+                prog.emit(VmInstr::Broadcast {
+                    dst: *acc,
+                    src: ScalarExpr::Const(0.0),
+                    width,
+                    dtype: acc_dtype,
+                });
             }
 
             // K tiles
@@ -916,10 +1175,32 @@ pub(crate) fn emit_gemm_gpu_pipelined(
                 // ─── Prologue: async load stage 0 ───
                 let k0 = k_tiles[0];
                 let kk0 = cta_k.min(k - k0);
-                emit_async_load_tile(prog, &smem_a_names[0], &smem_b_names[0],
-                    a_ptr, b_ptr, i_cta, j_cta, k0, mi, nj, kk0,
-                    cta_m, cta_n, cta_k, n, k, a_elem, a_dtype, b_elem, b_dtype, width,
-                    smem_a_row_bytes, smem_b_row_bytes, use_tma);
+                emit_async_load_tile(
+                    prog,
+                    &smem_a_names[0],
+                    &smem_b_names[0],
+                    a_ptr,
+                    b_ptr,
+                    i_cta,
+                    j_cta,
+                    k0,
+                    mi,
+                    nj,
+                    kk0,
+                    cta_m,
+                    cta_n,
+                    cta_k,
+                    n,
+                    k,
+                    a_elem,
+                    a_dtype,
+                    b_elem,
+                    b_dtype,
+                    width,
+                    smem_a_row_bytes,
+                    smem_b_row_bytes,
+                    use_tma,
+                );
 
                 if num_k_tiles == 1 {
                     // Single K tile: wait + compute + done
@@ -931,11 +1212,32 @@ pub(crate) fn emit_gemm_gpu_pipelined(
                     } else {
                         prog.emit(VmInstr::AsyncWait { handle: 0 });
                     }
-                    emit_mma_on_smem(prog, &accs, &smem_a_names[0], &smem_b_names[0],
-                        i_cta, j_cta, k0, mi, nj, kk0.min(cta_k),
-                        cta_m, cta_n, cta_k, warp_m, warp_n, mma_k,
-                        n, k, a_elem, b_elem, acc_dtype, width,
-                        smem_a_row_bytes, smem_b_row_bytes);
+                    emit_mma_on_smem(
+                        prog,
+                        &accs,
+                        &smem_a_names[0],
+                        &smem_b_names[0],
+                        i_cta,
+                        j_cta,
+                        k0,
+                        mi,
+                        nj,
+                        kk0.min(cta_k),
+                        cta_m,
+                        cta_n,
+                        cta_k,
+                        warp_m,
+                        warp_n,
+                        mma_k,
+                        n,
+                        k,
+                        a_elem,
+                        b_elem,
+                        acc_dtype,
+                        width,
+                        smem_a_row_bytes,
+                        smem_b_row_bytes,
+                    );
                 } else {
                     // ─── Steady state: compute tile[i] ‖ async load tile[i+1] ───
                     let mut cur_stage = 0usize;
@@ -961,26 +1263,90 @@ pub(crate) fn emit_gemm_gpu_pipelined(
 
                         if tile_idx < num_k_tiles - 1 {
                             // Compute current tile from smem[cur_stage] ‖ async load next tile into smem[next_stage]
-                            emit_mma_on_smem(prog, &accs, &smem_a_names[cur_stage], &smem_b_names[cur_stage],
-                                i_cta, j_cta, ki, mi, nj, kki,
-                                cta_m, cta_n, cta_k, warp_m, warp_n, mma_k,
-                                n, k, a_elem, b_elem, acc_dtype, width,
-                                smem_a_row_bytes, smem_b_row_bytes);
+                            emit_mma_on_smem(
+                                prog,
+                                &accs,
+                                &smem_a_names[cur_stage],
+                                &smem_b_names[cur_stage],
+                                i_cta,
+                                j_cta,
+                                ki,
+                                mi,
+                                nj,
+                                kki,
+                                cta_m,
+                                cta_n,
+                                cta_k,
+                                warp_m,
+                                warp_n,
+                                mma_k,
+                                n,
+                                k,
+                                a_elem,
+                                b_elem,
+                                acc_dtype,
+                                width,
+                                smem_a_row_bytes,
+                                smem_b_row_bytes,
+                            );
 
                             // Async load next K tile
                             let ki_next = k_tiles[tile_idx + 1];
                             let kki_next = cta_k.min(k - ki_next);
-                            emit_async_load_tile(prog, &smem_a_names[next_stage], &smem_b_names[next_stage],
-                                a_ptr, b_ptr, i_cta, j_cta, ki_next, mi, nj, kki_next,
-                                cta_m, cta_n, cta_k, n, k, a_elem, a_dtype, b_elem, b_dtype, width,
-                                smem_a_row_bytes, smem_b_row_bytes, use_tma);
+                            emit_async_load_tile(
+                                prog,
+                                &smem_a_names[next_stage],
+                                &smem_b_names[next_stage],
+                                a_ptr,
+                                b_ptr,
+                                i_cta,
+                                j_cta,
+                                ki_next,
+                                mi,
+                                nj,
+                                kki_next,
+                                cta_m,
+                                cta_n,
+                                cta_k,
+                                n,
+                                k,
+                                a_elem,
+                                a_dtype,
+                                b_elem,
+                                b_dtype,
+                                width,
+                                smem_a_row_bytes,
+                                smem_b_row_bytes,
+                                use_tma,
+                            );
                         } else {
                             // Epilogue: compute last tile (no more async loads)
-                            emit_mma_on_smem(prog, &accs, &smem_a_names[cur_stage], &smem_b_names[cur_stage],
-                                i_cta, j_cta, ki, mi, nj, kki,
-                                cta_m, cta_n, cta_k, warp_m, warp_n, mma_k,
-                                n, k, a_elem, b_elem, acc_dtype, width,
-                                smem_a_row_bytes, smem_b_row_bytes);
+                            emit_mma_on_smem(
+                                prog,
+                                &accs,
+                                &smem_a_names[cur_stage],
+                                &smem_b_names[cur_stage],
+                                i_cta,
+                                j_cta,
+                                ki,
+                                mi,
+                                nj,
+                                kki,
+                                cta_m,
+                                cta_n,
+                                cta_k,
+                                warp_m,
+                                warp_n,
+                                mma_k,
+                                n,
+                                k,
+                                a_elem,
+                                b_elem,
+                                acc_dtype,
+                                width,
+                                smem_a_row_bytes,
+                                smem_b_row_bytes,
+                            );
                         }
 
                         parity ^= 1;
@@ -998,7 +1364,13 @@ pub(crate) fn emit_gemm_gpu_pipelined(
                     let c_off = ((i_cta + row) * n + j_cta + col) * c_elem;
                     let store_src = if needs_narrow {
                         let narrowed = prog.alloc_vreg(VRegKind::Vec, width);
-                        prog.emit(VmInstr::VecNarrow { dst: narrowed, src: accs[acc_idx], dst_dtype: c_dtype, src_dtype: acc_dtype, width });
+                        prog.emit(VmInstr::VecNarrow {
+                            dst: narrowed,
+                            src: accs[acc_idx],
+                            dst_dtype: c_dtype,
+                            src_dtype: acc_dtype,
+                            width,
+                        });
                         narrowed
                     } else {
                         accs[acc_idx]
@@ -1008,7 +1380,8 @@ pub(crate) fn emit_gemm_gpu_pipelined(
                         offset: OffsetExpr::Const(c_off),
                         src: store_src,
                         width,
-                        dtype: c_dtype, predicate: None,
+                        dtype: c_dtype,
+                        predicate: None,
                     });
                 }
             }
@@ -1058,9 +1431,15 @@ pub(crate) fn emit_async_load_tile(
         // TMA path (SM90+): one Tma2DCopy per tile — hardware handles the entire transfer.
         // coord_x / coord_y are GPR registers holding the tile's global starting coordinates.
         let coord_row_a = prog.alloc_vreg(VRegKind::Scalar, width);
-        prog.emit(VmInstr::GprLoadImm { dst: coord_row_a, value: i_cta });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: coord_row_a,
+            value: i_cta,
+        });
         let coord_col_a = prog.alloc_vreg(VRegKind::Scalar, width);
-        prog.emit(VmInstr::GprLoadImm { dst: coord_col_a, value: k_off });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: coord_col_a,
+            value: k_off,
+        });
 
         prog.emit(VmInstr::Tma2DCopy {
             desc_name: "tma_desc_a".to_string(),
@@ -1071,9 +1450,15 @@ pub(crate) fn emit_async_load_tile(
         });
 
         let coord_row_b = prog.alloc_vreg(VRegKind::Scalar, width);
-        prog.emit(VmInstr::GprLoadImm { dst: coord_row_b, value: k_off });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: coord_row_b,
+            value: k_off,
+        });
         let coord_col_b = prog.alloc_vreg(VRegKind::Scalar, width);
-        prog.emit(VmInstr::GprLoadImm { dst: coord_col_b, value: j_cta });
+        prog.emit(VmInstr::GprLoadImm {
+            dst: coord_col_b,
+            value: j_cta,
+        });
 
         prog.emit(VmInstr::Tma2DCopy {
             desc_name: "tma_desc_b".to_string(),
@@ -1096,7 +1481,8 @@ pub(crate) fn emit_async_load_tile(
                 base: _a_ptr,
                 offset: OffsetExpr::Const(global_offset),
                 width,
-                dtype: a_dtype, predicate: None,
+                dtype: a_dtype,
+                predicate: None,
             });
             prog.emit(VmInstr::SharedMemAsyncStore {
                 name: smem_a_name.to_string(),
@@ -1118,7 +1504,8 @@ pub(crate) fn emit_async_load_tile(
                 base: _b_ptr,
                 offset: OffsetExpr::Const(global_offset),
                 width,
-                dtype: b_dtype, predicate: None,
+                dtype: b_dtype,
+                predicate: None,
             });
             prog.emit(VmInstr::SharedMemAsyncStore {
                 name: smem_b_name.to_string(),
@@ -1163,8 +1550,16 @@ pub(crate) fn emit_mma_on_smem(
     smem_b_row_stride: usize,
 ) {
     // Padded row stride in matrix-native elements (divide byte stride by per-matrix elem).
-    let smem_a_row_elems = if a_elem > 0 { smem_a_row_stride / a_elem } else { 0 };
-    let smem_b_row_elems = if b_elem > 0 { smem_b_row_stride / b_elem } else { 0 };
+    let smem_a_row_elems = if a_elem > 0 {
+        smem_a_row_stride / a_elem
+    } else {
+        0
+    };
+    let smem_b_row_elems = if b_elem > 0 {
+        smem_b_row_stride / b_elem
+    } else {
+        0
+    };
 
     // Warp-level loop within CTA tile
     for i_warp in (0..mi).step_by(warp_m) {
@@ -1220,9 +1615,14 @@ pub(crate) fn emit_mma_on_smem(
 /// k_off: byte offset VRegId (= counter * step_bytes)
 /// j_off: byte offset VRegId for J dimension
 pub(crate) fn b_offset_expr(
-    k_counter: VRegId, k_off: VRegId,
+    k_counter: VRegId,
+    k_off: VRegId,
     j_off: VRegId,
-    b_row_stride: usize, _elem: usize, _n: usize, k: usize, trans_b: bool,
+    b_row_stride: usize,
+    _elem: usize,
+    _n: usize,
+    k: usize,
+    trans_b: bool,
     _lanes: usize,
 ) -> OffsetExpr {
     if trans_b {
@@ -1237,7 +1637,10 @@ pub(crate) fn b_offset_expr(
         // B[p,j]: offset = p * n * elem + j_byte_off
         // p = k_counter (iteration index), b_row_stride = n * elem
         OffsetExpr::Add(
-            Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::ScalarVReg(k_counter)), b_row_stride)),
+            Box::new(OffsetExpr::Mul(
+                Box::new(OffsetExpr::ScalarVReg(k_counter)),
+                b_row_stride,
+            )),
             Box::new(OffsetExpr::LoopOffset(j_off)),
         )
     }
@@ -1277,7 +1680,10 @@ pub(crate) fn b_offset_expr_indexed(
         // j_off 是 c_elem 步进 — 偏差。标记为需要进一步处理。
         // 保守方案：假设 trans_b 时 j 按 b_elem 步进（B 矩阵自身的列布局）。
         OffsetExpr::Add(
-            Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(j_off)), b_elem / b_elem.max(1))),
+            Box::new(OffsetExpr::Mul(
+                Box::new(OffsetExpr::LoopOffset(j_off)),
+                b_elem / b_elem.max(1),
+            )),
             Box::new(OffsetExpr::LoopOffset(_k_idx)),
         )
     } else {
@@ -1288,7 +1694,10 @@ pub(crate) fn b_offset_expr_indexed(
         // 若 c_elem ≠ b_elem，j_off 不能直接用。
         // 此处假设 j 维 c_elem == b_elem（多数情况 A/B/C 同 dtype）。
         OffsetExpr::Add(
-            Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(_k_idx)), b_row_stride)),
+            Box::new(OffsetExpr::Mul(
+                Box::new(OffsetExpr::LoopOffset(_k_idx)),
+                b_row_stride,
+            )),
             Box::new(OffsetExpr::LoopOffset(j_off)),
         )
     }
@@ -1305,21 +1714,30 @@ pub(crate) fn b_offset_expr_indexed(
 // @trace GEMM-TRANS-B-MIXED-DTYPE [req:REQ-DTYPE-006] [level:unit]
 pub(crate) fn emit_gemm_trans_b_inline(
     prog: &mut VmProgram,
-    m_dim: &SymDim, n: usize, k: usize,
+    m_dim: &SymDim,
+    n: usize,
+    k: usize,
     width: SimdWidth,
-    a_ptr: VRegId, b_ptr: VRegId, c_ptr: VRegId,
+    a_ptr: VRegId,
+    b_ptr: VRegId,
+    c_ptr: VRegId,
     epilogue: &[TraceOp],
     sym_map: &SymDimSlotMap,
     seq_bound_override: Option<&BoundExpr>,
-    a_dtype: QuantPrecision, b_dtype: QuantPrecision, c_dtype: QuantPrecision,
+    a_dtype: QuantPrecision,
+    b_dtype: QuantPrecision,
+    c_dtype: QuantPrecision,
 ) -> Result<(), CompilerError> {
     let m = match m_dim {
         SymDim::Concrete(v) => *v,
-        SymDim::Symbolic { max_value, .. } => max_value
-            .expect("ARCH-SYMDIM: GEMM M Symbolic must have max_value"),
+        SymDim::Symbolic { max_value, .. } => {
+            max_value.expect("ARCH-SYMDIM: GEMM M Symbolic must have max_value")
+        }
     };
     if m == 0 || n == 0 || k == 0 {
-        return Err(CompilerError::CodegenViolation(format!("zero dim ({m},{n},{k})")));
+        return Err(CompilerError::CodegenViolation(format!(
+            "zero dim ({m},{n},{k})"
+        )));
     }
     let lanes = width.f32_lanes().max(1);
     // BCE-20260629-003 (Pattern c): 多 dtype — a/c 通常 F32 (激活计算), b 权重 BF16。
@@ -1357,122 +1775,180 @@ pub(crate) fn emit_gemm_trans_b_inline(
     let s_acc = prog.alloc_vreg(VRegKind::Vec, s_width);
     let s_tail = prog.alloc_vreg(VRegKind::Vec, s_width);
 
-
     // j loop uses independent offsets to avoid compile-time unrolling (n can be 576/1536).
     let emit_j_loop = |prog: &mut VmProgram, m_off: OffsetExpr| -> Result<(), CompilerError> {
-        prog.emit_loop_multi_try(BoundExpr::Const(n), &[c_step, b_row_step], |prog, _j_ctr, offsets| {
-            let c_off = offsets[0];
-            let b_row_off = offsets[1];
+        prog.emit_loop_multi_try(
+            BoundExpr::Const(n),
+            &[c_step, b_row_step],
+            |prog, _j_ctr, offsets| {
+                let c_off = offsets[0];
+                let b_row_off = offsets[1];
 
-            prog.emit(VmInstr::Broadcast {
-                dst: acc_vec, src: ScalarExpr::Const(0.0), width, dtype: acc_dtype,
-            });
-
-            if k_vecs > 0 {
-                prog.emit_loop_multi_try(
-                    BoundExpr::Const(k_vecs),
-                    &[a_k_step, b_k_step],
-                    |prog, _p_ctr, offsets| {
-                        let a_off = offsets[0];
-                        let b_off = offsets[1];
-                        // Each operand uses its own storage stride in the K dimension.
-                        prog.emit(VmInstr::VecLoad {
-                            dst: a_vec, base: a_ptr,
-                            offset: OffsetExpr::Add(
-                                Box::new(OffsetExpr::Mul(
-                                    Box::new(m_off.clone()), a_row_stride,
-                                )),
-                                Box::new(OffsetExpr::LoopOffset(a_off)),
-                            ),
-                            width, dtype: a_dtype, predicate: None,
-                        });
-                        prog.emit(VmInstr::VecLoad {
-                            dst: b_vec, base: b_ptr,
-                            offset: OffsetExpr::Add(
-                                Box::new(OffsetExpr::LoopOffset(b_row_off)),
-                                Box::new(OffsetExpr::LoopOffset(b_off)),
-                            ),
-                            width, dtype: b_dtype, predicate: None,
-                        });
-                        // Direct FMA: dst = acc + a * b (in-place accumulate). a/b 已 widen 到 F32.
-                        prog.emit(VmInstr::Fma { dst: acc_vec, acc: acc_vec, a: a_vec, b: b_vec, dtype: acc_dtype });
-                        Ok::<(), CompilerError>(())
-                    },
-                )?;
-            }
-
-            if k_tail > 0 {
-                let tail_base = k_vecs * lanes * b_elem;
-                let tail_base_a = k_vecs * lanes * a_elem; // BCE-20260706: A 的 tail 起始 (a_elem)
                 prog.emit(VmInstr::Broadcast {
-                    dst: s_tail, src: ScalarExpr::Const(0.0), width: s_width, dtype: acc_dtype,
+                    dst: acc_vec,
+                    src: ScalarExpr::Const(0.0),
+                    width,
+                    dtype: acc_dtype,
                 });
-                for t in 0..k_tail {
-                    let p_byte = tail_base + t * b_elem;       // B tail offset
-                    let p_byte_a = tail_base_a + t * a_elem;    // A tail offset (BCE-20260706)
-                    prog.emit(VmInstr::Broadcast {
-                        dst: s_acc,
-                        src: ScalarExpr::MemLoad(a_ptr, OffsetExpr::Add(
-                            Box::new(OffsetExpr::Mul(Box::new(m_off.clone()), a_row_stride)),
-                            Box::new(OffsetExpr::Const(p_byte_a)),
-                        )),
-                        width: s_width, dtype: a_dtype,
-                    });
-                    let s_b = prog.alloc_vreg(VRegKind::Vec, s_width);
-                    prog.emit(VmInstr::Broadcast {
-                        dst: s_b,
-                        src: ScalarExpr::MemLoad(b_ptr, OffsetExpr::Add(
-                            Box::new(OffsetExpr::LoopOffset(b_row_off)),
-                            Box::new(OffsetExpr::Const(p_byte)),
-                        )),
-                        width: s_width, dtype: b_dtype,
-                    });
-                    // Direct FMA: s_tail = s_tail + s_acc * s_b
-                    prog.emit(VmInstr::Fma { dst: s_tail, acc: s_tail, a: s_acc, b: s_b, dtype: acc_dtype });
+
+                if k_vecs > 0 {
+                    prog.emit_loop_multi_try(
+                        BoundExpr::Const(k_vecs),
+                        &[a_k_step, b_k_step],
+                        |prog, _p_ctr, offsets| {
+                            let a_off = offsets[0];
+                            let b_off = offsets[1];
+                            // Each operand uses its own storage stride in the K dimension.
+                            prog.emit(VmInstr::VecLoad {
+                                dst: a_vec,
+                                base: a_ptr,
+                                offset: OffsetExpr::Add(
+                                    Box::new(OffsetExpr::Mul(
+                                        Box::new(m_off.clone()),
+                                        a_row_stride,
+                                    )),
+                                    Box::new(OffsetExpr::LoopOffset(a_off)),
+                                ),
+                                width,
+                                dtype: a_dtype,
+                                predicate: None,
+                            });
+                            prog.emit(VmInstr::VecLoad {
+                                dst: b_vec,
+                                base: b_ptr,
+                                offset: OffsetExpr::Add(
+                                    Box::new(OffsetExpr::LoopOffset(b_row_off)),
+                                    Box::new(OffsetExpr::LoopOffset(b_off)),
+                                ),
+                                width,
+                                dtype: b_dtype,
+                                predicate: None,
+                            });
+                            // Direct FMA: dst = acc + a * b (in-place accumulate). a/b 已 widen 到 F32.
+                            prog.emit(VmInstr::Fma {
+                                dst: acc_vec,
+                                acc: acc_vec,
+                                a: a_vec,
+                                b: b_vec,
+                                dtype: acc_dtype,
+                            });
+                            Ok::<(), CompilerError>(())
+                        },
+                    )?;
                 }
-            }
 
-            let reduced = prog.alloc_vreg(VRegKind::Vec, s_width);
-            prog.emit(VmInstr::HReduce { dst: reduced, src: acc_vec, op: ReduceOp::Sum });
+                if k_tail > 0 {
+                    let tail_base = k_vecs * lanes * b_elem;
+                    let tail_base_a = k_vecs * lanes * a_elem; // BCE-20260706: A 的 tail 起始 (a_elem)
+                    prog.emit(VmInstr::Broadcast {
+                        dst: s_tail,
+                        src: ScalarExpr::Const(0.0),
+                        width: s_width,
+                        dtype: acc_dtype,
+                    });
+                    for t in 0..k_tail {
+                        let p_byte = tail_base + t * b_elem; // B tail offset
+                        let p_byte_a = tail_base_a + t * a_elem; // A tail offset (BCE-20260706)
+                        prog.emit(VmInstr::Broadcast {
+                            dst: s_acc,
+                            src: ScalarExpr::MemLoad(
+                                a_ptr,
+                                OffsetExpr::Add(
+                                    Box::new(OffsetExpr::Mul(
+                                        Box::new(m_off.clone()),
+                                        a_row_stride,
+                                    )),
+                                    Box::new(OffsetExpr::Const(p_byte_a)),
+                                ),
+                            ),
+                            width: s_width,
+                            dtype: a_dtype,
+                        });
+                        let s_b = prog.alloc_vreg(VRegKind::Vec, s_width);
+                        prog.emit(VmInstr::Broadcast {
+                            dst: s_b,
+                            src: ScalarExpr::MemLoad(
+                                b_ptr,
+                                OffsetExpr::Add(
+                                    Box::new(OffsetExpr::LoopOffset(b_row_off)),
+                                    Box::new(OffsetExpr::Const(p_byte)),
+                                ),
+                            ),
+                            width: s_width,
+                            dtype: b_dtype,
+                        });
+                        // Direct FMA: s_tail = s_tail + s_acc * s_b
+                        prog.emit(VmInstr::Fma {
+                            dst: s_tail,
+                            acc: s_tail,
+                            a: s_acc,
+                            b: s_b,
+                            dtype: acc_dtype,
+                        });
+                    }
+                }
 
-            let result = if k_tail > 0 {
-                let sum = prog.alloc_vreg(VRegKind::Vec, s_width);
-                let add_body: Vec<TraceOp> = vec![
-                    TraceOp::Input(0), TraceOp::Input(1), TraceOp::Add(ValueId(0), ValueId(1)),
-                ];
-                super::auto_select::auto_lower_trace_into(
-                    prog, &add_body, &[reduced, s_tail], sum, s_width, c_dtype,
-                ).expect("trans_b GEMM add tail");
-                sum
-            } else {
-                reduced
-            };
-
-            if !epilogue.is_empty() {
-                lower::lower_trace_body_compat(prog, epilogue, result, None, s_width, c_dtype)
-                    .expect("lower_trace_body: OpTrace invariant violation");
-            }
-
-            let store_src = if needs_narrow {
-                let narrowed = prog.alloc_vreg(VRegKind::Vec, s_width);
-                prog.emit(VmInstr::VecNarrow {
-                    dst: narrowed, src: result, dst_dtype: c_dtype, src_dtype: acc_dtype, width: s_width,
+                let reduced = prog.alloc_vreg(VRegKind::Vec, s_width);
+                prog.emit(VmInstr::HReduce {
+                    dst: reduced,
+                    src: acc_vec,
+                    op: ReduceOp::Sum,
                 });
-                narrowed
-            } else {
-                result
-            };
 
-            prog.emit(VmInstr::VecStore {
-                base: c_ptr,
-                offset: OffsetExpr::Add(
-                    Box::new(OffsetExpr::Mul(Box::new(m_off.clone()), c_row_stride)),
-                    Box::new(OffsetExpr::LoopOffset(c_off)),
-                ),
-                src: store_src, width: s_width, dtype: c_dtype, predicate: None,
-            });
-            Ok::<(), CompilerError>(())
-        })?;
+                let result = if k_tail > 0 {
+                    let sum = prog.alloc_vreg(VRegKind::Vec, s_width);
+                    let add_body: Vec<TraceOp> = vec![
+                        TraceOp::Input(0),
+                        TraceOp::Input(1),
+                        TraceOp::Add(ValueId(0), ValueId(1)),
+                    ];
+                    super::auto_select::auto_lower_trace_into(
+                        prog,
+                        &add_body,
+                        &[reduced, s_tail],
+                        sum,
+                        s_width,
+                        c_dtype,
+                    )
+                    .expect("trans_b GEMM add tail");
+                    sum
+                } else {
+                    reduced
+                };
+
+                if !epilogue.is_empty() {
+                    lower::lower_trace_body_compat(prog, epilogue, result, None, s_width, c_dtype)
+                        .expect("lower_trace_body: OpTrace invariant violation");
+                }
+
+                let store_src = if needs_narrow {
+                    let narrowed = prog.alloc_vreg(VRegKind::Vec, s_width);
+                    prog.emit(VmInstr::VecNarrow {
+                        dst: narrowed,
+                        src: result,
+                        dst_dtype: c_dtype,
+                        src_dtype: acc_dtype,
+                        width: s_width,
+                    });
+                    narrowed
+                } else {
+                    result
+                };
+
+                prog.emit(VmInstr::VecStore {
+                    base: c_ptr,
+                    offset: OffsetExpr::Add(
+                        Box::new(OffsetExpr::Mul(Box::new(m_off.clone()), c_row_stride)),
+                        Box::new(OffsetExpr::LoopOffset(c_off)),
+                    ),
+                    src: store_src,
+                    width: s_width,
+                    dtype: c_dtype,
+                    predicate: None,
+                });
+                Ok::<(), CompilerError>(())
+            },
+        )?;
         Ok(())
     };
 
@@ -1498,30 +1974,51 @@ pub(crate) fn emit_gemm_trans_b_inline(
 
 pub(crate) fn emit_gemm_inline_with_epilogue(
     prog: &mut VmProgram,
-    m_dim: &SymDim, n: usize, k: usize,
+    m_dim: &SymDim,
+    n: usize,
+    k: usize,
     width: SimdWidth,
-    a_ptr: VRegId, b_ptr: VRegId, c_ptr: VRegId,
+    a_ptr: VRegId,
+    b_ptr: VRegId,
+    c_ptr: VRegId,
     epilogue: &[TraceOp],
     sym_map: &SymDimSlotMap,
     enable_row_stats: bool,
     seq_bound_override: Option<&BoundExpr>,
-    a_dtype: QuantPrecision, b_dtype: QuantPrecision, c_dtype: QuantPrecision,
+    a_dtype: QuantPrecision,
+    b_dtype: QuantPrecision,
+    c_dtype: QuantPrecision,
     trans_b: bool,
     epi_place: super::isa_hook::EpiloguePlace,
 ) -> Result<(), CompilerError> {
     let m = match m_dim {
         SymDim::Concrete(v) => *v,
-        SymDim::Symbolic { max_value, .. } => max_value
-            .expect("ARCH-SYMDIM: GEMM M Symbolic must have max_value"),
+        SymDim::Symbolic { max_value, .. } => {
+            max_value.expect("ARCH-SYMDIM: GEMM M Symbolic must have max_value")
+        }
     };
     if m == 0 || n == 0 || k == 0 {
-        return Err(CompilerError::CodegenViolation(format!("zero dim ({m},{n},{k})")));
+        return Err(CompilerError::CodegenViolation(format!(
+            "zero dim ({m},{n},{k})"
+        )));
     }
     // Route trans_b to K-dimension vectorized path
     if trans_b {
         return emit_gemm_trans_b_inline(
-            prog, m_dim, n, k, width, a_ptr, b_ptr, c_ptr,
-            epilogue, sym_map, seq_bound_override, a_dtype, b_dtype, c_dtype,
+            prog,
+            m_dim,
+            n,
+            k,
+            width,
+            a_ptr,
+            b_ptr,
+            c_ptr,
+            epilogue,
+            sym_map,
+            seq_bound_override,
+            a_dtype,
+            b_dtype,
+            c_dtype,
         );
     }
     let lanes = width.f32_lanes().max(1);
@@ -1584,26 +2081,58 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
     prog.emit_loop(m_bound, 1, |prog, _m_ctr, m_off| {
         if n_vecs > 0 {
             prog.emit_loop(BoundExpr::Const(n_vecs), j_step, |prog, _j_ctr, j_off| {
-                prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::Const(0.0), width, dtype: acc_dtype });
+                prog.emit(VmInstr::Broadcast {
+                    dst: acc,
+                    src: ScalarExpr::Const(0.0),
+                    width,
+                    dtype: acc_dtype,
+                });
                 // BCE-20260629-003 (Pattern c): k 循环按**索引**步进 (step=1),
                 // A/B 各自的 byte offset 用 a_elem/b_elem 单独算（避免 weight≠compute 时
                 // 共享同一 byte offset 导致 stride 错位）。FMA 累加用 c_dtype (F32)。
                 prog.emit_loop(BoundExpr::Const(k), 1, |prog, k_ctr, k_idx| {
                     prog.emit(VmInstr::Broadcast {
                         dst: a_broadcast,
-                        src: ScalarExpr::MemLoad(a_ptr, OffsetExpr::Add(
-                            Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(m_off)), a_row_stride)),
-                            Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(k_idx)), a_elem)),
-                        )),
-                        width, dtype: a_dtype,
+                        src: ScalarExpr::MemLoad(
+                            a_ptr,
+                            OffsetExpr::Add(
+                                Box::new(OffsetExpr::Mul(
+                                    Box::new(OffsetExpr::LoopOffset(m_off)),
+                                    a_row_stride,
+                                )),
+                                Box::new(OffsetExpr::Mul(
+                                    Box::new(OffsetExpr::LoopOffset(k_idx)),
+                                    a_elem,
+                                )),
+                            ),
+                        ),
+                        width,
+                        dtype: a_dtype,
                     });
                     prog.emit(VmInstr::VecLoad {
-                        dst: b_vec, base: b_ptr,
-                        offset: b_offset_expr_indexed(k_ctr, k_idx, j_off, b_row_stride, b_elem, lanes, trans_b),
-                        width, dtype: b_dtype, predicate: None,
+                        dst: b_vec,
+                        base: b_ptr,
+                        offset: b_offset_expr_indexed(
+                            k_ctr,
+                            k_idx,
+                            j_off,
+                            b_row_stride,
+                            b_elem,
+                            lanes,
+                            trans_b,
+                        ),
+                        width,
+                        dtype: b_dtype,
+                        predicate: None,
                     });
                     // Direct FMA: dst = acc + a * b (in-place accumulate). a/b 已是 widen 后的 F32.
-                    prog.emit(VmInstr::Fma { dst: acc, acc, a: a_broadcast, b: b_vec, dtype: acc_dtype });
+                    prog.emit(VmInstr::Fma {
+                        dst: acc,
+                        acc,
+                        a: a_broadcast,
+                        b: b_vec,
+                        dtype: acc_dtype,
+                    });
                 });
                 if !epilogue.is_empty() && do_epilogue_inline {
                     lower::lower_trace_body_compat(prog, epilogue, acc, None, width, c_dtype)
@@ -1611,16 +2140,30 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
                 }
                 let store_src = if needs_narrow {
                     let narrowed = prog.alloc_vreg(VRegKind::Vec, width);
-                    prog.emit(VmInstr::VecNarrow { dst: narrowed, src: acc, dst_dtype: c_dtype, src_dtype: acc_dtype, width });
+                    prog.emit(VmInstr::VecNarrow {
+                        dst: narrowed,
+                        src: acc,
+                        dst_dtype: c_dtype,
+                        src_dtype: acc_dtype,
+                        width,
+                    });
                     narrowed
-                } else { acc };
+                } else {
+                    acc
+                };
                 prog.emit(VmInstr::VecStore {
                     base: c_ptr,
                     offset: OffsetExpr::Add(
-                        Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(m_off)), c_row_stride)),
+                        Box::new(OffsetExpr::Mul(
+                            Box::new(OffsetExpr::LoopOffset(m_off)),
+                            c_row_stride,
+                        )),
                         Box::new(OffsetExpr::LoopOffset(j_off)),
                     ),
-                    src: store_src, width, dtype: c_dtype, predicate: None,
+                    src: store_src,
+                    width,
+                    dtype: c_dtype,
+                    predicate: None,
                 });
             });
         }
@@ -1628,33 +2171,66 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
             let s_width = SimdWidth::Scalar;
             for t in 0..n_tail {
                 let j_off_const = tail_base_bytes + t * c_elem;
-                prog.emit(VmInstr::Broadcast { dst: s_acc, src: ScalarExpr::Const(0.0), width: s_width, dtype: acc_dtype });
+                prog.emit(VmInstr::Broadcast {
+                    dst: s_acc,
+                    src: ScalarExpr::Const(0.0),
+                    width: s_width,
+                    dtype: acc_dtype,
+                });
                 prog.emit_loop(BoundExpr::Const(k), 1, |prog, k_ctr, k_idx| {
                     prog.emit(VmInstr::Broadcast {
                         dst: s_a,
-                        src: ScalarExpr::MemLoad(a_ptr, OffsetExpr::Add(
-                            Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(m_off)), a_row_stride)),
-                            Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(k_idx)), a_elem)),
-                        )),
-                        width: s_width, dtype: a_dtype,
+                        src: ScalarExpr::MemLoad(
+                            a_ptr,
+                            OffsetExpr::Add(
+                                Box::new(OffsetExpr::Mul(
+                                    Box::new(OffsetExpr::LoopOffset(m_off)),
+                                    a_row_stride,
+                                )),
+                                Box::new(OffsetExpr::Mul(
+                                    Box::new(OffsetExpr::LoopOffset(k_idx)),
+                                    a_elem,
+                                )),
+                            ),
+                        ),
+                        width: s_width,
+                        dtype: a_dtype,
                     });
                     prog.emit(VmInstr::VecLoad {
-                        dst: s_b, base: b_ptr,
+                        dst: s_b,
+                        base: b_ptr,
                         offset: if trans_b {
                             OffsetExpr::Add(
-                                Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::Const(j_off_const / c_elem)), k)),
-                                Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(k_idx)), b_elem)),
+                                Box::new(OffsetExpr::Mul(
+                                    Box::new(OffsetExpr::Const(j_off_const / c_elem)),
+                                    k,
+                                )),
+                                Box::new(OffsetExpr::Mul(
+                                    Box::new(OffsetExpr::LoopOffset(k_idx)),
+                                    b_elem,
+                                )),
                             )
                         } else {
                             OffsetExpr::Add(
-                                Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(k_ctr)), b_row_stride)),
+                                Box::new(OffsetExpr::Mul(
+                                    Box::new(OffsetExpr::LoopOffset(k_ctr)),
+                                    b_row_stride,
+                                )),
                                 Box::new(OffsetExpr::Const(j_off_const)),
                             )
                         },
-                        width: s_width, dtype: b_dtype, predicate: None,
+                        width: s_width,
+                        dtype: b_dtype,
+                        predicate: None,
                     });
                     // Direct FMA: dst = s_acc + s_a * s_b (in-place accumulate)
-                    prog.emit(VmInstr::Fma { dst: s_acc, acc: s_acc, a: s_a, b: s_b, dtype: acc_dtype });
+                    prog.emit(VmInstr::Fma {
+                        dst: s_acc,
+                        acc: s_acc,
+                        a: s_a,
+                        b: s_b,
+                        dtype: acc_dtype,
+                    });
                 });
                 if !epilogue.is_empty() && do_epilogue_inline {
                     lower::lower_trace_body_compat(prog, epilogue, s_acc, None, s_width, c_dtype)
@@ -1663,16 +2239,30 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
                 // REQ-DTYPE-006: 窄化写回 (scalar tail path)
                 let s_store_src = if needs_narrow {
                     let s_narrowed = prog.alloc_vreg(VRegKind::Vec, s_width);
-                    prog.emit(VmInstr::VecNarrow { dst: s_narrowed, src: s_acc, dst_dtype: c_dtype, src_dtype: acc_dtype, width: s_width });
+                    prog.emit(VmInstr::VecNarrow {
+                        dst: s_narrowed,
+                        src: s_acc,
+                        dst_dtype: c_dtype,
+                        src_dtype: acc_dtype,
+                        width: s_width,
+                    });
                     s_narrowed
-                } else { s_acc };
+                } else {
+                    s_acc
+                };
                 prog.emit(VmInstr::VecStore {
                     base: c_ptr,
                     offset: OffsetExpr::Add(
-                        Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(m_off)), c_row_stride)),
+                        Box::new(OffsetExpr::Mul(
+                            Box::new(OffsetExpr::LoopOffset(m_off)),
+                            c_row_stride,
+                        )),
                         Box::new(OffsetExpr::Const(j_off_const)),
                     ),
-                    src: s_store_src, width: s_width, dtype: c_dtype, predicate: None,
+                    src: s_store_src,
+                    width: s_width,
+                    dtype: c_dtype,
+                    predicate: None,
                 });
             }
         }
@@ -1688,10 +2278,12 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
         let last_row_offset = (m.saturating_sub(1)) * c_row_stride;
         let row_stats_vec = prog.alloc_vreg(VRegKind::Vec, width);
         prog.emit(VmInstr::VecLoad {
-            dst: row_stats_vec, base: c_ptr,
+            dst: row_stats_vec,
+            base: c_ptr,
             offset: OffsetExpr::Const(last_row_offset),
             width,
-            dtype: c_dtype, predicate: None,
+            dtype: c_dtype,
+            predicate: None,
         });
         emit_gemm_row_stats_telemetry(prog, row_stats_vec, width, sym_map, c_dtype)?;
     }
@@ -1712,14 +2304,18 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
 /// 当模板不可用或参数不足时返回 `None`。
 pub(crate) fn emit_gemm_template_driven(
     prog: &mut VmProgram,
-    m: usize, n: usize, k: usize,
+    m: usize,
+    n: usize,
+    k: usize,
     width: SimdWidth,
-    a_ptr: VRegId, b_ptr: VRegId, c_ptr: VRegId,
+    a_ptr: VRegId,
+    b_ptr: VRegId,
+    c_ptr: VRegId,
     dtype: QuantPrecision,
     resource_plan: Option<&super::resource_planner::GraphResourcePlan>,
 ) -> Option<(String, Vec<TraceOp>)> {
+    use super::algo_interpreter::{ParamTable, TemplateInputs, TemplateInterpreter};
     use super::algo_registry;
-    use super::algo_interpreter::{TemplateInterpreter, ParamTable, TemplateInputs};
     use crate::dispatch::device_profile::DeviceProfile;
 
     // 策略选择: 根据 DeviceProfile 选择最优模板
@@ -1730,13 +2326,19 @@ pub(crate) fn emit_gemm_template_driven(
             &crate::compiler::codegen::vm::algo_template::AlgoStrategy::GemmBlis,
             &profile,
         ) {
-            (crate::compiler::codegen::vm::algo_template::AlgoStrategy::GemmBlis, tmpl)
+            (
+                crate::compiler::codegen::vm::algo_template::AlgoStrategy::GemmBlis,
+                tmpl,
+            )
         } else {
             let tmpl = algo_registry::select_template(
-            &crate::compiler::codegen::vm::algo_template::AlgoStrategy::GemmNaive,
-            &profile,
-        )?;
-            (crate::compiler::codegen::vm::algo_template::AlgoStrategy::GemmNaive, tmpl)
+                &crate::compiler::codegen::vm::algo_template::AlgoStrategy::GemmNaive,
+                &profile,
+            )?;
+            (
+                crate::compiler::codegen::vm::algo_template::AlgoStrategy::GemmNaive,
+                tmpl,
+            )
         }
     };
 
@@ -1749,7 +2351,13 @@ pub(crate) fn emit_gemm_template_driven(
 
     let (mr, nr, mc, nc, kc) = if let Some(plan) = resource_plan {
         if let Some(blocking) = plan.gemm_blocking_for_group(0) {
-            (blocking.mr, blocking.nr, blocking.mc, blocking.nc, blocking.kc)
+            (
+                blocking.mr,
+                blocking.nr,
+                blocking.mc,
+                blocking.nc,
+                blocking.kc,
+            )
         } else {
             (4, lanes, m.min(64), n.min(64), k.min(32))
         }
@@ -1776,8 +2384,13 @@ pub(crate) fn emit_gemm_template_driven(
     let c_offset = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
 
     super::auto_select::auto_lower_trace_raw(
-        prog, &trace_ops, &[a_ptr, b_ptr, c_ptr, a_offset, b_offset, c_offset], width, dtype,
-    ).ok()?;
+        prog,
+        &trace_ops,
+        &[a_ptr, b_ptr, c_ptr, a_offset, b_offset, c_offset],
+        width,
+        dtype,
+    )
+    .ok()?;
 
     Some((template.name.to_string(), trace_ops))
 }
@@ -1788,10 +2401,12 @@ mod template_tests {
 
     #[test]
     fn test_template_driven_gemm_produces_instrs() {
+        use crate::compiler::codegen::vm::algo_interpreter::{
+            ParamTable, TemplateInputs, TemplateInterpreter,
+        };
         use crate::compiler::codegen::vm::algo_registry;
-        use crate::compiler::codegen::vm::algo_interpreter::{TemplateInterpreter, ParamTable, TemplateInputs};
-        use crate::dispatch::device_profile::DeviceProfile;
         use crate::compiler::codegen::vm::algo_template::AlgoStrategy;
+        use crate::dispatch::device_profile::DeviceProfile;
 
         let profile = DeviceProfile::detect();
         let tmpl = algo_registry::select_template(&AlgoStrategy::GemmNaive, &profile)
@@ -1817,9 +2432,17 @@ mod template_tests {
         let c_offset = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
 
         let lower_result = super::super::auto_select::auto_lower_trace_raw(
-            &mut prog, &ops, &[a_ptr, b_ptr, c_ptr, a_offset, b_offset, c_offset], width, QuantPrecision::F32,
+            &mut prog,
+            &ops,
+            &[a_ptr, b_ptr, c_ptr, a_offset, b_offset, c_offset],
+            width,
+            QuantPrecision::F32,
         );
-        assert!(lower_result.is_ok(), "auto_lower_trace_raw should succeed: {:?}", lower_result);
+        assert!(
+            lower_result.is_ok(),
+            "auto_lower_trace_raw should succeed: {:?}",
+            lower_result
+        );
         assert!(!prog.instrs.is_empty(), "should produce VmInstrs");
     }
 
@@ -1832,18 +2455,33 @@ mod template_tests {
         let c_ptr = prog.alloc_vreg(VRegKind::Ptr, width);
 
         let result = emit_gemm_template_driven(
-            &mut prog, 32, 64, 128,
-            width, a_ptr, b_ptr, c_ptr,
+            &mut prog,
+            32,
+            64,
+            128,
+            width,
+            a_ptr,
+            b_ptr,
+            c_ptr,
             QuantPrecision::F32,
             None,
         );
 
-        assert!(result.is_some(), "template-driven GEMM large should succeed");
+        assert!(
+            result.is_some(),
+            "template-driven GEMM large should succeed"
+        );
         let (name, _trace_ops) = result.unwrap();
-        assert!(name == "GEMM_NAIVE" || name == "GEMM_BLIS",
-            "template name should be GEMM_NAIVE or GEMM_BLIS, got {}", name);
-        assert!(prog.instrs.len() > 10,
-            "large GEMM should produce significant instructions, got {}", prog.instrs.len());
+        assert!(
+            name == "GEMM_NAIVE" || name == "GEMM_BLIS",
+            "template name should be GEMM_NAIVE or GEMM_BLIS, got {}",
+            name
+        );
+        assert!(
+            prog.instrs.len() > 10,
+            "large GEMM should produce significant instructions, got {}",
+            prog.instrs.len()
+        );
     }
 
     #[test]
@@ -1881,7 +2519,10 @@ mod template_tests {
         // Transposed B: offset = j_off * k + k_off
         match expr {
             OffsetExpr::Add(inner, _) => {
-                assert!(matches!(*inner, OffsetExpr::Mul(..)), "trans-B first term should be Mul(j_off, k)");
+                assert!(
+                    matches!(*inner, OffsetExpr::Mul(..)),
+                    "trans-B first term should be Mul(j_off, k)"
+                );
             }
             other => panic!("expected Add for trans-B layout, got {:?}", other),
         }
@@ -1898,7 +2539,23 @@ mod template_tests {
         let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &SymDim::Concrete(0), 4, 4, width, a, b, c, &[], &sym_map, false, None, dtype, dtype, dtype, false, crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
+            &mut prog,
+            &SymDim::Concrete(0),
+            4,
+            4,
+            width,
+            a,
+            b,
+            c,
+            &[],
+            &sym_map,
+            false,
+            None,
+            dtype,
+            dtype,
+            dtype,
+            false,
+            crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
         assert!(result.is_err(), "zero M should be rejected");
     }
@@ -1914,7 +2571,23 @@ mod template_tests {
         let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &SymDim::Concrete(4), 0, 4, width, a, b, c, &[], &sym_map, false, None, dtype, dtype, dtype, false, crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
+            &mut prog,
+            &SymDim::Concrete(4),
+            0,
+            4,
+            width,
+            a,
+            b,
+            c,
+            &[],
+            &sym_map,
+            false,
+            None,
+            dtype,
+            dtype,
+            dtype,
+            false,
+            crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
         assert!(result.is_err(), "zero N should be rejected");
     }
@@ -1930,7 +2603,23 @@ mod template_tests {
         let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &SymDim::Concrete(4), 4, 0, width, a, b, c, &[], &sym_map, false, None, dtype, dtype, dtype, false, crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
+            &mut prog,
+            &SymDim::Concrete(4),
+            4,
+            0,
+            width,
+            a,
+            b,
+            c,
+            &[],
+            &sym_map,
+            false,
+            None,
+            dtype,
+            dtype,
+            dtype,
+            false,
+            crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
         assert!(result.is_err(), "zero K should be rejected");
     }
@@ -1947,8 +2636,15 @@ mod template_tests {
         let result = emit_gemm_blis_inline(
             &mut prog, 4, 8, 16, width, a, b, c, 4, 2, None, 1, dtype, dtype, dtype, false,
         );
-        assert!(result.is_ok(), "BLIS GEMM should succeed: {:?}", result.err());
-        assert!(!prog.instrs.is_empty(), "BLIS GEMM should produce instructions");
+        assert!(
+            result.is_ok(),
+            "BLIS GEMM should succeed: {:?}",
+            result.err()
+        );
+        assert!(
+            !prog.instrs.is_empty(),
+            "BLIS GEMM should produce instructions"
+        );
     }
 
     #[test]
@@ -1961,11 +2657,36 @@ mod template_tests {
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
 
         let result = emit_gemm_gpu_tiled_inline(
-            &mut prog, 16, 16, 16, width, a, b, c,
-            16, 16, 16, 16, 16, 16, dtype, dtype, dtype, false, false, &BoundExpr::Const(16),
+            &mut prog,
+            16,
+            16,
+            16,
+            width,
+            a,
+            b,
+            c,
+            16,
+            16,
+            16,
+            16,
+            16,
+            16,
+            dtype,
+            dtype,
+            dtype,
+            false,
+            false,
+            &BoundExpr::Const(16),
         );
-        assert!(result.is_ok(), "GPU tiled GEMM should succeed: {:?}", result.err());
-        assert!(!prog.instrs.is_empty(), "GPU tiled GEMM should produce instructions");
+        assert!(
+            result.is_ok(),
+            "GPU tiled GEMM should succeed: {:?}",
+            result.err()
+        );
+        assert!(
+            !prog.instrs.is_empty(),
+            "GPU tiled GEMM should produce instructions"
+        );
     }
 
     #[test]
@@ -1979,9 +2700,29 @@ mod template_tests {
         let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &SymDim::Concrete(2), 8, 8, width, a, b, c, &[], &sym_map, false, None, dtype, dtype, dtype, false, crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
+            &mut prog,
+            &SymDim::Concrete(2),
+            8,
+            8,
+            width,
+            a,
+            b,
+            c,
+            &[],
+            &sym_map,
+            false,
+            None,
+            dtype,
+            dtype,
+            dtype,
+            false,
+            crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
-        assert!(result.is_ok(), "small concrete GEMM should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "small concrete GEMM should succeed: {:?}",
+            result.err()
+        );
         assert!(!prog.instrs.is_empty());
     }
 
@@ -2031,22 +2772,32 @@ mod template_tests {
         // Assert: Copy semantics and equality
         assert_eq!(id_a, id_b, "VRegId should support Copy");
         assert_eq!(id_a, id_c, "VRegId with same inner value should be equal");
-        assert_ne!(id_a, id_d, "VRegId with different inner value should not be equal");
+        assert_ne!(
+            id_a, id_d,
+            "VRegId with different inner value should not be equal"
+        );
     }
 
     #[test]
     fn test_vreg_kind_all_variants_are_distinct() {
         // Arrange: all VRegKind variants
         let kinds = [
-            VRegKind::Ptr, VRegKind::Vec, VRegKind::Scalar,
-            VRegKind::Counter, VRegKind::ByteOffset, VRegKind::Tile, VRegKind::Mask,
+            VRegKind::Ptr,
+            VRegKind::Vec,
+            VRegKind::Scalar,
+            VRegKind::Counter,
+            VRegKind::ByteOffset,
+            VRegKind::Tile,
+            VRegKind::Mask,
         ];
 
         // Act & Assert: every pair is distinct
         for i in 0..kinds.len() {
             for j in (i + 1)..kinds.len() {
-                assert_ne!(kinds[i], kinds[j],
-                    "VRegKind variants at index {i} and {j} should be distinct");
+                assert_ne!(
+                    kinds[i], kinds[j],
+                    "VRegKind variants at index {i} and {j} should be distinct"
+                );
             }
         }
     }
@@ -2060,8 +2811,11 @@ mod template_tests {
         let expr = OffsetExpr::loop_plus_const(vreg, 0);
 
         // Assert
-        assert_eq!(expr, OffsetExpr::LoopOffset(vreg),
-            "loop_plus_const with 0 should yield bare LoopOffset");
+        assert_eq!(
+            expr,
+            OffsetExpr::LoopOffset(vreg),
+            "loop_plus_const with 0 should yield bare LoopOffset"
+        );
     }
 
     #[test]
@@ -2103,7 +2857,10 @@ mod template_tests {
             )),
             4,
         );
-        assert_eq!(result, expected, "substitute should replace only the target LoopOffset");
+        assert_eq!(
+            result, expected,
+            "substitute should replace only the target LoopOffset"
+        );
     }
 
     #[test]
@@ -2141,8 +2898,10 @@ mod template_tests {
     fn test_tma_swizzle_debug_format() {
         // Arrange: all TmaSwizzle variants
         let variants = [
-            TmaSwizzle::None, TmaSwizzle::Swizzle32,
-            TmaSwizzle::Swizzle64, TmaSwizzle::Swizzle128,
+            TmaSwizzle::None,
+            TmaSwizzle::Swizzle32,
+            TmaSwizzle::Swizzle64,
+            TmaSwizzle::Swizzle128,
         ];
 
         // Act: format via Debug
@@ -2154,8 +2913,10 @@ mod template_tests {
         }
         for i in 0..debug_strs.len() {
             for j in (i + 1)..debug_strs.len() {
-                assert_ne!(debug_strs[i], debug_strs[j],
-                    "TmaSwizzle Debug outputs should be unique for different variants");
+                assert_ne!(
+                    debug_strs[i], debug_strs[j],
+                    "TmaSwizzle Debug outputs should be unique for different variants"
+                );
             }
         }
     }
@@ -2196,8 +2957,15 @@ mod template_tests {
         let needs_narrow = dtype.needs_narrowing_from(acc);
 
         // Assert: BF16 -> F32 accumulator, then narrowing back to BF16
-        assert_eq!(acc, QuantPrecision::F32, "BF16 accumulator should widen to F32");
-        assert!(needs_narrow, "BF16 should need narrowing from F32 accumulator");
+        assert_eq!(
+            acc,
+            QuantPrecision::F32,
+            "BF16 accumulator should widen to F32"
+        );
+        assert!(
+            needs_narrow,
+            "BF16 should need narrowing from F32 accumulator"
+        );
     }
 
     #[test]
@@ -2229,7 +2997,10 @@ mod template_tests {
 
     #[test]
     fn test_sym_dim_symbolic_is_symbolic_true() {
-        let dim = SymDim::Symbolic { name: "seq_len".into(), max_value: Some(2048) };
+        let dim = SymDim::Symbolic {
+            name: "seq_len".into(),
+            max_value: Some(2048),
+        };
 
         assert!(dim.is_symbolic());
         assert_eq!(dim.as_concrete(), None);
@@ -2248,8 +3019,16 @@ mod template_tests {
 
         match &result {
             OffsetExpr::Add(left, right) => {
-                assert_eq!(**left, OffsetExpr::ScalarVReg(vreg), "ScalarVReg should pass through unchanged");
-                assert_eq!(**right, OffsetExpr::Const(999), "LoopOffset should be substituted");
+                assert_eq!(
+                    **left,
+                    OffsetExpr::ScalarVReg(vreg),
+                    "ScalarVReg should pass through unchanged"
+                );
+                assert_eq!(
+                    **right,
+                    OffsetExpr::Const(999),
+                    "LoopOffset should be substituted"
+                );
             }
             other => panic!("expected Add, got {:?}", other),
         }
@@ -2281,7 +3060,9 @@ mod template_tests {
 
         assert!(result.is_ok());
         let instrs: Vec<&VmInstr> = prog.instrs.iter().collect();
-        let has_tile_config = instrs.iter().any(|i| matches!(i, VmInstr::TileConfig { .. }));
+        let has_tile_config = instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::TileConfig { .. }));
         let has_tile_release = instrs.iter().any(|i| matches!(i, VmInstr::TileRelease));
         assert!(has_tile_config, "should emit TileConfig");
         assert!(has_tile_release, "should emit TileRelease");
@@ -2297,8 +3078,25 @@ mod template_tests {
         let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let result = emit_gemm_trans_b_inline(
-            &mut prog, &SymDim::Concrete(4), 8, 0, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, );
-        assert!(result.is_err(), "trans_b GEMM with zero K should be rejected");
+            &mut prog,
+            &SymDim::Concrete(4),
+            8,
+            0,
+            width,
+            a,
+            b,
+            c,
+            &[],
+            &sym_map,
+            None,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
+        assert!(
+            result.is_err(),
+            "trans_b GEMM with zero K should be rejected"
+        );
     }
 
     #[test]
@@ -2311,13 +3109,43 @@ mod template_tests {
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
 
         let result = emit_gemm_gpu_pipelined(
-            &mut prog, 16, 16, 16, width, a, b, c,
-            16, 16, 16, 8, 8, 16, 2, dtype, dtype, dtype, false, false, false, &BoundExpr::Const(16),
+            &mut prog,
+            16,
+            16,
+            16,
+            width,
+            a,
+            b,
+            c,
+            16,
+            16,
+            16,
+            8,
+            8,
+            16,
+            2,
+            dtype,
+            dtype,
+            dtype,
+            false,
+            false,
+            false,
+            &BoundExpr::Const(16),
         );
 
-        assert!(result.is_ok(), "pipelined GPU GEMM with single K tile should succeed: {:?}", result.err());
-        let has_smem_alloc = prog.instrs.iter().any(|i| matches!(i, VmInstr::SharedMemAlloc { .. }));
-        assert!(has_smem_alloc, "pipelined GEMM should allocate shared memory");
+        assert!(
+            result.is_ok(),
+            "pipelined GPU GEMM with single K tile should succeed: {:?}",
+            result.err()
+        );
+        let has_smem_alloc = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::SharedMemAlloc { .. }));
+        assert!(
+            has_smem_alloc,
+            "pipelined GEMM should allocate shared memory"
+        );
     }
 
     #[test]
@@ -2332,7 +3160,11 @@ mod template_tests {
         let result = emit_gemm_blis_inline(
             &mut prog, 4, 8, 16, width, a, b, c, 4, 2, None, 1, dtype, dtype, dtype, true,
         );
-        assert!(result.is_ok(), "BLIS GEMM with trans_b should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "BLIS GEMM with trans_b should succeed: {:?}",
+            result.err()
+        );
         assert!(!prog.instrs.is_empty());
     }
 
@@ -2352,7 +3184,11 @@ mod template_tests {
     fn test_quant_precision_fp8e4m3_elem_bytes_is_one() {
         let dtype = QuantPrecision::FP8E4M3;
 
-        assert_eq!(dtype.elem_bytes(), 1, "FP8 E4M3 should be 1 byte per element");
+        assert_eq!(
+            dtype.elem_bytes(),
+            1,
+            "FP8 E4M3 should be 1 byte per element"
+        );
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2373,10 +3209,27 @@ mod template_tests {
 
         // Act
         let result = emit_gemm_trans_b_inline(
-            &mut prog, &SymDim::Concrete(0), 8, 16, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, );
+            &mut prog,
+            &SymDim::Concrete(0),
+            8,
+            16,
+            width,
+            a,
+            b,
+            c,
+            &[],
+            &sym_map,
+            None,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert: zero M is a CodegenViolation
-        assert!(result.is_err(), "trans_b GEMM with zero M should be rejected");
+        assert!(
+            result.is_err(),
+            "trans_b GEMM with zero M should be rejected"
+        );
     }
 
     #[test]
@@ -2391,10 +3244,27 @@ mod template_tests {
 
         // Act
         let result = emit_gemm_trans_b_inline(
-            &mut prog, &SymDim::Concrete(4), 0, 16, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, );
+            &mut prog,
+            &SymDim::Concrete(4),
+            0,
+            16,
+            width,
+            a,
+            b,
+            c,
+            &[],
+            &sym_map,
+            None,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert: zero N is a CodegenViolation
-        assert!(result.is_err(), "trans_b GEMM with zero N should be rejected");
+        assert!(
+            result.is_err(),
+            "trans_b GEMM with zero N should be rejected"
+        );
     }
 
     #[test]
@@ -2409,11 +3279,32 @@ mod template_tests {
 
         // Act: M=2, N=8, K=16 with trans_b path
         let result = emit_gemm_trans_b_inline(
-            &mut prog, &SymDim::Concrete(2), 8, 16, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, );
+            &mut prog,
+            &SymDim::Concrete(2),
+            8,
+            16,
+            width,
+            a,
+            b,
+            c,
+            &[],
+            &sym_map,
+            None,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert: succeeds and produces instructions (VecStore at minimum)
-        assert!(result.is_ok(), "trans_b GEMM with valid dims should succeed: {:?}", result.err());
-        let has_store = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecStore { .. }));
+        assert!(
+            result.is_ok(),
+            "trans_b GEMM with valid dims should succeed: {:?}",
+            result.err()
+        );
+        let has_store = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecStore { .. }));
         assert!(has_store, "trans_b GEMM should emit VecStore instructions");
     }
 
@@ -2429,14 +3320,42 @@ mod template_tests {
 
         // Act
         let result = emit_gemm_gpu_tiled_inline(
-            &mut prog, 16, 16, 16, width, a, b, c,
-            16, 16, 16, 16, 16, 16, dtype, dtype, dtype, false, false, &BoundExpr::Const(16),
+            &mut prog,
+            16,
+            16,
+            16,
+            width,
+            a,
+            b,
+            c,
+            16,
+            16,
+            16,
+            16,
+            16,
+            16,
+            dtype,
+            dtype,
+            dtype,
+            false,
+            false,
+            &BoundExpr::Const(16),
         );
 
         // Assert: BF16 should produce VecNarrow to convert F32 accumulator back to BF16
-        assert!(result.is_ok(), "GPU tiled GEMM with BF16 should succeed: {:?}", result.err());
-        let has_narrow = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecNarrow { .. }));
-        assert!(has_narrow, "BF16 GPU tiled GEMM should emit VecNarrow for accumulator writeback");
+        assert!(
+            result.is_ok(),
+            "GPU tiled GEMM with BF16 should succeed: {:?}",
+            result.err()
+        );
+        let has_narrow = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecNarrow { .. }));
+        assert!(
+            has_narrow,
+            "BF16 GPU tiled GEMM should emit VecNarrow for accumulator writeback"
+        );
     }
 
     #[test]
@@ -2448,25 +3367,59 @@ mod template_tests {
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
         let sym_map = SymDimSlotMap::mega_kernel_abi();
-        let m_dim = SymDim::Symbolic { name: "seq_len".into(), max_value: Some(512) };
+        let m_dim = SymDim::Symbolic {
+            name: "seq_len".into(),
+            max_value: Some(512),
+        };
 
         // Act: symbolic M with concrete N=8, K=16
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &m_dim, 8, 16, width, a, b, c, &[], &sym_map, false, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            &mut prog,
+            &m_dim,
+            8,
+            16,
+            width,
+            a,
+            b,
+            c,
+            &[],
+            &sym_map,
+            false,
+            None,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
 
         // Assert: symbolic M should succeed (loop bound from sym_map)
-        assert!(result.is_ok(), "symbolic M GEMM should succeed: {:?}", result.err());
-        assert!(!prog.instrs.is_empty(), "symbolic M GEMM should produce instructions");
+        assert!(
+            result.is_ok(),
+            "symbolic M GEMM should succeed: {:?}",
+            result.err()
+        );
+        assert!(
+            !prog.instrs.is_empty(),
+            "symbolic M GEMM should produce instructions"
+        );
     }
 
     #[test]
     fn test_bound_expr_symbolic_constructs_and_compares() {
         // Arrange: two SymBound instances with same name
-        let sb1 = SymBound { name: "seq_len".into(), max_alloc: 2048 };
-        let sb2 = SymBound { name: "seq_len".into(), max_alloc: 2048 };
-        let sb3 = SymBound { name: "batch_size".into(), max_alloc: 32 };
+        let sb1 = SymBound {
+            name: "seq_len".into(),
+            max_alloc: 2048,
+        };
+        let sb2 = SymBound {
+            name: "seq_len".into(),
+            max_alloc: 2048,
+        };
+        let sb3 = SymBound {
+            name: "batch_size".into(),
+            max_alloc: 32,
+        };
 
         // Act: wrap in BoundExpr
         let be1 = BoundExpr::Symbolic(sb1.clone());
@@ -2474,7 +3427,10 @@ mod template_tests {
         let be3 = BoundExpr::Symbolic(sb3);
 
         // Assert: equality semantics
-        assert_eq!(be1, be2, "Symbolic with same name and max_alloc should be equal");
+        assert_eq!(
+            be1, be2,
+            "Symbolic with same name and max_alloc should be equal"
+        );
         assert_ne!(be1, be3, "Symbolic with different name should not be equal");
 
         // Assert: Debug is non-empty
@@ -2522,8 +3478,15 @@ mod template_tests {
 
         // Assert: FP8 is 1 byte per element, accumulator widens to F32, needs narrowing
         assert_eq!(elem_bytes, 1, "FP8 E5M2 should be 1 byte per element");
-        assert_eq!(acc, QuantPrecision::F32, "FP8 E5M2 accumulator should widen to F32");
-        assert!(needs_narrow, "FP8 E5M2 should need narrowing from F32 accumulator");
+        assert_eq!(
+            acc,
+            QuantPrecision::F32,
+            "FP8 E5M2 accumulator should widen to F32"
+        );
+        assert!(
+            needs_narrow,
+            "FP8 E5M2 should need narrowing from F32 accumulator"
+        );
     }
 
     #[test]
@@ -2537,11 +3500,30 @@ mod template_tests {
 
         // Act: M=2, mr=4 — mr_actual should clamp to 2, not panic
         let result = emit_gemm_blis_inline(
-            &mut prog, 2, 16, 16, width, a, b, c, 4, 2, None, 1, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            &mut prog,
+            2,
+            16,
+            16,
+            width,
+            a,
+            b,
+            c,
+            4,
+            2,
+            None,
+            1,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
         );
 
         // Assert: should succeed despite M < mr
-        assert!(result.is_ok(), "BLIS GEMM with M < mr should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "BLIS GEMM with M < mr should succeed: {:?}",
+            result.err()
+        );
         assert!(!prog.instrs.is_empty(), "should still produce instructions");
     }
 
@@ -2561,8 +3543,16 @@ mod template_tests {
         // Assert: target replaced, bystander unchanged
         match result {
             OffsetExpr::Add(left, right) => {
-                assert_eq!(*left, OffsetExpr::Const(200), "target LoopOffset should be substituted");
-                assert_eq!(*right, OffsetExpr::LoopOffset(bystander), "non-target LoopOffset should pass through");
+                assert_eq!(
+                    *left,
+                    OffsetExpr::Const(200),
+                    "target LoopOffset should be substituted"
+                );
+                assert_eq!(
+                    *right,
+                    OffsetExpr::LoopOffset(bystander),
+                    "non-target LoopOffset should pass through"
+                );
             }
             other => panic!("expected Add, got {:?}", other),
         }
@@ -2586,14 +3576,44 @@ mod template_tests {
 
         // Act: use_tma=true triggers TmaDescriptorInit + BarrierInit
         let result = emit_gemm_gpu_pipelined(
-            &mut prog, 16, 16, 32, width, a, b, c,
-            16, 16, 16, 8, 8, 16, 2, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, true, false, &BoundExpr::Const(16),
+            &mut prog,
+            16,
+            16,
+            32,
+            width,
+            a,
+            b,
+            c,
+            16,
+            16,
+            16,
+            8,
+            8,
+            16,
+            2,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
+            true,
+            false,
+            &BoundExpr::Const(16),
         );
 
         // Assert
-        assert!(result.is_ok(), "TMA pipelined GEMM should succeed: {:?}", result.err());
-        let has_tma_desc = prog.instrs.iter().any(|i| matches!(i, VmInstr::TmaDescriptorInit { .. }));
-        let has_barrier = prog.instrs.iter().any(|i| matches!(i, VmInstr::BarrierInit { .. }));
+        assert!(
+            result.is_ok(),
+            "TMA pipelined GEMM should succeed: {:?}",
+            result.err()
+        );
+        let has_tma_desc = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::TmaDescriptorInit { .. }));
+        let has_barrier = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::BarrierInit { .. }));
         assert!(has_tma_desc, "TMA path should emit TmaDescriptorInit");
         assert!(has_barrier, "TMA path should emit BarrierInit");
     }
@@ -2603,21 +3623,48 @@ mod template_tests {
         // Arrange: MMA on shared memory accumulates into registers
         let mut prog = VmProgram::new();
         let width = SimdWidth::Warp(32);
-        let accs: Vec<VRegId> = (0..4).map(|_| prog.alloc_vreg(VRegKind::Vec, width)).collect();
+        let accs: Vec<VRegId> = (0..4)
+            .map(|_| prog.alloc_vreg(VRegKind::Vec, width))
+            .collect();
 
         // Act: mi=2, nj=2, kk=16, warp_m=2, warp_n=2, mma_k=16
         emit_mma_on_smem(
-            &mut prog, &accs, "smem_a", "smem_b",
-            0, 0, 0, 2, 2, 16,
-            16, 16, 16, 2, 2, 16,
-            16, 16, 4, 4, QuantPrecision::F32, width,
-            128, 128,
+            &mut prog,
+            &accs,
+            "smem_a",
+            "smem_b",
+            0,
+            0,
+            0,
+            2,
+            2,
+            16,
+            16,
+            16,
+            16,
+            2,
+            2,
+            16,
+            16,
+            16,
+            4,
+            4,
+            QuantPrecision::F32,
+            width,
+            128,
+            128,
         );
 
         // Assert: should produce SharedMemLoad + Fma instructions
-        let has_smem_load = prog.instrs.iter().any(|i| matches!(i, VmInstr::SharedMemLoad { .. }));
+        let has_smem_load = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::SharedMemLoad { .. }));
         let has_fma = prog.instrs.iter().any(|i| matches!(i, VmInstr::Fma { .. }));
-        assert!(has_smem_load, "MMA on smem should emit SharedMemLoad for A/B fragments");
+        assert!(
+            has_smem_load,
+            "MMA on smem should emit SharedMemLoad for A/B fragments"
+        );
         assert!(has_fma, "MMA on smem should emit Fma to accumulate");
     }
 
@@ -2631,24 +3678,49 @@ mod template_tests {
 
         // Act: load a 2x2 tile via SM80 per-row path
         emit_async_load_tile(
-            &mut prog, "smem_a", "smem_b",
-            a_ptr, b_ptr,
-            0, 0, 0, // i_cta, j_cta, k_off
-            2, 2, 2, // mi, nj, kk
-            4, 4, 4, // cta_m, cta_n, cta_k
-            8, 8, // n, k
-            4, QuantPrecision::F32, // a_elem, a_dtype
-            4, QuantPrecision::F32, // b_elem, b_dtype
+            &mut prog,
+            "smem_a",
+            "smem_b",
+            a_ptr,
+            b_ptr,
+            0,
+            0,
+            0, // i_cta, j_cta, k_off
+            2,
+            2,
+            2, // mi, nj, kk
+            4,
+            4,
+            4, // cta_m, cta_n, cta_k
+            8,
+            8, // n, k
+            4,
+            QuantPrecision::F32, // a_elem, a_dtype
+            4,
+            QuantPrecision::F32, // b_elem, b_dtype
             width,
-            32, 32, // smem_a_row_stride, smem_b_row_stride
+            32,
+            32,    // smem_a_row_stride, smem_b_row_stride
             false, // use_tma=false -> SM80 path
         );
 
         // Assert: SM80 path should emit VecLoad + SharedMemAsyncStore per row
-        let has_async_store = prog.instrs.iter().any(|i| matches!(i, VmInstr::SharedMemAsyncStore { .. }));
-        let has_vec_load = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecLoad { .. }));
-        assert!(has_vec_load, "SM80 async load should emit VecLoad from global");
-        assert!(has_async_store, "SM80 async load should emit SharedMemAsyncStore to smem");
+        let has_async_store = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::SharedMemAsyncStore { .. }));
+        let has_vec_load = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecLoad { .. }));
+        assert!(
+            has_vec_load,
+            "SM80 async load should emit VecLoad from global"
+        );
+        assert!(
+            has_async_store,
+            "SM80 async load should emit SharedMemAsyncStore to smem"
+        );
     }
 
     #[test]
@@ -2662,11 +3734,30 @@ mod template_tests {
 
         // Act: K=32 with unroll_factor=4 -> 8 k iterations instead of 32
         let result = emit_gemm_blis_inline(
-            &mut prog, 4, 8, 32, width, a, b, c, 4, 2, None, 4, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            &mut prog,
+            4,
+            8,
+            32,
+            width,
+            a,
+            b,
+            c,
+            4,
+            2,
+            None,
+            4,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
         );
 
         // Assert: should succeed with fewer loop iterations due to unrolling
-        assert!(result.is_ok(), "BLIS GEMM with unroll_factor=4 should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "BLIS GEMM with unroll_factor=4 should succeed: {:?}",
+            result.err()
+        );
         assert!(!prog.instrs.is_empty());
     }
 
@@ -2681,12 +3772,34 @@ mod template_tests {
 
         // Act: M=20 with cta_m=16 -> last tile has mi=4 (partial)
         let result = emit_gemm_gpu_tiled_inline(
-            &mut prog, 20, 20, 20, width, a, b, c,
-            16, 16, 16, 16, 16, 16, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, false, &BoundExpr::Const(20),
+            &mut prog,
+            20,
+            20,
+            20,
+            width,
+            a,
+            b,
+            c,
+            16,
+            16,
+            16,
+            16,
+            16,
+            16,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
+            false,
+            &BoundExpr::Const(20),
         );
 
         // Assert: partial tiles should be handled correctly (clamped mi/nj)
-        assert!(result.is_ok(), "GPU tiled GEMM with partial tiles should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "GPU tiled GEMM with partial tiles should succeed: {:?}",
+            result.err()
+        );
         assert!(!prog.instrs.is_empty());
     }
 
@@ -2699,10 +3812,7 @@ mod template_tests {
             Box::new(OffsetExpr::Const(10)),
         );
         let mid = OffsetExpr::Mul(Box::new(inner), 8);
-        let outer = OffsetExpr::Add(
-            Box::new(mid),
-            Box::new(OffsetExpr::Const(256)),
-        );
+        let outer = OffsetExpr::Add(Box::new(mid), Box::new(OffsetExpr::Const(256)));
 
         // Act: substitute LoopOffset(1) -> Const(50)
         let result = outer.substitute_loop_offset(target, 50);
@@ -2710,7 +3820,11 @@ mod template_tests {
         // Assert: substitution recurses through all nesting levels
         match &result {
             OffsetExpr::Add(left, right) => {
-                assert_eq!(**right, OffsetExpr::Const(256), "outer Const(256) should be unchanged");
+                assert_eq!(
+                    **right,
+                    OffsetExpr::Const(256),
+                    "outer Const(256) should be unchanged"
+                );
                 match left.as_ref() {
                     OffsetExpr::Mul(inner_add, scale) => {
                         assert_eq!(*scale, 8);
@@ -2752,7 +3866,10 @@ mod template_tests {
         let map = SymDimSlotMap::mega_kernel_abi();
 
         // Act: look up "seq_len" — the most fundamental symbolic dimension
-        let dim = SymDim::Symbolic { name: "seq_len".into(), max_value: Some(512) };
+        let dim = SymDim::Symbolic {
+            name: "seq_len".into(),
+            max_value: Some(512),
+        };
         let bound = map.to_bound(&dim);
 
         // Assert: should produce a valid bound (any variant is acceptable)
@@ -2782,16 +3899,39 @@ mod template_tests {
 
         // Act
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &SymDim::Concrete(2), 8, 8, width, a, b, c, &[], &sym_map,
+            &mut prog,
+            &SymDim::Concrete(2),
+            8,
+            8,
+            width,
+            a,
+            b,
+            c,
+            &[],
+            &sym_map,
             true, // enable_row_stats = true
-            None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            None,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
 
         // Assert: telemetry should emit HReduce for row statistics
-        assert!(result.is_ok(), "GEMM with telemetry should succeed: {:?}", result.err());
-        let has_hreduce = prog.instrs.iter().any(|i| matches!(i, VmInstr::HReduce { .. }));
-        assert!(has_hreduce, "GEMM with enable_row_stats should emit HReduce");
+        assert!(
+            result.is_ok(),
+            "GEMM with telemetry should succeed: {:?}",
+            result.err()
+        );
+        let has_hreduce = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::HReduce { .. }));
+        assert!(
+            has_hreduce,
+            "GEMM with enable_row_stats should emit HReduce"
+        );
     }
 
     #[test]
@@ -2803,16 +3943,43 @@ mod template_tests {
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
         let sym_map = SymDimSlotMap::mega_kernel_abi();
-        let m_dim = SymDim::Symbolic { name: "seq_len".into(), max_value: Some(128) };
+        let m_dim = SymDim::Symbolic {
+            name: "seq_len".into(),
+            max_value: Some(128),
+        };
 
         // Act
         let result = emit_gemm_trans_b_inline(
-            &mut prog, &m_dim, 8, 16, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, );
+            &mut prog,
+            &m_dim,
+            8,
+            16,
+            width,
+            a,
+            b,
+            c,
+            &[],
+            &sym_map,
+            None,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert: symbolic M should work for trans-B path too
-        assert!(result.is_ok(), "trans-B GEMM with symbolic M should succeed: {:?}", result.err());
-        let has_store = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecStore { .. }));
-        assert!(has_store, "trans-B GEMM with symbolic M should emit VecStore");
+        assert!(
+            result.is_ok(),
+            "trans-B GEMM with symbolic M should succeed: {:?}",
+            result.err()
+        );
+        let has_store = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecStore { .. }));
+        assert!(
+            has_store,
+            "trans-B GEMM with symbolic M should emit VecStore"
+        );
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2832,20 +3999,60 @@ mod template_tests {
         let sym_map = SymDimSlotMap::mega_kernel_abi();
         // Use Symbolic M (max=8192, as in real SmolLM2 lm_head) WITHOUT override
         // to reproduce the SIGSEGV: m_bound should NOT degrade to max_value.
-        let m_dim = SymDim::Symbolic { name: "seq_len".into(), max_value: Some(8192) };
+        let m_dim = SymDim::Symbolic {
+            name: "seq_len".into(),
+            max_value: Some(8192),
+        };
         let result = emit_gemm_trans_b_inline(
-            &mut prog, &m_dim, 49152, 576, width, a, b, c, &[], &sym_map, None, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, );
+            &mut prog,
+            &m_dim,
+            49152,
+            576,
+            width,
+            a,
+            b,
+            c,
+            &[],
+            &sym_map,
+            None,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+        );
         assert!(result.is_ok(), "{:?}", result.err());
         for (i, instr) in prog.instrs.iter().enumerate() {
             match instr {
-                VmInstr::LoopBegin { counter, offsets, bound } => {
-                    eprintln!("[{}] LoopBegin counter=v{} offsets={:?} bound={:?}",
-                        i, counter.0, offsets.iter().map(|offset| offset.vreg.0).collect::<Vec<_>>(), bound);
+                VmInstr::LoopBegin {
+                    counter,
+                    offsets,
+                    bound,
+                } => {
+                    eprintln!(
+                        "[{}] LoopBegin counter=v{} offsets={:?} bound={:?}",
+                        i,
+                        counter.0,
+                        offsets
+                            .iter()
+                            .map(|offset| offset.vreg.0)
+                            .collect::<Vec<_>>(),
+                        bound
+                    );
                 }
-                VmInstr::LoopEnd => { eprintln!("[{}] LoopEnd", i); }
-                VmInstr::VecStore { base, offset, src, width, dtype, .. } => {
-                    eprintln!("[{}] VecStore base=v{} offset={:?} src=v{} width={:?} dtype={:?}",
-                        i, base.0, offset, src.0, width, dtype);
+                VmInstr::LoopEnd => {
+                    eprintln!("[{}] LoopEnd", i);
+                }
+                VmInstr::VecStore {
+                    base,
+                    offset,
+                    src,
+                    width,
+                    dtype,
+                    ..
+                } => {
+                    eprintln!(
+                        "[{}] VecStore base=v{} offset={:?} src=v{} width={:?} dtype={:?}",
+                        i, base.0, offset, src.0, width, dtype
+                    );
                 }
                 _ => {}
             }
@@ -2866,12 +4073,36 @@ mod template_tests {
 
         // Act: K=13 not divisible by lanes=8, so k_tail=5
         let result = emit_gemm_trans_b_inline(
-            &mut prog, &SymDim::Concrete(1), 4, 13, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, );
+            &mut prog,
+            &SymDim::Concrete(1),
+            4,
+            13,
+            width,
+            a,
+            b,
+            c,
+            &[],
+            &sym_map,
+            None,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert: k_tail path should emit HReduce to collapse vector accumulator
-        assert!(result.is_ok(), "trans-B GEMM with K-tail should succeed: {:?}", result.err());
-        let has_hreduce = prog.instrs.iter().any(|i| matches!(i, VmInstr::HReduce { .. }));
-        assert!(has_hreduce, "trans-B GEMM with k_tail>0 should emit HReduce");
+        assert!(
+            result.is_ok(),
+            "trans-B GEMM with K-tail should succeed: {:?}",
+            result.err()
+        );
+        let has_hreduce = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::HReduce { .. }));
+        assert!(
+            has_hreduce,
+            "trans-B GEMM with k_tail>0 should emit HReduce"
+        );
     }
 
     #[test]
@@ -2891,11 +4122,32 @@ mod template_tests {
 
         // Act
         let result = emit_gemm_trans_b_inline(
-            &mut prog, &SymDim::Concrete(1), 4, 16, width, a, b, c, &epilogue, &sym_map, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, );
+            &mut prog,
+            &SymDim::Concrete(1),
+            4,
+            16,
+            width,
+            a,
+            b,
+            c,
+            &epilogue,
+            &sym_map,
+            None,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert: epilogue should be lowered without error
-        assert!(result.is_ok(), "trans-B GEMM with epilogue should succeed: {:?}", result.err());
-        assert!(!prog.instrs.is_empty(), "should produce instructions with epilogue");
+        assert!(
+            result.is_ok(),
+            "trans-B GEMM with epilogue should succeed: {:?}",
+            result.err()
+        );
+        assert!(
+            !prog.instrs.is_empty(),
+            "should produce instructions with epilogue"
+        );
     }
 
     #[test]
@@ -2909,14 +4161,44 @@ mod template_tests {
 
         // Act: BF16 with 2-stage pipeline, single K-tile (K=cta_k=16)
         let result = emit_gemm_gpu_pipelined(
-            &mut prog, 16, 16, 16, width, a, b, c,
-            16, 16, 16, 8, 8, 16, 2, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, false, false, false, &BoundExpr::Const(16),
+            &mut prog,
+            16,
+            16,
+            16,
+            width,
+            a,
+            b,
+            c,
+            16,
+            16,
+            16,
+            8,
+            8,
+            16,
+            2,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+            false,
+            false,
+            false,
+            &BoundExpr::Const(16),
         );
 
         // Assert: BF16 writeback should emit VecNarrow (F32 acc -> BF16 store)
-        assert!(result.is_ok(), "pipelined GPU GEMM BF16 should succeed: {:?}", result.err());
-        let has_narrow = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecNarrow { .. }));
-        assert!(has_narrow, "BF16 pipelined GEMM should emit VecNarrow for writeback");
+        assert!(
+            result.is_ok(),
+            "pipelined GPU GEMM BF16 should succeed: {:?}",
+            result.err()
+        );
+        let has_narrow = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecNarrow { .. }));
+        assert!(
+            has_narrow,
+            "BF16 pipelined GEMM should emit VecNarrow for writeback"
+        );
     }
 
     #[test]
@@ -2932,13 +4214,35 @@ mod template_tests {
 
         // Act: trans_b=true triggers the trans-B routing path
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &SymDim::Concrete(2), 8, 16, width, a, b, c, &[], &sym_map, false, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, true, // trans_b = true
+            &mut prog,
+            &SymDim::Concrete(2),
+            8,
+            16,
+            width,
+            a,
+            b,
+            c,
+            &[],
+            &sym_map,
+            false,
+            None,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            true, // trans_b = true
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
 
         // Assert: trans-B routing should succeed
-        assert!(result.is_ok(), "epilogue GEMM with trans_b should route and succeed: {:?}", result.err());
-        assert!(!prog.instrs.is_empty(), "should produce instructions via trans-B path");
+        assert!(
+            result.is_ok(),
+            "epilogue GEMM with trans_b should route and succeed: {:?}",
+            result.err()
+        );
+        assert!(
+            !prog.instrs.is_empty(),
+            "should produce instructions via trans-B path"
+        );
     }
 
     #[test]
@@ -2954,14 +4258,39 @@ mod template_tests {
 
         // Act: N=3 < lanes=8, only scalar tail path runs
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &SymDim::Concrete(1), 3, 4, width, a, b, c, &[], &sym_map, false, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            &mut prog,
+            &SymDim::Concrete(1),
+            3,
+            4,
+            width,
+            a,
+            b,
+            c,
+            &[],
+            &sym_map,
+            false,
+            None,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
 
         // Assert: tail-only path should succeed and emit VecStore
-        assert!(result.is_ok(), "GEMM with N < lanes should succeed: {:?}", result.err());
-        let has_store = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecStore { .. }));
-        assert!(has_store, "tail-only GEMM should emit VecStore for scalar elements");
+        assert!(
+            result.is_ok(),
+            "GEMM with N < lanes should succeed: {:?}",
+            result.err()
+        );
+        let has_store = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecStore { .. }));
+        assert!(
+            has_store,
+            "tail-only GEMM should emit VecStore for scalar elements"
+        );
     }
 
     #[test]
@@ -2976,12 +4305,34 @@ mod template_tests {
 
         // Act: BLIS with PackMap (non-None) — should use pack_map.blis_k_stride_bytes
         let result = emit_gemm_blis_inline(
-            &mut prog, 4, 8, 16, width, a, b, c, 4, 2, Some(&pack_map), 1, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            &mut prog,
+            4,
+            8,
+            16,
+            width,
+            a,
+            b,
+            c,
+            4,
+            2,
+            Some(&pack_map),
+            1,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
         );
 
         // Assert: should succeed; PackMap path is exercised
-        assert!(result.is_ok(), "BLIS GEMM with PackMap should succeed: {:?}", result.err());
-        assert!(!prog.instrs.is_empty(), "BLIS GEMM with PackMap should produce instructions");
+        assert!(
+            result.is_ok(),
+            "BLIS GEMM with PackMap should succeed: {:?}",
+            result.err()
+        );
+        assert!(
+            !prog.instrs.is_empty(),
+            "BLIS GEMM with PackMap should produce instructions"
+        );
     }
 
     #[test]
@@ -2995,14 +4346,44 @@ mod template_tests {
 
         // Act: K=32 > cta_k=16, triggers multi-K-tile steady-state loop
         let result = emit_gemm_gpu_pipelined(
-            &mut prog, 16, 16, 32, width, a, b, c,
-            16, 16, 16, 8, 8, 16, 2, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, false, false, &BoundExpr::Const(16),
+            &mut prog,
+            16,
+            16,
+            32,
+            width,
+            a,
+            b,
+            c,
+            16,
+            16,
+            16,
+            8,
+            8,
+            16,
+            2,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
+            false,
+            false,
+            &BoundExpr::Const(16),
         );
 
         // Assert: multi-tile pipeline should succeed with AsyncWait for overlap
-        assert!(result.is_ok(), "multi-K-tile pipelined GEMM should succeed: {:?}", result.err());
-        let has_async_wait = prog.instrs.iter().any(|i| matches!(i, VmInstr::AsyncWait { .. }));
-        assert!(has_async_wait, "multi-K-tile pipeline should emit AsyncWait for stage synchronization");
+        assert!(
+            result.is_ok(),
+            "multi-K-tile pipelined GEMM should succeed: {:?}",
+            result.err()
+        );
+        let has_async_wait = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::AsyncWait { .. }));
+        assert!(
+            has_async_wait,
+            "multi-K-tile pipeline should emit AsyncWait for stage synchronization"
+        );
     }
 
     #[test]
@@ -3022,12 +4403,31 @@ mod template_tests {
 
         // Act: AfterStore — do_epilogue_inline is false
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &SymDim::Concrete(2), 8, 8, width, a, b, c, &epilogue, &sym_map, false, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            &mut prog,
+            &SymDim::Concrete(2),
+            8,
+            8,
+            width,
+            a,
+            b,
+            c,
+            &epilogue,
+            &sym_map,
+            false,
+            None,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::AfterStore,
         );
 
         // Assert: should succeed; epilogue is deferred to AfterStore phase
-        assert!(result.is_ok(), "AfterStore GEMM should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "AfterStore GEMM should succeed: {:?}",
+            result.err()
+        );
         assert!(!prog.instrs.is_empty());
     }
 
@@ -3041,24 +4441,49 @@ mod template_tests {
 
         // Act: TMA path — should emit GprLoadImm for coords + Tma2DCopy per tile
         emit_async_load_tile(
-            &mut prog, "smem_a", "smem_b",
-            a_ptr, b_ptr,
-            0, 0, 0, // i_cta, j_cta, k_off
-            2, 2, 2, // mi, nj, kk
-            4, 4, 4, // cta_m, cta_n, cta_k
-            8, 8, // n, k
-            4, QuantPrecision::F32, // a_elem, a_dtype
-            4, QuantPrecision::F32, // b_elem, b_dtype
+            &mut prog,
+            "smem_a",
+            "smem_b",
+            a_ptr,
+            b_ptr,
+            0,
+            0,
+            0, // i_cta, j_cta, k_off
+            2,
+            2,
+            2, // mi, nj, kk
+            4,
+            4,
+            4, // cta_m, cta_n, cta_k
+            8,
+            8, // n, k
+            4,
+            QuantPrecision::F32, // a_elem, a_dtype
+            4,
+            QuantPrecision::F32, // b_elem, b_dtype
             width,
-            32, 32, // smem_a_row_stride, smem_b_row_stride
+            32,
+            32,   // smem_a_row_stride, smem_b_row_stride
             true, // use_tma=true -> TMA path
         );
 
         // Assert: TMA path emits Tma2DCopy (2 for A and B) and GprLoadImm for coordinates
-        let has_tma_copy = prog.instrs.iter().any(|i| matches!(i, VmInstr::Tma2DCopy { .. }));
-        let has_gpr_load = prog.instrs.iter().any(|i| matches!(i, VmInstr::GprLoadImm { .. }));
-        assert!(has_gpr_load, "TMA path should emit GprLoadImm for tile coordinates");
-        assert!(has_tma_copy, "TMA path should emit Tma2DCopy for async tile load");
+        let has_tma_copy = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::Tma2DCopy { .. }));
+        let has_gpr_load = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::GprLoadImm { .. }));
+        assert!(
+            has_gpr_load,
+            "TMA path should emit GprLoadImm for tile coordinates"
+        );
+        assert!(
+            has_tma_copy,
+            "TMA path should emit Tma2DCopy for async tile load"
+        );
     }
 
     #[test]
@@ -3072,14 +4497,42 @@ mod template_tests {
 
         // Act: M=10 with cta_m=8 -> last tile has mi=2; BF16 needs narrowing
         let result = emit_gemm_gpu_tiled_inline(
-            &mut prog, 10, 10, 16, width, a, b, c,
-            8, 8, 16, 4, 4, 16, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, false, false, &BoundExpr::Const(10),
+            &mut prog,
+            10,
+            10,
+            16,
+            width,
+            a,
+            b,
+            c,
+            8,
+            8,
+            16,
+            4,
+            4,
+            16,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+            false,
+            false,
+            &BoundExpr::Const(10),
         );
 
         // Assert: partial tiles with BF16 should produce VecNarrow on writeback
-        assert!(result.is_ok(), "GPU tiled BF16 partial tiles should succeed: {:?}", result.err());
-        let has_narrow = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecNarrow { .. }));
-        assert!(has_narrow, "BF16 GPU tiled with partial tiles should emit VecNarrow");
+        assert!(
+            result.is_ok(),
+            "GPU tiled BF16 partial tiles should succeed: {:?}",
+            result.err()
+        );
+        let has_narrow = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecNarrow { .. }));
+        assert!(
+            has_narrow,
+            "BF16 GPU tiled with partial tiles should emit VecNarrow"
+        );
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -3100,12 +4553,34 @@ mod template_tests {
 
         // Act: N=4 < nr*lanes=16 -> nr_actual clamped down
         let result = emit_gemm_blis_inline(
-            &mut prog, 4, 4, 16, width, a, b, c, 4, 2, None, 1, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            &mut prog,
+            4,
+            4,
+            16,
+            width,
+            a,
+            b,
+            c,
+            4,
+            2,
+            None,
+            1,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
         );
 
         // Assert: should succeed with clamped nr_actual, no out-of-bounds access
-        assert!(result.is_ok(), "BLIS GEMM with N < nr*lanes should succeed: {:?}", result.err());
-        assert!(!prog.instrs.is_empty(), "should produce instructions with clamped nr");
+        assert!(
+            result.is_ok(),
+            "BLIS GEMM with N < nr*lanes should succeed: {:?}",
+            result.err()
+        );
+        assert!(
+            !prog.instrs.is_empty(),
+            "should produce instructions with clamped nr"
+        );
     }
 
     #[test]
@@ -3121,16 +4596,44 @@ mod template_tests {
 
         // Act: K=16 / lanes=8 = 2 exactly, no k_tail
         let result = emit_gemm_trans_b_inline(
-            &mut prog, &SymDim::Concrete(1), 4, 16, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, );
+            &mut prog,
+            &SymDim::Concrete(1),
+            4,
+            16,
+            width,
+            a,
+            b,
+            c,
+            &[],
+            &sym_map,
+            None,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert: vector-only path should emit VecLoad (not scalar Broadcast for tail)
-        assert!(result.is_ok(), "trans-B GEMM with exact K/lanes should succeed: {:?}", result.err());
-        let has_vec_load = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecLoad { .. }));
+        assert!(
+            result.is_ok(),
+            "trans-B GEMM with exact K/lanes should succeed: {:?}",
+            result.err()
+        );
+        let has_vec_load = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecLoad { .. }));
         assert!(has_vec_load, "should emit VecLoad for vectorized K loop");
         // k_tail=0: no scalar Add needed between vector and tail accumulator
-        let broadcast_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::Broadcast { .. })).count();
+        let broadcast_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::Broadcast { .. }))
+            .count();
         // k_tail=0 means we still have Broadcast for zero-init, but no per-tail-element Broadcast
-        assert!(broadcast_count > 0, "should have at least the accumulator zero-init Broadcast");
+        assert!(
+            broadcast_count > 0,
+            "should have at least the accumulator zero-init Broadcast"
+        );
     }
 
     #[test]
@@ -3145,15 +4648,40 @@ mod template_tests {
 
         // Act: M=1 single-row decode GEMM
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &SymDim::Concrete(1), 16, 32, width, a, b, c, &[], &sym_map, false, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            &mut prog,
+            &SymDim::Concrete(1),
+            16,
+            32,
+            width,
+            a,
+            b,
+            c,
+            &[],
+            &sym_map,
+            false,
+            None,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
 
         // Assert: single-row GEMM should succeed with valid instruction stream
-        assert!(result.is_ok(), "M=1 decode GEMM should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "M=1 decode GEMM should succeed: {:?}",
+            result.err()
+        );
         assert!(!prog.instrs.is_empty());
-        let has_store = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecStore { .. }));
-        assert!(has_store, "M=1 GEMM should emit VecStore for result writeback");
+        let has_store = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecStore { .. }));
+        assert!(
+            has_store,
+            "M=1 GEMM should emit VecStore for result writeback"
+        );
     }
 
     #[test]
@@ -3167,16 +4695,46 @@ mod template_tests {
 
         // Act: M=32, cta_m=16, warp_m=8, mma_k=16 — all divide evenly
         let result = emit_gemm_gpu_tiled_inline(
-            &mut prog, 32, 32, 32, width, a, b, c,
-            16, 16, 16, 8, 8, 16, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, false, &BoundExpr::Const(32),
+            &mut prog,
+            32,
+            32,
+            32,
+            width,
+            a,
+            b,
+            c,
+            16,
+            16,
+            16,
+            8,
+            8,
+            16,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
+            false,
+            &BoundExpr::Const(32),
         );
 
         // Assert: exact division means mi/wi/wj always equal full tile size
-        assert!(result.is_ok(), "exact-divisible GPU tiled GEMM should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "exact-divisible GPU tiled GEMM should succeed: {:?}",
+            result.err()
+        );
         assert!(!prog.instrs.is_empty());
         // With 2x2 CTAs and 2x2 warps per CTA, there should be multiple FMA ops
-        let fma_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::Fma { .. })).count();
-        assert!(fma_count > 1, "exact-divisible GPU GEMM should have multiple FMA instructions, got {}", fma_count);
+        let fma_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::Fma { .. }))
+            .count();
+        assert!(
+            fma_count > 1,
+            "exact-divisible GPU GEMM should have multiple FMA instructions, got {}",
+            fma_count
+        );
     }
 
     #[test]
@@ -3185,24 +4743,60 @@ mod template_tests {
         // warp tiles get clamped: wi=min(4,3)=3, wj=min(4,3)=3
         let mut prog = VmProgram::new();
         let width = SimdWidth::Warp(32);
-        let accs: Vec<VRegId> = (0..16).map(|_| prog.alloc_vreg(VRegKind::Vec, width)).collect();
+        let accs: Vec<VRegId> = (0..16)
+            .map(|_| prog.alloc_vreg(VRegKind::Vec, width))
+            .collect();
 
         // Act: mi=3, nj=3 with warp_m=4, warp_n=4 -> clamped to 3x3
         emit_mma_on_smem(
-            &mut prog, &accs, "smem_a", "smem_b",
-            0, 0, 0, 3, 3, 16,
-            4, 4, 16, 4, 4, 16,
-            4, 16, 4, 4, QuantPrecision::F32, width,
-            64, 64,
+            &mut prog,
+            &accs,
+            "smem_a",
+            "smem_b",
+            0,
+            0,
+            0,
+            3,
+            3,
+            16,
+            4,
+            4,
+            16,
+            4,
+            4,
+            16,
+            4,
+            16,
+            4,
+            4,
+            QuantPrecision::F32,
+            width,
+            64,
+            64,
         );
 
         // Assert: partial warp should still emit SharedMemLoad + Fma
-        let smem_load_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::SharedMemLoad { .. })).count();
-        let fma_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::Fma { .. })).count();
-        assert!(smem_load_count > 0, "partial warp MMA should emit SharedMemLoad");
+        let smem_load_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::SharedMemLoad { .. }))
+            .count();
+        let fma_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::Fma { .. }))
+            .count();
+        assert!(
+            smem_load_count > 0,
+            "partial warp MMA should emit SharedMemLoad"
+        );
         assert!(fma_count > 0, "partial warp MMA should emit Fma");
         // 3x3 = 9 accumulator entries, each needing a pair of loads + FMA
-        assert!(fma_count >= 9, "partial 3x3 warp should have at least 9 FMAs, got {}", fma_count);
+        assert!(
+            fma_count >= 9,
+            "partial 3x3 warp should have at least 9 FMAs, got {}",
+            fma_count
+        );
     }
 
     #[test]
@@ -3215,27 +4809,47 @@ mod template_tests {
 
         // Act: mi=0 means no A rows to load; kk=2 means B loads still happen
         emit_async_load_tile(
-            &mut prog, "smem_a", "smem_b",
-            a_ptr, b_ptr,
-            0, 0, 0, // i_cta, j_cta, k_off
-            0, 2, 2, // mi=0, nj=2, kk=2
-            4, 4, 4, // cta_m, cta_n, cta_k
-            8, 8, // n, k
-            4, QuantPrecision::F32, // a_elem, a_dtype
-            4, QuantPrecision::F32, // b_elem, b_dtype
+            &mut prog,
+            "smem_a",
+            "smem_b",
+            a_ptr,
+            b_ptr,
+            0,
+            0,
+            0, // i_cta, j_cta, k_off
+            0,
+            2,
+            2, // mi=0, nj=2, kk=2
+            4,
+            4,
+            4, // cta_m, cta_n, cta_k
+            8,
+            8, // n, k
+            4,
+            QuantPrecision::F32, // a_elem, a_dtype
+            4,
+            QuantPrecision::F32, // b_elem, b_dtype
             width,
-            32, 32,
+            32,
+            32,
             false, // use_tma=false
         );
 
         // Assert: no SharedMemAsyncStore for smem_a (mi=0), but B loads present
-        let smem_a_stores = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::SharedMemAsyncStore { name, .. } if name == "smem_a")
-        }).count();
-        let smem_b_stores = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::SharedMemAsyncStore { name, .. } if name == "smem_b")
-        }).count();
-        assert_eq!(smem_a_stores, 0, "mi=0 should produce zero smem_a async stores");
+        let smem_a_stores = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::SharedMemAsyncStore { name, .. } if name == "smem_a"))
+            .count();
+        let smem_b_stores = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::SharedMemAsyncStore { name, .. } if name == "smem_b"))
+            .count();
+        assert_eq!(
+            smem_a_stores, 0,
+            "mi=0 should produce zero smem_a async stores"
+        );
         assert!(smem_b_stores > 0, "kk=2 should produce smem_b async stores");
     }
 
@@ -3278,14 +4892,46 @@ mod template_tests {
 
         // Act: pipeline_depth=3 with K=48, cta_k=16 -> 3 K-tiles across 3 stages
         let result = emit_gemm_gpu_pipelined(
-            &mut prog, 16, 16, 48, width, a, b, c,
-            16, 16, 16, 8, 8, 16, 3, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, false, false, &BoundExpr::Const(16),
+            &mut prog,
+            16,
+            16,
+            48,
+            width,
+            a,
+            b,
+            c,
+            16,
+            16,
+            16,
+            8,
+            8,
+            16,
+            3,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
+            false,
+            false,
+            &BoundExpr::Const(16),
         );
 
         // Assert: 3 stages should allocate 6 SharedMemAlloc (3 for A + 3 for B)
-        assert!(result.is_ok(), "3-stage pipeline GEMM should succeed: {:?}", result.err());
-        let smem_alloc_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::SharedMemAlloc { .. })).count();
-        assert_eq!(smem_alloc_count, 6, "3-stage pipeline should allocate 6 shared memory buffers (3A+3B), got {}", smem_alloc_count);
+        assert!(
+            result.is_ok(),
+            "3-stage pipeline GEMM should succeed: {:?}",
+            result.err()
+        );
+        let smem_alloc_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::SharedMemAlloc { .. }))
+            .count();
+        assert_eq!(
+            smem_alloc_count, 6,
+            "3-stage pipeline should allocate 6 shared memory buffers (3A+3B), got {}",
+            smem_alloc_count
+        );
     }
 
     #[test]
@@ -3300,14 +4946,39 @@ mod template_tests {
 
         // Act: BF16 with N=16 -> n_vecs=2, n_tail=0; BF16 accumulator widens to F32
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &SymDim::Concrete(2), 16, 8, width, a, b, c, &[], &sym_map, false, None, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, false,
+            &mut prog,
+            &SymDim::Concrete(2),
+            16,
+            8,
+            width,
+            a,
+            b,
+            c,
+            &[],
+            &sym_map,
+            false,
+            None,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+            false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
 
         // Assert: BF16 with vectorized output should emit VecNarrow
-        assert!(result.is_ok(), "BF16 vectorized GEMM should succeed: {:?}", result.err());
-        let has_narrow = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecNarrow { .. }));
-        assert!(has_narrow, "BF16 vectorized GEMM should emit VecNarrow for F32->BF16 writeback");
+        assert!(
+            result.is_ok(),
+            "BF16 vectorized GEMM should succeed: {:?}",
+            result.err()
+        );
+        let has_narrow = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecNarrow { .. }));
+        assert!(
+            has_narrow,
+            "BF16 vectorized GEMM should emit VecNarrow for F32->BF16 writeback"
+        );
     }
 
     #[test]
@@ -3322,12 +4993,34 @@ mod template_tests {
 
         // Act: K=3 with unroll_factor=8 -> k_unroll clamped to min(8,3)=3
         let result = emit_gemm_blis_inline(
-            &mut prog, 4, 8, 3, width, a, b, c, 4, 2, None, 8, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            &mut prog,
+            4,
+            8,
+            3,
+            width,
+            a,
+            b,
+            c,
+            4,
+            2,
+            None,
+            8,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
         );
 
         // Assert: K < unroll_factor should not panic; single K iteration with 3 micro-steps
-        assert!(result.is_ok(), "BLIS GEMM with K < unroll_factor should succeed: {:?}", result.err());
-        assert!(!prog.instrs.is_empty(), "should produce instructions with clamped k_unroll");
+        assert!(
+            result.is_ok(),
+            "BLIS GEMM with K < unroll_factor should succeed: {:?}",
+            result.err()
+        );
+        assert!(
+            !prog.instrs.is_empty(),
+            "should produce instructions with clamped k_unroll"
+        );
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -3347,8 +5040,11 @@ mod template_tests {
         let result = expr.substitute_loop_offset(target, 999);
 
         // Assert: Const has no LoopOffset children, returns identical value
-        assert_eq!(result, OffsetExpr::Const(256),
-            "Const substitute should return the same Const");
+        assert_eq!(
+            result,
+            OffsetExpr::Const(256),
+            "Const substitute should return the same Const"
+        );
     }
 
     #[test]
@@ -3366,8 +5062,14 @@ mod template_tests {
 
         // Assert: should still emit TileConfig + TileRelease lifecycle
         assert!(result.is_ok());
-        let has_config = prog.instrs.iter().any(|i| matches!(i, VmInstr::TileConfig { .. }));
-        let has_release = prog.instrs.iter().any(|i| matches!(i, VmInstr::TileRelease));
+        let has_config = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::TileConfig { .. }));
+        let has_release = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::TileRelease));
         assert!(has_config, "non-square tiles should emit TileConfig");
         assert!(has_release, "non-square tiles should emit TileRelease");
     }
@@ -3383,11 +5085,30 @@ mod template_tests {
 
         // Act: mr=1 means each M-block processes exactly 1 row
         let result = emit_gemm_blis_inline(
-            &mut prog, 4, 16, 8, width, a, b, c, 1, 2, None, 1, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            &mut prog,
+            4,
+            16,
+            8,
+            width,
+            a,
+            b,
+            c,
+            1,
+            2,
+            None,
+            1,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
         );
 
         // Assert: mr=1 should succeed with 1×nr accumulators per block
-        assert!(result.is_ok(), "BLIS mr=1 should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "BLIS mr=1 should succeed: {:?}",
+            result.err()
+        );
         assert!(!prog.instrs.is_empty());
     }
 
@@ -3403,15 +5124,41 @@ mod template_tests {
 
         // Act: BF16 with N=12 produces both vectorized + scalar tail paths
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &SymDim::Concrete(2), 12, 8, width, a, b, c, &[], &sym_map, false, None, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, false,
+            &mut prog,
+            &SymDim::Concrete(2),
+            12,
+            8,
+            width,
+            a,
+            b,
+            c,
+            &[],
+            &sym_map,
+            false,
+            None,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+            false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
 
         // Assert: BF16 tail path should emit VecNarrow for both vectorized and scalar stores
-        assert!(result.is_ok(), "BF16 GEMM with tail should succeed: {:?}", result.err());
-        let narrow_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::VecNarrow { .. })).count();
-        assert!(narrow_count >= 1,
-            "BF16 GEMM with tail should emit at least 1 VecNarrow, got {}", narrow_count);
+        assert!(
+            result.is_ok(),
+            "BF16 GEMM with tail should succeed: {:?}",
+            result.err()
+        );
+        let narrow_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::VecNarrow { .. }))
+            .count();
+        assert!(
+            narrow_count >= 1,
+            "BF16 GEMM with tail should emit at least 1 VecNarrow, got {}",
+            narrow_count
+        );
     }
 
     #[test]
@@ -3425,14 +5172,44 @@ mod template_tests {
 
         // Act: TMA + multi-K-tile triggers steady-state compute/load overlap
         let result = emit_gemm_gpu_pipelined(
-            &mut prog, 16, 16, 32, width, a, b, c,
-            16, 16, 16, 8, 8, 16, 2, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, true, false, &BoundExpr::Const(16),
+            &mut prog,
+            16,
+            16,
+            32,
+            width,
+            a,
+            b,
+            c,
+            16,
+            16,
+            16,
+            8,
+            8,
+            16,
+            2,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
+            true,
+            false,
+            &BoundExpr::Const(16),
         );
 
         // Assert: TMA steady-state should emit WarpBarrierWait for synchronization
-        assert!(result.is_ok(), "TMA multi-K pipelined should succeed: {:?}", result.err());
-        let has_barrier_wait = prog.instrs.iter().any(|i| matches!(i, VmInstr::WarpBarrierWait { .. }));
-        assert!(has_barrier_wait, "TMA multi-K pipeline should emit WarpBarrierWait");
+        assert!(
+            result.is_ok(),
+            "TMA multi-K pipelined should succeed: {:?}",
+            result.err()
+        );
+        let has_barrier_wait = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::WarpBarrierWait { .. }));
+        assert!(
+            has_barrier_wait,
+            "TMA multi-K pipeline should emit WarpBarrierWait"
+        );
     }
 
     #[test]
@@ -3440,21 +5217,49 @@ mod template_tests {
         // Arrange: MMA where kk=mma_k=16 — exactly one inner K iteration
         let mut prog = VmProgram::new();
         let width = SimdWidth::Warp(32);
-        let accs: Vec<VRegId> = (0..4).map(|_| prog.alloc_vreg(VRegKind::Vec, width)).collect();
+        let accs: Vec<VRegId> = (0..4)
+            .map(|_| prog.alloc_vreg(VRegKind::Vec, width))
+            .collect();
 
         // Act: mi=2, nj=2, kk=16, mma_k=16 -> single inner K step
         emit_mma_on_smem(
-            &mut prog, &accs, "smem_a", "smem_b",
-            0, 0, 0, 2, 2, 16,
-            2, 2, 16, 2, 2, 16,
-            2, 16, 4, 4, QuantPrecision::F32, width,
-            64, 64,
+            &mut prog,
+            &accs,
+            "smem_a",
+            "smem_b",
+            0,
+            0,
+            0,
+            2,
+            2,
+            16,
+            2,
+            2,
+            16,
+            2,
+            2,
+            16,
+            2,
+            16,
+            4,
+            4,
+            QuantPrecision::F32,
+            width,
+            64,
+            64,
         );
 
         // Assert: exactly 2*2=4 FMA (one per accumulator per single K step)
-        let fma_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::Fma { .. })).count();
-        assert_eq!(fma_count, 4,
-            "single K-step MMA should have exactly 4 FMAs (2×2), got {}", fma_count);
+        let fma_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::Fma { .. }))
+            .count();
+        assert_eq!(
+            fma_count, 4,
+            "single K-step MMA should have exactly 4 FMAs (2×2), got {}",
+            fma_count
+        );
     }
 
     #[test]
@@ -3467,22 +5272,42 @@ mod template_tests {
 
         // Act: i_cta=4, j_cta=8, k_off=16 with mi=2, kk=2
         emit_async_load_tile(
-            &mut prog, "smem_a", "smem_b",
-            a_ptr, b_ptr,
-            4, 8, 16, // i_cta=4, j_cta=8, k_off=16
-            2, 2, 2, // mi=2, nj=2, kk=2
-            8, 8, 8, // cta_m, cta_n, cta_k
-            16, 32, // n, k
-            4, QuantPrecision::F32, // a_elem, a_dtype
-            4, QuantPrecision::F32, // b_elem, b_dtype
+            &mut prog,
+            "smem_a",
+            "smem_b",
+            a_ptr,
+            b_ptr,
+            4,
+            8,
+            16, // i_cta=4, j_cta=8, k_off=16
+            2,
+            2,
+            2, // mi=2, nj=2, kk=2
+            8,
+            8,
+            8, // cta_m, cta_n, cta_k
+            16,
+            32, // n, k
+            4,
+            QuantPrecision::F32, // a_elem, a_dtype
+            4,
+            QuantPrecision::F32, // b_elem, b_dtype
             width,
-            128, 128,
+            128,
+            128,
             false, // SM80 path
         );
 
         // Assert: nonzero offsets should not panic; VecLoad offsets incorporate i_cta/k_off
-        let vec_load_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::VecLoad { .. })).count();
-        assert!(vec_load_count > 0, "SM80 with nonzero offsets should emit VecLoad instructions");
+        let vec_load_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::VecLoad { .. }))
+            .count();
+        assert!(
+            vec_load_count > 0,
+            "SM80 with nonzero offsets should emit VecLoad instructions"
+        );
     }
 
     #[test]
@@ -3497,11 +5322,32 @@ mod template_tests {
 
         // Act: 1×1×1 GEMV (single dot product)
         let result = emit_gemm_trans_b_inline(
-            &mut prog, &SymDim::Concrete(1), 1, 1, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, );
+            &mut prog,
+            &SymDim::Concrete(1),
+            1,
+            1,
+            width,
+            a,
+            b,
+            c,
+            &[],
+            &sym_map,
+            None,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert: minimal GEMV should succeed with at least a store
-        assert!(result.is_ok(), "1×1×1 trans-B GEMV should succeed: {:?}", result.err());
-        let has_store = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecStore { .. }));
+        assert!(
+            result.is_ok(),
+            "1×1×1 trans-B GEMV should succeed: {:?}",
+            result.err()
+        );
+        let has_store = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecStore { .. }));
         assert!(has_store, "minimal trans-B GEMV should emit VecStore");
     }
 
@@ -3516,12 +5362,34 @@ mod template_tests {
 
         // Act: M=16, cta_m=16, N=16, cta_n=16 — single CTA covers entire output
         let result = emit_gemm_gpu_tiled_inline(
-            &mut prog, 16, 16, 32, width, a, b, c,
-            16, 16, 16, 8, 8, 16, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, false, &BoundExpr::Const(16),
+            &mut prog,
+            16,
+            16,
+            32,
+            width,
+            a,
+            b,
+            c,
+            16,
+            16,
+            16,
+            8,
+            8,
+            16,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
+            false,
+            &BoundExpr::Const(16),
         );
 
         // Assert: single-CTA should succeed with no partial CTA tiles
-        assert!(result.is_ok(), "single-CTA GPU tiled should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "single-CTA GPU tiled should succeed: {:?}",
+            result.err()
+        );
         assert!(!prog.instrs.is_empty());
     }
 
@@ -3534,16 +5402,16 @@ mod template_tests {
             Box::new(OffsetExpr::Const(32)),
         );
         let mid = OffsetExpr::Mul(Box::new(inner), 4);
-        let outer = OffsetExpr::Add(
-            Box::new(mid),
-            Box::new(OffsetExpr::ScalarVReg(VRegId(99))),
-        );
+        let outer = OffsetExpr::Add(Box::new(mid), Box::new(OffsetExpr::ScalarVReg(VRegId(99))));
 
         // Act: clone the entire structure
         let cloned = outer.clone();
 
         // Assert: cloned structure is deeply equal
-        assert_eq!(outer, cloned, "deeply nested OffsetExpr clone should be equal");
+        assert_eq!(
+            outer, cloned,
+            "deeply nested OffsetExpr clone should be equal"
+        );
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -3571,32 +5439,108 @@ mod template_tests {
 
         // Act: M=2, N=16, K=8 with both widths
         let r128 = emit_gemm_inline_with_epilogue(
-            &mut prog_w128, &SymDim::Concrete(2), 16, 8, width_128, a1, b1, c1, &[], &sym_map, false, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            &mut prog_w128,
+            &SymDim::Concrete(2),
+            16,
+            8,
+            width_128,
+            a1,
+            b1,
+            c1,
+            &[],
+            &sym_map,
+            false,
+            None,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
         let r256 = emit_gemm_inline_with_epilogue(
-            &mut prog_w256, &SymDim::Concrete(2), 16, 8, width_256, a2, b2, c2, &[], &sym_map, false, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            &mut prog_w256,
+            &SymDim::Concrete(2),
+            16,
+            8,
+            width_256,
+            a2,
+            b2,
+            c2,
+            &[],
+            &sym_map,
+            false,
+            None,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
 
         // Assert: both succeed; W128 VecStore instructions carry W128 width, W256 carry W256
         assert!(r128.is_ok(), "W128 GEMM should succeed: {:?}", r128.err());
         assert!(r256.is_ok(), "W256 GEMM should succeed: {:?}", r256.err());
-        let w128_stores = prog_w128.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecStore { width: SimdWidth::W128, .. })
-        }).count();
-        let w256_stores = prog_w256.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecStore { width: SimdWidth::W256, .. })
-        }).count();
-        assert!(w128_stores > 0, "W128 GEMM should emit VecStore with W128 width");
-        assert!(w256_stores > 0, "W256 GEMM should emit VecStore with W256 width");
+        let w128_stores = prog_w128
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecStore {
+                        width: SimdWidth::W128,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let w256_stores = prog_w256
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecStore {
+                        width: SimdWidth::W256,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            w128_stores > 0,
+            "W128 GEMM should emit VecStore with W128 width"
+        );
+        assert!(
+            w256_stores > 0,
+            "W256 GEMM should emit VecStore with W256 width"
+        );
         // Verify no cross-width contamination: W128 program has no W256 stores, vice versa
-        let w128_cross = prog_w128.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecStore { width: SimdWidth::W256, .. })
-        }).count();
-        let w256_cross = prog_w256.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecStore { width: SimdWidth::W128, .. })
-        }).count();
+        let w128_cross = prog_w128
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecStore {
+                        width: SimdWidth::W256,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let w256_cross = prog_w256
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecStore {
+                        width: SimdWidth::W128,
+                        ..
+                    }
+                )
+            })
+            .count();
         assert_eq!(w128_cross, 0, "W128 GEMM should not emit W256 VecStore");
         assert_eq!(w256_cross, 0, "W256 GEMM should not emit W128 VecStore");
     }
@@ -3617,20 +5561,65 @@ mod template_tests {
 
         // Act: M=2, N=8, K=8
         let r_f32 = emit_gemm_inline_with_epilogue(
-            &mut prog_f32, &SymDim::Concrete(2), 8, 8, width, a1, b1, c1, &[], &sym_map, false, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            &mut prog_f32,
+            &SymDim::Concrete(2),
+            8,
+            8,
+            width,
+            a1,
+            b1,
+            c1,
+            &[],
+            &sym_map,
+            false,
+            None,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
         let r_bf16 = emit_gemm_inline_with_epilogue(
-            &mut prog_bf16, &SymDim::Concrete(2), 8, 8, width, a2, b2, c2, &[], &sym_map, false, None, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, false,
+            &mut prog_bf16,
+            &SymDim::Concrete(2),
+            8,
+            8,
+            width,
+            a2,
+            b2,
+            c2,
+            &[],
+            &sym_map,
+            false,
+            None,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+            false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
 
         // Assert: both succeed; BF16 has extra VecNarrow instructions
         assert!(r_f32.is_ok(), "F32 GEMM should succeed: {:?}", r_f32.err());
-        assert!(r_bf16.is_ok(), "BF16 GEMM should succeed: {:?}", r_bf16.err());
-        let bf16_narrow_count = prog_bf16.instrs.iter().filter(|i| matches!(i, VmInstr::VecNarrow { .. })).count();
-        assert!(bf16_narrow_count > 0, "BF16 GEMM should emit VecNarrow instructions");
-        let f32_narrow_count = prog_f32.instrs.iter().filter(|i| matches!(i, VmInstr::VecNarrow { .. })).count();
+        assert!(
+            r_bf16.is_ok(),
+            "BF16 GEMM should succeed: {:?}",
+            r_bf16.err()
+        );
+        let bf16_narrow_count = prog_bf16
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::VecNarrow { .. }))
+            .count();
+        assert!(
+            bf16_narrow_count > 0,
+            "BF16 GEMM should emit VecNarrow instructions"
+        );
+        let f32_narrow_count = prog_f32
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::VecNarrow { .. }))
+            .count();
         assert_eq!(f32_narrow_count, 0, "F32 GEMM should not emit VecNarrow");
     }
 
@@ -3654,15 +5643,21 @@ mod template_tests {
             OffsetExpr::Add(mul_term, loop_term) => {
                 match mul_term.as_ref() {
                     OffsetExpr::Mul(inner, factor) => {
-                        assert_eq!(*factor, b_row_stride,
-                            "normal layout Mul factor should equal b_row_stride");
-                        assert!(matches!(inner.as_ref(), OffsetExpr::ScalarVReg(_)),
-                            "normal layout Mul inner should be ScalarVReg(k_ctr)");
+                        assert_eq!(
+                            *factor, b_row_stride,
+                            "normal layout Mul factor should equal b_row_stride"
+                        );
+                        assert!(
+                            matches!(inner.as_ref(), OffsetExpr::ScalarVReg(_)),
+                            "normal layout Mul inner should be ScalarVReg(k_ctr)"
+                        );
                     }
                     other => panic!("expected Mul for normal layout first term, got {:?}", other),
                 }
-                assert!(matches!(loop_term.as_ref(), OffsetExpr::LoopOffset(_)),
-                    "normal layout second term should be LoopOffset(j_off)");
+                assert!(
+                    matches!(loop_term.as_ref(), OffsetExpr::LoopOffset(_)),
+                    "normal layout second term should be LoopOffset(j_off)"
+                );
             }
             other => panic!("expected Add for normal layout, got {:?}", other),
         }
@@ -3679,13 +5674,38 @@ mod template_tests {
 
         // Act: trans_b=true with BF16
         let result = emit_gemm_blis_inline(
-            &mut prog, 4, 8, 16, width, a, b, c, 4, 2, None, 1, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, true,
+            &mut prog,
+            4,
+            8,
+            16,
+            width,
+            a,
+            b,
+            c,
+            4,
+            2,
+            None,
+            1,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+            true,
         );
 
         // Assert: should succeed and emit VecNarrow for BF16 writeback
-        assert!(result.is_ok(), "BLIS trans_b BF16 should succeed: {:?}", result.err());
-        let has_narrow = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecNarrow { .. }));
-        assert!(has_narrow, "BLIS trans_b BF16 should emit VecNarrow for accumulator writeback");
+        assert!(
+            result.is_ok(),
+            "BLIS trans_b BF16 should succeed: {:?}",
+            result.err()
+        );
+        let has_narrow = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecNarrow { .. }));
+        assert!(
+            has_narrow,
+            "BLIS trans_b BF16 should emit VecNarrow for accumulator writeback"
+        );
     }
 
     #[test]
@@ -3697,20 +5717,47 @@ mod template_tests {
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
         let sym_map = SymDimSlotMap::mega_kernel_abi();
-        let m_dim = SymDim::Symbolic { name: "seq_len".into(), max_value: Some(1024) };
+        let m_dim = SymDim::Symbolic {
+            name: "seq_len".into(),
+            max_value: Some(1024),
+        };
         let override_bound = BoundExpr::Const(64);
 
         // Act: symbolic M with explicit override (e.g., batch scheduler knows actual seq_len=64)
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &m_dim, 8, 16, width, a, b, c, &[], &sym_map, false,
-            Some(&override_bound), QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            &mut prog,
+            &m_dim,
+            8,
+            16,
+            width,
+            a,
+            b,
+            c,
+            &[],
+            &sym_map,
+            false,
+            Some(&override_bound),
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
 
         // Assert: should succeed using the override bound instead of sym_map
-        assert!(result.is_ok(), "symbolic M with seq_bound_override should succeed: {:?}", result.err());
-        assert!(!prog.instrs.is_empty(), "should produce instructions with override bound");
-        let has_store = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecStore { .. }));
+        assert!(
+            result.is_ok(),
+            "symbolic M with seq_bound_override should succeed: {:?}",
+            result.err()
+        );
+        assert!(
+            !prog.instrs.is_empty(),
+            "should produce instructions with override bound"
+        );
+        let has_store = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecStore { .. }));
         assert!(has_store, "GEMM with override bound should emit VecStore");
     }
 
@@ -3729,10 +5776,20 @@ mod template_tests {
 
         // Assert: should succeed and emit TileConfig with BF16 dtype
         assert!(result.is_ok());
-        let tile_config = prog.instrs.iter().find(|i| matches!(i, VmInstr::TileConfig { .. }));
-        assert!(tile_config.is_some(), "BF16 tile GEMM should emit TileConfig");
+        let tile_config = prog
+            .instrs
+            .iter()
+            .find(|i| matches!(i, VmInstr::TileConfig { .. }));
+        assert!(
+            tile_config.is_some(),
+            "BF16 tile GEMM should emit TileConfig"
+        );
         if let Some(VmInstr::TileConfig { dtype, .. }) = tile_config {
-            assert_eq!(*dtype, crate::types::DType::BF16, "TileConfig dtype should be BF16");
+            assert_eq!(
+                *dtype,
+                crate::types::DType::BF16,
+                "TileConfig dtype should be BF16"
+            );
         }
     }
 
@@ -3747,15 +5804,43 @@ mod template_tests {
 
         // Act: M=1 with cta_m=16 -> mi=1 (partial first CTA tile)
         let result = emit_gemm_gpu_tiled_inline(
-            &mut prog, 1, 16, 32, width, a, b, c,
-            16, 16, 16, 1, 1, 16, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, false, &BoundExpr::Const(1),
+            &mut prog,
+            1,
+            16,
+            32,
+            width,
+            a,
+            b,
+            c,
+            16,
+            16,
+            16,
+            1,
+            1,
+            16,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
+            false,
+            &BoundExpr::Const(1),
         );
 
         // Assert: M=1 GPU GEMV should succeed with partial tile handling
-        assert!(result.is_ok(), "GPU M=1 decode GEMV should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "GPU M=1 decode GEMV should succeed: {:?}",
+            result.err()
+        );
         assert!(!prog.instrs.is_empty(), "should produce instructions");
-        let has_store = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecStore { .. }));
-        assert!(has_store, "GPU M=1 GEMV should emit VecStore for result writeback");
+        let has_store = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecStore { .. }));
+        assert!(
+            has_store,
+            "GPU M=1 GEMV should emit VecStore for result writeback"
+        );
     }
 
     #[test]
@@ -3770,19 +5855,62 @@ mod template_tests {
 
         // Act: N=8 = lanes=8 -> n_vecs=1, n_tail=0
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &SymDim::Concrete(2), 8, 8, width, a, b, c, &[], &sym_map, false, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            &mut prog,
+            &SymDim::Concrete(2),
+            8,
+            8,
+            width,
+            a,
+            b,
+            c,
+            &[],
+            &sym_map,
+            false,
+            None,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
 
         // Assert: should succeed with only vectorized path, no scalar tail
-        assert!(result.is_ok(), "N=lanes GEMM should succeed: {:?}", result.err());
-        let has_vec_store = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecStore { width: SimdWidth::W256, .. }));
-        assert!(has_vec_store, "N=lanes GEMM should emit W256 VecStore (vectorized path)");
+        assert!(
+            result.is_ok(),
+            "N=lanes GEMM should succeed: {:?}",
+            result.err()
+        );
+        let has_vec_store = prog.instrs.iter().any(|i| {
+            matches!(
+                i,
+                VmInstr::VecStore {
+                    width: SimdWidth::W256,
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_vec_store,
+            "N=lanes GEMM should emit W256 VecStore (vectorized path)"
+        );
         // No scalar VecStore should appear since n_tail=0
-        let scalar_stores = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecStore { width: SimdWidth::Scalar, .. })
-        }).count();
-        assert_eq!(scalar_stores, 0, "N=lanes should not emit scalar VecStore (n_tail=0)");
+        let scalar_stores = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecStore {
+                        width: SimdWidth::Scalar,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            scalar_stores, 0,
+            "N=lanes should not emit scalar VecStore (n_tail=0)"
+        );
     }
 
     #[test]
@@ -3796,14 +5924,41 @@ mod template_tests {
 
         // Act: M=16, mr=4 -> 4 M-blocks (0..4, 4..8, 8..12, 12..16)
         let result = emit_gemm_blis_inline(
-            &mut prog, 16, 16, 16, width, a, b, c, 4, 2, None, 1, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            &mut prog,
+            16,
+            16,
+            16,
+            width,
+            a,
+            b,
+            c,
+            4,
+            2,
+            None,
+            1,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
         );
 
         // Assert: should succeed with multiple M-blocks
-        assert!(result.is_ok(), "BLIS GEMM with M > mr should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "BLIS GEMM with M > mr should succeed: {:?}",
+            result.err()
+        );
         // Each M-block writes its C rows via VecStore; 4 blocks should produce multiple stores
-        let store_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::VecStore { .. })).count();
-        assert!(store_count >= 4, "M=16 with mr=4 should have at least 4 VecStore groups, got {}", store_count);
+        let store_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::VecStore { .. }))
+            .count();
+        assert!(
+            store_count >= 4,
+            "M=16 with mr=4 should have at least 4 VecStore groups, got {}",
+            store_count
+        );
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -3825,13 +5980,35 @@ mod template_tests {
 
         // Act: nr=1 means each J-block processes 1*lanes=8 columns per iteration
         let result = emit_gemm_blis_inline(
-            &mut prog, 4, 16, 8, width, a, b, c, 4, 1, None, 1, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            &mut prog,
+            4,
+            16,
+            8,
+            width,
+            a,
+            b,
+            c,
+            4,
+            1,
+            None,
+            1,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
         );
 
         // Assert: nr=1 should succeed with 1-column accumulator per microkernel
-        assert!(result.is_ok(), "BLIS GEMM with nr=1 should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "BLIS GEMM with nr=1 should succeed: {:?}",
+            result.err()
+        );
         assert!(!prog.instrs.is_empty());
-        let has_store = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecStore { .. }));
+        let has_store = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecStore { .. }));
         assert!(has_store, "BLIS nr=1 should emit VecStore for C writeback");
     }
 
@@ -3853,14 +6030,44 @@ mod template_tests {
 
         // Act: BF16, K=10 (k_vecs=1, k_tail=2), with epilogue
         let result = emit_gemm_trans_b_inline(
-            &mut prog, &SymDim::Concrete(1), 4, 10, width, a, b, c, &epilogue, &sym_map, None, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, );
+            &mut prog,
+            &SymDim::Concrete(1),
+            4,
+            10,
+            width,
+            a,
+            b,
+            c,
+            &epilogue,
+            &sym_map,
+            None,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+        );
 
         // Assert: BF16 trans-B with k_tail + epilogue should succeed
-        assert!(result.is_ok(), "trans-B BF16 with k_tail+epilogue should succeed: {:?}", result.err());
-        let has_narrow = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecNarrow { .. }));
-        assert!(has_narrow, "BF16 trans-B should emit VecNarrow for F32->BF16 writeback");
-        let has_hreduce = prog.instrs.iter().any(|i| matches!(i, VmInstr::HReduce { .. }));
-        assert!(has_hreduce, "trans-B with k_tail should emit HReduce to collapse vector acc");
+        assert!(
+            result.is_ok(),
+            "trans-B BF16 with k_tail+epilogue should succeed: {:?}",
+            result.err()
+        );
+        let has_narrow = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecNarrow { .. }));
+        assert!(
+            has_narrow,
+            "BF16 trans-B should emit VecNarrow for F32->BF16 writeback"
+        );
+        let has_hreduce = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::HReduce { .. }));
+        assert!(
+            has_hreduce,
+            "trans-B with k_tail should emit HReduce to collapse vector acc"
+        );
     }
 
     #[test]
@@ -3875,15 +6082,44 @@ mod template_tests {
 
         // Act: K=24, mma_k=16 -> partial last inner K step
         let result = emit_gemm_gpu_tiled_inline(
-            &mut prog, 16, 16, 24, width, a, b, c,
-            16, 16, 24, 4, 4, 16, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, false, &BoundExpr::Const(16),
+            &mut prog,
+            16,
+            16,
+            24,
+            width,
+            a,
+            b,
+            c,
+            16,
+            16,
+            24,
+            4,
+            4,
+            16,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
+            false,
+            &BoundExpr::Const(16),
         );
 
         // Assert: partial K steps should be handled correctly
-        assert!(result.is_ok(), "GPU tiled GEMM with K not divisible by mma_k should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "GPU tiled GEMM with K not divisible by mma_k should succeed: {:?}",
+            result.err()
+        );
         assert!(!prog.instrs.is_empty());
-        let fma_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::Fma { .. })).count();
-        assert!(fma_count > 0, "should emit FMA instructions for partial K steps");
+        let fma_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::Fma { .. }))
+            .count();
+        assert!(
+            fma_count > 0,
+            "should emit FMA instructions for partial K steps"
+        );
     }
 
     #[test]
@@ -3897,14 +6133,40 @@ mod template_tests {
 
         // Act: M=4, mr=4 -> exactly one M-block, mr_actual=mr=4
         let result = emit_gemm_blis_inline(
-            &mut prog, 4, 16, 16, width, a, b, c, 4, 2, None, 1, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            &mut prog,
+            4,
+            16,
+            16,
+            width,
+            a,
+            b,
+            c,
+            4,
+            2,
+            None,
+            1,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
         );
 
         // Assert: exact boundary should succeed without clamping
-        assert!(result.is_ok(), "BLIS GEMM with M=mr should succeed: {:?}", result.err());
-        let broadcast_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::Broadcast { .. })).count();
+        assert!(
+            result.is_ok(),
+            "BLIS GEMM with M=mr should succeed: {:?}",
+            result.err()
+        );
+        let broadcast_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::Broadcast { .. }))
+            .count();
         // With exactly one M-block, there should be exactly one set of accumulator zero-inits
-        assert!(broadcast_count > 0, "should have accumulator zero-init Broadcast instructions");
+        assert!(
+            broadcast_count > 0,
+            "should have accumulator zero-init Broadcast instructions"
+        );
     }
 
     #[test]
@@ -3916,20 +6178,49 @@ mod template_tests {
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
         let sym_map = SymDimSlotMap::mega_kernel_abi();
-        let m_dim = SymDim::Symbolic { name: "seq_len".into(), max_value: Some(256) };
+        let m_dim = SymDim::Symbolic {
+            name: "seq_len".into(),
+            max_value: Some(256),
+        };
 
         // Act: no seq_bound_override — must use sym_map.to_bound()
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &m_dim, 8, 16, width, a, b, c, &[], &sym_map, false, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            &mut prog,
+            &m_dim,
+            8,
+            16,
+            width,
+            a,
+            b,
+            c,
+            &[],
+            &sym_map,
+            false,
+            None,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
 
         // Assert: symbolic M should produce a valid instruction stream
-        assert!(result.is_ok(), "symbolic M via sym_map should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "symbolic M via sym_map should succeed: {:?}",
+            result.err()
+        );
         assert!(!prog.instrs.is_empty());
         // Verify the M loop produces VecStore (not just zero-init)
-        let store_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::VecStore { .. })).count();
-        assert!(store_count > 0, "symbolic M GEMM should emit VecStore instructions");
+        let store_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::VecStore { .. }))
+            .count();
+        assert!(
+            store_count > 0,
+            "symbolic M GEMM should emit VecStore instructions"
+        );
     }
 
     #[test]
@@ -3945,15 +6236,46 @@ mod template_tests {
         // Act: M=10, N=10 with cta_m=8, cta_n=8, warp_m=4, warp_n=4
         // First CTA tile: mi=8, nj=8 (full). Second CTA tile: mi=2, nj=2 (partial)
         let result = emit_gemm_gpu_tiled_inline(
-            &mut prog, 10, 10, 16, width, a, b, c,
-            8, 8, 16, 4, 4, 16, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, false, false, &BoundExpr::Const(10),
+            &mut prog,
+            10,
+            10,
+            16,
+            width,
+            a,
+            b,
+            c,
+            8,
+            8,
+            16,
+            4,
+            4,
+            16,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+            QuantPrecision::BF16,
+            false,
+            false,
+            &BoundExpr::Const(10),
         );
 
         // Assert: partial tiles with BF16 should produce VecNarrow on writeback
-        assert!(result.is_ok(), "GPU tiled BF16 partial should succeed: {:?}", result.err());
-        let has_narrow = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecNarrow { .. }));
-        assert!(has_narrow, "BF16 GPU tiled with partial tiles should emit VecNarrow");
-        let has_store = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecStore { .. }));
+        assert!(
+            result.is_ok(),
+            "GPU tiled BF16 partial should succeed: {:?}",
+            result.err()
+        );
+        let has_narrow = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecNarrow { .. }));
+        assert!(
+            has_narrow,
+            "BF16 GPU tiled with partial tiles should emit VecNarrow"
+        );
+        let has_store = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecStore { .. }));
         assert!(has_store, "should emit VecStore for result writeback");
     }
 
@@ -3974,7 +6296,10 @@ mod template_tests {
 
         // Assert: structurally different — normal uses ScalarVReg(k_ctr) * row_stride,
         // trans uses LoopOffset(j_off) * k
-        assert_ne!(normal, trans, "normal and trans-B offset expressions should differ");
+        assert_ne!(
+            normal, trans,
+            "normal and trans-B offset expressions should differ"
+        );
         // Normal: first term is Mul(ScalarVReg(k_ctr), b_row_stride)
         if let OffsetExpr::Add(mul_term, _) = &normal {
             if let OffsetExpr::Mul(inner, factor) = mul_term.as_ref() {
@@ -4011,17 +6336,49 @@ mod template_tests {
         // Act: N=32, nr=2, lanes=8 -> nr*lanes=16 -> 2 J-blocks per M-block
         // Each J-block must zero its mr*nr_actual accumulator registers
         let result = emit_gemm_blis_inline(
-            &mut prog, 4, 32, 8, width, a, b, c, 4, 2, None, 1, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            &mut prog,
+            4,
+            32,
+            8,
+            width,
+            a,
+            b,
+            c,
+            4,
+            2,
+            None,
+            1,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            false,
         );
 
         // Assert: accumulator zero-init Broadcast(0.0) should appear multiple times
-        assert!(result.is_ok(), "BLIS GEMM should succeed: {:?}", result.err());
-        let zero_broadcasts = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::Broadcast { src: ScalarExpr::Const(0.0), .. })
-        }).count();
+        assert!(
+            result.is_ok(),
+            "BLIS GEMM should succeed: {:?}",
+            result.err()
+        );
+        let zero_broadcasts = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::Broadcast {
+                        src: ScalarExpr::Const(0.0),
+                        ..
+                    }
+                )
+            })
+            .count();
         // With 2 J-blocks and mr=4, nr=2 -> 4*2=8 acc per block -> at least 2*8=16 zero-inits
-        assert!(zero_broadcasts >= 16,
-            "should have at least 16 accumulator zero-inits (2 J-blocks × 8 accs), got {}", zero_broadcasts);
+        assert!(
+            zero_broadcasts >= 16,
+            "should have at least 16 accumulator zero-inits (2 J-blocks × 8 accs), got {}",
+            zero_broadcasts
+        );
     }
 
     #[test]
@@ -4029,25 +6386,60 @@ mod template_tests {
         // Arrange: MMA where kk < mma_k — single partial inner K iteration
         let mut prog = VmProgram::new();
         let width = SimdWidth::Warp(32);
-        let accs: Vec<VRegId> = (0..4).map(|_| prog.alloc_vreg(VRegKind::Vec, width)).collect();
+        let accs: Vec<VRegId> = (0..4)
+            .map(|_| prog.alloc_vreg(VRegKind::Vec, width))
+            .collect();
 
         // Act: mi=2, nj=2, kk=8, mma_k=16 -> single inner step with 8 elements
         emit_mma_on_smem(
-            &mut prog, &accs, "smem_a", "smem_b",
-            0, 0, 0, 2, 2, 8, // kk=8 < mma_k=16
-            2, 2, 16, 2, 2, 16,
-            16, 16, 4, 4, QuantPrecision::F32, width,
-            64, 64,
+            &mut prog,
+            &accs,
+            "smem_a",
+            "smem_b",
+            0,
+            0,
+            0,
+            2,
+            2,
+            8, // kk=8 < mma_k=16
+            2,
+            2,
+            16,
+            2,
+            2,
+            16,
+            16,
+            16,
+            4,
+            4,
+            QuantPrecision::F32,
+            width,
+            64,
+            64,
         );
 
         // Assert: single partial K step should emit SharedMemLoad + Fma for 2x2=4 accs
-        let fma_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::Fma { .. })).count();
-        let smem_load_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::SharedMemLoad { .. })).count();
-        assert_eq!(fma_count, 4,
-            "partial kk MMA should have exactly 4 FMAs (2×2), got {}", fma_count);
+        let fma_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::Fma { .. }))
+            .count();
+        let smem_load_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::SharedMemLoad { .. }))
+            .count();
+        assert_eq!(
+            fma_count, 4,
+            "partial kk MMA should have exactly 4 FMAs (2×2), got {}",
+            fma_count
+        );
         // A fragment is shared across columns: 2 A loads (per row) + 4 B loads (per row×col) = 6 SharedMemLoad
-        assert_eq!(smem_load_count, 6,
-            "partial kk MMA should have 6 SharedMemLoads (2 A + 4 B), got {}", smem_load_count);
+        assert_eq!(
+            smem_load_count, 6,
+            "partial kk MMA should have 6 SharedMemLoads (2 A + 4 B), got {}",
+            smem_load_count
+        );
     }
 
     #[test]
@@ -4059,18 +6451,43 @@ mod template_tests {
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
         let sym_map = SymDimSlotMap::mega_kernel_abi();
-        let m_dim = SymDim::Symbolic { name: "seq_len".into(), max_value: Some(2048) };
+        let m_dim = SymDim::Symbolic {
+            name: "seq_len".into(),
+            max_value: Some(2048),
+        };
         let override_bound = BoundExpr::Const(1); // Override to M=1 (decode path)
 
         // Act: symbolic M with override=1 for trans-B path
         let result = emit_gemm_trans_b_inline(
-            &mut prog, &m_dim, 8, 16, width, a, b, c, &[], &sym_map,
-            Some(&override_bound), QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, );
+            &mut prog,
+            &m_dim,
+            8,
+            16,
+            width,
+            a,
+            b,
+            c,
+            &[],
+            &sym_map,
+            Some(&override_bound),
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
 
         // Assert: override should work for trans-B path just like normal path
-        assert!(result.is_ok(), "trans-B symbolic M with override should succeed: {:?}", result.err());
-        let has_store = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecStore { .. }));
-        assert!(has_store, "trans-B GEMM with symbolic M override should emit VecStore");
+        assert!(
+            result.is_ok(),
+            "trans-B symbolic M with override should succeed: {:?}",
+            result.err()
+        );
+        let has_store = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecStore { .. }));
+        assert!(
+            has_store,
+            "trans-B GEMM with symbolic M override should emit VecStore"
+        );
     }
 }
-

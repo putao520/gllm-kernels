@@ -64,7 +64,10 @@ impl CompilationCache {
         let dir = default_cache_dir();
         if let Some(ref d) = dir {
             if let Err(e) = std::fs::create_dir_all(d) {
-                eprintln!("[gllm-kernels] warning: failed to create cache dir {}: {e}", d.display());
+                eprintln!(
+                    "[gllm-kernels] warning: failed to create cache dir {}: {e}",
+                    d.display()
+                );
             }
         }
         CompilationCache {
@@ -79,12 +82,9 @@ impl CompilationCache {
     pub fn lookup(&mut self, config_hash: u64) -> Option<(CompiledLayer, CacheSource)> {
         // Hot path: memory
         if let Some(entry) = self.entries.get(&config_hash) {
-            let layer = CompiledLayer::from_code(
-                &entry.code_bytes,
-                entry.scratchpad_bytes,
-                config_hash,
-            )
-            .ok()?;
+            let layer =
+                CompiledLayer::from_code(&entry.code_bytes, entry.scratchpad_bytes, config_hash)
+                    .ok()?;
             return Some((layer, CacheSource::Memory));
         }
 
@@ -112,12 +112,7 @@ impl CompilationCache {
     }
 
     /// Store a compiled layer in the cache.
-    pub fn put(
-        &mut self,
-        config_hash: u64,
-        code_bytes: &[u8],
-        scratchpad_bytes: usize,
-    ) {
+    pub fn put(&mut self, config_hash: u64, code_bytes: &[u8], scratchpad_bytes: usize) {
         let entry = CacheEntry {
             code_bytes: code_bytes.to_vec(),
             scratchpad_bytes,
@@ -370,7 +365,8 @@ unsafe fn crc32c_hw(data: &[u8]) -> u32 {
     // Process 8 bytes at a time
     while i + 8 <= len {
         // SAFETY: loop guard `i + 8 <= len` ensures exactly 8 bytes available
-        let chunk = u64::from_le_bytes(data[i..i + 8].try_into().expect("slice is exactly 8 bytes"));
+        let chunk =
+            u64::from_le_bytes(data[i..i + 8].try_into().expect("slice is exactly 8 bytes"));
         crc = _mm_crc32_u64(crc, chunk);
         i += 8;
     }
@@ -428,7 +424,7 @@ pub struct IncrementalCompileResult {
 
 // ── OpTrace persistence ─────────────────────────────────────────────
 
-use crate::compiler::trace::{TraceOp, ValueId, Fp8Format, ScaleSelector};
+use crate::compiler::trace::{Fp8Format, ScaleSelector, TraceOp, ValueId};
 use crate::quant_format::PackedScaleAlgorithm;
 
 /// Compact binary representation of a TraceOp.
@@ -443,114 +439,643 @@ struct SerializedTraceOp {
 impl SerializedTraceOp {
     fn from_trace_op(op: &TraceOp) -> Self {
         match op {
-            TraceOp::Input(n) => Self { tag: 0, operands: [*n, 0, 0, 0], float_val: 0.0 },
-            TraceOp::Const(v) => Self { tag: 1, operands: [0, 0, 0, 0], float_val: *v },
-            TraceOp::Add(a, b) => Self { tag: 2, operands: [a.0, b.0, 0, 0], float_val: 0.0 },
-            TraceOp::Sub(a, b) => Self { tag: 3, operands: [a.0, b.0, 0, 0], float_val: 0.0 },
-            TraceOp::Mul(a, b) => Self { tag: 4, operands: [a.0, b.0, 0, 0], float_val: 0.0 },
-            TraceOp::Div(a, b) => Self { tag: 5, operands: [a.0, b.0, 0, 0], float_val: 0.0 },
-            TraceOp::Pow(a, b) => Self { tag: 42, operands: [a.0, b.0, 0, 0], float_val: 0.0 },
-            TraceOp::Fma(a, b, c) => Self { tag: 6, operands: [a.0, b.0, c.0, 0], float_val: 0.0 },
-            TraceOp::Neg(a) => Self { tag: 7, operands: [a.0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::Abs(a) => Self { tag: 8, operands: [a.0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::Exp(a) => Self { tag: 9, operands: [a.0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::Sqrt(a) => Self { tag: 10, operands: [a.0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::Rsqrt(a) => Self { tag: 11, operands: [a.0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::Tanh(a) => Self { tag: 12, operands: [a.0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::Recip(a) => Self { tag: 13, operands: [a.0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::Log(a) => Self { tag: 16, operands: [a.0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::Max(a, b) => Self { tag: 14, operands: [a.0, b.0, 0, 0], float_val: 0.0 },
-            TraceOp::Min(a, b) => Self { tag: 15, operands: [a.0, b.0, 0, 0], float_val: 0.0 },
-            TraceOp::ConditionalBranch(mask, t_val, f_val) => Self { tag: 17, operands: [mask.0, t_val.0, f_val.0, 0], float_val: 0.0 },
-            TraceOp::QuantFma { acc, act, weight, .. } => Self { tag: 18, operands: [acc.0, act.0, weight.0, 0], float_val: 0.0 },
-            TraceOp::BlockScale { data, scale, block_size } => Self { tag: 19, operands: [data.0, scale.0, *block_size as u32, 0], float_val: 0.0 },
-            TraceOp::Cast { src, .. } => Self { tag: 20, operands: [src.0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::HReduce { src, .. } => Self { tag: 21, operands: [src.0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::Prefetch { .. } => Self { tag: 22, operands: [0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::NonTemporalStore => Self { tag: 23, operands: [0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::BitExtract { src, offset, width } => Self { tag: 24, operands: [src.0, *offset, (*width), 0], float_val: 0.0 },
-            TraceOp::Permute { src, indices } => Self { tag: 25, operands: [src.0, indices.0, 0, 0], float_val: 0.0 },
-            TraceOp::Compare { a, b, .. } => Self { tag: 26, operands: [a.0, b.0, 0, 0], float_val: 0.0 },
-            TraceOp::MaskedOp { mask, .. } => Self { tag: 27, operands: [mask.0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::AtomicAdd { addr, val } => Self { tag: 28, operands: [addr.0, val.0, 0, 0], float_val: 0.0 },
-            TraceOp::FWHT { src, dim } => Self { tag: 29, operands: [src.0, *dim as u32, 0, 0], float_val: 0.0 },
-            TraceOp::ScalarLoad { base, offset } => Self { tag: 30, operands: [base.0, offset.0, 0, 0], float_val: 0.0 },
-            TraceOp::StrideMul { value, stride } => Self { tag: 31, operands: [value.0, *stride as u32, 0, 0], float_val: 0.0 },
-            TraceOp::PtrAdd { base, offset } => Self { tag: 32, operands: [base.0, offset.0, 0, 0], float_val: 0.0 },
-            TraceOp::VecLoadIndexed { base, offset } => Self { tag: 33, operands: [base.0, offset.0, 0, 0], float_val: 0.0 },
-            TraceOp::VecStoreIndexed { base, offset, value } => Self { tag: 34, operands: [base.0, offset.0, value.0, 0], float_val: 0.0 },
-            TraceOp::BroadcastScalar { src } => Self { tag: 35, operands: [src.0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::BroadcastLoad { base, offset } => Self { tag: 38, operands: [base.0, offset.0, 0, 0], float_val: 0.0 },
-            TraceOp::GatherLoad { base, indices, stride } => Self { tag: 36, operands: [base.0, indices.0, *stride as u32, 0], float_val: 0.0 },
-            TraceOp::ScatterStore { base, indices, value, stride } => Self { tag: 37, operands: [base.0, indices.0, value.0, 0], float_val: *stride as f64 },
-            TraceOp::TableLookup { base, row_index, row_bytes } => Self { tag: 38, operands: [base.0, row_index.0, *row_bytes as u32, 0], float_val: 0.0 },
-            TraceOp::Mxfp4Dequant { data, scales, off_a, stride_a: _, off_b: _, stride_b: _, off_c: _, const_off, block_size } =>
-                Self { tag: 39, operands: [data.0, scales.0, off_a.as_ref().map_or(u32::MAX, |v| v.0), *block_size as u32], float_val: *const_off as f64 },
-            TraceOp::Sigmoid(a) => Self { tag: 40, operands: [a.0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::BitAnd(a, b) => Self { tag: 41, operands: [a.0, b.0, 0, 0], float_val: 0.0 },
-            TraceOp::QuantBitAnd { lhs, rhs } => Self { tag: 50, operands: [lhs.0, rhs.0, 0, 0], float_val: 0.0 },
-            TraceOp::QuantBitOr { lhs, rhs } => Self { tag: 51, operands: [lhs.0, rhs.0, 0, 0], float_val: 0.0 },
-            TraceOp::QuantBroadcast { src, lanes } => Self { tag: 52, operands: [src.0, *lanes as u32, 0, 0], float_val: 0.0 },
-            TraceOp::QuantCastF16toF32 { src } => Self { tag: 53, operands: [src.0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::QuantCastI8toF32 { src } => Self { tag: 54, operands: [src.0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::QuantCastFp8toF32 { src, format } => Self { tag: match format { Fp8Format::E4M3 => 98, Fp8Format::E5M2 => 99 }, operands: [src.0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::QuantCodebookLookup { indices, vector_size, bits_per_entry, .. } =>
-                Self { tag: 55, operands: [indices.0, *vector_size as u32, *bits_per_entry as u32, 0], float_val: 0.0 },
-            TraceOp::QuantExtractBits { src, bit_offset, bit_width } =>
-                Self { tag: 56, operands: [src.0, *bit_offset, *bit_width as u32, 0], float_val: 0.0 },
-            TraceOp::QuantDequantFma { acc, a, b } => Self { tag: 57, operands: [acc.0, a.0, b.0, 0], float_val: 0.0 },
-            TraceOp::QuantIntDivConst { src, divisor } => Self { tag: 58, operands: [src.0, 0, 0, 0], float_val: *divisor as f64 },
-            TraceOp::QuantIntMul { src, factor } => Self { tag: 59, operands: [src.0, 0, 0, 0], float_val: *factor as f64 },
-            TraceOp::QuantInterleave { lo, hi } => Self { tag: 60, operands: [lo.0, hi.0, 0, 0], float_val: 0.0 },
-            TraceOp::QuantConcatSeq { lo, hi } => Self { tag: 61, operands: [lo.0, hi.0, 0, 0], float_val: 0.0 },
-            TraceOp::QuantPtrAddOffset { base, offset_bytes } => Self { tag: 66, operands: [base.0, 0, 0, 0], float_val: *offset_bytes as f64 },
-            TraceOp::QuantPtrAddDynamic { base, index } => Self { tag: 67, operands: [base.0, index.0, 0, 0], float_val: 0.0 },
-            TraceOp::QuantAndMask { src, mask } => Self { tag: 68, operands: [src.0, 0, 0, 0], float_val: *mask as f64 },
-            TraceOp::QuantScalarLoad { ptr, offset_bytes } => Self { tag: 61, operands: [ptr.0, 0, 0, 0], float_val: *offset_bytes as f64 },
-            TraceOp::QuantLoadF16toF32 { ptr, offset_bytes } => Self { tag: 64, operands: [ptr.0, 0, 0, 0], float_val: *offset_bytes as f64 },
-            TraceOp::QuantLoadI8toF32 { ptr, offset_bytes } => Self { tag: 65, operands: [ptr.0, 0, 0, 0], float_val: *offset_bytes as f64 },
-            TraceOp::QuantShiftLeft { src, amount } => Self { tag: 62, operands: [src.0, *amount, 0, 0], float_val: 0.0 },
-            TraceOp::QuantShiftRight { src, amount } => Self { tag: 63, operands: [src.0, *amount, 0, 0], float_val: 0.0 },
-            TraceOp::QuantScaleLoad { source, offset, .. } => Self { tag: 66, operands: [source.0, 0, 0, 0], float_val: *offset as f64 },
-            TraceOp::QuantDataLoad { source, offset, .. } => Self { tag: 67, operands: [source.0, 0, 0, 0], float_val: *offset as f64 },
-            TraceOp::QuantZeroLoad { source, offset, .. } => Self { tag: 68, operands: [source.0, 0, 0, 0], float_val: *offset as f64 },
-            TraceOp::QuantSubScaleLoad { block_ptr, byte_offset, .. } => Self { tag: 69, operands: [block_ptr.0, 0, 0, 0], float_val: *byte_offset as f64 },
-            TraceOp::QuantHighBitsLoad { block_ptr, byte_offset, .. } => Self { tag: 70, operands: [block_ptr.0, 0, 0, 0], float_val: *byte_offset as f64 },
-            TraceOp::QuantCodebookDequant { indices, codebook_ptr, vector_size, bits_per_entry } => Self { tag: 71, operands: [indices.0, codebook_ptr.0, *vector_size as u32, *bits_per_entry as u32], float_val: 0.0 },
-            TraceOp::QuantE2m1LutDecode { packed_data_ptr, scale_byte, nvfp4_mode } => Self { tag: 72, operands: [packed_data_ptr.0, scale_byte.0, *nvfp4_mode as u32, 0], float_val: 0.0 },
-            TraceOp::QuantLoadBytesVec { ptr, offset_bytes, count, signed } => Self { tag: 73, operands: [ptr.0, *signed as u32, *count as u32, 0], float_val: *offset_bytes as f64 },
-            TraceOp::QuantKQuantPackedScaleLookup { scales_base, sub_block_idx, scale_algo, selector } => Self { tag: 74, operands: [scales_base.0, sub_block_idx.0, matches!(scale_algo, PackedScaleAlgorithm::Q3KExtended) as u32, matches!(selector, ScaleSelector::Min) as u32], float_val: 0.0 },
-            TraceOp::Loop { .. } => Self { tag: 80, operands: [0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::PanelLoad { base, offset, rows, cols } => Self { tag: 81, operands: [base.0, offset.0, *rows as u32, *cols as u32], float_val: 0.0 },
-            TraceOp::PanelStore { base, offset, rows, cols } => Self { tag: 82, operands: [base.0, offset.0, *rows as u32, *cols as u32], float_val: 0.0 },
-            TraceOp::PackBuffer { src, dst, rows, cols, .. } => Self { tag: 83, operands: [src.0, dst.0, *rows as u32, *cols as u32], float_val: 0.0 },
-            TraceOp::SharedMemDeclare { bytes, .. } => Self { tag: 84, operands: [0, 0, 0, 0], float_val: *bytes as f64 },
-            TraceOp::AsyncCopyToShared { src_offset, bytes, .. } => Self { tag: 85, operands: [src_offset.0, 0, 0, 0], float_val: *bytes as f64 },
-            TraceOp::AsyncWaitGroup { n } => Self { tag: 86, operands: [*n, 0, 0, 0], float_val: 0.0 },
-            TraceOp::SyncBarrier { .. } => Self { tag: 87, operands: [0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::TileConfig { rows, cols } => Self { tag: 88, operands: [*rows as u32, *cols as u32, 0, 0], float_val: 0.0 },
+            TraceOp::Input(n) => Self {
+                tag: 0,
+                operands: [*n, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::Const(v) => Self {
+                tag: 1,
+                operands: [0, 0, 0, 0],
+                float_val: *v,
+            },
+            TraceOp::Add(a, b) => Self {
+                tag: 2,
+                operands: [a.0, b.0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::Sub(a, b) => Self {
+                tag: 3,
+                operands: [a.0, b.0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::Mul(a, b) => Self {
+                tag: 4,
+                operands: [a.0, b.0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::Div(a, b) => Self {
+                tag: 5,
+                operands: [a.0, b.0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::Pow(a, b) => Self {
+                tag: 42,
+                operands: [a.0, b.0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::Fma(a, b, c) => Self {
+                tag: 6,
+                operands: [a.0, b.0, c.0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::Neg(a) => Self {
+                tag: 7,
+                operands: [a.0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::Abs(a) => Self {
+                tag: 8,
+                operands: [a.0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::Exp(a) => Self {
+                tag: 9,
+                operands: [a.0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::Sqrt(a) => Self {
+                tag: 10,
+                operands: [a.0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::Rsqrt(a) => Self {
+                tag: 11,
+                operands: [a.0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::Tanh(a) => Self {
+                tag: 12,
+                operands: [a.0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::Recip(a) => Self {
+                tag: 13,
+                operands: [a.0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::Log(a) => Self {
+                tag: 16,
+                operands: [a.0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::Max(a, b) => Self {
+                tag: 14,
+                operands: [a.0, b.0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::Min(a, b) => Self {
+                tag: 15,
+                operands: [a.0, b.0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::ConditionalBranch(mask, t_val, f_val) => Self {
+                tag: 17,
+                operands: [mask.0, t_val.0, f_val.0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::QuantFma {
+                acc, act, weight, ..
+            } => Self {
+                tag: 18,
+                operands: [acc.0, act.0, weight.0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::BlockScale {
+                data,
+                scale,
+                block_size,
+            } => Self {
+                tag: 19,
+                operands: [data.0, scale.0, *block_size as u32, 0],
+                float_val: 0.0,
+            },
+            TraceOp::Cast { src, .. } => Self {
+                tag: 20,
+                operands: [src.0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::HReduce { src, .. } => Self {
+                tag: 21,
+                operands: [src.0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::Prefetch { .. } => Self {
+                tag: 22,
+                operands: [0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::NonTemporalStore => Self {
+                tag: 23,
+                operands: [0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::BitExtract { src, offset, width } => Self {
+                tag: 24,
+                operands: [src.0, *offset, (*width), 0],
+                float_val: 0.0,
+            },
+            TraceOp::Permute { src, indices } => Self {
+                tag: 25,
+                operands: [src.0, indices.0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::Compare { a, b, .. } => Self {
+                tag: 26,
+                operands: [a.0, b.0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::MaskedOp { mask, .. } => Self {
+                tag: 27,
+                operands: [mask.0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::AtomicAdd { addr, val } => Self {
+                tag: 28,
+                operands: [addr.0, val.0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::FWHT { src, dim } => Self {
+                tag: 29,
+                operands: [src.0, *dim as u32, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::ScalarLoad { base, offset } => Self {
+                tag: 30,
+                operands: [base.0, offset.0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::StrideMul { value, stride } => Self {
+                tag: 31,
+                operands: [value.0, *stride as u32, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::PtrAdd { base, offset } => Self {
+                tag: 32,
+                operands: [base.0, offset.0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::VecLoadIndexed { base, offset } => Self {
+                tag: 33,
+                operands: [base.0, offset.0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::VecStoreIndexed {
+                base,
+                offset,
+                value,
+            } => Self {
+                tag: 34,
+                operands: [base.0, offset.0, value.0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::BroadcastScalar { src } => Self {
+                tag: 35,
+                operands: [src.0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::BroadcastLoad { base, offset } => Self {
+                tag: 38,
+                operands: [base.0, offset.0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::GatherLoad {
+                base,
+                indices,
+                stride,
+            } => Self {
+                tag: 36,
+                operands: [base.0, indices.0, *stride as u32, 0],
+                float_val: 0.0,
+            },
+            TraceOp::ScatterStore {
+                base,
+                indices,
+                value,
+                stride,
+            } => Self {
+                tag: 37,
+                operands: [base.0, indices.0, value.0, 0],
+                float_val: *stride as f64,
+            },
+            TraceOp::TableLookup {
+                base,
+                row_index,
+                row_bytes,
+            } => Self {
+                tag: 38,
+                operands: [base.0, row_index.0, *row_bytes as u32, 0],
+                float_val: 0.0,
+            },
+            TraceOp::Mxfp4Dequant {
+                data,
+                scales,
+                off_a,
+                stride_a: _,
+                off_b: _,
+                stride_b: _,
+                off_c: _,
+                const_off,
+                block_size,
+            } => Self {
+                tag: 39,
+                operands: [
+                    data.0,
+                    scales.0,
+                    off_a.as_ref().map_or(u32::MAX, |v| v.0),
+                    *block_size as u32,
+                ],
+                float_val: *const_off as f64,
+            },
+            TraceOp::Sigmoid(a) => Self {
+                tag: 40,
+                operands: [a.0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::BitAnd(a, b) => Self {
+                tag: 41,
+                operands: [a.0, b.0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::QuantBitAnd { lhs, rhs } => Self {
+                tag: 50,
+                operands: [lhs.0, rhs.0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::QuantBitOr { lhs, rhs } => Self {
+                tag: 51,
+                operands: [lhs.0, rhs.0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::QuantBroadcast { src, lanes } => Self {
+                tag: 52,
+                operands: [src.0, *lanes as u32, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::QuantCastF16toF32 { src } => Self {
+                tag: 53,
+                operands: [src.0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::QuantCastI8toF32 { src } => Self {
+                tag: 54,
+                operands: [src.0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::QuantCastFp8toF32 { src, format } => Self {
+                tag: match format {
+                    Fp8Format::E4M3 => 98,
+                    Fp8Format::E5M2 => 99,
+                },
+                operands: [src.0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::QuantCodebookLookup {
+                indices,
+                vector_size,
+                bits_per_entry,
+                ..
+            } => Self {
+                tag: 55,
+                operands: [indices.0, *vector_size as u32, *bits_per_entry as u32, 0],
+                float_val: 0.0,
+            },
+            TraceOp::QuantExtractBits {
+                src,
+                bit_offset,
+                bit_width,
+            } => Self {
+                tag: 56,
+                operands: [src.0, *bit_offset, *bit_width as u32, 0],
+                float_val: 0.0,
+            },
+            TraceOp::QuantDequantFma { acc, a, b } => Self {
+                tag: 57,
+                operands: [acc.0, a.0, b.0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::QuantIntDivConst { src, divisor } => Self {
+                tag: 58,
+                operands: [src.0, 0, 0, 0],
+                float_val: *divisor as f64,
+            },
+            TraceOp::QuantIntMul { src, factor } => Self {
+                tag: 59,
+                operands: [src.0, 0, 0, 0],
+                float_val: *factor as f64,
+            },
+            TraceOp::QuantInterleave { lo, hi } => Self {
+                tag: 60,
+                operands: [lo.0, hi.0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::QuantConcatSeq { lo, hi } => Self {
+                tag: 61,
+                operands: [lo.0, hi.0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::QuantPtrAddOffset { base, offset_bytes } => Self {
+                tag: 66,
+                operands: [base.0, 0, 0, 0],
+                float_val: *offset_bytes as f64,
+            },
+            TraceOp::QuantPtrAddDynamic { base, index } => Self {
+                tag: 67,
+                operands: [base.0, index.0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::QuantAndMask { src, mask } => Self {
+                tag: 68,
+                operands: [src.0, 0, 0, 0],
+                float_val: *mask as f64,
+            },
+            TraceOp::QuantScalarLoad { ptr, offset_bytes } => Self {
+                tag: 61,
+                operands: [ptr.0, 0, 0, 0],
+                float_val: *offset_bytes as f64,
+            },
+            TraceOp::QuantLoadF16toF32 { ptr, offset_bytes } => Self {
+                tag: 64,
+                operands: [ptr.0, 0, 0, 0],
+                float_val: *offset_bytes as f64,
+            },
+            TraceOp::QuantLoadI8toF32 { ptr, offset_bytes } => Self {
+                tag: 65,
+                operands: [ptr.0, 0, 0, 0],
+                float_val: *offset_bytes as f64,
+            },
+            TraceOp::QuantShiftLeft { src, amount } => Self {
+                tag: 62,
+                operands: [src.0, *amount, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::QuantShiftRight { src, amount } => Self {
+                tag: 63,
+                operands: [src.0, *amount, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::QuantScaleLoad { source, offset, .. } => Self {
+                tag: 66,
+                operands: [source.0, 0, 0, 0],
+                float_val: *offset as f64,
+            },
+            TraceOp::QuantDataLoad { source, offset, .. } => Self {
+                tag: 67,
+                operands: [source.0, 0, 0, 0],
+                float_val: *offset as f64,
+            },
+            TraceOp::QuantZeroLoad { source, offset, .. } => Self {
+                tag: 68,
+                operands: [source.0, 0, 0, 0],
+                float_val: *offset as f64,
+            },
+            TraceOp::QuantSubScaleLoad {
+                block_ptr,
+                byte_offset,
+                ..
+            } => Self {
+                tag: 69,
+                operands: [block_ptr.0, 0, 0, 0],
+                float_val: *byte_offset as f64,
+            },
+            TraceOp::QuantHighBitsLoad {
+                block_ptr,
+                byte_offset,
+                ..
+            } => Self {
+                tag: 70,
+                operands: [block_ptr.0, 0, 0, 0],
+                float_val: *byte_offset as f64,
+            },
+            TraceOp::QuantCodebookDequant {
+                indices,
+                codebook_ptr,
+                vector_size,
+                bits_per_entry,
+            } => Self {
+                tag: 71,
+                operands: [
+                    indices.0,
+                    codebook_ptr.0,
+                    *vector_size as u32,
+                    *bits_per_entry as u32,
+                ],
+                float_val: 0.0,
+            },
+            TraceOp::QuantE2m1LutDecode {
+                packed_data_ptr,
+                scale_byte,
+                nvfp4_mode,
+            } => Self {
+                tag: 72,
+                operands: [packed_data_ptr.0, scale_byte.0, *nvfp4_mode as u32, 0],
+                float_val: 0.0,
+            },
+            TraceOp::QuantLoadBytesVec {
+                ptr,
+                offset_bytes,
+                count,
+                signed,
+            } => Self {
+                tag: 73,
+                operands: [ptr.0, *signed as u32, *count as u32, 0],
+                float_val: *offset_bytes as f64,
+            },
+            TraceOp::QuantKQuantPackedScaleLookup {
+                scales_base,
+                sub_block_idx,
+                scale_algo,
+                selector,
+            } => Self {
+                tag: 74,
+                operands: [
+                    scales_base.0,
+                    sub_block_idx.0,
+                    matches!(scale_algo, PackedScaleAlgorithm::Q3KExtended) as u32,
+                    matches!(selector, ScaleSelector::Min) as u32,
+                ],
+                float_val: 0.0,
+            },
+            TraceOp::Loop { .. } => Self {
+                tag: 80,
+                operands: [0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::PanelLoad {
+                base,
+                offset,
+                rows,
+                cols,
+            } => Self {
+                tag: 81,
+                operands: [base.0, offset.0, *rows as u32, *cols as u32],
+                float_val: 0.0,
+            },
+            TraceOp::PanelStore {
+                base,
+                offset,
+                rows,
+                cols,
+            } => Self {
+                tag: 82,
+                operands: [base.0, offset.0, *rows as u32, *cols as u32],
+                float_val: 0.0,
+            },
+            TraceOp::PackBuffer {
+                src,
+                dst,
+                rows,
+                cols,
+                ..
+            } => Self {
+                tag: 83,
+                operands: [src.0, dst.0, *rows as u32, *cols as u32],
+                float_val: 0.0,
+            },
+            TraceOp::SharedMemDeclare { bytes, .. } => Self {
+                tag: 84,
+                operands: [0, 0, 0, 0],
+                float_val: *bytes as f64,
+            },
+            TraceOp::AsyncCopyToShared {
+                src_offset, bytes, ..
+            } => Self {
+                tag: 85,
+                operands: [src_offset.0, 0, 0, 0],
+                float_val: *bytes as f64,
+            },
+            TraceOp::AsyncWaitGroup { n } => Self {
+                tag: 86,
+                operands: [*n, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::SyncBarrier { .. } => Self {
+                tag: 87,
+                operands: [0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::TileConfig { rows, cols } => Self {
+                tag: 88,
+                operands: [*rows as u32, *cols as u32, 0, 0],
+                float_val: 0.0,
+            },
             TraceOp::TileMma { c, a, b, m, n, k } => {
                 // operands 装不下 6 个值 (c,a,b,m,n,k): [c, a, b, m] 进 operands,
                 // (n, k) 进 float_val 位 reinterpret 为两个 u32 (低32=n, 高32=k)。
                 // tile 维度通常 ≤ u16, u32 容纳无溢出; 解码侧 to_trace_op tag 89 还原。
                 let nk: u64 = (*n as u64) | ((*k as u64) << 32);
-                Self { tag: 89, operands: [c.0, a.0, b.0, *m as u32], float_val: f64::from_bits(nk) }
+                Self {
+                    tag: 89,
+                    operands: [c.0, a.0, b.0, *m as u32],
+                    float_val: f64::from_bits(nk),
+                }
+            }
+            TraceOp::TileRelease => Self {
+                tag: 90,
+                operands: [0, 0, 0, 0],
+                float_val: 0.0,
             },
-            TraceOp::TileRelease => Self { tag: 90, operands: [0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::Softmax { src, dst } => Self { tag: 91, operands: [src.0, dst.0, 0, 0], float_val: 0.0 },
-            TraceOp::EpilogueChain { .. } => Self { tag: 92, operands: [0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::QuantGather { .. } => Self { tag: 93, operands: [0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::QuantGemm { .. } => Self { tag: 94, operands: [0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::MtpDraft { .. } => Self { tag: 95, operands: [0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::MlaAttnScore { .. } => Self { tag: 96, operands: [0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::MlaRopeMerge { .. } => Self { tag: 97, operands: [0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::Tma2DCopy { .. } => Self { tag: 128, operands: [0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::DynamicPrecisionSelect { .. } => Self { tag: 129, operands: [0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::QuantQ3KDecode { block_base, lane_offset, d_slot, .. } => Self { tag: 130, operands: [block_base.0, lane_offset.0, d_slot.0, 0], float_val: 0.0 },
-            TraceOp::QuantQ6KDecode { block_base, lane_offset, d_slot, .. } => Self { tag: 131, operands: [block_base.0, lane_offset.0, d_slot.0, 0], float_val: 0.0 },
-            TraceOp::QuantQ5Decode { block_base, lane_offset, d_slot, has_min, .. } => Self { tag: 132, operands: [block_base.0, lane_offset.0, d_slot.0, if *has_min {1} else {0}], float_val: 0.0 },
-            TraceOp::QuantQ5KDecode { block_base, lane_offset, d_slot, .. } => Self { tag: 133, operands: [block_base.0, lane_offset.0, d_slot.0, 0], float_val: 0.0 },
-            TraceOp::QuantQ4KDecode { block_base, lane_offset, d_slot, .. } => Self { tag: 134, operands: [block_base.0, lane_offset.0, d_slot.0, 0], float_val: 0.0 },
+            TraceOp::Softmax { src, dst } => Self {
+                tag: 91,
+                operands: [src.0, dst.0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::EpilogueChain { .. } => Self {
+                tag: 92,
+                operands: [0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::QuantGather { .. } => Self {
+                tag: 93,
+                operands: [0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::QuantGemm { .. } => Self {
+                tag: 94,
+                operands: [0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::MtpDraft { .. } => Self {
+                tag: 95,
+                operands: [0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::MlaAttnScore { .. } => Self {
+                tag: 96,
+                operands: [0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::MlaRopeMerge { .. } => Self {
+                tag: 97,
+                operands: [0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::Tma2DCopy { .. } => Self {
+                tag: 128,
+                operands: [0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::DynamicPrecisionSelect { .. } => Self {
+                tag: 129,
+                operands: [0, 0, 0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::QuantQ3KDecode {
+                block_base,
+                lane_offset,
+                d_slot,
+                ..
+            } => Self {
+                tag: 130,
+                operands: [block_base.0, lane_offset.0, d_slot.0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::QuantQ6KDecode {
+                block_base,
+                lane_offset,
+                d_slot,
+                ..
+            } => Self {
+                tag: 131,
+                operands: [block_base.0, lane_offset.0, d_slot.0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::QuantQ5Decode {
+                block_base,
+                lane_offset,
+                d_slot,
+                has_min,
+                ..
+            } => Self {
+                tag: 132,
+                operands: [
+                    block_base.0,
+                    lane_offset.0,
+                    d_slot.0,
+                    if *has_min { 1 } else { 0 },
+                ],
+                float_val: 0.0,
+            },
+            TraceOp::QuantQ5KDecode {
+                block_base,
+                lane_offset,
+                d_slot,
+                ..
+            } => Self {
+                tag: 133,
+                operands: [block_base.0, lane_offset.0, d_slot.0, 0],
+                float_val: 0.0,
+            },
+            TraceOp::QuantQ4KDecode {
+                block_base,
+                lane_offset,
+                d_slot,
+                ..
+            } => Self {
+                tag: 134,
+                operands: [block_base.0, lane_offset.0, d_slot.0, 0],
+                float_val: 0.0,
+            },
         }
     }
 
@@ -575,14 +1100,22 @@ impl SerializedTraceOp {
             15 => Some(TraceOp::Min(ValueId(o[0]), ValueId(o[1]))),
             16 => Some(TraceOp::Log(ValueId(o[0]))),
             42 => Some(TraceOp::Pow(ValueId(o[0]), ValueId(o[1]))),
-            17 => Some(TraceOp::ConditionalBranch(ValueId(o[0]), ValueId(o[1]), ValueId(o[2]))),
+            17 => Some(TraceOp::ConditionalBranch(
+                ValueId(o[0]),
+                ValueId(o[1]),
+                ValueId(o[2]),
+            )),
             40 => Some(TraceOp::Sigmoid(ValueId(o[0]))),
             41 => Some(TraceOp::BitAnd(ValueId(o[0]), ValueId(o[1]))),
             // Mxfp4Dequant: partial deserialization (offset components use defaults)
             39 => Some(TraceOp::Mxfp4Dequant {
                 data: ValueId(o[0]),
                 scales: ValueId(o[1]),
-                off_a: if o[2] == u32::MAX { None } else { Some(ValueId(o[2])) },
+                off_a: if o[2] == u32::MAX {
+                    None
+                } else {
+                    Some(ValueId(o[2]))
+                },
                 stride_a: 0,
                 off_b: None,
                 stride_b: 0,
@@ -604,13 +1137,33 @@ impl SerializedTraceOp {
             74 => Some(TraceOp::QuantKQuantPackedScaleLookup {
                 scales_base: ValueId(o[0]),
                 sub_block_idx: ValueId(o[1]),
-                scale_algo: if o[2] != 0 { PackedScaleAlgorithm::Q3KExtended } else { PackedScaleAlgorithm::KQuant6Bit },
-                selector: if o[3] != 0 { ScaleSelector::Min } else { ScaleSelector::Scale },
+                scale_algo: if o[2] != 0 {
+                    PackedScaleAlgorithm::Q3KExtended
+                } else {
+                    PackedScaleAlgorithm::KQuant6Bit
+                },
+                selector: if o[3] != 0 {
+                    ScaleSelector::Min
+                } else {
+                    ScaleSelector::Scale
+                },
             }),
-            95 => Some(TraceOp::MtpDraft { depth: 1, hidden_size: 1, vocab_size: 1 }),
-            96 => Some(TraceOp::MlaAttnScore { num_heads: 1, head_dim: 1, d_c: 1, d_rope: 1 }),
+            95 => Some(TraceOp::MtpDraft {
+                depth: 1,
+                hidden_size: 1,
+                vocab_size: 1,
+            }),
+            96 => Some(TraceOp::MlaAttnScore {
+                num_heads: 1,
+                head_dim: 1,
+                d_c: 1,
+                d_rope: 1,
+            }),
             97 => Some(TraceOp::MlaRopeMerge { d_c: 1, d_rope: 1 }),
-            88 => Some(TraceOp::TileConfig { rows: o[0] as usize, cols: o[1] as usize }),
+            88 => Some(TraceOp::TileConfig {
+                rows: o[0] as usize,
+                cols: o[1] as usize,
+            }),
             89 => {
                 // TileMma round-trip: operands=[c, a, b, m], float_val bits=(n | k<<32)。
                 let nk = self.float_val.to_bits();
@@ -624,9 +1177,20 @@ impl SerializedTraceOp {
                 })
             }
             90 => Some(TraceOp::TileRelease),
-            98 => Some(TraceOp::QuantCastFp8toF32 { src: ValueId(o[0]), format: Fp8Format::E4M3 }),
-            99 => Some(TraceOp::QuantCastFp8toF32 { src: ValueId(o[0]), format: Fp8Format::E5M2 }),
-            128 => Some(TraceOp::Tma2DCopy { desc: String::new(), coord_x: ValueId(0), coord_y: ValueId(0), bytes: 0 }),
+            98 => Some(TraceOp::QuantCastFp8toF32 {
+                src: ValueId(o[0]),
+                format: Fp8Format::E4M3,
+            }),
+            99 => Some(TraceOp::QuantCastFp8toF32 {
+                src: ValueId(o[0]),
+                format: Fp8Format::E5M2,
+            }),
+            128 => Some(TraceOp::Tma2DCopy {
+                desc: String::new(),
+                coord_x: ValueId(0),
+                coord_y: ValueId(0),
+                bytes: 0,
+            }),
             130 => Some(TraceOp::QuantQ3KDecode {
                 block_base: ValueId(o[0]),
                 lane_offset: ValueId(o[1]),
@@ -682,14 +1246,20 @@ impl SerializedTraceOp {
     }
 
     fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < 25 { return None; }
+        if data.len() < 25 {
+            return None;
+        }
         let tag = data[0];
         let o0 = u32::from_le_bytes(data[1..5].try_into().ok()?);
         let o1 = u32::from_le_bytes(data[5..9].try_into().ok()?);
         let o2 = u32::from_le_bytes(data[9..13].try_into().ok()?);
         let o3 = u32::from_le_bytes(data[13..17].try_into().ok()?);
         let fv = f64::from_le_bytes(data[17..25].try_into().ok()?);
-        Some(Self { tag, operands: [o0, o1, o2, o3], float_val: fv })
+        Some(Self {
+            tag,
+            operands: [o0, o1, o2, o3],
+            float_val: fv,
+        })
     }
 }
 
@@ -707,12 +1277,16 @@ pub fn serialize_trace_ops(ops: &[TraceOp]) -> Vec<u8> {
 
 /// Deserialize a `Vec<TraceOp>` from bytes.
 pub fn deserialize_trace_ops(data: &[u8]) -> Option<Vec<TraceOp>> {
-    if data.len() < 4 { return None; }
+    if data.len() < 4 {
+        return None;
+    }
     let count = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
     let mut ops = Vec::with_capacity(count);
     let mut offset = 4;
     for _ in 0..count {
-        if offset + 28 > data.len() { return None; }
+        if offset + 28 > data.len() {
+            return None;
+        }
         let sop = SerializedTraceOp::from_bytes(&data[offset..offset + 28])?;
         ops.push(sop.to_trace_op()?);
         offset += 28;
@@ -748,9 +1322,7 @@ pub struct CacheStats {
 impl CompilationCache {
     /// Get cache statistics.
     pub fn stats(&self) -> CacheStats {
-        let total_code_bytes: usize = self.entries.values()
-            .map(|e| e.code_bytes.len())
-            .sum();
+        let total_code_bytes: usize = self.entries.values().map(|e| e.code_bytes.len()).sum();
         CacheStats {
             memory_hits: 0,
             disk_hits: 0,
@@ -1006,8 +1578,8 @@ mod tests {
 
     #[test]
     fn test_serialize_trace_ops_roundtrip() {
-        use crate::compiler::trace::{TraceOp, ValueId, Fp8Format, ScaleSelector};
-use crate::quant_format::PackedScaleAlgorithm;
+        use crate::compiler::trace::{Fp8Format, ScaleSelector, TraceOp, ValueId};
+        use crate::quant_format::PackedScaleAlgorithm;
 
         let ops = vec![
             TraceOp::Input(0),
@@ -1046,8 +1618,8 @@ use crate::quant_format::PackedScaleAlgorithm;
 
     #[test]
     fn test_trace_aware_hash_differs() {
-        use crate::compiler::trace::{TraceOp, ValueId, Fp8Format, ScaleSelector};
-use crate::quant_format::PackedScaleAlgorithm;
+        use crate::compiler::trace::{Fp8Format, ScaleSelector, TraceOp, ValueId};
+        use crate::quant_format::PackedScaleAlgorithm;
 
         let ops1 = vec![TraceOp::Input(0), TraceOp::Neg(ValueId(0))];
         let ops2 = vec![TraceOp::Input(0), TraceOp::Exp(ValueId(0))];
@@ -1060,10 +1632,14 @@ use crate::quant_format::PackedScaleAlgorithm;
 
     #[test]
     fn test_trace_aware_hash_deterministic() {
-        use crate::compiler::trace::{TraceOp, ValueId, Fp8Format, ScaleSelector};
-use crate::quant_format::PackedScaleAlgorithm;
+        use crate::compiler::trace::{Fp8Format, ScaleSelector, TraceOp, ValueId};
+        use crate::quant_format::PackedScaleAlgorithm;
 
-        let ops = vec![TraceOp::Input(0), TraceOp::Const(3.14), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let ops = vec![
+            TraceOp::Input(0),
+            TraceOp::Const(3.14),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
 
         let h1 = trace_aware_hash(b"ir", "hw_fp", &ops);
         let h2 = trace_aware_hash(b"ir", "hw_fp", &ops);
@@ -1088,8 +1664,8 @@ use crate::quant_format::PackedScaleAlgorithm;
 
     #[test]
     fn test_serialized_trace_op_all_variants() {
-        use crate::compiler::trace::{TraceOp, ValueId, Fp8Format, ScaleSelector};
-use crate::quant_format::PackedScaleAlgorithm;
+        use crate::compiler::trace::{Fp8Format, ScaleSelector, TraceOp, ValueId};
+        use crate::quant_format::PackedScaleAlgorithm;
 
         let all_ops = vec![
             TraceOp::Input(42),
@@ -1252,7 +1828,10 @@ use crate::quant_format::PackedScaleAlgorithm;
         let hash_b = config_hash(ir_bytes, hw_b);
 
         // Assert
-        assert_ne!(hash_a, hash_b, "different HW fingerprints should produce different hashes");
+        assert_ne!(
+            hash_a, hash_b,
+            "different HW fingerprints should produce different hashes"
+        );
     }
 
     // ── Test 28: CompilationCache clear empties entries ──
@@ -1291,7 +1870,10 @@ use crate::quant_format::PackedScaleAlgorithm;
     #[test]
     fn cache_version_non_empty() {
         // Assert
-        assert!(!CACHE_VERSION.is_empty(), "CACHE_VERSION should not be empty");
+        assert!(
+            !CACHE_VERSION.is_empty(),
+            "CACHE_VERSION should not be empty"
+        );
     }
 
     // ── Test 31: load_from_disk rejects empty code file ──
@@ -1318,8 +1900,14 @@ use crate::quant_format::PackedScaleAlgorithm;
 
         // Assert — empty code file is treated as miss and cleaned up
         assert!(result.is_none(), "empty code file should not be loaded");
-        assert!(!cache_file_path(&dir, hash).exists(), "empty code file should be deleted");
-        assert!(!meta_file_path(&dir, hash).exists(), "meta for empty code should be deleted");
+        assert!(
+            !cache_file_path(&dir, hash).exists(),
+            "empty code file should be deleted"
+        );
+        assert!(
+            !meta_file_path(&dir, hash).exists(),
+            "meta for empty code should be deleted"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1342,7 +1930,10 @@ use crate::quant_format::PackedScaleAlgorithm;
             // Assert
             assert_eq!(cache.len(), 1, "same hash should overwrite, not add");
             let layer = cache.get(0x5001).unwrap();
-            assert_eq!(layer.scratchpad_bytes, 999, "scratchpad should reflect the overwrite");
+            assert_eq!(
+                layer.scratchpad_bytes, 999,
+                "scratchpad should reflect the overwrite"
+            );
         }
     }
 
@@ -1374,9 +1965,18 @@ use crate::quant_format::PackedScaleAlgorithm;
         let bad3 = "";
 
         // Act & Assert
-        assert!(CacheMeta::from_json(bad1).is_none(), "truncated JSON should fail");
-        assert!(CacheMeta::from_json(bad2).is_none(), "missing fields should fail");
-        assert!(CacheMeta::from_json(bad3).is_none(), "empty string should fail");
+        assert!(
+            CacheMeta::from_json(bad1).is_none(),
+            "truncated JSON should fail"
+        );
+        assert!(
+            CacheMeta::from_json(bad2).is_none(),
+            "missing fields should fail"
+        );
+        assert!(
+            CacheMeta::from_json(bad3).is_none(),
+            "empty string should fail"
+        );
     }
 
     // ── Test 35: SerializedTraceOp from_bytes rejects short data ──
@@ -1390,7 +1990,10 @@ use crate::quant_format::PackedScaleAlgorithm;
         let result = SerializedTraceOp::from_bytes(short);
 
         // Assert
-        assert!(result.is_none(), "data shorter than 25 bytes should return None");
+        assert!(
+            result.is_none(),
+            "data shorter than 25 bytes should return None"
+        );
     }
 
     // ── Test 36: deserialize_trace_ops rejects truncated body ──
@@ -1405,7 +2008,10 @@ use crate::quant_format::PackedScaleAlgorithm;
         let result = deserialize_trace_ops(&data);
 
         // Assert
-        assert!(result.is_none(), "truncated body should fail deserialization");
+        assert!(
+            result.is_none(),
+            "truncated body should fail deserialization"
+        );
     }
 
     // ── Test 37: deserialize_trace_ops rejects header shorter than 4 bytes ──
@@ -1435,8 +2041,14 @@ use crate::quant_format::PackedScaleAlgorithm;
         let meta_path = meta_file_path(dir, hash);
 
         // Assert — `{hash:016x}` is lowercase hex, zero-padded to 16 chars, big-endian display
-        assert_eq!(code_path.to_str().unwrap(), "/tmp/test_cache/00000000abcd1234.bin");
-        assert_eq!(meta_path.to_str().unwrap(), "/tmp/test_cache/00000000abcd1234.meta");
+        assert_eq!(
+            code_path.to_str().unwrap(),
+            "/tmp/test_cache/00000000abcd1234.bin"
+        );
+        assert_eq!(
+            meta_path.to_str().unwrap(),
+            "/tmp/test_cache/00000000abcd1234.meta"
+        );
     }
 
     // ── Test 39: clear on memory-only cache is no-op (does not panic) ──
@@ -1468,7 +2080,11 @@ use crate::quant_format::PackedScaleAlgorithm;
         cache.clear_disk_cache();
 
         // Assert — memory entries still present
-        assert_eq!(cache.len(), 1, "memory entries should survive clear_disk_cache with no disk");
+        assert_eq!(
+            cache.len(),
+            1,
+            "memory entries should survive clear_disk_cache with no disk"
+        );
     }
 
     // ── Test 41: trace_aware_hash with empty trace ops equals config_hash ──
@@ -1488,7 +2104,10 @@ use crate::quant_format::PackedScaleAlgorithm;
 
         // Assert
         // Even empty ops add a 4-byte length prefix, so the hash should differ from raw config_hash
-        assert_ne!(base, with_empty, "trace_aware_hash should differ from config_hash even with 0 ops");
+        assert_ne!(
+            base, with_empty,
+            "trace_aware_hash should differ from config_hash even with 0 ops"
+        );
         assert_eq!(with_empty, with_ops, "same input should be deterministic");
     }
 
@@ -1544,7 +2163,10 @@ use crate::quant_format::PackedScaleAlgorithm;
         let result = deserialize_trace_ops(&data);
 
         // Assert — to_trace_op returns None for unknown tag, so deserialization fails
-        assert!(result.is_none(), "unknown tag should cause deserialization failure");
+        assert!(
+            result.is_none(),
+            "unknown tag should cause deserialization failure"
+        );
     }
 
     // ── Test 45: SerializedTraceOp to_bytes always produces exactly 28 bytes ──
@@ -1562,7 +2184,11 @@ use crate::quant_format::PackedScaleAlgorithm;
         for op in &ops {
             let sop = SerializedTraceOp::from_trace_op(op);
             let bytes = sop.to_bytes();
-            assert_eq!(bytes.len(), 28, "SerializedTraceOp must be exactly 28 bytes");
+            assert_eq!(
+                bytes.len(),
+                28,
+                "SerializedTraceOp must be exactly 28 bytes"
+            );
         }
     }
 
@@ -1573,7 +2199,7 @@ use crate::quant_format::PackedScaleAlgorithm;
         // Arrange — 25 bytes: 1 tag + 4×4 u32 + 8 f64 = 25 bytes minimum
         let mut data = vec![0u8; 25];
         data[0] = 1; // tag = Const
-        // operands all zero, float_val all zero → Const(0.0)
+                     // operands all zero, float_val all zero → Const(0.0)
 
         // Act
         let result = SerializedTraceOp::from_bytes(&data);
@@ -1681,7 +2307,11 @@ use crate::quant_format::PackedScaleAlgorithm;
     #[test]
     fn with_disk_creates_dir_on_put() {
         // Arrange — a deeply nested path that does not exist
-        let dir = std::env::temp_dir().join("gllm_cache_deep_test").join("a").join("b").join("c");
+        let dir = std::env::temp_dir()
+            .join("gllm_cache_deep_test")
+            .join("a")
+            .join("b")
+            .join("c");
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join("gllm_cache_deep_test"));
 
         // with_disk does NOT auto-create directories (unlike default_disk)
@@ -1719,7 +2349,10 @@ use crate::quant_format::PackedScaleAlgorithm;
         let h_flipped = config_hash(&flipped_ir, "hw");
 
         // Assert
-        assert_ne!(h_base, h_flipped, "flipping one byte in ir_bytes should produce a different hash");
+        assert_ne!(
+            h_base, h_flipped,
+            "flipping one byte in ir_bytes should produce a different hash"
+        );
     }
 
     // ── Test 52: config_hash concatenation — same byte sequence produces same hash ──
@@ -1736,7 +2369,10 @@ use crate::quant_format::PackedScaleAlgorithm;
         let h2 = config_hash(b"a", "bcd");
 
         // Assert — same concatenated byte stream → same hash
-        assert_eq!(h1, h2, "same byte sequence should produce the same hash regardless of ir/hw split");
+        assert_eq!(
+            h1, h2,
+            "same byte sequence should produce the same hash regardless of ir/hw split"
+        );
     }
 
     // ── Test 53: trace_aware_hash differs when trace length changes ──
@@ -1745,14 +2381,21 @@ use crate::quant_format::PackedScaleAlgorithm;
     fn trace_aware_hash_differs_for_different_trace_length() {
         // Arrange
         let ops_short = vec![TraceOp::Input(0)];
-        let ops_long = vec![TraceOp::Input(0), TraceOp::Neg(ValueId(0)), TraceOp::Exp(ValueId(1))];
+        let ops_long = vec![
+            TraceOp::Input(0),
+            TraceOp::Neg(ValueId(0)),
+            TraceOp::Exp(ValueId(1)),
+        ];
 
         // Act
         let h_short = trace_aware_hash(b"ir", "hw", &ops_short);
         let h_long = trace_aware_hash(b"ir", "hw", &ops_long);
 
         // Assert
-        assert_ne!(h_short, h_long, "different trace lengths should produce different hashes");
+        assert_ne!(
+            h_short, h_long,
+            "different trace lengths should produce different hashes"
+        );
     }
 
     // ── Test 54: multiple memory insertions all retrievable ──
@@ -1781,7 +2424,10 @@ use crate::quant_format::PackedScaleAlgorithm;
             // Assert — all retrievable with correct scratchpad
             for &(hash, _, sp) in &entries {
                 let layer = cache.get(hash).unwrap();
-                assert_eq!(layer.scratchpad_bytes, sp, "scratchpad mismatch for hash {hash:#x}");
+                assert_eq!(
+                    layer.scratchpad_bytes, sp,
+                    "scratchpad mismatch for hash {hash:#x}"
+                );
             }
         }
     }
@@ -1826,11 +2472,26 @@ use crate::quant_format::PackedScaleAlgorithm;
         let debug = format!("{:?}", stats);
 
         // Assert
-        assert!(debug.contains("memory_hits"), "Debug output should contain 'memory_hits'");
-        assert!(debug.contains("disk_hits"), "Debug output should contain 'disk_hits'");
-        assert!(debug.contains("misses"), "Debug output should contain 'misses'");
-        assert!(debug.contains("total_code_bytes"), "Debug output should contain 'total_code_bytes'");
-        assert!(debug.contains("num_entries"), "Debug output should contain 'num_entries'");
+        assert!(
+            debug.contains("memory_hits"),
+            "Debug output should contain 'memory_hits'"
+        );
+        assert!(
+            debug.contains("disk_hits"),
+            "Debug output should contain 'disk_hits'"
+        );
+        assert!(
+            debug.contains("misses"),
+            "Debug output should contain 'misses'"
+        );
+        assert!(
+            debug.contains("total_code_bytes"),
+            "Debug output should contain 'total_code_bytes'"
+        );
+        assert!(
+            debug.contains("num_entries"),
+            "Debug output should contain 'num_entries'"
+        );
     }
 
     // ── Test 57: IncrementalCompileResult field access and construction ──
@@ -1879,12 +2540,19 @@ use crate::quant_format::PackedScaleAlgorithm;
         {
             let mut cache = CompilationCache::with_disk(dir.clone());
             let (layer, _source) = cache.lookup(hash).unwrap();
-            assert_eq!(layer.scratchpad_bytes, 9999, "scratchpad should reflect the overwrite");
+            assert_eq!(
+                layer.scratchpad_bytes, 9999,
+                "scratchpad should reflect the overwrite"
+            );
         }
 
         // Code file on disk should have the new content
         let code = std::fs::read(cache_file_path(&dir, hash)).unwrap();
-        assert_eq!(code, vec![0xC3u8; 8], "code file should reflect the overwrite");
+        assert_eq!(
+            code,
+            vec![0xC3u8; 8],
+            "code file should reflect the overwrite"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1901,8 +2569,14 @@ use crate::quant_format::PackedScaleAlgorithm;
         let mut cache = CompilationCache::with_disk(dir.clone());
         let hash: u64 = 0x1234_5678;
         cache.put(hash, &[0xC3], 2048);
-        assert!(cache_file_path(&dir, hash).exists(), "code file should exist after put");
-        assert!(meta_file_path(&dir, hash).exists(), "meta file should exist after put");
+        assert!(
+            cache_file_path(&dir, hash).exists(),
+            "code file should exist after put"
+        );
+        assert!(
+            meta_file_path(&dir, hash).exists(),
+            "meta file should exist after put"
+        );
 
         // Act
         cache.clear();
@@ -1911,8 +2585,14 @@ use crate::quant_format::PackedScaleAlgorithm;
         assert!(cache.is_empty());
         assert!(cache.get(hash).is_none(), "cleared cache should miss");
         // Disk files are also removed
-        assert!(!cache_file_path(&dir, hash).exists(), "code file should be removed after clear");
-        assert!(!meta_file_path(&dir, hash).exists(), "meta file should be removed after clear");
+        assert!(
+            !cache_file_path(&dir, hash).exists(),
+            "code file should be removed after clear"
+        );
+        assert!(
+            !meta_file_path(&dir, hash).exists(),
+            "meta file should be removed after clear"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1936,7 +2616,11 @@ use crate::quant_format::PackedScaleAlgorithm;
         let bytes_3 = serialize_trace_ops(&ops_3);
 
         // Assert — header (4 bytes) + 28 bytes per op
-        assert_eq!(bytes_0.len(), 4, "0 ops should produce 4 bytes (header only)");
+        assert_eq!(
+            bytes_0.len(),
+            4,
+            "0 ops should produce 4 bytes (header only)"
+        );
         assert_eq!(bytes_1.len(), 4 + 28, "1 op should produce 32 bytes");
         assert_eq!(bytes_3.len(), 4 + 28 * 3, "3 ops should produce 88 bytes");
     }

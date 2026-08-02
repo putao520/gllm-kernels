@@ -9,7 +9,7 @@
 //! LoopBegin/End, GprBinOp) composed through TraceOp bodies + auto_lower_trace.
 
 use super::instr::*;
-use crate::compiler::trace::{QuantPrecision, TraceOp, ReduceKind, ValueId};
+use crate::compiler::trace::{QuantPrecision, ReduceKind, TraceOp, ValueId};
 use crate::types::CompilerError;
 
 // ── Shared TraceOp bodies ──────────────────────────────────────────────────
@@ -17,9 +17,9 @@ use crate::types::CompilerError;
 /// FMA dot product accumulation: acc += a * b
 fn dot_fma_body() -> Vec<TraceOp> {
     vec![
-        TraceOp::Input(0), // acc
-        TraceOp::Input(1), // a
-        TraceOp::Input(2), // b
+        TraceOp::Input(0),                                // acc
+        TraceOp::Input(1),                                // a
+        TraceOp::Input(2),                                // b
         TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2)), // acc + a*b
     ]
 }
@@ -36,10 +36,10 @@ fn scale_body() -> Vec<TraceOp> {
 /// V accumulation: o_acc = o_acc * correction + weight * v_vec
 fn accumulate_body() -> Vec<TraceOp> {
     vec![
-        TraceOp::Input(0), // o_acc
-        TraceOp::Input(1), // correction
-        TraceOp::Input(2), // weight
-        TraceOp::Input(3), // v_vec
+        TraceOp::Input(0),                    // o_acc
+        TraceOp::Input(1),                    // correction
+        TraceOp::Input(2),                    // weight
+        TraceOp::Input(3),                    // v_vec
         TraceOp::Mul(ValueId(0), ValueId(1)), // o_acc * correction
         TraceOp::Mul(ValueId(2), ValueId(3)), // weight * v_vec
         TraceOp::Add(ValueId(4), ValueId(5)), // result
@@ -50,22 +50,22 @@ fn accumulate_body() -> Vec<TraceOp> {
 /// [0]=running_max, [1]=score, [2]=new_max, [4]=correction, [6]=weight
 fn softmax_body() -> Vec<TraceOp> {
     vec![
-        TraceOp::Input(0), // running_max
-        TraceOp::Input(1), // score
-        TraceOp::Max(ValueId(0), ValueId(1)),       // [2] new_max
-        TraceOp::Sub(ValueId(0), ValueId(2)),        // [3] old_max - new_max = correction_exp_arg
-        TraceOp::Exp(ValueId(3)),                     // [4] correction = exp(old_max - new_max)
-        TraceOp::Sub(ValueId(1), ValueId(2)),        // [5] score - new_max
-        TraceOp::Exp(ValueId(5)),                     // [6] weight = exp(score - new_max)
+        TraceOp::Input(0),                    // running_max
+        TraceOp::Input(1),                    // score
+        TraceOp::Max(ValueId(0), ValueId(1)), // [2] new_max
+        TraceOp::Sub(ValueId(0), ValueId(2)), // [3] old_max - new_max = correction_exp_arg
+        TraceOp::Exp(ValueId(3)),             // [4] correction = exp(old_max - new_max)
+        TraceOp::Sub(ValueId(1), ValueId(2)), // [5] score - new_max
+        TraceOp::Exp(ValueId(5)),             // [6] weight = exp(score - new_max)
     ]
 }
 
 /// Running sum update: new_sum = sum * correction + weight
 fn sum_update_body() -> Vec<TraceOp> {
     vec![
-        TraceOp::Input(0), // running_sum
-        TraceOp::Input(1), // correction
-        TraceOp::Input(2), // weight
+        TraceOp::Input(0),                    // running_sum
+        TraceOp::Input(1),                    // correction
+        TraceOp::Input(2),                    // weight
         TraceOp::Mul(ValueId(0), ValueId(1)), // sum * correction
         TraceOp::Add(ValueId(3), ValueId(2)), // new_sum
     ]
@@ -168,7 +168,10 @@ pub(crate) fn emit_mla_attn_score_inline(
     let dot_body = dot_fma_body();
     let hreduce_body = vec![
         TraceOp::Input(0),
-        TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Sum },
+        TraceOp::HReduce {
+            src: ValueId(0),
+            op: ReduceKind::Sum,
+        },
     ];
     let s_body = scale_body();
     let sm_body = softmax_body();
@@ -291,33 +294,50 @@ pub(crate) fn emit_mla_attn_score_inline(
             });
 
             if dc_vecs > 0 {
-                prog.emit_loop(BoundExpr::Const(dc_vecs), dc_vec_step, |prog, _d_ctr, d_off| {
-                    let q_vec = prog.alloc_vreg(VRegKind::Vec, width);
-                    prog.emit(VmInstr::VecLoad {
-                        dst: q_vec,
-                        base: q_row,
-                        offset: OffsetExpr::LoopOffset(d_off),
-                        width,
-                        dtype: default_dtype, predicate: None,
-                    });
-                    let k_vec = prog.alloc_vreg(VRegKind::Vec, width);
-                    prog.emit(VmInstr::VecLoad {
-                        dst: k_vec,
-                        base: key_row,
-                        offset: OffsetExpr::LoopOffset(d_off),
-                        width,
-                        dtype: default_dtype, predicate: None,
-                    });
-                    super::auto_select::auto_lower_trace_into(
-                        prog, &dot_body, &[dot_acc, q_vec, k_vec], dot_acc, width, default_dtype,
-                    ).expect("MLA dot FMA auto_lower failed");
-                });
+                prog.emit_loop(
+                    BoundExpr::Const(dc_vecs),
+                    dc_vec_step,
+                    |prog, _d_ctr, d_off| {
+                        let q_vec = prog.alloc_vreg(VRegKind::Vec, width);
+                        prog.emit(VmInstr::VecLoad {
+                            dst: q_vec,
+                            base: q_row,
+                            offset: OffsetExpr::LoopOffset(d_off),
+                            width,
+                            dtype: default_dtype,
+                            predicate: None,
+                        });
+                        let k_vec = prog.alloc_vreg(VRegKind::Vec, width);
+                        prog.emit(VmInstr::VecLoad {
+                            dst: k_vec,
+                            base: key_row,
+                            offset: OffsetExpr::LoopOffset(d_off),
+                            width,
+                            dtype: default_dtype,
+                            predicate: None,
+                        });
+                        super::auto_select::auto_lower_trace_into(
+                            prog,
+                            &dot_body,
+                            &[dot_acc, q_vec, k_vec],
+                            dot_acc,
+                            width,
+                            default_dtype,
+                        )
+                        .expect("MLA dot FMA auto_lower failed");
+                    },
+                );
             }
 
             // HReduce sum + scale
             let hr_slots = super::auto_select::auto_lower_trace_raw(
-                prog, &hreduce_body, &[dot_acc], width, default_dtype,
-            ).expect("MLA HReduce auto_lower failed");
+                prog,
+                &hreduce_body,
+                &[dot_acc],
+                width,
+                default_dtype,
+            )
+            .expect("MLA HReduce auto_lower failed");
             let score_scalar = hr_slots[1];
             prog.emit(VmInstr::Broadcast {
                 dst: dot_acc,
@@ -326,26 +346,49 @@ pub(crate) fn emit_mla_attn_score_inline(
                 dtype: default_dtype,
             });
             super::auto_select::auto_lower_trace_into(
-                prog, &s_body, &[dot_acc, scale_vec], dot_acc, width, default_dtype,
-            ).expect("MLA scale auto_lower failed");
+                prog,
+                &s_body,
+                &[dot_acc, scale_vec],
+                dot_acc,
+                width,
+                default_dtype,
+            )
+            .expect("MLA scale auto_lower failed");
 
             // Online softmax update
             let sm_slots = super::auto_select::auto_lower_trace_raw(
-                prog, &sm_body, &[running_max, dot_acc], width, default_dtype,
-            ).expect("MLA softmax auto_lower failed");
+                prog,
+                &sm_body,
+                &[running_max, dot_acc],
+                width,
+                default_dtype,
+            )
+            .expect("MLA softmax auto_lower failed");
             let new_max = sm_slots[2];
             let correction = sm_slots[4];
             let weight = sm_slots[6];
 
             // Update running_sum: new_sum = sum * correction + weight
             super::auto_select::auto_lower_trace_into(
-                prog, &su_body, &[running_sum, correction, weight], running_sum, width, default_dtype,
-            ).expect("MLA sum update auto_lower failed");
+                prog,
+                &su_body,
+                &[running_sum, correction, weight],
+                running_sum,
+                width,
+                default_dtype,
+            )
+            .expect("MLA sum update auto_lower failed");
 
             // Update running_max: running_max = new_max
             super::auto_select::auto_lower_trace_into(
-                prog, &id_body, &[new_max], running_max, width, default_dtype,
-            ).expect("MLA max identity auto_lower failed");
+                prog,
+                &id_body,
+                &[new_max],
+                running_max,
+                width,
+                default_dtype,
+            )
+            .expect("MLA max identity auto_lower failed");
 
             // Store weight in score buffer for Phase 2
             // score_buf_ptr[pos_idx] = weight (we need pos_idx * vec_step, but weight is broadcast)
@@ -355,7 +398,8 @@ pub(crate) fn emit_mla_attn_score_inline(
                 offset: OffsetExpr::LoopOffset(pos_off),
                 src: weight,
                 width: SimdWidth::Scalar, // store single scalar
-                dtype: default_dtype, predicate: None,
+                dtype: default_dtype,
+                predicate: None,
             });
 
             // V accumulation: for each head_dim vector, rescale o_acc by correction and add weight*v
@@ -373,118 +417,135 @@ pub(crate) fn emit_mla_attn_score_inline(
 
                 // GEMV: v[d_chunk] = sum over c_chunks of c_KV[c_chunk] * W_UV[c_chunk, d_chunk]
                 if dc_vecs > 0 {
-                    prog.emit_loop(BoundExpr::Const(dc_vecs), dc_vec_step, |prog, _c_ctr, c_off| {
-                        let ckv_vec = prog.alloc_vreg(VRegKind::Vec, width);
-                        prog.emit(VmInstr::VecLoad {
-                            dst: ckv_vec,
-                            base: key_row, // key_row points to c_KV (first d_c elements of KV cache row)
-                            offset: OffsetExpr::LoopOffset(c_off),
-                            width,
-                            dtype: default_dtype, predicate: None,
-                        });
-                        // W_UV offset: d * hd_vec_step + c_off (row-major: [d_c, head_dim])
-                        // Actually W_UV is [d_c, head_dim], so for output dim chunk d:
-                        // W_UV[c_chunk, d_chunk] is at offset c_chunk * head_dim_bytes + d_chunk * elem_bytes
-                        let d_out_off = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                        prog.emit(VmInstr::GprBinOp {
-                            dst: d_out_off,
-                            a: _c_ctr, // This is wrong, we need the byte offset not counter
-                            b: GprOperand::Imm(0),
-                            op: GprOp::Add,
-                        });
-                        // Simplified: load W_UV at (c_off + d * hd_vec_step) treating W_UV as flat
-                        // Actually for GEMV, the weight layout matters.
-                        // W_UV is [d_c, head_dim] per head, stored row-major.
-                        // v[d] = sum_c c_KV[c] * W_UV[c, d]
-                        // For vectorized inner product across chunks:
-                        // Each chunk of output d processes: v_chunk = sum_c (c_KV_chunk_c * W_UV_chunk_c_for_d)
-                        // W_UV at (c, d_chunk) is at offset: c * head_dim_bytes + d * hd_vec_step
-                        let wuv_d_offset = d * hd_vec_step;
-                        let w_vec = prog.alloc_vreg(VRegKind::Vec, width);
-                        // We need to compute the correct offset for W_UV[c_chunk, d_chunk]
-                        // W_UV layout per head: row-major [d_c, head_dim]
-                        // Element (c, d_i) = wuv_row + c * head_dim_bytes + d_i * elem_bytes
-                        // For vectorized load of row c, output dim chunk d:
-                        // offset = c_off * head_dim / dc_vec_step * hd_vec_step ... complex
-                        //
-                        // Simpler approach: load W_UV column-chunk for all c in inner loop
-                        // This requires the inner loop to iterate c (d_c dimension) and for each c,
-                        // load the weight element at column offset d.
-                        //
-                        // But since we're inside a c_chunk loop, we use the transposed access:
-                        // The weight for (c_chunk, d_chunk) at byte offset c_chunk_row_offset + d * elem_bytes
-                        // where c_chunk_row_offset = (c_off counter * head_dim_bytes / elem_bytes) ...
-                        //
-                        // For correctness, we emit a scalar GEMV loop instead of trying to vectorize
-                        // the inner dimension. This is the same approach as attention_emit's score dot.
-                        // The inner loop is over dc_vecs chunks of the c_KV dimension.
-                        // W_UV[c_chunk, d_chunk] needs: c_chunk_base + d_chunk_offset
-                        // c_chunk_base = c_off_counter * head_dim_bytes (but c_off is byte offset for c)
-                        // So the row index for c is c_off / dc_vec_step (element index of c chunk)
-                        // Then the weight offset for that row's d_chunk is:
-                        //   row_bytes = head_dim * elem_bytes
-                        //   row_idx_elems = c_off / (lanes * elem_bytes)  -- which c-chunk we're on
-                        //   weight_offset = row_idx_elems * row_bytes + d * hd_vec_step
-                        //
-                        // Since c_off is already LoopOffset (byte offset stepping dc_vec_step),
-                        // row_idx_bytes = c_off * head_dim / dc_vec_step ... but c_off is VReg not usize
-                        //
-                        // Simpler: precompute the GPR offset for each W_UV element
-                        // weight_base_for_c_chunk = wuv_row + (c_off / elem_bytes_per_lane) * head_dim_bytes
-                        // This requires integer division at runtime which is expensive.
-                        //
-                        // Most efficient: iterate c dimension in scalar, accumulate per d_chunk.
-                        // But that defeats vectorization.
-                        //
-                        // Pragmatic approach for decode (M=1): the V restore GEMV is small
-                        // (d_c x head_dim = 512 x 128), we use the same tiled approach as
-                        // emit_score_dot_cpu: vectorize the inner (c) dimension with FMA,
-                        // one accumulator per output d_chunk.
-                        //
-                        // The weight access pattern for W_UV[c_chunk, d_chunk]:
-                        // stride between c chunks = head_dim_bytes (row stride of W_UV)
-                        // offset within c chunk to reach d_chunk = d * hd_vec_step
-                        //
-                        // So weight address = wuv_row + c_elem * head_dim_bytes + d * hd_vec_step
-                        // where c_elem is the starting element of the current c_chunk.
-                        //
-                        // Since c_off is the byte offset stepping dc_vec_step (= lanes * elem_bytes),
-                        // c_elem = c_off / elem_bytes, but we need c_off * head_dim_bytes / (lanes * elem_bytes)
-                        // which simplifies to (c_off / elem_bytes) * head_dim_bytes
-                        // = c_off * head_dim_bytes / elem_bytes
-                        // This requires runtime multiply which we can do with GprBinOp.
-                        let c_off_gpr = _c_ctr; // c counter (not byte offset)
-                        let w_row_off = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                        prog.emit(VmInstr::GprBinOp {
-                            dst: w_row_off,
-                            a: c_off_gpr,
-                            b: GprOperand::Imm(head_hd_bytes as i64),
-                            op: GprOp::Mul,
-                        });
-                        let w_addr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                        prog.emit(VmInstr::GprBinOp {
-                            dst: w_addr,
-                            a: wuv_row,
-                            b: GprOperand::VReg(w_row_off),
-                            op: GprOp::Add,
-                        });
-                        prog.emit(VmInstr::VecLoad {
-                            dst: w_vec,
-                            base: w_addr,
-                            offset: OffsetExpr::Const(wuv_d_offset),
-                            width,
-                            dtype: default_dtype, predicate: None,
-                        });
-                        super::auto_select::auto_lower_trace_into(
-                            prog, &dot_body, &[v_acc, ckv_vec, w_vec], v_acc, width, default_dtype,
-                        ).expect("MLA V restore GEMV FMA auto_lower failed");
-                    });
+                    prog.emit_loop(
+                        BoundExpr::Const(dc_vecs),
+                        dc_vec_step,
+                        |prog, _c_ctr, c_off| {
+                            let ckv_vec = prog.alloc_vreg(VRegKind::Vec, width);
+                            prog.emit(VmInstr::VecLoad {
+                                dst: ckv_vec,
+                                base: key_row, // key_row points to c_KV (first d_c elements of KV cache row)
+                                offset: OffsetExpr::LoopOffset(c_off),
+                                width,
+                                dtype: default_dtype,
+                                predicate: None,
+                            });
+                            // W_UV offset: d * hd_vec_step + c_off (row-major: [d_c, head_dim])
+                            // Actually W_UV is [d_c, head_dim], so for output dim chunk d:
+                            // W_UV[c_chunk, d_chunk] is at offset c_chunk * head_dim_bytes + d_chunk * elem_bytes
+                            let d_out_off = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+                            prog.emit(VmInstr::GprBinOp {
+                                dst: d_out_off,
+                                a: _c_ctr, // This is wrong, we need the byte offset not counter
+                                b: GprOperand::Imm(0),
+                                op: GprOp::Add,
+                            });
+                            // Simplified: load W_UV at (c_off + d * hd_vec_step) treating W_UV as flat
+                            // Actually for GEMV, the weight layout matters.
+                            // W_UV is [d_c, head_dim] per head, stored row-major.
+                            // v[d] = sum_c c_KV[c] * W_UV[c, d]
+                            // For vectorized inner product across chunks:
+                            // Each chunk of output d processes: v_chunk = sum_c (c_KV_chunk_c * W_UV_chunk_c_for_d)
+                            // W_UV at (c, d_chunk) is at offset: c * head_dim_bytes + d * hd_vec_step
+                            let wuv_d_offset = d * hd_vec_step;
+                            let w_vec = prog.alloc_vreg(VRegKind::Vec, width);
+                            // We need to compute the correct offset for W_UV[c_chunk, d_chunk]
+                            // W_UV layout per head: row-major [d_c, head_dim]
+                            // Element (c, d_i) = wuv_row + c * head_dim_bytes + d_i * elem_bytes
+                            // For vectorized load of row c, output dim chunk d:
+                            // offset = c_off * head_dim / dc_vec_step * hd_vec_step ... complex
+                            //
+                            // Simpler approach: load W_UV column-chunk for all c in inner loop
+                            // This requires the inner loop to iterate c (d_c dimension) and for each c,
+                            // load the weight element at column offset d.
+                            //
+                            // But since we're inside a c_chunk loop, we use the transposed access:
+                            // The weight for (c_chunk, d_chunk) at byte offset c_chunk_row_offset + d * elem_bytes
+                            // where c_chunk_row_offset = (c_off counter * head_dim_bytes / elem_bytes) ...
+                            //
+                            // For correctness, we emit a scalar GEMV loop instead of trying to vectorize
+                            // the inner dimension. This is the same approach as attention_emit's score dot.
+                            // The inner loop is over dc_vecs chunks of the c_KV dimension.
+                            // W_UV[c_chunk, d_chunk] needs: c_chunk_base + d_chunk_offset
+                            // c_chunk_base = c_off_counter * head_dim_bytes (but c_off is byte offset for c)
+                            // So the row index for c is c_off / dc_vec_step (element index of c chunk)
+                            // Then the weight offset for that row's d_chunk is:
+                            //   row_bytes = head_dim * elem_bytes
+                            //   row_idx_elems = c_off / (lanes * elem_bytes)  -- which c-chunk we're on
+                            //   weight_offset = row_idx_elems * row_bytes + d * hd_vec_step
+                            //
+                            // Since c_off is already LoopOffset (byte offset stepping dc_vec_step),
+                            // row_idx_bytes = c_off * head_dim / dc_vec_step ... but c_off is VReg not usize
+                            //
+                            // Simpler: precompute the GPR offset for each W_UV element
+                            // weight_base_for_c_chunk = wuv_row + (c_off / elem_bytes_per_lane) * head_dim_bytes
+                            // This requires integer division at runtime which is expensive.
+                            //
+                            // Most efficient: iterate c dimension in scalar, accumulate per d_chunk.
+                            // But that defeats vectorization.
+                            //
+                            // Pragmatic approach for decode (M=1): the V restore GEMV is small
+                            // (d_c x head_dim = 512 x 128), we use the same tiled approach as
+                            // emit_score_dot_cpu: vectorize the inner (c) dimension with FMA,
+                            // one accumulator per output d_chunk.
+                            //
+                            // The weight access pattern for W_UV[c_chunk, d_chunk]:
+                            // stride between c chunks = head_dim_bytes (row stride of W_UV)
+                            // offset within c chunk to reach d_chunk = d * hd_vec_step
+                            //
+                            // So weight address = wuv_row + c_elem * head_dim_bytes + d * hd_vec_step
+                            // where c_elem is the starting element of the current c_chunk.
+                            //
+                            // Since c_off is the byte offset stepping dc_vec_step (= lanes * elem_bytes),
+                            // c_elem = c_off / elem_bytes, but we need c_off * head_dim_bytes / (lanes * elem_bytes)
+                            // which simplifies to (c_off / elem_bytes) * head_dim_bytes
+                            // = c_off * head_dim_bytes / elem_bytes
+                            // This requires runtime multiply which we can do with GprBinOp.
+                            let c_off_gpr = _c_ctr; // c counter (not byte offset)
+                            let w_row_off = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+                            prog.emit(VmInstr::GprBinOp {
+                                dst: w_row_off,
+                                a: c_off_gpr,
+                                b: GprOperand::Imm(head_hd_bytes as i64),
+                                op: GprOp::Mul,
+                            });
+                            let w_addr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                            prog.emit(VmInstr::GprBinOp {
+                                dst: w_addr,
+                                a: wuv_row,
+                                b: GprOperand::VReg(w_row_off),
+                                op: GprOp::Add,
+                            });
+                            prog.emit(VmInstr::VecLoad {
+                                dst: w_vec,
+                                base: w_addr,
+                                offset: OffsetExpr::Const(wuv_d_offset),
+                                width,
+                                dtype: default_dtype,
+                                predicate: None,
+                            });
+                            super::auto_select::auto_lower_trace_into(
+                                prog,
+                                &dot_body,
+                                &[v_acc, ckv_vec, w_vec],
+                                v_acc,
+                                width,
+                                default_dtype,
+                            )
+                            .expect("MLA V restore GEMV FMA auto_lower failed");
+                        },
+                    );
                 }
 
                 // HReduce the GEMV accumulator
                 let v_hr = super::auto_select::auto_lower_trace_raw(
-                    prog, &hreduce_body, &[v_acc], width, default_dtype,
-                ).expect("MLA V restore HReduce auto_lower failed");
+                    prog,
+                    &hreduce_body,
+                    &[v_acc],
+                    width,
+                    default_dtype,
+                )
+                .expect("MLA V restore HReduce auto_lower failed");
                 prog.emit(VmInstr::Broadcast {
                     dst: v_acc,
                     src: ScalarExpr::ExtractLane0(v_hr[1]),
@@ -494,28 +555,45 @@ pub(crate) fn emit_mla_attn_score_inline(
 
                 // o_acc[d] = o_acc[d] * correction + weight * v[d]
                 super::auto_select::auto_lower_trace_into(
-                    prog, &acc_body, &[o_acc[d], correction, weight, v_acc], o_acc[d], width, default_dtype,
-                ).expect("MLA V accumulate auto_lower failed");
+                    prog,
+                    &acc_body,
+                    &[o_acc[d], correction, weight, v_acc],
+                    o_acc[d],
+                    width,
+                    default_dtype,
+                )
+                .expect("MLA V accumulate auto_lower failed");
             }
         });
 
         // ── Phase 2: Normalize output ──
         // O[d] = O_acc[d] / running_sum
         let recip_slots = super::auto_select::auto_lower_trace_raw(
-            prog, &rec_body, &[running_sum], width, default_dtype,
-        ).expect("MLA recip auto_lower failed");
+            prog,
+            &rec_body,
+            &[running_sum],
+            width,
+            default_dtype,
+        )
+        .expect("MLA recip auto_lower failed");
         let recip_sum = recip_slots[1];
 
         for d in 0..hd_vecs {
             let norm_slots = super::auto_select::auto_lower_trace_raw(
-                prog, &norm_body, &[o_acc[d], recip_sum], width, default_dtype,
-            ).expect("MLA normalize auto_lower failed");
+                prog,
+                &norm_body,
+                &[o_acc[d], recip_sum],
+                width,
+                default_dtype,
+            )
+            .expect("MLA normalize auto_lower failed");
             prog.emit(VmInstr::VecStore {
                 base: o_row,
                 offset: OffsetExpr::Const(d * hd_vec_step),
                 src: norm_slots[2],
                 width,
-                dtype: default_dtype, predicate: None,
+                dtype: default_dtype,
+                predicate: None,
             });
         }
     });
@@ -574,10 +652,10 @@ pub(crate) fn emit_mla_rope_merge_inline(
 
     // TraceOp body for RoPE rotation: out_even = x0*cos - x1*sin, out_odd = x1*cos + x0*sin
     let rope_body: Vec<TraceOp> = vec![
-        TraceOp::Input(0),  // [0] x0 (even)
-        TraceOp::Input(1),  // [1] x1 (odd)
-        TraceOp::Input(2),  // [2] cos
-        TraceOp::Input(3),  // [3] sin
+        TraceOp::Input(0),                    // [0] x0 (even)
+        TraceOp::Input(1),                    // [1] x1 (odd)
+        TraceOp::Input(2),                    // [2] cos
+        TraceOp::Input(3),                    // [3] sin
         TraceOp::Mul(ValueId(0), ValueId(2)), // [4] x0 * cos
         TraceOp::Mul(ValueId(1), ValueId(3)), // [5] x1 * sin
         TraceOp::Sub(ValueId(4), ValueId(5)), // [6] out_even = x0*cos - x1*sin
@@ -591,26 +669,37 @@ pub(crate) fn emit_mla_rope_merge_inline(
 
     // Step 1: Copy c_KV[0..d_main] to output[0..d_main]
     if d_main_vecs > 0 {
-        prog.emit_loop(BoundExpr::Const(d_main_vecs), dc_vec_step, |prog, _ctr, byte_off| {
-            let data = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecLoad {
-                dst: data,
-                base: c_kv_ptr,
-                offset: OffsetExpr::LoopOffset(byte_off),
-                width,
-                dtype: default_dtype, predicate: None,
-            });
-            let slots = super::auto_select::auto_lower_trace_raw(
-                prog, &copy_body, &[data], width, default_dtype,
-            ).expect("MlaRopeMerge copy auto_lower failed");
-            prog.emit(VmInstr::VecStore {
-                base: output_ptr,
-                offset: OffsetExpr::LoopOffset(byte_off),
-                src: slots[0],
-                width,
-                dtype: default_dtype, predicate: None,
-            });
-        });
+        prog.emit_loop(
+            BoundExpr::Const(d_main_vecs),
+            dc_vec_step,
+            |prog, _ctr, byte_off| {
+                let data = prog.alloc_vreg(VRegKind::Vec, width);
+                prog.emit(VmInstr::VecLoad {
+                    dst: data,
+                    base: c_kv_ptr,
+                    offset: OffsetExpr::LoopOffset(byte_off),
+                    width,
+                    dtype: default_dtype,
+                    predicate: None,
+                });
+                let slots = super::auto_select::auto_lower_trace_raw(
+                    prog,
+                    &copy_body,
+                    &[data],
+                    width,
+                    default_dtype,
+                )
+                .expect("MlaRopeMerge copy auto_lower failed");
+                prog.emit(VmInstr::VecStore {
+                    base: output_ptr,
+                    offset: OffsetExpr::LoopOffset(byte_off),
+                    src: slots[0],
+                    width,
+                    dtype: default_dtype,
+                    predicate: None,
+                });
+            },
+        );
     }
 
     // Step 2: Apply RoPE to k_pe and store at output[d_main..d_c]
@@ -622,65 +711,83 @@ pub(crate) fn emit_mla_rope_merge_inline(
     if d_rope_half > 0 && d_rope_half % lanes == 0 {
         // Vectorized RoPE: process d_rope_half elements at a time
         let vec_step = lanes * elem_bytes;
-        prog.emit_loop(BoundExpr::Const(rope_pair_vecs), vec_step, |prog, _ctr, byte_off| {
-            // Load k_pe even components: k_pe[2i]
-            let x_even = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecLoad {
-                dst: x_even,
-                base: k_pe_ptr,
-                offset: OffsetExpr::LoopOffset(byte_off),
-                width,
-                dtype: default_dtype, predicate: None,
-            });
-            // Load k_pe odd components: k_pe[2i+1] (offset by d_rope_half)
-            let x_odd = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecLoad {
-                dst: x_odd,
-                base: k_pe_ptr,
-                offset: OffsetExpr::loop_plus_const(byte_off, d_rope_half * elem_bytes),
-                width,
-                dtype: default_dtype, predicate: None,
-            });
-            // Load cos/sin
-            let cos_val = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecLoad {
-                dst: cos_val,
-                base: cos_ptr,
-                offset: OffsetExpr::LoopOffset(byte_off),
-                width,
-                dtype: default_dtype, predicate: None,
-            });
-            let sin_val = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecLoad {
-                dst: sin_val,
-                base: sin_ptr,
-                offset: OffsetExpr::LoopOffset(byte_off),
-                width,
-                dtype: default_dtype, predicate: None,
-            });
-            // Apply RoPE rotation
-            let rope_slots = super::auto_select::auto_lower_trace_raw(
-                prog, &rope_body, &[x_even, x_odd, cos_val, sin_val], width, default_dtype,
-            ).expect("MlaRopeMerge RoPE auto_lower failed");
-            let out_even = rope_slots[6];
-            let out_odd = rope_slots[9];
-            // Store even result at output[d_main + 2i]
-            prog.emit(VmInstr::VecStore {
-                base: output_ptr,
-                offset: OffsetExpr::loop_plus_const(byte_off, d_main_bytes),
-                src: out_even,
-                width,
-                dtype: default_dtype, predicate: None,
-            });
-            // Store odd result at output[d_main + 2i + d_rope_half]
-            prog.emit(VmInstr::VecStore {
-                base: output_ptr,
-                offset: OffsetExpr::loop_plus_const(byte_off, d_main_bytes + d_rope_half * elem_bytes),
-                src: out_odd,
-                width,
-                dtype: default_dtype, predicate: None,
-            });
-        });
+        prog.emit_loop(
+            BoundExpr::Const(rope_pair_vecs),
+            vec_step,
+            |prog, _ctr, byte_off| {
+                // Load k_pe even components: k_pe[2i]
+                let x_even = prog.alloc_vreg(VRegKind::Vec, width);
+                prog.emit(VmInstr::VecLoad {
+                    dst: x_even,
+                    base: k_pe_ptr,
+                    offset: OffsetExpr::LoopOffset(byte_off),
+                    width,
+                    dtype: default_dtype,
+                    predicate: None,
+                });
+                // Load k_pe odd components: k_pe[2i+1] (offset by d_rope_half)
+                let x_odd = prog.alloc_vreg(VRegKind::Vec, width);
+                prog.emit(VmInstr::VecLoad {
+                    dst: x_odd,
+                    base: k_pe_ptr,
+                    offset: OffsetExpr::loop_plus_const(byte_off, d_rope_half * elem_bytes),
+                    width,
+                    dtype: default_dtype,
+                    predicate: None,
+                });
+                // Load cos/sin
+                let cos_val = prog.alloc_vreg(VRegKind::Vec, width);
+                prog.emit(VmInstr::VecLoad {
+                    dst: cos_val,
+                    base: cos_ptr,
+                    offset: OffsetExpr::LoopOffset(byte_off),
+                    width,
+                    dtype: default_dtype,
+                    predicate: None,
+                });
+                let sin_val = prog.alloc_vreg(VRegKind::Vec, width);
+                prog.emit(VmInstr::VecLoad {
+                    dst: sin_val,
+                    base: sin_ptr,
+                    offset: OffsetExpr::LoopOffset(byte_off),
+                    width,
+                    dtype: default_dtype,
+                    predicate: None,
+                });
+                // Apply RoPE rotation
+                let rope_slots = super::auto_select::auto_lower_trace_raw(
+                    prog,
+                    &rope_body,
+                    &[x_even, x_odd, cos_val, sin_val],
+                    width,
+                    default_dtype,
+                )
+                .expect("MlaRopeMerge RoPE auto_lower failed");
+                let out_even = rope_slots[6];
+                let out_odd = rope_slots[9];
+                // Store even result at output[d_main + 2i]
+                prog.emit(VmInstr::VecStore {
+                    base: output_ptr,
+                    offset: OffsetExpr::loop_plus_const(byte_off, d_main_bytes),
+                    src: out_even,
+                    width,
+                    dtype: default_dtype,
+                    predicate: None,
+                });
+                // Store odd result at output[d_main + 2i + d_rope_half]
+                prog.emit(VmInstr::VecStore {
+                    base: output_ptr,
+                    offset: OffsetExpr::loop_plus_const(
+                        byte_off,
+                        d_main_bytes + d_rope_half * elem_bytes,
+                    ),
+                    src: out_odd,
+                    width,
+                    dtype: default_dtype,
+                    predicate: None,
+                });
+            },
+        );
     } else {
         // Scalar fallback for non-aligned d_rope (shouldn't happen with typical configs)
         // Handle remaining elements one by one using the same TraceOp body
@@ -710,11 +817,21 @@ mod tests {
         let kv_len = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
 
         let result = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 16, 4,
+            &mut prog,
+            2,
+            8,
+            16,
+            4,
             &[q_absorbed_ptr, kv_cache_ptr, w_uv_ptr, output_ptr],
-            kv_len, width, dtype,
+            kv_len,
+            width,
+            dtype,
         );
-        assert!(result.is_ok(), "emit_mla_attn_score_inline failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "emit_mla_attn_score_inline failed: {:?}",
+            result.err()
+        );
         assert!(!prog.is_empty(), "expected non-empty VmInstr output");
     }
 
@@ -733,11 +850,18 @@ mod tests {
 
         // d_c=32, d_rope=16: d_main=16, d_rope_half=8 (aligned to 8 lanes)
         let result = emit_mla_rope_merge_inline(
-            &mut prog, 32, 16,
+            &mut prog,
+            32,
+            16,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, position],
-            width, dtype,
+            width,
+            dtype,
         );
-        assert!(result.is_ok(), "emit_mla_rope_merge_inline failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "emit_mla_rope_merge_inline failed: {:?}",
+            result.err()
+        );
         assert!(!prog.is_empty(), "expected non-empty VmInstr output");
     }
 
@@ -756,9 +880,12 @@ mod tests {
 
         // d_rope=6 -> d_rope_half=3, not aligned to 8 lanes
         let result = emit_mla_rope_merge_inline(
-            &mut prog, 16, 6,
+            &mut prog,
+            16,
+            6,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, dummy],
-            width, dtype,
+            width,
+            dtype,
         );
         assert!(result.is_err(), "expected error for unaligned d_rope");
     }
@@ -776,9 +903,15 @@ mod tests {
         let kv_len = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
 
         let result = emit_mla_attn_score_inline(
-            &mut prog, 0, 8, 16, 4,
+            &mut prog,
+            0,
+            8,
+            16,
+            4,
             &[q_ptr, kv_ptr, w_ptr, out_ptr],
-            kv_len, width, dtype,
+            kv_len,
+            width,
+            dtype,
         );
         assert!(result.is_err(), "zero num_heads should be rejected");
     }
@@ -796,9 +929,15 @@ mod tests {
         let kv_len = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
 
         let result = emit_mla_attn_score_inline(
-            &mut prog, 4, 8, 0, 4,
+            &mut prog,
+            4,
+            8,
+            0,
+            4,
             &[q_ptr, kv_ptr, w_ptr, out_ptr],
-            kv_len, width, dtype,
+            kv_len,
+            width,
+            dtype,
         );
         assert!(result.is_err(), "zero d_c should be rejected");
     }
@@ -817,9 +956,12 @@ mod tests {
         let pos = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
 
         let result = emit_mla_rope_merge_inline(
-            &mut prog, 0, 8,
+            &mut prog,
+            0,
+            8,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
+            width,
+            dtype,
         );
         assert!(result.is_err(), "zero d_c should be rejected");
     }
@@ -838,9 +980,12 @@ mod tests {
         let pos = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
 
         let result = emit_mla_rope_merge_inline(
-            &mut prog, 16, 0,
+            &mut prog,
+            16,
+            0,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
+            width,
+            dtype,
         );
         assert!(result.is_err(), "zero d_rope should be rejected");
     }
@@ -852,7 +997,10 @@ mod tests {
         assert!(matches!(body[0], TraceOp::Input(0)));
         assert!(matches!(body[1], TraceOp::Input(1)));
         assert!(matches!(body[2], TraceOp::Input(2)));
-        assert!(matches!(body[3], TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2))));
+        assert!(matches!(
+            body[3],
+            TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2))
+        ));
     }
 
     #[test]
@@ -942,13 +1090,23 @@ mod tests {
 
         // Act: emit with num_heads=1, head_dim=8, d_c=16, d_rope=8
         let result = emit_mla_attn_score_inline(
-            &mut prog, 1, 8, 16, 8,
+            &mut prog,
+            1,
+            8,
+            16,
+            8,
             &[q_ptr, kv_ptr, w_ptr, out_ptr],
-            kv_len, width, dtype,
+            kv_len,
+            width,
+            dtype,
         );
 
         // Assert: succeeds, produces instructions, returns output ptr
-        assert!(result.is_ok(), "single head should compile: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "single head should compile: {:?}",
+            result.err()
+        );
         assert!(prog.len() > 0, "single head should emit instructions");
         assert_eq!(result.unwrap(), out_ptr, "should return output_ptr");
     }
@@ -968,13 +1126,23 @@ mod tests {
 
         // Act: d_c=32, head_dim=32 must both be divisible by 16 lanes
         let result = emit_mla_attn_score_inline(
-            &mut prog, 4, 32, 32, 16,
+            &mut prog,
+            4,
+            32,
+            32,
+            16,
             &[q_ptr, kv_ptr, w_ptr, out_ptr],
-            kv_len, width, dtype,
+            kv_len,
+            width,
+            dtype,
         );
 
         // Assert: AVX-512 compilation succeeds
-        assert!(result.is_ok(), "AVX-512 compilation should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "AVX-512 compilation should succeed: {:?}",
+            result.err()
+        );
         assert!(prog.len() > 0, "should emit instructions for AVX-512");
     }
 
@@ -993,9 +1161,15 @@ mod tests {
 
         // Act: head_dim=0 is invalid
         let result = emit_mla_attn_score_inline(
-            &mut prog, 4, 0, 16, 4,
+            &mut prog,
+            4,
+            0,
+            16,
+            4,
             &[q_ptr, kv_ptr, w_ptr, out_ptr],
-            kv_len, width, dtype,
+            kv_len,
+            width,
+            dtype,
         );
 
         // Assert
@@ -1017,10 +1191,17 @@ mod tests {
 
         // Act
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 16, 4,
+            &mut prog,
+            2,
+            8,
+            16,
+            4,
             &[q_ptr, kv_ptr, w_ptr, out_ptr],
-            kv_len, width, dtype,
-        ).unwrap();
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: first instruction should be Broadcast of inv_sqrt_dc
         let has_const_broadcast = prog.instrs.iter().any(|instr| {
@@ -1029,7 +1210,10 @@ mod tests {
                 ..
             } if *v != 0.0 && *v != f32::NEG_INFINITY)
         });
-        assert!(has_const_broadcast, "should emit Broadcast with 1/sqrt(d_c) constant");
+        assert!(
+            has_const_broadcast,
+            "should emit Broadcast with 1/sqrt(d_c) constant"
+        );
     }
 
     #[test]
@@ -1047,10 +1231,17 @@ mod tests {
 
         // Act
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 16, 4,
+            &mut prog,
+            2,
+            8,
+            16,
+            4,
             &[q_ptr, kv_ptr, w_ptr, out_ptr],
-            kv_len, width, dtype,
-        ).unwrap();
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: should have a Broadcast with NEG_INFINITY for running_max init
         let has_neg_inf = prog.instrs.iter().any(|instr| {
@@ -1059,7 +1250,10 @@ mod tests {
                 ..
             } if *v == f32::NEG_INFINITY)
         });
-        assert!(has_neg_inf, "should initialize running_max to -inf via Broadcast");
+        assert!(
+            has_neg_inf,
+            "should initialize running_max to -inf via Broadcast"
+        );
     }
 
     #[test]
@@ -1077,16 +1271,29 @@ mod tests {
 
         // Act
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 16, 4,
+            &mut prog,
+            2,
+            8,
+            16,
+            4,
             &[q_ptr, kv_ptr, w_ptr, out_ptr],
-            kv_len, width, dtype,
-        ).unwrap();
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: must contain LoopBegin instructions
-        let loop_count = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::LoopBegin { .. })
-        }).count();
-        assert!(loop_count >= 2, "should emit at least 2 LoopBegin (heads + kv_len), got {}", loop_count);
+        let loop_count = prog
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::LoopBegin { .. }))
+            .count();
+        assert!(
+            loop_count >= 2,
+            "should emit at least 2 LoopBegin (heads + kv_len), got {}",
+            loop_count
+        );
     }
 
     #[test]
@@ -1105,13 +1312,20 @@ mod tests {
 
         // Act: d_c=16, d_rope=16 → d_main=0, d_rope_half=8 (aligned to 8 lanes)
         let result = emit_mla_rope_merge_inline(
-            &mut prog, 16, 16,
+            &mut prog,
+            16,
+            16,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
+            width,
+            dtype,
         );
 
         // Assert: should succeed since d_rope_half=8 is aligned
-        assert!(result.is_ok(), "d_main=0 case should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "d_main=0 case should succeed: {:?}",
+            result.err()
+        );
         assert!(prog.len() > 0, "should still emit RoPE instructions");
     }
 
@@ -1131,9 +1345,12 @@ mod tests {
 
         // Act: d_rope_half=4, aligned to 4 lanes (W128)
         let result = emit_mla_rope_merge_inline(
-            &mut prog, 16, 8,
+            &mut prog,
+            16,
+            8,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
+            width,
+            dtype,
         );
 
         // Assert
@@ -1157,16 +1374,26 @@ mod tests {
 
         // Act
         let _ = emit_mla_rope_merge_inline(
-            &mut prog, 32, 16,
+            &mut prog,
+            32,
+            16,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
-        ).unwrap();
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: VecLoad instructions with base=k_pe_ptr must exist
-        let k_pe_loads = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecLoad { base, .. } if *base == k_pe_ptr)
-        }).count();
-        assert!(k_pe_loads >= 2, "should emit at least 2 VecLoad from k_pe_ptr (even+odd), got {}", k_pe_loads);
+        let k_pe_loads = prog
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::VecLoad { base, .. } if *base == k_pe_ptr))
+            .count();
+        assert!(
+            k_pe_loads >= 2,
+            "should emit at least 2 VecLoad from k_pe_ptr (even+odd), got {}",
+            k_pe_loads
+        );
     }
 
     #[test]
@@ -1185,20 +1412,36 @@ mod tests {
 
         // Act
         let _ = emit_mla_rope_merge_inline(
-            &mut prog, 32, 16,
+            &mut prog,
+            32,
+            16,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
-        ).unwrap();
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: VecLoad from cos_ptr and sin_ptr
-        let cos_loads = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecLoad { base, .. } if *base == cos_ptr)
-        }).count();
-        let sin_loads = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecLoad { base, .. } if *base == sin_ptr)
-        }).count();
-        assert!(cos_loads >= 1, "should emit VecLoad from cos_ptr, got {}", cos_loads);
-        assert!(sin_loads >= 1, "should emit VecLoad from sin_ptr, got {}", sin_loads);
+        let cos_loads = prog
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::VecLoad { base, .. } if *base == cos_ptr))
+            .count();
+        let sin_loads = prog
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::VecLoad { base, .. } if *base == sin_ptr))
+            .count();
+        assert!(
+            cos_loads >= 1,
+            "should emit VecLoad from cos_ptr, got {}",
+            cos_loads
+        );
+        assert!(
+            sin_loads >= 1,
+            "should emit VecLoad from sin_ptr, got {}",
+            sin_loads
+        );
     }
 
     #[test]
@@ -1217,17 +1460,27 @@ mod tests {
 
         // Act
         let _ = emit_mla_rope_merge_inline(
-            &mut prog, 32, 16,
+            &mut prog,
+            32,
+            16,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
-        ).unwrap();
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: VecStore to output_ptr for both copy and RoPE phases
-        let output_stores = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecStore { base, .. } if *base == output_ptr)
-        }).count();
+        let output_stores = prog
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::VecStore { base, .. } if *base == output_ptr))
+            .count();
         // copy phase: d_main_vecs stores + RoPE phase: 2 stores per iteration (even+odd)
-        assert!(output_stores >= 2, "should emit VecStore to output_ptr, got {}", output_stores);
+        assert!(
+            output_stores >= 2,
+            "should emit VecStore to output_ptr, got {}",
+            output_stores
+        );
     }
 
     #[test]
@@ -1246,13 +1499,19 @@ mod tests {
 
         // Act: d_rope=6 → d_rope_half=3, not aligned to W128 lanes=4
         let result = emit_mla_rope_merge_inline(
-            &mut prog, 16, 6,
+            &mut prog,
+            16,
+            6,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, dummy],
-            width, dtype,
+            width,
+            dtype,
         );
 
         // Assert: unaligned d_rope_half should be rejected
-        assert!(result.is_err(), "unaligned d_rope_half=3 with W128 should be rejected");
+        assert!(
+            result.is_err(),
+            "unaligned d_rope_half=3 with W128 should be rejected"
+        );
     }
 
     #[test]
@@ -1270,9 +1529,17 @@ mod tests {
         let kl1 = prog_small.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         // d_c=16, head_dim=8 → dc_vecs=2, hd_vecs=1
         emit_mla_attn_score_inline(
-            &mut prog_small, 2, 8, 16, 4,
-            &[q1, kv1, w1, o1], kl1, width, dtype,
-        ).unwrap();
+            &mut prog_small,
+            2,
+            8,
+            16,
+            4,
+            &[q1, kv1, w1, o1],
+            kl1,
+            width,
+            dtype,
+        )
+        .unwrap();
         let count_small = prog_small.len();
 
         let mut prog_large = VmProgram::new();
@@ -1283,15 +1550,26 @@ mod tests {
         let kl2 = prog_large.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         // d_c=32, head_dim=16 → dc_vecs=4, hd_vecs=2 (more inner loop unrolling)
         emit_mla_attn_score_inline(
-            &mut prog_large, 2, 16, 32, 8,
-            &[q2, kv2, w2, o2], kl2, width, dtype,
-        ).unwrap();
+            &mut prog_large,
+            2,
+            16,
+            32,
+            8,
+            &[q2, kv2, w2, o2],
+            kl2,
+            width,
+            dtype,
+        )
+        .unwrap();
         let count_large = prog_large.len();
 
         // Assert: larger d_c/head_dim should produce more instructions
-        assert!(count_large > count_small,
+        assert!(
+            count_large > count_small,
             "d_c=32/head_dim=16 ({}) should produce more instructions than d_c=16/head_dim=8 ({})",
-            count_large, count_small);
+            count_large,
+            count_small
+        );
     }
 
     // ── 10 additional tests ──────────────────────────────────────────────
@@ -1301,10 +1579,10 @@ mod tests {
         // Arrange: the RoPE rotation body defined inline in emit_mla_rope_merge_inline
         // has 10 ops: 4 Inputs + 4 Muls + 1 Sub + 1 Add
         let rope_body: Vec<TraceOp> = vec![
-            TraceOp::Input(0),  // x0
-            TraceOp::Input(1),  // x1
-            TraceOp::Input(2),  // cos
-            TraceOp::Input(3),  // sin
+            TraceOp::Input(0),                    // x0
+            TraceOp::Input(1),                    // x1
+            TraceOp::Input(2),                    // cos
+            TraceOp::Input(3),                    // sin
             TraceOp::Mul(ValueId(0), ValueId(2)), // x0*cos
             TraceOp::Mul(ValueId(1), ValueId(3)), // x1*sin
             TraceOp::Sub(ValueId(4), ValueId(5)), // even = x0*cos - x1*sin
@@ -1314,13 +1592,35 @@ mod tests {
         ];
 
         // Assert
-        assert_eq!(rope_body.len(), 10, "RoPE body should have exactly 10 TraceOps");
-        assert!(matches!(rope_body[0], TraceOp::Input(0)), "first input is x0");
-        assert!(matches!(rope_body[1], TraceOp::Input(1)), "second input is x1");
-        assert!(matches!(rope_body[2], TraceOp::Input(2)), "third input is cos");
-        assert!(matches!(rope_body[3], TraceOp::Input(3)), "fourth input is sin");
-        assert!(matches!(rope_body[6], TraceOp::Sub(..)), "op[6] computes even component");
-        assert!(matches!(rope_body[9], TraceOp::Add(..)), "op[9] computes odd component");
+        assert_eq!(
+            rope_body.len(),
+            10,
+            "RoPE body should have exactly 10 TraceOps"
+        );
+        assert!(
+            matches!(rope_body[0], TraceOp::Input(0)),
+            "first input is x0"
+        );
+        assert!(
+            matches!(rope_body[1], TraceOp::Input(1)),
+            "second input is x1"
+        );
+        assert!(
+            matches!(rope_body[2], TraceOp::Input(2)),
+            "third input is cos"
+        );
+        assert!(
+            matches!(rope_body[3], TraceOp::Input(3)),
+            "fourth input is sin"
+        );
+        assert!(
+            matches!(rope_body[6], TraceOp::Sub(..)),
+            "op[6] computes even component"
+        );
+        assert!(
+            matches!(rope_body[9], TraceOp::Add(..)),
+            "op[9] computes odd component"
+        );
     }
 
     #[test]
@@ -1348,16 +1648,34 @@ mod tests {
 
         // Act: zero d_c
         let result = emit_mla_attn_score_inline(
-            &mut prog, 4, 8, 0, 4,
+            &mut prog,
+            4,
+            8,
+            0,
+            4,
             &[q_ptr, kv_ptr, w_ptr, out_ptr],
-            kv_len, width, dtype,
+            kv_len,
+            width,
+            dtype,
         );
 
         // Assert: error message should contain all dimension values for diagnostics
         let err_msg = format!("{:?}", result.unwrap_err());
-        assert!(err_msg.contains("num_heads=4"), "error should mention num_heads, got: {}", err_msg);
-        assert!(err_msg.contains("head_dim=8"), "error should mention head_dim, got: {}", err_msg);
-        assert!(err_msg.contains("d_c=0"), "error should mention d_c=0, got: {}", err_msg);
+        assert!(
+            err_msg.contains("num_heads=4"),
+            "error should mention num_heads, got: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("head_dim=8"),
+            "error should mention head_dim, got: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("d_c=0"),
+            "error should mention d_c=0, got: {}",
+            err_msg
+        );
     }
 
     #[test]
@@ -1376,15 +1694,26 @@ mod tests {
 
         // Act: zero d_rope
         let result = emit_mla_rope_merge_inline(
-            &mut prog, 16, 0,
+            &mut prog,
+            16,
+            0,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
+            width,
+            dtype,
         );
 
         // Assert: error should contain both d_c and d_rope
         let err_msg = format!("{:?}", result.unwrap_err());
-        assert!(err_msg.contains("d_c=16"), "error should mention d_c, got: {}", err_msg);
-        assert!(err_msg.contains("d_rope=0"), "error should mention d_rope=0, got: {}", err_msg);
+        assert!(
+            err_msg.contains("d_c=16"),
+            "error should mention d_c, got: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("d_rope=0"),
+            "error should mention d_rope=0, got: {}",
+            err_msg
+        );
     }
 
     #[test]
@@ -1402,13 +1731,23 @@ mod tests {
 
         // Act
         let result = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 16, 4,
+            &mut prog,
+            2,
+            8,
+            16,
+            4,
             &[q_ptr, kv_ptr, w_ptr, out_ptr],
-            kv_len, width, dtype,
-        ).unwrap();
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert
-        assert_eq!(result, out_ptr, "emit_mla_attn_score_inline should return the output_ptr slot");
+        assert_eq!(
+            result, out_ptr,
+            "emit_mla_attn_score_inline should return the output_ptr slot"
+        );
     }
 
     #[test]
@@ -1427,13 +1766,20 @@ mod tests {
 
         // Act
         let result = emit_mla_rope_merge_inline(
-            &mut prog, 32, 16,
+            &mut prog,
+            32,
+            16,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
-        ).unwrap();
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert
-        assert_eq!(result, output_ptr, "emit_mla_rope_merge_inline should return the output_ptr slot");
+        assert_eq!(
+            result, output_ptr,
+            "emit_mla_rope_merge_inline should return the output_ptr slot"
+        );
     }
 
     #[test]
@@ -1451,13 +1797,20 @@ mod tests {
 
         // Act: only 5 slots, no position
         let result = emit_mla_rope_merge_inline(
-            &mut prog, 32, 16,
+            &mut prog,
+            32,
+            16,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr],
-            width, dtype,
+            width,
+            dtype,
         );
 
         // Assert: should succeed without position
-        assert!(result.is_ok(), "should work without 6th position slot: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "should work without 6th position slot: {:?}",
+            result.err()
+        );
         assert!(prog.len() > 0, "should still emit instructions");
     }
 
@@ -1476,16 +1829,37 @@ mod tests {
 
         // Act
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 16, 4,
+            &mut prog,
+            2,
+            8,
+            16,
+            4,
             &[q_ptr, kv_ptr, w_ptr, out_ptr],
-            kv_len, width, dtype,
-        ).unwrap();
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: at least one VecStore with Scalar width (score buffer store)
-        let scalar_stores = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecStore { width: SimdWidth::Scalar, .. })
-        }).count();
-        assert!(scalar_stores >= 1, "should emit at least one Scalar-width VecStore for score buffer, got {}", scalar_stores);
+        let scalar_stores = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                matches!(
+                    instr,
+                    VmInstr::VecStore {
+                        width: SimdWidth::Scalar,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            scalar_stores >= 1,
+            "should emit at least one Scalar-width VecStore for score buffer, got {}",
+            scalar_stores
+        );
     }
 
     #[test]
@@ -1504,18 +1878,26 @@ mod tests {
 
         // Act: d_c=32, d_rope=16 → d_main=16 > 0, so copy phase should happen
         let _ = emit_mla_rope_merge_inline(
-            &mut prog, 32, 16,
+            &mut prog,
+            32,
+            16,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
-        ).unwrap();
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: VecLoad from c_kv_ptr must exist (copy phase)
-        let c_kv_loads = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecLoad { base, .. } if *base == c_kv_ptr)
-        }).count();
-        assert!(c_kv_loads >= 1,
+        let c_kv_loads = prog
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::VecLoad { base, .. } if *base == c_kv_ptr))
+            .count();
+        assert!(
+            c_kv_loads >= 1,
             "d_main=16 > 0 should trigger copy phase with VecLoad from c_kv_ptr, got {} loads",
-            c_kv_loads);
+            c_kv_loads
+        );
     }
 
     #[test]
@@ -1534,13 +1916,20 @@ mod tests {
 
         // Act: d_c=64, d_rope=32 → d_main=32, d_rope_half=16 (aligned to W512=16 lanes)
         let result = emit_mla_rope_merge_inline(
-            &mut prog, 64, 32,
+            &mut prog,
+            64,
+            32,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
+            width,
+            dtype,
         );
 
         // Assert
-        assert!(result.is_ok(), "W512 with aligned d_rope_half=16 should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "W512 with aligned d_rope_half=16 should succeed: {:?}",
+            result.err()
+        );
         assert!(prog.len() > 0, "should emit instructions for W512");
     }
 
@@ -1561,20 +1950,49 @@ mod tests {
 
         // Act
         let result = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 16, 4,
+            &mut prog,
+            2,
+            8,
+            16,
+            4,
             &[q_ptr, kv_ptr, w_ptr, out_ptr],
-            kv_len, width, dtype,
+            kv_len,
+            width,
+            dtype,
         );
 
         // Assert: should compile successfully with BF16
-        assert!(result.is_ok(), "BF16 dtype should compile: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "BF16 dtype should compile: {:?}",
+            result.err()
+        );
         // All Broadcast and VecLoad instructions should use BF16 dtype
-        let bf16_instrs = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::Broadcast { dtype: QuantPrecision::BF16, .. }
-                     | VmInstr::VecLoad { dtype: QuantPrecision::BF16, predicate: None, .. }
-                     | VmInstr::VecStore { dtype: QuantPrecision::BF16, predicate: None, .. })
-        }).count();
-        assert!(bf16_instrs > 0, "should emit BF16-typed instructions, got 0");
+        let bf16_instrs = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                matches!(
+                    instr,
+                    VmInstr::Broadcast {
+                        dtype: QuantPrecision::BF16,
+                        ..
+                    } | VmInstr::VecLoad {
+                        dtype: QuantPrecision::BF16,
+                        predicate: None,
+                        ..
+                    } | VmInstr::VecStore {
+                        dtype: QuantPrecision::BF16,
+                        predicate: None,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            bf16_instrs > 0,
+            "should emit BF16-typed instructions, got 0"
+        );
     }
 
     #[test]
@@ -1593,17 +2011,38 @@ mod tests {
 
         // Act: d_c=32, d_rope=16 → d_rope_half=8 aligned to W256
         let result = emit_mla_rope_merge_inline(
-            &mut prog, 32, 16,
+            &mut prog,
+            32,
+            16,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
+            width,
+            dtype,
         );
 
         // Assert
-        assert!(result.is_ok(), "BF16 rope merge should compile: {:?}", result.err());
-        let bf16_stores = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecStore { dtype: QuantPrecision::BF16, predicate: None, .. })
-        }).count();
-        assert!(bf16_stores > 0, "should emit BF16-typed VecStore instructions");
+        assert!(
+            result.is_ok(),
+            "BF16 rope merge should compile: {:?}",
+            result.err()
+        );
+        let bf16_stores = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                matches!(
+                    instr,
+                    VmInstr::VecStore {
+                        dtype: QuantPrecision::BF16,
+                        predicate: None,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            bf16_stores > 0,
+            "should emit BF16-typed VecStore instructions"
+        );
     }
 
     #[test]
@@ -1621,17 +2060,26 @@ mod tests {
 
         // Act
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 16, 4,
+            &mut prog,
+            2,
+            8,
+            16,
+            4,
             &[q_ptr, kv_ptr, w_ptr, out_ptr],
-            kv_len, width, dtype,
-        ).unwrap();
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: AddPtr with base=output_ptr and offset = num_heads*head_dim*elem_bytes = 2*8*4 = 64
-        let has_score_buf_addptr = prog.instrs.iter().any(|instr| {
-            matches!(instr, VmInstr::AddPtr { base, offset: 64, .. } if *base == out_ptr)
-        });
-        assert!(has_score_buf_addptr,
-            "should emit AddPtr from output_ptr with offset=64 (2 heads * 8 head_dim * 4 bytes)");
+        let has_score_buf_addptr = prog.instrs.iter().any(
+            |instr| matches!(instr, VmInstr::AddPtr { base, offset: 64, .. } if *base == out_ptr),
+        );
+        assert!(
+            has_score_buf_addptr,
+            "should emit AddPtr from output_ptr with offset=64 (2 heads * 8 head_dim * 4 bytes)"
+        );
     }
 
     #[test]
@@ -1649,21 +2097,33 @@ mod tests {
 
         // Act: d_c=16, head_dim=8 → w_uv_head_stride = 16*8*4 = 512
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 16, 4,
+            &mut prog,
+            2,
+            8,
+            16,
+            4,
             &[q_ptr, kv_ptr, w_ptr, out_ptr],
-            kv_len, width, dtype,
-        ).unwrap();
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: GprBinOp::Mul with Imm(512) for w_uv_head_stride
         let has_wuv_stride_mul = prog.instrs.iter().any(|instr| {
-            matches!(instr, VmInstr::GprBinOp {
-                op: GprOp::Mul,
-                b: GprOperand::Imm(512),
-                ..
-            })
+            matches!(
+                instr,
+                VmInstr::GprBinOp {
+                    op: GprOp::Mul,
+                    b: GprOperand::Imm(512),
+                    ..
+                }
+            )
         });
-        assert!(has_wuv_stride_mul,
-            "should emit GprBinOp::Mul with Imm(512) for w_uv_head_stride");
+        assert!(
+            has_wuv_stride_mul,
+            "should emit GprBinOp::Mul with Imm(512) for w_uv_head_stride"
+        );
     }
 
     #[test]
@@ -1681,18 +2141,32 @@ mod tests {
 
         // Act
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 16, 4,
+            &mut prog,
+            2,
+            8,
+            16,
+            4,
             &[q_ptr, kv_ptr, w_ptr, out_ptr],
-            kv_len, width, dtype,
-        ).unwrap();
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: at least one LoopBegin references the kv_len VRegId as DynamicVReg
-        let dynamic_loop_count = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::LoopBegin { bound: BoundExpr::DynamicVReg(vreg), .. }
+        let dynamic_loop_count = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                matches!(instr, VmInstr::LoopBegin { bound: BoundExpr::DynamicVReg(vreg), .. }
                      if *vreg == kv_len)
-        }).count();
-        assert!(dynamic_loop_count >= 1,
-            "should emit at least one LoopBegin with DynamicVReg(kv_len), got {}", dynamic_loop_count);
+            })
+            .count();
+        assert!(
+            dynamic_loop_count >= 1,
+            "should emit at least one LoopBegin with DynamicVReg(kv_len), got {}",
+            dynamic_loop_count
+        );
     }
 
     #[test]
@@ -1710,22 +2184,34 @@ mod tests {
 
         // Act: 8 heads, head_dim=8, d_c=16
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 8, 8, 16, 4,
+            &mut prog,
+            8,
+            8,
+            16,
+            4,
             &[q_ptr, kv_ptr, w_ptr, out_ptr],
-            kv_len, width, dtype,
-        ).unwrap();
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: GprBinOp::Mul with Imm(64) = head_hd_bytes = 8*4*2 = 64... wait
         // head_hd_bytes = head_dim * elem_bytes = 8 * 4 = 32
         let has_output_stride_mul = prog.instrs.iter().any(|instr| {
-            matches!(instr, VmInstr::GprBinOp {
-                op: GprOp::Mul,
-                b: GprOperand::Imm(32),
-                ..
-            })
+            matches!(
+                instr,
+                VmInstr::GprBinOp {
+                    op: GprOp::Mul,
+                    b: GprOperand::Imm(32),
+                    ..
+                }
+            )
         });
-        assert!(has_output_stride_mul,
-            "should emit GprBinOp::Mul with Imm(32) for output head stride (head_dim=8 * 4 bytes)");
+        assert!(
+            has_output_stride_mul,
+            "should emit GprBinOp::Mul with Imm(32) for output head stride (head_dim=8 * 4 bytes)"
+        );
     }
 
     #[test]
@@ -1744,13 +2230,19 @@ mod tests {
 
         // Act: d_c=16, d_rope=16 → d_main=0, no copy phase
         emit_mla_rope_merge_inline(
-            &mut prog_no_copy, 16, 16,
+            &mut prog_no_copy,
+            16,
+            16,
             &[c1, k1, o1, cos1, sin1, p1],
-            width, dtype,
-        ).unwrap();
-        let stores_no_copy = prog_no_copy.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecStore { base, .. } if *base == o1)
-        }).count();
+            width,
+            dtype,
+        )
+        .unwrap();
+        let stores_no_copy = prog_no_copy
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::VecStore { base, .. } if *base == o1))
+            .count();
 
         // Now with d_main > 0 (has copy phase)
         let mut prog_with_copy = VmProgram::new();
@@ -1763,13 +2255,19 @@ mod tests {
 
         // Act: d_c=32, d_rope=16 → d_main=16, has copy phase
         emit_mla_rope_merge_inline(
-            &mut prog_with_copy, 32, 16,
+            &mut prog_with_copy,
+            32,
+            16,
             &[c2, k2, o2, cos2, sin2, p2],
-            width, dtype,
-        ).unwrap();
-        let stores_with_copy = prog_with_copy.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecStore { base, .. } if *base == o2)
-        }).count();
+            width,
+            dtype,
+        )
+        .unwrap();
+        let stores_with_copy = prog_with_copy
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::VecStore { base, .. } if *base == o2))
+            .count();
 
         // Assert: more stores when copy phase is present
         assert!(stores_with_copy > stores_no_copy,
@@ -1792,16 +2290,27 @@ mod tests {
         let o1 = prog1.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let kl1 = prog1.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         emit_mla_attn_score_inline(
-            &mut prog1, 2, 8, 16, 4,
-            &[q1, kv1, w1, o1], kl1, width, dtype,
-        ).unwrap();
+            &mut prog1,
+            2,
+            8,
+            16,
+            4,
+            &[q1, kv1, w1, o1],
+            kl1,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         let expected_scale_16 = 1.0f32 / 16.0f32.sqrt();
         let has_correct_scale_16 = prog1.instrs.iter().any(|instr| {
             matches!(instr, VmInstr::Broadcast { src: ScalarExpr::Const(v), .. }
                      if (*v - expected_scale_16).abs() < 1e-6)
         });
-        assert!(has_correct_scale_16, "d_c=16 scale should be 1/sqrt(16) ≈ 0.25");
+        assert!(
+            has_correct_scale_16,
+            "d_c=16 scale should be 1/sqrt(16) ≈ 0.25"
+        );
 
         let mut prog2 = VmProgram::new();
         let q2 = prog2.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -1810,16 +2319,27 @@ mod tests {
         let o2 = prog2.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let kl2 = prog2.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         emit_mla_attn_score_inline(
-            &mut prog2, 2, 16, 64, 8,
-            &[q2, kv2, w2, o2], kl2, width, dtype,
-        ).unwrap();
+            &mut prog2,
+            2,
+            16,
+            64,
+            8,
+            &[q2, kv2, w2, o2],
+            kl2,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         let expected_scale_64 = 1.0f32 / 64.0f32.sqrt();
         let has_correct_scale_64 = prog2.instrs.iter().any(|instr| {
             matches!(instr, VmInstr::Broadcast { src: ScalarExpr::Const(v), .. }
                      if (*v - expected_scale_64).abs() < 1e-6)
         });
-        assert!(has_correct_scale_64, "d_c=64 scale should be 1/sqrt(64) = 0.125");
+        assert!(
+            has_correct_scale_64,
+            "d_c=64 scale should be 1/sqrt(64) = 0.125"
+        );
     }
 
     #[test]
@@ -1838,17 +2358,26 @@ mod tests {
 
         // Act: d_c=32, d_rope=16 → d_main=16, d_rope_half=8, rope_pair_vecs=1
         let _ = emit_mla_rope_merge_inline(
-            &mut prog, 32, 16,
+            &mut prog,
+            32,
+            16,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
-        ).unwrap();
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: must have LoopBegin instructions (copy loop + RoPE loop)
-        let loop_count = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::LoopBegin { .. })
-        }).count();
-        assert!(loop_count >= 2,
-            "should emit at least 2 loops (copy + RoPE), got {}", loop_count);
+        let loop_count = prog
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::LoopBegin { .. }))
+            .count();
+        assert!(
+            loop_count >= 2,
+            "should emit at least 2 loops (copy + RoPE), got {}",
+            loop_count
+        );
     }
 
     #[test]
@@ -1867,27 +2396,42 @@ mod tests {
 
         // Act: d_rope=16, d_rope_half=8, d_rope_half*elem_bytes=32 for F32
         let _ = emit_mla_rope_merge_inline(
-            &mut prog, 32, 16,
+            &mut prog,
+            32,
+            16,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
-        ).unwrap();
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: odd component VecLoad from k_pe_ptr uses Add offset containing Const(32)
         // This is produced by OffsetExpr::loop_plus_const(byte_off, d_rope_half * elem_bytes)
-        let odd_loads = prog.instrs.iter().filter(|instr| {
-            if let VmInstr::VecLoad { base, offset, .. } = instr {
-                if *base != k_pe_ptr { return false; }
-                // Check if offset is Add(_, Const(32)) — the d_rope_half * elem_bytes offset
-                if let OffsetExpr::Add(_, rhs) = offset {
-                    if let OffsetExpr::Const(32) = rhs.as_ref() { return true; }
+        let odd_loads = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                if let VmInstr::VecLoad { base, offset, .. } = instr {
+                    if *base != k_pe_ptr {
+                        return false;
+                    }
+                    // Check if offset is Add(_, Const(32)) — the d_rope_half * elem_bytes offset
+                    if let OffsetExpr::Add(_, rhs) = offset {
+                        if let OffsetExpr::Const(32) = rhs.as_ref() {
+                            return true;
+                        }
+                    }
+                    false
+                } else {
+                    false
                 }
-                false
-            } else {
-                false
-            }
-        }).count();
-        assert!(odd_loads >= 1,
-            "should emit VecLoad from k_pe_ptr with Add(_, Const(32)) for odd components, got {}", odd_loads);
+            })
+            .count();
+        assert!(
+            odd_loads >= 1,
+            "should emit VecLoad from k_pe_ptr with Add(_, Const(32)) for odd components, got {}",
+            odd_loads
+        );
     }
 
     #[test]
@@ -1905,19 +2449,42 @@ mod tests {
 
         // Act: with Scalar width, d_c=4 → dc_vecs=4/1=4, head_dim=4 → hd_vecs=4/1=4
         let result = emit_mla_attn_score_inline(
-            &mut prog, 2, 4, 4, 2,
+            &mut prog,
+            2,
+            4,
+            4,
+            2,
             &[q_ptr, kv_ptr, w_ptr, out_ptr],
-            kv_len, width, dtype,
+            kv_len,
+            width,
+            dtype,
         );
 
         // Assert: should succeed with scalar width
-        assert!(result.is_ok(), "Scalar width should compile: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Scalar width should compile: {:?}",
+            result.err()
+        );
         assert!(prog.len() > 0, "should emit instructions with Scalar width");
         // With scalar width, all broadcasts should be scalar-width
-        let scalar_broadcasts = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::Broadcast { width: SimdWidth::Scalar, .. })
-        }).count();
-        assert!(scalar_broadcasts > 0, "should emit Scalar-width Broadcast instructions");
+        let scalar_broadcasts = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                matches!(
+                    instr,
+                    VmInstr::Broadcast {
+                        width: SimdWidth::Scalar,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            scalar_broadcasts > 0,
+            "should emit Scalar-width Broadcast instructions"
+        );
     }
 
     // ── 10 new tests (wave-12kkc) ────────────────────────────────────────────
@@ -1937,13 +2504,23 @@ mod tests {
 
         // Act: d_c=32, head_dim=32, d_rope=16, all divisible by 32
         let result = emit_mla_attn_score_inline(
-            &mut prog, 4, 32, 32, 16,
+            &mut prog,
+            4,
+            32,
+            32,
+            16,
             &[q_ptr, kv_ptr, w_ptr, out_ptr],
-            kv_len, width, dtype,
+            kv_len,
+            width,
+            dtype,
         );
 
         // Assert: should compile successfully with GPU Warp width
-        assert!(result.is_ok(), "Warp(32) width should compile: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Warp(32) width should compile: {:?}",
+            result.err()
+        );
         assert!(prog.len() > 0, "should emit instructions with Warp width");
     }
 
@@ -1963,13 +2540,20 @@ mod tests {
 
         // Act: d_c=96, d_rope=64 → d_main=32, d_rope_half=32 aligned to Warp(32) lanes
         let result = emit_mla_rope_merge_inline(
-            &mut prog, 96, 64,
+            &mut prog,
+            96,
+            64,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
+            width,
+            dtype,
         );
 
         // Assert
-        assert!(result.is_ok(), "Warp(32) rope merge should compile: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Warp(32) rope merge should compile: {:?}",
+            result.err()
+        );
         assert!(prog.len() > 0, "should emit instructions with Warp width");
     }
 
@@ -1989,19 +2573,39 @@ mod tests {
 
         // Act: head_dim=16 → hd_vecs=2, so 2 o_acc zero Broadcasts inside the head loop
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 16, 16, 4,
+            &mut prog,
+            2,
+            16,
+            16,
+            4,
             &[q_ptr, kv_ptr, w_ptr, out_ptr],
-            kv_len, width, dtype,
-        ).unwrap();
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: count zero-valued Broadcast instructions
-        let zero_broadcasts = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::Broadcast { src: ScalarExpr::Const(0.0), .. })
-        }).count();
+        let zero_broadcasts = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                matches!(
+                    instr,
+                    VmInstr::Broadcast {
+                        src: ScalarExpr::Const(0.0),
+                        ..
+                    }
+                )
+            })
+            .count();
         // Per head: 1 running_sum + hd_vecs=2 o_acc + 1 dot_acc per kv iteration (in loop)
         // At minimum 1 (running_sum) + 2 (o_acc) = 3 zero broadcasts outside loops
-        assert!(zero_broadcasts >= 3,
-            "should emit at least 3 zero Broadcast (running_sum + 2 o_acc), got {}", zero_broadcasts);
+        assert!(
+            zero_broadcasts >= 3,
+            "should emit at least 3 zero Broadcast (running_sum + 2 o_acc), got {}",
+            zero_broadcasts
+        );
     }
 
     #[test]
@@ -2009,10 +2613,10 @@ mod tests {
         // Arrange: verify the RoPE body TraceOp chain uses correct ValueId references
         // The chain must satisfy SSA def-before-use for all intermediate values
         let rope_body: Vec<TraceOp> = vec![
-            TraceOp::Input(0),  // [0] x0
-            TraceOp::Input(1),  // [1] x1
-            TraceOp::Input(2),  // [2] cos
-            TraceOp::Input(3),  // [3] sin
+            TraceOp::Input(0),                    // [0] x0
+            TraceOp::Input(1),                    // [1] x1
+            TraceOp::Input(2),                    // [2] cos
+            TraceOp::Input(3),                    // [3] sin
             TraceOp::Mul(ValueId(0), ValueId(2)), // [4] x0*cos
             TraceOp::Mul(ValueId(1), ValueId(3)), // [5] x1*sin
             TraceOp::Sub(ValueId(4), ValueId(5)), // [6] even
@@ -2060,21 +2664,35 @@ mod tests {
 
         // Act
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 16, 4,
+            &mut prog,
+            2,
+            8,
+            16,
+            4,
             &[q_ptr, kv_ptr, w_ptr, out_ptr],
-            kv_len, width, dtype,
-        ).unwrap();
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: GprBinOp::Add with base=kv_ptr (computing key_row = kv_cache_ptr + pos_off)
-        let kv_adds = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::GprBinOp {
+        let kv_adds = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                matches!(instr, VmInstr::GprBinOp {
                 op: GprOp::Add,
                 a,
                 ..
             } if *a == kv_ptr)
-        }).count();
-        assert!(kv_adds >= 1,
-            "should emit GprBinOp::Add with kv_ptr as base for key row access, got {}", kv_adds);
+            })
+            .count();
+        assert!(
+            kv_adds >= 1,
+            "should emit GprBinOp::Add with kv_ptr as base for key row access, got {}",
+            kv_adds
+        );
     }
 
     #[test]
@@ -2093,17 +2711,26 @@ mod tests {
 
         // Act: d_c=16, d_rope=16 → d_main=0, copy phase skipped entirely
         let _ = emit_mla_rope_merge_inline(
-            &mut prog, 16, 16,
+            &mut prog,
+            16,
+            16,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
-        ).unwrap();
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: zero VecLoad from c_kv_ptr (copy phase is skipped)
-        let c_kv_loads = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecLoad { base, .. } if *base == c_kv_ptr)
-        }).count();
-        assert_eq!(c_kv_loads, 0,
-            "d_main=0 should not emit VecLoad from c_kv_ptr, got {}", c_kv_loads);
+        let c_kv_loads = prog
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::VecLoad { base, .. } if *base == c_kv_ptr))
+            .count();
+        assert_eq!(
+            c_kv_loads, 0,
+            "d_main=0 should not emit VecLoad from c_kv_ptr, got {}",
+            c_kv_loads
+        );
     }
 
     #[test]
@@ -2127,8 +2754,10 @@ mod tests {
             panic!("body[3] should be Sub");
         }
         // [4] = Exp([3]) — references Sub result, valid
-        assert!(matches!(body[4], TraceOp::Exp(ValueId(3))),
-            "body[4] should be Exp(ValueId(3))");
+        assert!(
+            matches!(body[4], TraceOp::Exp(ValueId(3))),
+            "body[4] should be Exp(ValueId(3))"
+        );
         // [5] = Sub([1], [2]) — references score and new_max
         if let TraceOp::Sub(ValueId(a), ValueId(b)) = body[5] {
             assert_eq!(a, 1, "Sub first arg should be slot 1 (score)");
@@ -2137,8 +2766,10 @@ mod tests {
             panic!("body[5] should be Sub");
         }
         // [6] = Exp([5]) — references second Sub result, valid
-        assert!(matches!(body[6], TraceOp::Exp(ValueId(5))),
-            "body[6] should be Exp(ValueId(5))");
+        assert!(
+            matches!(body[6], TraceOp::Exp(ValueId(5))),
+            "body[6] should be Exp(ValueId(5))"
+        );
     }
 
     #[test]
@@ -2157,29 +2788,41 @@ mod tests {
 
         // Act: d_c=48, d_rope=16 → d_main=32, d_main_bytes=128 (32*4)
         let _ = emit_mla_rope_merge_inline(
-            &mut prog, 48, 16,
+            &mut prog,
+            48,
+            16,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
-        ).unwrap();
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: RoPE even/odd stores use offset Add(_, Const(128)) or larger
-        let rope_stores_with_d_main = prog.instrs.iter().filter(|instr| {
-            if let VmInstr::VecStore { base, offset, .. } = instr {
-                if *base != output_ptr { return false; }
-                // Check for Add offset containing d_main_bytes=128
-                if let OffsetExpr::Add(_, rhs) = offset {
-                    if let OffsetExpr::Const(v) = rhs.as_ref() {
-                        return *v >= 128; // d_main_bytes or more
+        let rope_stores_with_d_main = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                if let VmInstr::VecStore { base, offset, .. } = instr {
+                    if *base != output_ptr {
+                        return false;
                     }
+                    // Check for Add offset containing d_main_bytes=128
+                    if let OffsetExpr::Add(_, rhs) = offset {
+                        if let OffsetExpr::Const(v) = rhs.as_ref() {
+                            return *v >= 128; // d_main_bytes or more
+                        }
+                    }
+                    false
+                } else {
+                    false
                 }
-                false
-            } else {
-                false
-            }
-        }).count();
-        assert!(rope_stores_with_d_main >= 1,
+            })
+            .count();
+        assert!(
+            rope_stores_with_d_main >= 1,
             "should emit VecStore to output_ptr with d_main offset >= 128, got {}",
-            rope_stores_with_d_main);
+            rope_stores_with_d_main
+        );
     }
 
     #[test]
@@ -2200,11 +2843,18 @@ mod tests {
 
         // Phase 1: rope merge
         let rope_result = emit_mla_rope_merge_inline(
-            &mut prog, 32, 16,
+            &mut prog,
+            32,
+            16,
             &[c_kv_ptr, k_pe_ptr, merged_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
+            width,
+            dtype,
         );
-        assert!(rope_result.is_ok(), "rope merge should succeed in pipeline: {:?}", rope_result.err());
+        assert!(
+            rope_result.is_ok(),
+            "rope merge should succeed in pipeline: {:?}",
+            rope_result.err()
+        );
         let instr_after_rope = prog.len();
 
         // Allocate new slots for attn score (some reuse the merged output)
@@ -2215,16 +2865,29 @@ mod tests {
 
         // Phase 2: attn score using merged KV as input
         let attn_result = emit_mla_attn_score_inline(
-            &mut prog, 4, 8, 32, 16,
+            &mut prog,
+            4,
+            8,
+            32,
+            16,
             &[q_ptr, merged_ptr, w_uv_ptr, out_ptr],
-            kv_len, width, dtype,
+            kv_len,
+            width,
+            dtype,
         );
 
         // Assert: both phases succeed, and attn adds more instructions
-        assert!(attn_result.is_ok(), "attn score should succeed after rope merge: {:?}", attn_result.err());
-        assert!(prog.len() > instr_after_rope,
+        assert!(
+            attn_result.is_ok(),
+            "attn score should succeed after rope merge: {:?}",
+            attn_result.err()
+        );
+        assert!(
+            prog.len() > instr_after_rope,
             "attn score should add instructions after rope merge ({} > {})",
-            prog.len(), instr_after_rope);
+            prog.len(),
+            instr_after_rope
+        );
     }
 
     #[test]
@@ -2243,16 +2906,26 @@ mod tests {
 
         // Act: d_rope=10 → d_rope_half=5, not aligned to W256 lanes=8
         let result = emit_mla_rope_merge_inline(
-            &mut prog, 24, 10,
+            &mut prog,
+            24,
+            10,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
+            width,
+            dtype,
         );
 
         // Assert: error message should mention both d_rope_half and lane count
         let err_msg = format!("{:?}", result.unwrap_err());
-        assert!(err_msg.contains("d_rope_half"), "error should mention d_rope_half, got: {}", err_msg);
-        assert!(err_msg.contains("aligned") || err_msg.contains("lanes"),
-            "error should mention alignment issue, got: {}", err_msg);
+        assert!(
+            err_msg.contains("d_rope_half"),
+            "error should mention d_rope_half, got: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("aligned") || err_msg.contains("lanes"),
+            "error should mention alignment issue, got: {}",
+            err_msg
+        );
     }
 
     // ── 10 new tests ──────────────────────────────────────────────────
@@ -2271,15 +2944,31 @@ mod tests {
 
         // Act
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 16, 4,
-            &[q_ptr, kv_ptr, w_ptr, out_ptr], kv_len, width, dtype,
-        ).unwrap();
+            &mut prog,
+            2,
+            8,
+            16,
+            4,
+            &[q_ptr, kv_ptr, w_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: GprBinOp::Add with a=q_ptr for computing q_row = q_ptr + head_offset
-        let q_adds = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::GprBinOp { op: GprOp::Add, a, .. } if *a == q_ptr)
-        }).count();
-        assert!(q_adds >= 1, "should emit GprBinOp::Add from q_ptr, got {}", q_adds);
+        let q_adds = prog
+            .instrs
+            .iter()
+            .filter(
+                |instr| matches!(instr, VmInstr::GprBinOp { op: GprOp::Add, a, .. } if *a == q_ptr),
+            )
+            .count();
+        assert!(
+            q_adds >= 1,
+            "should emit GprBinOp::Add from q_ptr, got {}",
+            q_adds
+        );
     }
 
     #[test]
@@ -2296,15 +2985,31 @@ mod tests {
 
         // Act
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 16, 4,
-            &[q_ptr, kv_ptr, w_ptr, out_ptr], kv_len, width, dtype,
-        ).unwrap();
+            &mut prog,
+            2,
+            8,
+            16,
+            4,
+            &[q_ptr, kv_ptr, w_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: GprBinOp::Add with a=w_ptr for computing wuv_row
-        let w_adds = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::GprBinOp { op: GprOp::Add, a, .. } if *a == w_ptr)
-        }).count();
-        assert!(w_adds >= 1, "should emit GprBinOp::Add from w_uv_ptr, got {}", w_adds);
+        let w_adds = prog
+            .instrs
+            .iter()
+            .filter(
+                |instr| matches!(instr, VmInstr::GprBinOp { op: GprOp::Add, a, .. } if *a == w_ptr),
+            )
+            .count();
+        assert!(
+            w_adds >= 1,
+            "should emit GprBinOp::Add from w_uv_ptr, got {}",
+            w_adds
+        );
     }
 
     #[test]
@@ -2321,16 +3026,37 @@ mod tests {
 
         // Act
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 16, 4,
-            &[q_ptr, kv_ptr, w_ptr, out_ptr], kv_len, width, dtype,
-        ).unwrap();
+            &mut prog,
+            2,
+            8,
+            16,
+            4,
+            &[q_ptr, kv_ptr, w_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: at least one Broadcast with ExtractLane0 (score scalar after HReduce)
-        let extract_count = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::Broadcast { src: ScalarExpr::ExtractLane0(_), .. })
-        }).count();
-        assert!(extract_count >= 1,
-            "should emit Broadcast with ExtractLane0 for score, got {}", extract_count);
+        let extract_count = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                matches!(
+                    instr,
+                    VmInstr::Broadcast {
+                        src: ScalarExpr::ExtractLane0(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            extract_count >= 1,
+            "should emit Broadcast with ExtractLane0 for score, got {}",
+            extract_count
+        );
     }
 
     #[test]
@@ -2347,15 +3073,27 @@ mod tests {
 
         // Act
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 16, 4,
-            &[q_ptr, kv_ptr, w_ptr, out_ptr], kv_len, width, dtype,
-        ).unwrap();
+            &mut prog,
+            2,
+            8,
+            16,
+            4,
+            &[q_ptr, kv_ptr, w_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: GprBinOp::Add with a=out_ptr for computing o_row = output_ptr + head_offset
         let out_adds = prog.instrs.iter().filter(|instr| {
             matches!(instr, VmInstr::GprBinOp { op: GprOp::Add, a, .. } if *a == out_ptr)
         }).count();
-        assert!(out_adds >= 1, "should emit GprBinOp::Add from output_ptr, got {}", out_adds);
+        assert!(
+            out_adds >= 1,
+            "should emit GprBinOp::Add from output_ptr, got {}",
+            out_adds
+        );
     }
 
     #[test]
@@ -2372,16 +3110,37 @@ mod tests {
 
         // Act: d_c=16, W256=8 lanes → dc_vecs=2
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 16, 4,
-            &[q_ptr, kv_ptr, w_ptr, out_ptr], kv_len, width, dtype,
-        ).unwrap();
+            &mut prog,
+            2,
+            8,
+            16,
+            4,
+            &[q_ptr, kv_ptr, w_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: LoopBegin with BoundExpr::Const(2) for dc_vecs=2
-        let dc_loops = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::LoopBegin { bound: BoundExpr::Const(2), .. })
-        }).count();
-        assert!(dc_loops >= 1,
-            "should emit LoopBegin with Const(2) for dc_vecs, got {}", dc_loops);
+        let dc_loops = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                matches!(
+                    instr,
+                    VmInstr::LoopBegin {
+                        bound: BoundExpr::Const(2),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            dc_loops >= 1,
+            "should emit LoopBegin with Const(2) for dc_vecs, got {}",
+            dc_loops
+        );
     }
 
     #[test]
@@ -2398,16 +3157,37 @@ mod tests {
 
         // Act
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 16, 4,
-            &[q_ptr, kv_ptr, w_ptr, out_ptr], kv_len, width, dtype,
-        ).unwrap();
+            &mut prog,
+            2,
+            8,
+            16,
+            4,
+            &[q_ptr, kv_ptr, w_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: VecStore with W256 width exists (normalize phase output stores)
-        let vec_stores = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecStore { width: SimdWidth::W256, .. })
-        }).count();
-        assert!(vec_stores >= 1,
-            "should emit W256-width VecStore for output, got {}", vec_stores);
+        let vec_stores = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                matches!(
+                    instr,
+                    VmInstr::VecStore {
+                        width: SimdWidth::W256,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            vec_stores >= 1,
+            "should emit W256-width VecStore for output, got {}",
+            vec_stores
+        );
     }
 
     #[test]
@@ -2425,17 +3205,34 @@ mod tests {
 
         // Act
         let _ = emit_mla_rope_merge_inline(
-            &mut prog, 32, 16,
+            &mut prog,
+            32,
+            16,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
-        ).unwrap();
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: LoopBegin with Const(2) for d_main_vecs=2 copy phase
-        let d_main_loops = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::LoopBegin { bound: BoundExpr::Const(2), .. })
-        }).count();
-        assert!(d_main_loops >= 1,
-            "should emit LoopBegin Const(2) for d_main_vecs copy phase, got {}", d_main_loops);
+        let d_main_loops = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                matches!(
+                    instr,
+                    VmInstr::LoopBegin {
+                        bound: BoundExpr::Const(2),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            d_main_loops >= 1,
+            "should emit LoopBegin Const(2) for d_main_vecs copy phase, got {}",
+            d_main_loops
+        );
     }
 
     #[test]
@@ -2454,10 +3251,14 @@ mod tests {
 
         // Act
         let _ = emit_mla_rope_merge_inline(
-            &mut prog, 32, 16,
+            &mut prog,
+            32,
+            16,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
-        ).unwrap();
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: even stores at offset Const(64), odd stores at Const(96)
         let even_offset_stores = prog.instrs.iter().filter(|instr| {
@@ -2472,8 +3273,16 @@ mod tests {
                     matches!(offset, OffsetExpr::Add(_, rhs) if matches!(rhs.as_ref(), OffsetExpr::Const(96)))
             } else { false }
         }).count();
-        assert!(even_offset_stores >= 1, "should emit even store with Const(64), got {}", even_offset_stores);
-        assert!(odd_offset_stores >= 1, "should emit odd store with Const(96), got {}", odd_offset_stores);
+        assert!(
+            even_offset_stores >= 1,
+            "should emit even store with Const(64), got {}",
+            even_offset_stores
+        );
+        assert!(
+            odd_offset_stores >= 1,
+            "should emit odd store with Const(96), got {}",
+            odd_offset_stores
+        );
     }
 
     #[test]
@@ -2490,16 +3299,27 @@ mod tests {
 
         // Act: 2 heads, each emits 1 NEG_INFINITY Broadcast for running_max
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 16, 4,
-            &[q_ptr, kv_ptr, w_ptr, out_ptr], kv_len, width, dtype,
-        ).unwrap();
+            &mut prog,
+            2,
+            8,
+            16,
+            4,
+            &[q_ptr, kv_ptr, w_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: at least 1 NEG_INFINITY broadcast for running_max init
         let neg_inf_count = prog.instrs.iter().filter(|instr| {
             matches!(instr, VmInstr::Broadcast { src: ScalarExpr::Const(v), .. } if *v == f32::NEG_INFINITY)
         }).count();
-        assert!(neg_inf_count >= 1,
-            "should produce at least 1 NEG_INFINITY broadcast, got {}", neg_inf_count);
+        assert!(
+            neg_inf_count >= 1,
+            "should produce at least 1 NEG_INFINITY broadcast, got {}",
+            neg_inf_count
+        );
     }
 
     #[test]
@@ -2517,12 +3337,19 @@ mod tests {
         let p1 = prog_small.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         // d_c=24, d_rope=16 → d_main=8, d_main_vecs=1
         emit_mla_rope_merge_inline(
-            &mut prog_small, 24, 16,
-            &[c1, k1, o1, cos1, sin1, p1], width, dtype,
-        ).unwrap();
-        let loads_small = prog_small.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecLoad { base, .. } if *base == c1)
-        }).count();
+            &mut prog_small,
+            24,
+            16,
+            &[c1, k1, o1, cos1, sin1, p1],
+            width,
+            dtype,
+        )
+        .unwrap();
+        let loads_small = prog_small
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::VecLoad { base, .. } if *base == c1))
+            .count();
 
         let mut prog_large = VmProgram::new();
         let c2 = prog_large.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -2533,17 +3360,27 @@ mod tests {
         let p2 = prog_large.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         // d_c=48, d_rope=16 → d_main=32, d_main_vecs=4
         emit_mla_rope_merge_inline(
-            &mut prog_large, 48, 16,
-            &[c2, k2, o2, cos2, sin2, p2], width, dtype,
-        ).unwrap();
-        let loads_large = prog_large.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecLoad { base, .. } if *base == c2)
-        }).count();
+            &mut prog_large,
+            48,
+            16,
+            &[c2, k2, o2, cos2, sin2, p2],
+            width,
+            dtype,
+        )
+        .unwrap();
+        let loads_large = prog_large
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::VecLoad { base, .. } if *base == c2))
+            .count();
 
         // Assert: larger d_main produces at least as many c_kv loads in copy phase
-        assert!(loads_large >= loads_small,
+        assert!(
+            loads_large >= loads_small,
             "d_main=32 ({} loads) should produce >= d_main=8 ({} loads) c_kv loads",
-            loads_large, loads_small);
+            loads_large,
+            loads_small
+        );
     }
 
     // ── 10 new tests (edge cases: d_kv zero, d_rope boundary, absorbed routing, c_KV offsets) ──
@@ -2565,13 +3402,24 @@ mod tests {
         // The function does not explicitly check d_rope > d_c, but this tests
         // that such misconfiguration still compiles (stride calculation proceeds).
         let result = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 8, 16,
-            &[q_ptr, kv_ptr, w_ptr, out_ptr], kv_len, width, dtype,
+            &mut prog,
+            2,
+            8,
+            8,
+            16,
+            &[q_ptr, kv_ptr, w_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
         );
 
         // Assert: compilation succeeds (stride math is valid) — semantic validation
         // belongs to the caller, not the emit function
-        assert!(result.is_ok(), "d_rope > d_c compiles (caller validates): {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "d_rope > d_c compiles (caller validates): {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -2590,18 +3438,30 @@ mod tests {
 
         // Act: d_c=32, d_rope=32 → d_main=0, d_rope_half=16 aligned to W256=8 lanes
         let result = emit_mla_rope_merge_inline(
-            &mut prog, 32, 32,
+            &mut prog,
+            32,
+            32,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
+            width,
+            dtype,
         );
 
         // Assert: fully absorbed case succeeds, no copy-phase stores to output_ptr
-        assert!(result.is_ok(), "d_c==d_rope absorbed path should succeed: {:?}", result.err());
-        let copy_stores = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecLoad { base, .. } if *base == c_kv_ptr)
-        }).count();
-        assert_eq!(copy_stores, 0,
-            "fully absorbed (d_main=0) should have zero c_kv loads, got {}", copy_stores);
+        assert!(
+            result.is_ok(),
+            "d_c==d_rope absorbed path should succeed: {:?}",
+            result.err()
+        );
+        let copy_stores = prog
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::VecLoad { base, .. } if *base == c_kv_ptr))
+            .count();
+        assert_eq!(
+            copy_stores, 0,
+            "fully absorbed (d_main=0) should have zero c_kv loads, got {}",
+            copy_stores
+        );
     }
 
     #[test]
@@ -2619,16 +3479,26 @@ mod tests {
 
         // Act: d_c=16, d_rope=8 → kv_row_bytes = (16+8)*4 = 96
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 16, 8,
-            &[q_ptr, kv_ptr, w_ptr, out_ptr], kv_len, width, dtype,
-        ).unwrap();
+            &mut prog,
+            2,
+            8,
+            16,
+            8,
+            &[q_ptr, kv_ptr, w_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: LoopBegin with step_bytes=96 for KV iteration
         let kv_loop_with_step_96 = prog.instrs.iter().any(|instr| {
             matches!(instr, VmInstr::LoopBegin { offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(96))
         });
-        assert!(kv_loop_with_step_96,
-            "should emit KV loop with step_bytes=96 ((d_c+d_rope)*4)");
+        assert!(
+            kv_loop_with_step_96,
+            "should emit KV loop with step_bytes=96 ((d_c+d_rope)*4)"
+        );
     }
 
     #[test]
@@ -2646,14 +3516,24 @@ mod tests {
 
         // Act: d_c=16, d_rope=8 → d_main=8, d_rope_half=4 aligned to W128=4 lanes
         let result = emit_mla_rope_merge_inline(
-            &mut prog, 16, 8,
+            &mut prog,
+            16,
+            8,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
+            width,
+            dtype,
         );
 
         // Assert: minimal aligned d_rope succeeds with W128
-        assert!(result.is_ok(), "minimal d_rope=8 with W128 should succeed: {:?}", result.err());
-        assert!(prog.len() > 0, "should emit instructions for minimal aligned d_rope");
+        assert!(
+            result.is_ok(),
+            "minimal d_rope=8 with W128 should succeed: {:?}",
+            result.err()
+        );
+        assert!(
+            prog.len() > 0,
+            "should emit instructions for minimal aligned d_rope"
+        );
     }
 
     #[test]
@@ -2672,16 +3552,26 @@ mod tests {
 
         // Act: d_c=16, d_rope=8 → c_KV is first 16 elements, k_pe is last 8
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 16, 8,
-            &[q_ptr, kv_ptr, w_ptr, out_ptr], kv_len, width, dtype,
-        ).unwrap();
+            &mut prog,
+            2,
+            8,
+            16,
+            8,
+            &[q_ptr, kv_ptr, w_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: dc_vecs loop step is dc_vec_step = lanes * elem_bytes = 8*4=32
         let dc_loop_step_32 = prog.instrs.iter().any(|instr| {
             matches!(instr, VmInstr::LoopBegin { offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(32))
         });
-        assert!(dc_loop_step_32,
-            "dc_vecs inner loop should step_bytes by 32 (8 lanes * 4 bytes F32)");
+        assert!(
+            dc_loop_step_32,
+            "dc_vecs inner loop should step_bytes by 32 (8 lanes * 4 bytes F32)"
+        );
     }
 
     #[test]
@@ -2700,22 +3590,36 @@ mod tests {
 
         // Act: d_c=48, d_rope=16 → d_main=32 (un-absorbed, significant copy phase)
         let _ = emit_mla_rope_merge_inline(
-            &mut prog, 48, 16,
+            &mut prog,
+            48,
+            16,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
-        ).unwrap();
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: both phases present — c_kv loads (copy) AND k_pe loads (RoPE)
-        let c_kv_loads = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecLoad { base, .. } if *base == c_kv_ptr)
-        }).count();
-        let k_pe_loads = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecLoad { base, .. } if *base == k_pe_ptr)
-        }).count();
-        assert!(c_kv_loads >= 1,
-            "un-absorbed path should have c_kv loads for copy phase, got {}", c_kv_loads);
-        assert!(k_pe_loads >= 2,
-            "un-absorbed path should have k_pe loads for RoPE phase (even+odd), got {}", k_pe_loads);
+        let c_kv_loads = prog
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::VecLoad { base, .. } if *base == c_kv_ptr))
+            .count();
+        let k_pe_loads = prog
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::VecLoad { base, .. } if *base == k_pe_ptr))
+            .count();
+        assert!(
+            c_kv_loads >= 1,
+            "un-absorbed path should have c_kv loads for copy phase, got {}",
+            c_kv_loads
+        );
+        assert!(
+            k_pe_loads >= 2,
+            "un-absorbed path should have k_pe loads for RoPE phase (even+odd), got {}",
+            k_pe_loads
+        );
     }
 
     #[test]
@@ -2734,16 +3638,36 @@ mod tests {
 
         // Act: head_dim=16 → hd_vecs=2, wuv_d_offset for d=0 = 0, d=1 = 32
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 16, 16, 8,
-            &[q_ptr, kv_ptr, w_ptr, out_ptr], kv_len, width, dtype,
-        ).unwrap();
+            &mut prog,
+            2,
+            16,
+            16,
+            8,
+            &[q_ptr, kv_ptr, w_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: VecLoad with OffsetExpr::Const(0) exists (first output chunk)
-        let w_loads_offset_0 = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecLoad { offset: OffsetExpr::Const(0), .. })
-        }).count();
-        assert!(w_loads_offset_0 >= 1,
-            "should emit VecLoad with Const(0) offset for first W_UV output chunk");
+        let w_loads_offset_0 = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                matches!(
+                    instr,
+                    VmInstr::VecLoad {
+                        offset: OffsetExpr::Const(0),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            w_loads_offset_0 >= 1,
+            "should emit VecLoad with Const(0) offset for first W_UV output chunk"
+        );
     }
 
     #[test]
@@ -2764,21 +3688,34 @@ mod tests {
         // Act: d_c=40, d_rope=16 → d_main=24, d_main_bytes=96, d_rope_half=8
         // odd store offset = Add(_, Const(96 + 32)) = Add(_, Const(128))
         let _ = emit_mla_rope_merge_inline(
-            &mut prog, 40, 16,
+            &mut prog,
+            40,
+            16,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
-        ).unwrap();
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: odd store uses offset Const(128) = 96 (d_main_bytes) + 32 (d_rope_half*4)
-        let odd_stores_128 = prog.instrs.iter().filter(|instr| {
-            if let VmInstr::VecStore { base, offset, .. } = instr {
-                *base == output_ptr &&
-                    matches!(offset, OffsetExpr::Add(_, rhs)
+        let odd_stores_128 = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                if let VmInstr::VecStore { base, offset, .. } = instr {
+                    *base == output_ptr
+                        && matches!(offset, OffsetExpr::Add(_, rhs)
                              if matches!(rhs.as_ref(), OffsetExpr::Const(128)))
-            } else { false }
-        }).count();
-        assert!(odd_stores_128 >= 1,
-            "odd component store should use offset Const(128), got {}", odd_stores_128);
+                } else {
+                    false
+                }
+            })
+            .count();
+        assert!(
+            odd_stores_128 >= 1,
+            "odd component store should use offset Const(128), got {}",
+            odd_stores_128
+        );
     }
 
     #[test]
@@ -2797,16 +3734,26 @@ mod tests {
 
         // Act: 4 heads, head_dim=8 → score_buf_offset = 4*8*4 = 128
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 4, 8, 16, 8,
-            &[q_ptr, kv_ptr, w_ptr, out_ptr], kv_len, width, dtype,
-        ).unwrap();
+            &mut prog,
+            4,
+            8,
+            16,
+            8,
+            &[q_ptr, kv_ptr, w_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: AddPtr with base=out_ptr and offset=128
-        let has_addptr_128 = prog.instrs.iter().any(|instr| {
-            matches!(instr, VmInstr::AddPtr { base, offset: 128, .. } if *base == out_ptr)
-        });
-        assert!(has_addptr_128,
-            "score_buf AddPtr should use offset=128 (4*8*4), got no matching instruction");
+        let has_addptr_128 = prog.instrs.iter().any(
+            |instr| matches!(instr, VmInstr::AddPtr { base, offset: 128, .. } if *base == out_ptr),
+        );
+        assert!(
+            has_addptr_128,
+            "score_buf AddPtr should use offset=128 (4*8*4), got no matching instruction"
+        );
     }
 
     #[test]
@@ -2826,10 +3773,18 @@ mod tests {
         let sin1 = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let p1 = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         let absorbed = emit_mla_rope_merge_inline(
-            &mut prog, 16, 16,
-            &[c1, k1, m1, cos1, sin1, p1], width, dtype,
+            &mut prog,
+            16,
+            16,
+            &[c1, k1, m1, cos1, sin1, p1],
+            width,
+            dtype,
         );
-        assert!(absorbed.is_ok(), "absorbed rope merge should succeed: {:?}", absorbed.err());
+        assert!(
+            absorbed.is_ok(),
+            "absorbed rope merge should succeed: {:?}",
+            absorbed.err()
+        );
         let instr_after_absorbed = prog.len();
 
         // Phase 2: un-absorbed rope merge (d_c=32, d_rope=16)
@@ -2840,15 +3795,26 @@ mod tests {
         let sin2 = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let p2 = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         let unabsorbed = emit_mla_rope_merge_inline(
-            &mut prog, 32, 16,
-            &[c2, k2, m2, cos2, sin2, p2], width, dtype,
+            &mut prog,
+            32,
+            16,
+            &[c2, k2, m2, cos2, sin2, p2],
+            width,
+            dtype,
         );
 
         // Assert: both paths succeed, un-absorbed adds more instructions
-        assert!(unabsorbed.is_ok(), "un-absorbed rope merge should succeed: {:?}", unabsorbed.err());
-        assert!(prog.len() > instr_after_absorbed,
+        assert!(
+            unabsorbed.is_ok(),
+            "un-absorbed rope merge should succeed: {:?}",
+            unabsorbed.err()
+        );
+        assert!(
+            prog.len() > instr_after_absorbed,
             "un-absorbed path should add more instructions ({} > {})",
-            prog.len(), instr_after_absorbed);
+            prog.len(),
+            instr_after_absorbed
+        );
     }
 
     // ── 10 new tests (wave-12x60: MLA VmInstr structure, d_c/d_rope ratio, SIMD width effects) ──
@@ -2859,15 +3825,28 @@ mod tests {
         // The hreduce_body is constructed inline: [Input(0), HReduce{src: ValueId(0), op: Sum}]
         let hreduce_body: Vec<TraceOp> = vec![
             TraceOp::Input(0),
-            TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Sum },
+            TraceOp::HReduce {
+                src: ValueId(0),
+                op: ReduceKind::Sum,
+            },
         ];
 
         // Assert: body has exactly 2 ops, first is Input, second is HReduce with Sum
         assert_eq!(hreduce_body.len(), 2, "hreduce body should have 2 ops");
-        assert!(matches!(hreduce_body[0], TraceOp::Input(0)),
-            "first op should be Input(0)");
-        assert!(matches!(hreduce_body[1], TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Sum }),
-            "second op should be HReduce Sum of slot 0");
+        assert!(
+            matches!(hreduce_body[0], TraceOp::Input(0)),
+            "first op should be Input(0)"
+        );
+        assert!(
+            matches!(
+                hreduce_body[1],
+                TraceOp::HReduce {
+                    src: ValueId(0),
+                    op: ReduceKind::Sum
+                }
+            ),
+            "second op should be HReduce Sum of slot 0"
+        );
     }
 
     #[test]
@@ -2885,12 +3864,31 @@ mod tests {
         let kl1 = prog_hd8.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         // d_c=16, head_dim=8 → w_uv_head_stride = 16*8*4 = 512
         emit_mla_attn_score_inline(
-            &mut prog_hd8, 2, 8, 16, 4,
-            &[q1, kv1, w1, o1], kl1, width, dtype,
-        ).unwrap();
-        let stride_512_count = prog_hd8.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::GprBinOp { op: GprOp::Mul, b: GprOperand::Imm(512), .. })
-        }).count();
+            &mut prog_hd8,
+            2,
+            8,
+            16,
+            4,
+            &[q1, kv1, w1, o1],
+            kl1,
+            width,
+            dtype,
+        )
+        .unwrap();
+        let stride_512_count = prog_hd8
+            .instrs
+            .iter()
+            .filter(|instr| {
+                matches!(
+                    instr,
+                    VmInstr::GprBinOp {
+                        op: GprOp::Mul,
+                        b: GprOperand::Imm(512),
+                        ..
+                    }
+                )
+            })
+            .count();
 
         let mut prog_hd16 = VmProgram::new();
         let q2 = prog_hd16.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -2900,18 +3898,43 @@ mod tests {
         let kl2 = prog_hd16.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         // d_c=16, head_dim=16 → w_uv_head_stride = 16*16*4 = 1024
         emit_mla_attn_score_inline(
-            &mut prog_hd16, 2, 16, 16, 4,
-            &[q2, kv2, w2, o2], kl2, width, dtype,
-        ).unwrap();
-        let stride_1024_count = prog_hd16.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::GprBinOp { op: GprOp::Mul, b: GprOperand::Imm(1024), .. })
-        }).count();
+            &mut prog_hd16,
+            2,
+            16,
+            16,
+            4,
+            &[q2, kv2, w2, o2],
+            kl2,
+            width,
+            dtype,
+        )
+        .unwrap();
+        let stride_1024_count = prog_hd16
+            .instrs
+            .iter()
+            .filter(|instr| {
+                matches!(
+                    instr,
+                    VmInstr::GprBinOp {
+                        op: GprOp::Mul,
+                        b: GprOperand::Imm(1024),
+                        ..
+                    }
+                )
+            })
+            .count();
 
         // Assert: both stride multipliers are present
-        assert!(stride_512_count >= 1,
-            "head_dim=8 should emit GprBinOp::Mul with Imm(512), got {}", stride_512_count);
-        assert!(stride_1024_count >= 1,
-            "head_dim=16 should emit GprBinOp::Mul with Imm(1024), got {}", stride_1024_count);
+        assert!(
+            stride_512_count >= 1,
+            "head_dim=8 should emit GprBinOp::Mul with Imm(512), got {}",
+            stride_512_count
+        );
+        assert!(
+            stride_1024_count >= 1,
+            "head_dim=16 should emit GprBinOp::Mul with Imm(1024), got {}",
+            stride_1024_count
+        );
     }
 
     #[test]
@@ -2930,17 +3953,29 @@ mod tests {
 
         // Act: d_c=32, d_rope=32 → d_main=0, d_rope_half=16, rope_pair_vecs=2
         let _ = emit_mla_rope_merge_inline(
-            &mut prog, 32, 32,
+            &mut prog,
+            32,
+            32,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
-        ).unwrap();
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: LoopBegin with Const(2) for rope_pair_vecs=2
         let rope_loops = prog.instrs.iter().any(|instr| {
-            matches!(instr, VmInstr::LoopBegin { bound: BoundExpr::Const(2), .. })
+            matches!(
+                instr,
+                VmInstr::LoopBegin {
+                    bound: BoundExpr::Const(2),
+                    ..
+                }
+            )
         });
-        assert!(rope_loops,
-            "should emit LoopBegin Const(2) for rope_pair_vecs=2 with d_rope_half=16/W256");
+        assert!(
+            rope_loops,
+            "should emit LoopBegin Const(2) for rope_pair_vecs=2 with d_rope_half=16/W256"
+        );
     }
 
     #[test]
@@ -2958,16 +3993,26 @@ mod tests {
 
         // Act: d_c=32, head_dim=8 → head_dc_bytes=128
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 32, 16,
-            &[q_ptr, kv_ptr, w_ptr, out_ptr], kv_len, width, dtype,
-        ).unwrap();
+            &mut prog,
+            2,
+            8,
+            32,
+            16,
+            &[q_ptr, kv_ptr, w_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: heads loop uses step_bytes=128 (d_c*4)
         let heads_loop_128 = prog.instrs.iter().any(|instr| {
             matches!(instr, VmInstr::LoopBegin { offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(128))
         });
-        assert!(heads_loop_128,
-            "heads loop should step by d_c*elem_bytes=128 (d_c=32, F32)");
+        assert!(
+            heads_loop_128,
+            "heads loop should step by d_c*elem_bytes=128 (d_c=32, F32)"
+        );
     }
 
     #[test]
@@ -2986,13 +4031,19 @@ mod tests {
 
         // Act: d_c=16, d_rope=7 → d_rope_half=3 (integer division), not aligned to 8
         let result = emit_mla_rope_merge_inline(
-            &mut prog, 16, 7,
+            &mut prog,
+            16,
+            7,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, dummy],
-            width, dtype,
+            width,
+            dtype,
         );
 
         // Assert: odd d_rope produces unaligned d_rope_half, should be rejected
-        assert!(result.is_err(), "odd d_rope=7 with W256 should be rejected (d_rope_half=3, not aligned to 8)");
+        assert!(
+            result.is_err(),
+            "odd d_rope=7 with W256 should be rejected (d_rope_half=3, not aligned to 8)"
+        );
     }
 
     #[test]
@@ -3011,12 +4062,30 @@ mod tests {
         let o1 = prog256.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let kl1 = prog256.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         emit_mla_attn_score_inline(
-            &mut prog256, 2, 16, 32, 16,
-            &[q1, kv1, w1, o1], kl1, width256, dtype,
-        ).unwrap();
-        let const_4_loops_w256 = prog256.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::LoopBegin { bound: BoundExpr::Const(4), .. })
-        }).count();
+            &mut prog256,
+            2,
+            16,
+            32,
+            16,
+            &[q1, kv1, w1, o1],
+            kl1,
+            width256,
+            dtype,
+        )
+        .unwrap();
+        let const_4_loops_w256 = prog256
+            .instrs
+            .iter()
+            .filter(|instr| {
+                matches!(
+                    instr,
+                    VmInstr::LoopBegin {
+                        bound: BoundExpr::Const(4),
+                        ..
+                    }
+                )
+            })
+            .count();
 
         let mut prog512 = VmProgram::new();
         let q2 = prog512.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -3025,18 +4094,42 @@ mod tests {
         let o2 = prog512.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let kl2 = prog512.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         emit_mla_attn_score_inline(
-            &mut prog512, 2, 16, 32, 16,
-            &[q2, kv2, w2, o2], kl2, width512, dtype,
-        ).unwrap();
-        let const_2_loops_w512 = prog512.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::LoopBegin { bound: BoundExpr::Const(2), .. })
-        }).count();
+            &mut prog512,
+            2,
+            16,
+            32,
+            16,
+            &[q2, kv2, w2, o2],
+            kl2,
+            width512,
+            dtype,
+        )
+        .unwrap();
+        let const_2_loops_w512 = prog512
+            .instrs
+            .iter()
+            .filter(|instr| {
+                matches!(
+                    instr,
+                    VmInstr::LoopBegin {
+                        bound: BoundExpr::Const(2),
+                        ..
+                    }
+                )
+            })
+            .count();
 
         // Assert: W256 has Const(4) loops (dc_vecs=4), W512 has Const(2) loops (dc_vecs=2)
-        assert!(const_4_loops_w256 >= 1,
-            "W256 d_c=32 should have Const(4) dc_vecs loop, got {}", const_4_loops_w256);
-        assert!(const_2_loops_w512 >= 1,
-            "W512 d_c=32 should have Const(2) dc_vecs loop, got {}", const_2_loops_w512);
+        assert!(
+            const_4_loops_w256 >= 1,
+            "W256 d_c=32 should have Const(4) dc_vecs loop, got {}",
+            const_4_loops_w256
+        );
+        assert!(
+            const_2_loops_w512 >= 1,
+            "W512 d_c=32 should have Const(2) dc_vecs loop, got {}",
+            const_2_loops_w512
+        );
     }
 
     #[test]
@@ -3057,9 +4150,14 @@ mod tests {
         let p1 = prog256.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         // d_c=32, d_rope=16 → d_main=16, d_main_vecs=2 for W256, step=32
         emit_mla_rope_merge_inline(
-            &mut prog256, 32, 16,
-            &[c1, k1, o1, cos1, sin1, p1], width256, dtype,
-        ).unwrap();
+            &mut prog256,
+            32,
+            16,
+            &[c1, k1, o1, cos1, sin1, p1],
+            width256,
+            dtype,
+        )
+        .unwrap();
         let step_32_loops = prog256.instrs.iter().filter(|instr| {
             matches!(instr, VmInstr::LoopBegin { offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(32))
         }).count();
@@ -3073,16 +4171,29 @@ mod tests {
         let p2 = prog128.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         // d_c=32, d_rope=16 → d_main=16, d_main_vecs=4 for W128, step=16
         emit_mla_rope_merge_inline(
-            &mut prog128, 32, 16,
-            &[c2, k2, o2, cos2, sin2, p2], width128, dtype,
-        ).unwrap();
+            &mut prog128,
+            32,
+            16,
+            &[c2, k2, o2, cos2, sin2, p2],
+            width128,
+            dtype,
+        )
+        .unwrap();
         let step_16_loops = prog128.instrs.iter().filter(|instr| {
             matches!(instr, VmInstr::LoopBegin { offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(16))
         }).count();
 
         // Assert: W256 uses step_bytes=32, W128 uses step_bytes=16
-        assert!(step_32_loops >= 1, "W256 copy/RoPE loops should step by 32, got {}", step_32_loops);
-        assert!(step_16_loops >= 1, "W128 copy/RoPE loops should step by 16, got {}", step_16_loops);
+        assert!(
+            step_32_loops >= 1,
+            "W256 copy/RoPE loops should step by 32, got {}",
+            step_32_loops
+        );
+        assert!(
+            step_16_loops >= 1,
+            "W128 copy/RoPE loops should step by 16, got {}",
+            step_16_loops
+        );
     }
 
     #[test]
@@ -3101,17 +4212,37 @@ mod tests {
 
         // Act: d_c=32, head_dim=8 → dc_vecs=4, hd_vecs=1
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 32, 16,
-            &[q_ptr, kv_ptr, w_ptr, out_ptr], kv_len, width, dtype,
-        ).unwrap();
+            &mut prog,
+            2,
+            8,
+            32,
+            16,
+            &[q_ptr, kv_ptr, w_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: at least one Const(4) loop for dc_vecs=4 (dot product accumulation)
-        let dc_vec4_loops_count = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::LoopBegin { bound: BoundExpr::Const(4), .. })
-        }).count();
-        assert!(dc_vec4_loops_count >= 1,
+        let dc_vec4_loops_count = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                matches!(
+                    instr,
+                    VmInstr::LoopBegin {
+                        bound: BoundExpr::Const(4),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            dc_vec4_loops_count >= 1,
             "d_c=32 with W256 should produce at least 1 Const(4) loop for dc_vecs, got {}",
-            dc_vec4_loops_count);
+            dc_vec4_loops_count
+        );
     }
 
     #[test]
@@ -3131,22 +4262,38 @@ mod tests {
 
         // Act: d_c=48, d_rope=16 → d_main=32, d_main_bytes=128
         let _ = emit_mla_rope_merge_inline(
-            &mut prog, 48, 16,
+            &mut prog,
+            48,
+            16,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
-        ).unwrap();
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: VecStore to output_ptr with Add offset containing Const(128) for even store
-        let even_stores = prog.instrs.iter().filter(|instr| {
-            if let VmInstr::VecStore { base, offset, .. } = instr {
-                *base == output_ptr && match offset {
-                    OffsetExpr::Add(_, rhs) => matches!(rhs.as_ref(), OffsetExpr::Const(128)),
-                    _ => false,
+        let even_stores = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                if let VmInstr::VecStore { base, offset, .. } = instr {
+                    *base == output_ptr
+                        && match offset {
+                            OffsetExpr::Add(_, rhs) => {
+                                matches!(rhs.as_ref(), OffsetExpr::Const(128))
+                            }
+                            _ => false,
+                        }
+                } else {
+                    false
                 }
-            } else { false }
-        }).count();
-        assert!(even_stores >= 1,
-            "even RoPE store should use Add(_, Const(128)) = d_main_bytes offset, got {}", even_stores);
+            })
+            .count();
+        assert!(
+            even_stores >= 1,
+            "even RoPE store should use Add(_, Const(128)) = d_main_bytes offset, got {}",
+            even_stores
+        );
     }
 
     #[test]
@@ -3165,16 +4312,37 @@ mod tests {
 
         // Act: head_dim=16 → hd_vecs=2, hd_vec_step=32
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 16, 16, 4,
-            &[q_ptr, kv_ptr, w_ptr, out_ptr], kv_len, width, dtype,
-        ).unwrap();
+            &mut prog,
+            2,
+            16,
+            16,
+            4,
+            &[q_ptr, kv_ptr, w_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: VecStore with Const(32) offset exists (second chunk of head_dim output)
-        let stores_offset_32 = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecStore { offset: OffsetExpr::Const(32), .. })
-        }).count();
-        assert!(stores_offset_32 >= 1,
-            "should emit VecStore with Const(32) for hd_vec_step, got {}", stores_offset_32);
+        let stores_offset_32 = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                matches!(
+                    instr,
+                    VmInstr::VecStore {
+                        offset: OffsetExpr::Const(32),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            stores_offset_32 >= 1,
+            "should emit VecStore with Const(32) for hd_vec_step, got {}",
+            stores_offset_32
+        );
     }
 
     #[test]
@@ -3194,17 +4362,26 @@ mod tests {
 
         // Act: d_c=16, d_rope=16 → d_main=0, d_main_vecs=0, copy loop is Const(0) bound
         let _ = emit_mla_rope_merge_inline(
-            &mut prog, 16, 16,
+            &mut prog,
+            16,
+            16,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
-        ).unwrap();
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: zero Const(0) bound loops may exist but no c_kv loads (copy body skipped)
-        let c_kv_loads = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecLoad { base, .. } if *base == c_kv_ptr)
-        }).count();
-        assert_eq!(c_kv_loads, 0,
-            "d_main=0 should produce zero c_kv loads (copy phase body never executes), got {}", c_kv_loads);
+        let c_kv_loads = prog
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::VecLoad { base, .. } if *base == c_kv_ptr))
+            .count();
+        assert_eq!(
+            c_kv_loads, 0,
+            "d_main=0 should produce zero c_kv loads (copy phase body never executes), got {}",
+            c_kv_loads
+        );
     }
 
     /// Test: 1/sqrt(d_c) scale in attention score uses non-zero, non-inf constant.
@@ -3223,18 +4400,39 @@ mod tests {
 
         // Act
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 4, 16, 64, 16,
-            &[q_ptr, kv_ptr, w_ptr, out_ptr], kv_len, width, dtype,
-        ).unwrap();
+            &mut prog,
+            4,
+            16,
+            64,
+            16,
+            &[q_ptr, kv_ptr, w_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: find Broadcast with Const scale in (0, 1) range
-        let scale_broadcasts = prog.instrs.iter().filter(|instr| {
-            if let VmInstr::Broadcast { src: ScalarExpr::Const(c), .. } = instr {
-                *c > 0.0 && *c < 1.0 && (*c - 0.125).abs() < 0.001
-            } else { false }
-        }).count();
-        assert!(scale_broadcasts >= 1,
-            "inv_sqrt_dc=0.125 should appear as Broadcast Const, got {} matches", scale_broadcasts);
+        let scale_broadcasts = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                if let VmInstr::Broadcast {
+                    src: ScalarExpr::Const(c),
+                    ..
+                } = instr
+                {
+                    *c > 0.0 && *c < 1.0 && (*c - 0.125).abs() < 0.001
+                } else {
+                    false
+                }
+            })
+            .count();
+        assert!(
+            scale_broadcasts >= 1,
+            "inv_sqrt_dc=0.125 should appear as Broadcast Const, got {} matches",
+            scale_broadcasts
+        );
     }
 
     /// Test: d_rope > d_c still compiles (caller validates semantic correctness).
@@ -3253,12 +4451,23 @@ mod tests {
 
         // Act: d_rope=64 > d_c=32 should still succeed (alignment is valid)
         let result = emit_mla_attn_score_inline(
-            &mut prog, 4, 16, 32, 64,
-            &[q_ptr, kv_ptr, w_ptr, out_ptr], kv_len, width, dtype,
+            &mut prog,
+            4,
+            16,
+            32,
+            64,
+            &[q_ptr, kv_ptr, w_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
         );
 
         // Assert: succeeds because alignment check passes (d_rope_half=32 aligned to 8)
-        assert!(result.is_ok(), "d_rope > d_c should compile if aligned, got {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "d_rope > d_c should compile if aligned, got {:?}",
+            result.err()
+        );
     }
 
     /// Test: Un-absorbed path (d_main > 0) produces copy-phase VecLoads from c_kv.
@@ -3279,17 +4488,26 @@ mod tests {
 
         // Act: un-absorbed (d_main=32 > 0)
         let _ = emit_mla_rope_merge_inline(
-            &mut prog, 48, 16,
+            &mut prog,
+            48,
+            16,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
-        ).unwrap();
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: c_kv loads exist because d_main > 0 triggers copy phase
-        let c_kv_loads = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecLoad { base, .. } if *base == c_kv_ptr)
-        }).count();
-        assert!(c_kv_loads > 0,
-            "d_main=32 should produce c_kv loads from copy phase, got {}", c_kv_loads);
+        let c_kv_loads = prog
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::VecLoad { base, .. } if *base == c_kv_ptr))
+            .count();
+        assert!(
+            c_kv_loads > 0,
+            "d_main=32 should produce c_kv loads from copy phase, got {}",
+            c_kv_loads
+        );
 
         // Compare: absorbed path (d_main=0) has zero c_kv loads
         let mut prog2 = VmProgram::new();
@@ -3300,15 +4518,24 @@ mod tests {
         let sin2 = prog2.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let pos2 = prog2.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         let _ = emit_mla_rope_merge_inline(
-            &mut prog2, 16, 16,
+            &mut prog2,
+            16,
+            16,
             &[c_kv2, k_pe2, out2, cos2, sin2, pos2],
-            width, dtype,
-        ).unwrap();
-        let c_kv_loads2 = prog2.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecLoad { base, .. } if *base == c_kv2)
-        }).count();
-        assert_eq!(c_kv_loads2, 0,
-            "absorbed path (d_main=0) should have zero c_kv loads, got {}", c_kv_loads2);
+            width,
+            dtype,
+        )
+        .unwrap();
+        let c_kv_loads2 = prog2
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::VecLoad { base, .. } if *base == c_kv2))
+            .count();
+        assert_eq!(
+            c_kv_loads2, 0,
+            "absorbed path (d_main=0) should have zero c_kv loads, got {}",
+            c_kv_loads2
+        );
     }
 
     /// Test: w_uv head stride scales with d_c and head_dim.
@@ -3327,15 +4554,38 @@ mod tests {
 
         // Act
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 4, 16, 32, 16,
-            &[q_ptr, kv_ptr, w_ptr, out_ptr], kv_len, width, dtype,
-        ).unwrap();
+            &mut prog,
+            4,
+            16,
+            32,
+            16,
+            &[q_ptr, kv_ptr, w_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: find GprBinOp::Mul with b=Imm(2048) for head stride
-        let stride_2048 = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::GprBinOp { op: GprOp::Mul, b: GprOperand::Imm(2048), .. })
-        }).count();
-        assert!(stride_2048 >= 1, "head_stride=2048 should appear in GprBinOp::Mul Imm, got {}", stride_2048);
+        let stride_2048 = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                matches!(
+                    instr,
+                    VmInstr::GprBinOp {
+                        op: GprOp::Mul,
+                        b: GprOperand::Imm(2048),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            stride_2048 >= 1,
+            "head_stride=2048 should appear in GprBinOp::Mul Imm, got {}",
+            stride_2048
+        );
     }
 
     /// Test: d_rope_half vecs loop bound matches alignment.
@@ -3355,18 +4605,34 @@ mod tests {
 
         // Act
         let _ = emit_mla_rope_merge_inline(
-            &mut prog, 64, 32,
+            &mut prog,
+            64,
+            32,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
-        ).unwrap();
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: LoopBegin with Const(2) for rope_pair_vecs
-        let const_2_loops = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::LoopBegin { bound: BoundExpr::Const(2), .. })
-        }).count();
-        assert!(const_2_loops >= 1,
+        let const_2_loops = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                matches!(
+                    instr,
+                    VmInstr::LoopBegin {
+                        bound: BoundExpr::Const(2),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            const_2_loops >= 1,
             "d_rope_half=16 with W256 should produce Const(2) loop for rope_pair_vecs, got {}",
-            const_2_loops);
+            const_2_loops
+        );
     }
 
     /// Test: KV loop step includes d_rope in stride calculation.
@@ -3385,15 +4651,27 @@ mod tests {
 
         // Act
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 4, 16, 32, 24,
-            &[q_ptr, kv_ptr, w_ptr, out_ptr], kv_len, width, dtype,
-        ).unwrap();
+            &mut prog,
+            4,
+            16,
+            32,
+            24,
+            &[q_ptr, kv_ptr, w_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: find LoopBegin with step_bytes=224 for KV loop
         let kv_loop_224 = prog.instrs.iter().filter(|instr| {
             matches!(instr, VmInstr::LoopBegin { offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(224))
         }).count();
-        assert!(kv_loop_224 >= 1, "KV loop should have step_bytes=(d_c+d_rope)*4=224, got {} matches", kv_loop_224);
+        assert!(
+            kv_loop_224 >= 1,
+            "KV loop should have step_bytes=(d_c+d_rope)*4=224, got {} matches",
+            kv_loop_224
+        );
     }
 
     /// Test: Absorbed path (d_c == d_rope) produces zero c_kv loads.
@@ -3413,17 +4691,26 @@ mod tests {
 
         // Act: d_c == d_rope (absorbed)
         let _ = emit_mla_rope_merge_inline(
-            &mut prog, 32, 32,
+            &mut prog,
+            32,
+            32,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
-        ).unwrap();
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: zero VecLoad from c_kv_ptr (no copy phase)
-        let c_kv_loads = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecLoad { base, .. } if *base == c_kv_ptr)
-        }).count();
-        assert_eq!(c_kv_loads, 0,
-            "absorbed path (d_c==d_rope) should have zero c_kv loads, got {}", c_kv_loads);
+        let c_kv_loads = prog
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::VecLoad { base, .. } if *base == c_kv_ptr))
+            .count();
+        assert_eq!(
+            c_kv_loads, 0,
+            "absorbed path (d_c==d_rope) should have zero c_kv loads, got {}",
+            c_kv_loads
+        );
     }
 
     /// Test: Output stride multiplier equals head_dim * sizeof(dtype).
@@ -3442,15 +4729,38 @@ mod tests {
 
         // Act
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 4, 16, 32, 16,
-            &[q_ptr, kv_ptr, w_ptr, out_ptr], kv_len, width, dtype,
-        ).unwrap();
+            &mut prog,
+            4,
+            16,
+            32,
+            16,
+            &[q_ptr, kv_ptr, w_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: GprBinOp::Mul with b=Imm(64) for output head stride
-        let stride_64 = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::GprBinOp { op: GprOp::Mul, b: GprOperand::Imm(64), .. })
-        }).count();
-        assert!(stride_64 >= 1, "head_dim=16 F32 should produce Mul Imm(64), got {}", stride_64);
+        let stride_64 = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                matches!(
+                    instr,
+                    VmInstr::GprBinOp {
+                        op: GprOp::Mul,
+                        b: GprOperand::Imm(64),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            stride_64 >= 1,
+            "head_dim=16 F32 should produce Mul Imm(64), got {}",
+            stride_64
+        );
     }
 
     /// Test: Un-absorbed path (d_main > 0) has both c_kv and k_pe loads.
@@ -3470,20 +4780,36 @@ mod tests {
 
         // Act
         let _ = emit_mla_rope_merge_inline(
-            &mut prog, 48, 16,
+            &mut prog,
+            48,
+            16,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
-        ).unwrap();
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: both c_kv loads (copy phase) and k_pe loads (RoPE phase) present
-        let c_kv_loads = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecLoad { base, .. } if *base == c_kv_ptr)
-        }).count();
-        let k_pe_loads = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecLoad { base, .. } if *base == k_pe_ptr)
-        }).count();
-        assert!(c_kv_loads > 0, "un-absorbed should have c_kv loads for copy phase, got {}", c_kv_loads);
-        assert!(k_pe_loads > 0, "un-absorbed should have k_pe loads for RoPE phase, got {}", k_pe_loads);
+        let c_kv_loads = prog
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::VecLoad { base, .. } if *base == c_kv_ptr))
+            .count();
+        let k_pe_loads = prog
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::VecLoad { base, .. } if *base == k_pe_ptr))
+            .count();
+        assert!(
+            c_kv_loads > 0,
+            "un-absorbed should have c_kv loads for copy phase, got {}",
+            c_kv_loads
+        );
+        assert!(
+            k_pe_loads > 0,
+            "un-absorbed should have k_pe loads for RoPE phase, got {}",
+            k_pe_loads
+        );
     }
 
     /// Test: Full MLA decode step combines rope merge + attn score in one program.
@@ -3504,11 +4830,18 @@ mod tests {
         let pos = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
 
         let rope_result = emit_mla_rope_merge_inline(
-            &mut prog, 64, 16,
+            &mut prog,
+            64,
+            16,
             &[c_kv_ptr, k_pe_ptr, merged_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
+            width,
+            dtype,
         );
-        assert!(rope_result.is_ok(), "rope merge should succeed: {:?}", rope_result.err());
+        assert!(
+            rope_result.is_ok(),
+            "rope merge should succeed: {:?}",
+            rope_result.err()
+        );
         let instr_after_rope = prog.len();
 
         // Phase 2: attn score (reusing merged_ptr as kv_ptr)
@@ -3518,14 +4851,29 @@ mod tests {
         let kv_len = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
 
         let attn_result = emit_mla_attn_score_inline(
-            &mut prog, 8, 16, 64, 16,
-            &[q_ptr, merged_ptr, w_uv_ptr, out_ptr], kv_len, width, dtype,
+            &mut prog,
+            8,
+            16,
+            64,
+            16,
+            &[q_ptr, merged_ptr, w_uv_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
         );
 
         // Assert: both phases succeed, attn adds instructions
-        assert!(attn_result.is_ok(), "attn score should succeed: {:?}", attn_result.err());
-        assert!(prog.len() > instr_after_rope,
-            "combined program should grow after attn ({} > {})", prog.len(), instr_after_rope);
+        assert!(
+            attn_result.is_ok(),
+            "attn score should succeed: {:?}",
+            attn_result.err()
+        );
+        assert!(
+            prog.len() > instr_after_rope,
+            "combined program should grow after attn ({} > {})",
+            prog.len(),
+            instr_after_rope
+        );
     }
 
     // ── 10 new tests (wave-12x61: MLA VmInstr structural, d_rope alignment edge, d_c scaling) ──
@@ -3549,17 +4897,38 @@ mod tests {
 
         // Act: head_hd_bytes = 8 * 4 = 32
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 16, 4,
-            &[q_ptr, kv_ptr, w_ptr, out_ptr], kv_len, width, dtype,
-        ).unwrap();
+            &mut prog,
+            2,
+            8,
+            16,
+            4,
+            &[q_ptr, kv_ptr, w_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: GprBinOp::Mul with Imm(32) exists for c_off * head_hd_bytes inside V-restore
-        let mul_32 = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::GprBinOp { op: GprOp::Mul, b: GprOperand::Imm(32), .. })
-        }).count();
-        assert!(mul_32 >= 1,
+        let mul_32 = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                matches!(
+                    instr,
+                    VmInstr::GprBinOp {
+                        op: GprOp::Mul,
+                        b: GprOperand::Imm(32),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            mul_32 >= 1,
             "V-restore GEMV should emit GprBinOp::Mul Imm(32) for c_off * head_hd_bytes, got {}",
-            mul_32);
+            mul_32
+        );
     }
 
     /// Test: RoPE merge odd component load from k_pe_ptr uses the correct
@@ -3581,23 +4950,35 @@ mod tests {
 
         // Act
         let _ = emit_mla_rope_merge_inline(
-            &mut prog, 48, 32,
+            &mut prog,
+            48,
+            32,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
-        ).unwrap();
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: VecLoad from k_pe_ptr with Add offset containing Const(64) for odd components
         // d_rope_half * elem_bytes = 16 * 4 = 64
-        let odd_loads_with_64 = prog.instrs.iter().filter(|instr| {
-            if let VmInstr::VecLoad { base, offset, .. } = instr {
-                *base == k_pe_ptr &&
-                    matches!(offset, OffsetExpr::Add(_, rhs)
+        let odd_loads_with_64 = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                if let VmInstr::VecLoad { base, offset, .. } = instr {
+                    *base == k_pe_ptr
+                        && matches!(offset, OffsetExpr::Add(_, rhs)
                              if matches!(rhs.as_ref(), OffsetExpr::Const(64)))
-            } else { false }
-        }).count();
-        assert!(odd_loads_with_64 >= 1,
+                } else {
+                    false
+                }
+            })
+            .count();
+        assert!(
+            odd_loads_with_64 >= 1,
             "odd component load from k_pe should have offset Const(64) = d_rope_half*4, got {}",
-            odd_loads_with_64);
+            odd_loads_with_64
+        );
     }
 
     /// Test: Absorbed path produces fewer total VecStore instructions than un-absorbed.
@@ -3618,12 +4999,19 @@ mod tests {
         let sin1 = prog_abs.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let p1 = prog_abs.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         emit_mla_rope_merge_inline(
-            &mut prog_abs, 16, 16,
-            &[c1, k1, o1, cos1, sin1, p1], width, dtype,
-        ).unwrap();
-        let abs_stores = prog_abs.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecStore { .. })
-        }).count();
+            &mut prog_abs,
+            16,
+            16,
+            &[c1, k1, o1, cos1, sin1, p1],
+            width,
+            dtype,
+        )
+        .unwrap();
+        let abs_stores = prog_abs
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::VecStore { .. }))
+            .count();
 
         // Un-absorbed: d_c=32, d_rope=16 → d_main=16
         let mut prog_unabs = VmProgram::new();
@@ -3634,17 +5022,27 @@ mod tests {
         let sin2 = prog_unabs.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let p2 = prog_unabs.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         emit_mla_rope_merge_inline(
-            &mut prog_unabs, 32, 16,
-            &[c2, k2, o2, cos2, sin2, p2], width, dtype,
-        ).unwrap();
-        let unabs_stores = prog_unabs.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecStore { .. })
-        }).count();
+            &mut prog_unabs,
+            32,
+            16,
+            &[c2, k2, o2, cos2, sin2, p2],
+            width,
+            dtype,
+        )
+        .unwrap();
+        let unabs_stores = prog_unabs
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::VecStore { .. }))
+            .count();
 
         // Assert: un-absorbed has more stores due to copy phase
-        assert!(unabs_stores > abs_stores,
+        assert!(
+            unabs_stores > abs_stores,
             "un-absorbed ({} stores) should exceed absorbed ({} stores) due to copy phase",
-            unabs_stores, abs_stores);
+            unabs_stores,
+            abs_stores
+        );
     }
 
     /// Test: The accumulate_body TraceOp correctly chains o_acc*correction + weight*v_vec.
@@ -3699,17 +5097,37 @@ mod tests {
 
         // Act: head_dim=16 → 2 V-restore output chunks, each with HReduce + ExtractLane0
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 16, 16, 8,
-            &[q_ptr, kv_ptr, w_ptr, out_ptr], kv_len, width, dtype,
-        ).unwrap();
+            &mut prog,
+            2,
+            16,
+            16,
+            8,
+            &[q_ptr, kv_ptr, w_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: at least 2 ExtractLane0 broadcasts (score scalar + at least 1 V-restore)
-        let extract_count = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::Broadcast { src: ScalarExpr::ExtractLane0(_), .. })
-        }).count();
-        assert!(extract_count >= 2,
+        let extract_count = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                matches!(
+                    instr,
+                    VmInstr::Broadcast {
+                        src: ScalarExpr::ExtractLane0(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            extract_count >= 2,
             "hd_vecs=2 should produce >= 2 ExtractLane0 broadcasts (score + V-restore), got {}",
-            extract_count);
+            extract_count
+        );
     }
 
     /// Test: RoPE merge odd component store uses offset = d_main_bytes + d_rope_half * elem_bytes.
@@ -3731,31 +5149,43 @@ mod tests {
         let pos = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
 
         let _ = emit_mla_rope_merge_inline(
-            &mut prog, 32, 16,
+            &mut prog,
+            32,
+            16,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
-        ).unwrap();
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Collect all Add-const offsets in VecStore to output_ptr
-        let mut const_offsets: Vec<usize> = prog.instrs.iter().filter_map(|instr| {
-            if let VmInstr::VecStore { base, offset, .. } = instr {
-                if *base == output_ptr {
-                    if let OffsetExpr::Add(_, rhs) = offset {
-                        if let OffsetExpr::Const(v) = rhs.as_ref() {
-                            return Some(*v);
+        let mut const_offsets: Vec<usize> = prog
+            .instrs
+            .iter()
+            .filter_map(|instr| {
+                if let VmInstr::VecStore { base, offset, .. } = instr {
+                    if *base == output_ptr {
+                        if let OffsetExpr::Add(_, rhs) = offset {
+                            if let OffsetExpr::Const(v) = rhs.as_ref() {
+                                return Some(*v);
+                            }
                         }
                     }
                 }
-            }
-            None
-        }).collect();
+                None
+            })
+            .collect();
         const_offsets.sort();
         const_offsets.dedup();
 
         // Assert: both 64 (even) and 96 (odd) offsets are present
         let has_64 = const_offsets.iter().any(|&v| v == 64);
         let has_96 = const_offsets.iter().any(|&v| v == 96);
-        assert!(has_64, "even RoPE store should use offset 64 (d_main_bytes), found offsets: {:?}", const_offsets);
+        assert!(
+            has_64,
+            "even RoPE store should use offset 64 (d_main_bytes), found offsets: {:?}",
+            const_offsets
+        );
         assert!(has_96, "odd RoPE store should use offset 96 (d_main_bytes + d_rope_half*4), found offsets: {:?}", const_offsets);
     }
 
@@ -3777,9 +5207,17 @@ mod tests {
         let o1 = prog1.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let kl1 = prog1.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         emit_mla_attn_score_inline(
-            &mut prog1, 2, 8, 16, 8,
-            &[q1, kv1, w1, o1], kl1, width, dtype,
-        ).unwrap();
+            &mut prog1,
+            2,
+            8,
+            16,
+            8,
+            &[q1, kv1, w1, o1],
+            kl1,
+            width,
+            dtype,
+        )
+        .unwrap();
         let has_step_96 = prog1.instrs.iter().any(|instr| {
             matches!(instr, VmInstr::LoopBegin { offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(96))
         });
@@ -3792,16 +5230,27 @@ mod tests {
         let o2 = prog2.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let kl2 = prog2.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         emit_mla_attn_score_inline(
-            &mut prog2, 2, 8, 16, 16,
-            &[q2, kv2, w2, o2], kl2, width, dtype,
-        ).unwrap();
+            &mut prog2,
+            2,
+            8,
+            16,
+            16,
+            &[q2, kv2, w2, o2],
+            kl2,
+            width,
+            dtype,
+        )
+        .unwrap();
         let has_step_128 = prog2.instrs.iter().any(|instr| {
             matches!(instr, VmInstr::LoopBegin { offsets, .. } if offsets.first().and_then(|offset| offset.stride.as_fixed_bytes()) == Some(128))
         });
 
         // Assert: different d_rope values produce different KV loop strides
         assert!(has_step_96, "d_rope=8 should produce KV loop step_bytes=96");
-        assert!(has_step_128, "d_rope=16 should produce KV loop step_bytes=128");
+        assert!(
+            has_step_128,
+            "d_rope=16 should produce KV loop step_bytes=128"
+        );
     }
 
     /// Test: The sum_update_body TraceOp correctly models running_sum * correction + weight.
@@ -3848,20 +5297,38 @@ mod tests {
 
         // Act: head_dim=8 → hd_vecs=1, normalize stores at OffsetExpr::Const(0)
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 8, 16, 4,
-            &[q_ptr, kv_ptr, w_ptr, out_ptr], kv_len, width, dtype,
-        ).unwrap();
+            &mut prog,
+            2,
+            8,
+            16,
+            4,
+            &[q_ptr, kv_ptr, w_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: VecStore with Const(0) offset and W256 width (normalize output chunk 0)
-        let const_0_vec_stores = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecStore {
-                offset: OffsetExpr::Const(0),
-                width: SimdWidth::W256,
-                .. })
-        }).count();
-        assert!(const_0_vec_stores >= 1,
+        let const_0_vec_stores = prog
+            .instrs
+            .iter()
+            .filter(|instr| {
+                matches!(
+                    instr,
+                    VmInstr::VecStore {
+                        offset: OffsetExpr::Const(0),
+                        width: SimdWidth::W256,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            const_0_vec_stores >= 1,
             "normalize phase should emit VecStore with Const(0) offset and W256 width, got {}",
-            const_0_vec_stores);
+            const_0_vec_stores
+        );
     }
 
     /// Test: The heads loop in emit_mla_attn_score_inline uses BoundExpr::Const(num_heads).
@@ -3880,18 +5347,35 @@ mod tests {
 
         // Act: 4 heads
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 4, 8, 16, 8,
-            &[q_ptr, kv_ptr, w_ptr, out_ptr], kv_len, width, dtype,
-        ).unwrap();
+            &mut prog,
+            4,
+            8,
+            16,
+            8,
+            &[q_ptr, kv_ptr, w_ptr, out_ptr],
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: first LoopBegin should have bound Const(4) for num_heads
-        let first_loop = prog.instrs.iter().find(|instr| {
-            matches!(instr, VmInstr::LoopBegin { .. })
-        });
+        let first_loop = prog
+            .instrs
+            .iter()
+            .find(|instr| matches!(instr, VmInstr::LoopBegin { .. }));
         assert!(first_loop.is_some(), "should emit at least one LoopBegin");
-        let has_const_4 = matches!(first_loop.unwrap(), VmInstr::LoopBegin { bound: BoundExpr::Const(4), .. });
-        assert!(has_const_4,
-            "first loop should have bound Const(4) for num_heads=4");
+        let has_const_4 = matches!(
+            first_loop.unwrap(),
+            VmInstr::LoopBegin {
+                bound: BoundExpr::Const(4),
+                ..
+            }
+        );
+        assert!(
+            has_const_4,
+            "first loop should have bound Const(4) for num_heads=4"
+        );
     }
 
     /// Test: RoPE merge with d_rope equal to d_c (absorbed path) still emits RoPE
@@ -3911,28 +5395,47 @@ mod tests {
 
         // Act
         let _ = emit_mla_rope_merge_inline(
-            &mut prog, 32, 32,
+            &mut prog,
+            32,
+            32,
             &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, pos],
-            width, dtype,
-        ).unwrap();
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Assert: k_pe, cos, sin loads all present despite d_main=0
-        let k_pe_loads = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecLoad { base, .. } if *base == k_pe_ptr)
-        }).count();
-        let cos_loads = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecLoad { base, .. } if *base == cos_ptr)
-        }).count();
-        let sin_loads = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecLoad { base, .. } if *base == sin_ptr)
-        }).count();
+        let k_pe_loads = prog
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::VecLoad { base, .. } if *base == k_pe_ptr))
+            .count();
+        let cos_loads = prog
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::VecLoad { base, .. } if *base == cos_ptr))
+            .count();
+        let sin_loads = prog
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::VecLoad { base, .. } if *base == sin_ptr))
+            .count();
 
-        assert!(k_pe_loads >= 2,
-            "absorbed path should still load k_pe (even+odd), got {}", k_pe_loads);
-        assert!(cos_loads >= 1,
-            "absorbed path should still load cos table, got {}", cos_loads);
-        assert!(sin_loads >= 1,
-            "absorbed path should still load sin table, got {}", sin_loads);
+        assert!(
+            k_pe_loads >= 2,
+            "absorbed path should still load k_pe (even+odd), got {}",
+            k_pe_loads
+        );
+        assert!(
+            cos_loads >= 1,
+            "absorbed path should still load cos table, got {}",
+            cos_loads
+        );
+        assert!(
+            sin_loads >= 1,
+            "absorbed path should still load sin table, got {}",
+            sin_loads
+        );
     }
 
     // ── MLA PagedAttention page stride tests (SPEC 33 REQ-MLA-008) ──
@@ -3944,8 +5447,8 @@ mod tests {
         let d_rope = 64;
         let page_size = 16;
         let page_stride = page_size * (d_c + d_rope) * 4; // F32
-        // Standard MHA would be: page_size * 2 * num_kv_heads * head_dim * 4
-        // MLA is more compact: page_size * (d_c + d_rope) * 4
+                                                          // Standard MHA would be: page_size * 2 * num_kv_heads * head_dim * 4
+                                                          // MLA is more compact: page_size * (d_c + d_rope) * 4
         let standard_stride = page_size * 2 * 32 * 128 * 4; // 32 heads, 128 dim
         assert!(page_stride < standard_stride,
             "MLA page stride ({page_stride}) should be much smaller than standard ({standard_stride})");
@@ -3962,7 +5465,10 @@ mod tests {
         // This is 56.9x compression vs standard 2*32*128 = 8192
         let standard_dim = 2 * 32 * 128;
         let compression = standard_dim as f64 / kv_dim as f64;
-        assert!(compression > 10.0, "MLA compression ratio should be >10x, got {compression:.1}x");
+        assert!(
+            compression > 10.0,
+            "MLA compression ratio should be >10x, got {compression:.1}x"
+        );
     }
 
     #[test]
@@ -3972,8 +5478,10 @@ mod tests {
         let head_dim = 128;
         let scale = 1.0 / (d_c as f32).sqrt();
         let standard_scale = 1.0 / (head_dim as f32).sqrt();
-        assert!(scale < standard_scale,
-            "MLA scale ({scale}) should be smaller than standard ({standard_scale})");
+        assert!(
+            scale < standard_scale,
+            "MLA scale ({scale}) should be smaller than standard ({standard_scale})"
+        );
         assert!((scale - 0.04419417f32).abs() < 1e-6);
     }
 
@@ -3991,14 +5499,27 @@ mod tests {
         let kv_len = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
 
         let result = emit_mla_attn_score_inline(
-            &mut prog, 4, 128, 512, 64,
+            &mut prog,
+            4,
+            128,
+            512,
+            64,
             &[q_ptr, kv_ptr, w_ptr, out_ptr],
-            kv_len, width, dtype,
+            kv_len,
+            width,
+            dtype,
         );
 
-        assert!(result.is_ok(), "single-token decode should compile: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "single-token decode should compile: {:?}",
+            result.err()
+        );
         // Should have LoopBegin for kv_len iteration (but may be eliminated for single token)
-        assert!(prog.instrs.len() > 5, "should produce instructions for attention scoring");
+        assert!(
+            prog.instrs.len() > 5,
+            "should produce instructions for attention scoring"
+        );
     }
 
     #[test]
@@ -4017,14 +5538,19 @@ mod tests {
             let sin_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
             let result = emit_mla_rope_merge_inline(
-                &mut prog, d_c, d_rope,
+                &mut prog,
+                d_c,
+                d_rope,
                 &[c_kv_ptr, k_pe_ptr, out_ptr, cos_ptr, sin_ptr],
-                width, dtype,
+                width,
+                dtype,
             );
 
-            assert!(result.is_ok(),
+            assert!(
+                result.is_ok(),
                 "rope merge should compile with d_c={d_c}, d_rope={d_rope}: {:?}",
-                result.err());
+                result.err()
+            );
         }
     }
 
@@ -4043,15 +5569,27 @@ mod tests {
         let kv_len = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
 
         let _ = emit_mla_attn_score_inline(
-            &mut prog, 2, 16, d_c, 8,
+            &mut prog,
+            2,
+            16,
+            d_c,
+            8,
             &[q_ptr, kv_ptr, w_ptr, out_ptr],
-            kv_len, width, dtype,
-        ).unwrap();
+            kv_len,
+            width,
+            dtype,
+        )
+        .unwrap();
 
         // Should contain FMA instructions for dot product in compressed space
-        let fma_count = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::Fma { .. })
-        }).count();
-        assert!(fma_count > 0, "should contain FMA for compressed dot product");
+        let fma_count = prog
+            .instrs
+            .iter()
+            .filter(|instr| matches!(instr, VmInstr::Fma { .. }))
+            .count();
+        assert!(
+            fma_count > 0,
+            "should contain FMA for compressed dot product"
+        );
     }
 }

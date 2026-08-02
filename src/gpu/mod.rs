@@ -15,7 +15,6 @@ use crate::traits::Element;
 #[cfg(feature = "jit-metal")]
 pub mod metal;
 
-
 // ── Error ────────────────────────────────────────────────────────────
 
 /// Errors from GPU device operations.
@@ -39,8 +38,14 @@ impl fmt::Display for GpuError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DeviceNotFound(s) => write!(f, "device not found: {s}"),
-            Self::OutOfMemory { requested, available } => {
-                write!(f, "out of memory: requested {requested} bytes, {available} available")
+            Self::OutOfMemory {
+                requested,
+                available,
+            } => {
+                write!(
+                    f,
+                    "out of memory: requested {requested} bytes, {available} available"
+                )
             }
             Self::KernelLaunch(s) => write!(f, "kernel launch failed: {s}"),
             Self::ShaderCompilation(s) => write!(f, "shader compilation failed: {s}"),
@@ -160,42 +165,42 @@ impl<E: Element, D: GpuDevice> GpuTensor<E, D> {
     pub fn alloc(device: &D, len: usize) -> Result<Self, GpuError> {
         let bytes = len * std::mem::size_of::<E>();
         let buffer = device.alloc(bytes)?;
-        Ok(Self { buffer, len, _elem: PhantomData })
+        Ok(Self {
+            buffer,
+            len,
+            _elem: PhantomData,
+        })
     }
 
     /// Allocate a zero-filled tensor of `len` elements.
     pub fn zeros(device: &D, len: usize) -> Result<Self, GpuError> {
         let bytes = len * std::mem::size_of::<E>();
         let buffer = device.alloc_zeros(bytes)?;
-        Ok(Self { buffer, len, _elem: PhantomData })
+        Ok(Self {
+            buffer,
+            len,
+            _elem: PhantomData,
+        })
     }
 
     /// Upload from a host slice.
-    pub fn from_slice(
-        device: &D,
-        data: &[E],
-        stream: &D::Stream,
-    ) -> Result<Self, GpuError> {
+    pub fn from_slice(device: &D, data: &[E], stream: &D::Stream) -> Result<Self, GpuError> {
         let bytes = std::mem::size_of_val(data);
         let mut buffer = device.alloc(bytes)?;
-        let src = unsafe {
-            std::slice::from_raw_parts(data.as_ptr() as *const u8, bytes)
-        };
+        let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, bytes) };
         device.htod(src, &mut buffer, stream)?;
-        Ok(Self { buffer, len: data.len(), _elem: PhantomData })
+        Ok(Self {
+            buffer,
+            len: data.len(),
+            _elem: PhantomData,
+        })
     }
 
     /// Download to a host `Vec`.
-    pub fn to_vec(
-        &self,
-        device: &D,
-        stream: &D::Stream,
-    ) -> Result<Vec<E>, GpuError> {
+    pub fn to_vec(&self, device: &D, stream: &D::Stream) -> Result<Vec<E>, GpuError> {
         let mut out = vec![E::ZERO; self.len];
         let bytes = self.len * std::mem::size_of::<E>();
-        let dst = unsafe {
-            std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, bytes)
-        };
+        let dst = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, bytes) };
         device.dtoh(&self.buffer, dst, stream)?;
         stream.synchronize()?;
         Ok(out)
@@ -411,8 +416,16 @@ mod tests {
 
     #[test]
     fn test_launch_config_equality() {
-        let a = LaunchConfig { grid_dim: [1, 1, 1], block_dim: [256, 1, 1], shared_mem_bytes: 0 };
-        let b = LaunchConfig { grid_dim: [1, 1, 1], block_dim: [256, 1, 1], shared_mem_bytes: 0 };
+        let a = LaunchConfig {
+            grid_dim: [1, 1, 1],
+            block_dim: [256, 1, 1],
+            shared_mem_bytes: 0,
+        };
+        let b = LaunchConfig {
+            grid_dim: [1, 1, 1],
+            block_dim: [256, 1, 1],
+            shared_mem_bytes: 0,
+        };
         assert_eq!(a, b);
     }
 
@@ -432,7 +445,10 @@ mod tests {
     #[test]
     fn test_gpu_error_display_out_of_memory() {
         // Arrange
-        let err = GpuError::OutOfMemory { requested: 1_073_741_824, available: 536_870_912 };
+        let err = GpuError::OutOfMemory {
+            requested: 1_073_741_824,
+            available: 536_870_912,
+        };
         // Act
         let msg = format!("{err}");
         // Assert
@@ -498,7 +514,7 @@ mod tests {
         // Arrange
         use crate::types::DType;
         let p = mock_cuda_profile(); // peak_gflops_f32=19500, peak_gflops_f16=39000
-        // Act
+                                     // Act
         let f32_gflops = p.peak_gflops(DType::F32);
         let f16_gflops = p.peak_gflops(DType::F16);
         let bf16_gflops = p.peak_gflops(DType::BF16);
@@ -513,7 +529,7 @@ mod tests {
         // Arrange
         use crate::types::DType;
         let p = mock_cuda_profile(); // peak_gflops_f16=39000; sub-byte = 2x f16
-        // Act
+                                     // Act
         let fp8_e4m3 = p.peak_gflops(DType::F8E4M3);
         let fp8_e5m2 = p.peak_gflops(DType::F8E5M2);
         let fp6_e3m2 = p.peak_gflops(DType::F6E3M2);
@@ -521,9 +537,17 @@ mod tests {
         let fp4 = p.peak_gflops(DType::F4E2M1);
         // Assert — all sub-byte types are 2x f16 peak
         let expected = 39000.0 * 2.0;
-        for (name, val) in [("f8e4m3", fp8_e4m3), ("f8e5m2", fp8_e5m2),
-                            ("f6e3m2", fp6_e3m2), ("f6e2m3", fp6_e2m3), ("fp4", fp4)] {
-            assert!((val - expected).abs() < 1e-6, "{name} = {val}, expected {expected}");
+        for (name, val) in [
+            ("f8e4m3", fp8_e4m3),
+            ("f8e5m2", fp8_e5m2),
+            ("f6e3m2", fp6_e3m2),
+            ("f6e2m3", fp6_e2m3),
+            ("fp4", fp4),
+        ] {
+            assert!(
+                (val - expected).abs() < 1e-6,
+                "{name} = {val}, expected {expected}"
+            );
         }
     }
 
@@ -545,7 +569,11 @@ mod tests {
         // Act
         let lc = p.launch_config_1d(0);
         // Assert — ceil(0/256) = 0 grid, block is still 256
-        assert_eq!(lc.grid_dim, [0, 1, 1], "grid for 0 elements should be [0,1,1]");
+        assert_eq!(
+            lc.grid_dim,
+            [0, 1, 1],
+            "grid for 0 elements should be [0,1,1]"
+        );
         assert_eq!(lc.block_dim, [256, 1, 1]);
         assert_eq!(lc.shared_mem_bytes, 0);
     }
@@ -555,7 +583,7 @@ mod tests {
         // Arrange
         let p = mock_cuda_profile(); // block_x = 256
         let n = 256 * 4; // 1024 — exact multiple of block size
-        // Act
+                         // Act
         let lc = p.launch_config_1d(n);
         // Assert
         assert_eq!(lc.grid_dim, [4, 1, 1], "exact 4 blocks");
@@ -586,7 +614,10 @@ mod tests {
         // Act — request 2000 rows, but max_grid_dim[0] = 1024
         let lc = p.launch_config_row_wise(2000, 256);
         // Assert
-        assert_eq!(lc.grid_dim[0], 1024, "grid should be clamped to max_grid_dim[0]");
+        assert_eq!(
+            lc.grid_dim[0], 1024,
+            "grid should be clamped to max_grid_dim[0]"
+        );
         assert_eq!(lc.block_dim, [256, 1, 1]);
     }
 }

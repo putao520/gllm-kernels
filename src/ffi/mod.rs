@@ -6,13 +6,12 @@
 pub mod types;
 
 pub use types::{
-    GllmStatus, GllmBackend, GllmTensor, GllmKvCache, GllmWeights, GllmModelConfig,
-    GllmWeightField,
+    GllmBackend, GllmKvCache, GllmModelConfig, GllmStatus, GllmTensor, GllmWeightField, GllmWeights,
 };
 
 use crate::inference::cpu_backend::CpuInferenceBackend;
-use crate::inference::tensor::DeviceTensor;
 use crate::inference::kv_cache::KvCache;
+use crate::inference::tensor::DeviceTensor;
 use crate::inference::weights::ModelWeights;
 use crate::inference::InferenceBackend;
 
@@ -335,12 +334,10 @@ pub unsafe extern "C" fn gllm_weights_get_ptr(
         GllmWeightField::WGate => tensor_out!(&mut lw.w_gate),
         GllmWeightField::WUp => tensor_out!(&mut lw.w_up),
         GllmWeightField::WDown => tensor_out!(&mut lw.w_down),
-        GllmWeightField::QkvBias => {
-            match lw.qkv_bias {
-                Some(ref mut t) => tensor_out!(t),
-                None => GllmStatus::InvalidArg as i32,
-            }
-        }
+        GllmWeightField::QkvBias => match lw.qkv_bias {
+            Some(ref mut t) => tensor_out!(t),
+            None => GllmStatus::InvalidArg as i32,
+        },
         GllmWeightField::AttnNormBias => tensor_out!(&mut lw.attn_norm_bias),
         GllmWeightField::FfnNormBias => tensor_out!(&mut lw.ffn_norm_bias),
         _ => GllmStatus::InvalidArg as i32,
@@ -410,7 +407,7 @@ mod tests {
     /// Build a tiny GllmModelConfig for testing.
     fn tiny_c_config() -> GllmModelConfig {
         GllmModelConfig {
-            arch: 0,              // Llama
+            arch: 0, // Llama
             hidden_size: 8,
             num_heads: 2,
             num_kv_heads: 2,
@@ -421,8 +418,8 @@ mod tests {
             max_seq_len: 8,
             rope_theta: 10000.0,
             norm_eps: 1e-5,
-            dtype: 0,             // F32
-            quant_type: -1,       // None
+            dtype: 0,       // F32
+            quant_type: -1, // None
             has_qkv_bias: 0,
             partial_rotary_factor: 1.0,
         }
@@ -440,7 +437,13 @@ mod tests {
             // Access a global field
             let mut ptr: *mut u8 = std::ptr::null_mut();
             let mut n: usize = 0;
-            let rc = gllm_weights_get_ptr(weights, GllmWeightField::Embedding as i32, 0, &mut ptr, &mut n);
+            let rc = gllm_weights_get_ptr(
+                weights,
+                GllmWeightField::Embedding as i32,
+                0,
+                &mut ptr,
+                &mut n,
+            );
             assert_eq!(rc, GllmStatus::Ok as i32);
             assert_eq!(n, 10 * 8); // vocab_size * hidden_size
 
@@ -450,7 +453,8 @@ mod tests {
             assert_eq!(n, 8 * 8); // hidden_size * (num_heads * head_dim)
 
             // Invalid layer index
-            let rc = gllm_weights_get_ptr(weights, GllmWeightField::Wq as i32, 99, &mut ptr, &mut n);
+            let rc =
+                gllm_weights_get_ptr(weights, GllmWeightField::Wq as i32, 99, &mut ptr, &mut n);
             assert_eq!(rc, GllmStatus::InvalidArg as i32);
 
             // Invalid field
@@ -458,7 +462,13 @@ mod tests {
             assert_eq!(rc, GllmStatus::InvalidArg as i32);
 
             // QkvBias absent for Llama
-            let rc = gllm_weights_get_ptr(weights, GllmWeightField::QkvBias as i32, 0, &mut ptr, &mut n);
+            let rc = gllm_weights_get_ptr(
+                weights,
+                GllmWeightField::QkvBias as i32,
+                0,
+                &mut ptr,
+                &mut n,
+            );
             assert_eq!(rc, GllmStatus::InvalidArg as i32);
 
             gllm_weights_free(weights);
@@ -476,7 +486,10 @@ mod tests {
 
             // Alloc weights and fill norm weights with 1.0
             let mut weights: GllmWeights = std::ptr::null_mut();
-            assert_eq!(gllm_weights_alloc(&cfg, &mut weights), GllmStatus::Ok as i32);
+            assert_eq!(
+                gllm_weights_alloc(&cfg, &mut weights),
+                GllmStatus::Ok as i32
+            );
 
             let h = cfg.hidden_size as usize;
             let ones = vec![1.0f32; h];
@@ -490,7 +503,10 @@ mod tests {
 
             // Alloc input tensor and upload data
             let mut input: GllmTensor = std::ptr::null_mut();
-            assert_eq!(gllm_tensor_alloc(backend, h, 0, &mut input), GllmStatus::Ok as i32);
+            assert_eq!(
+                gllm_tensor_alloc(backend, h, 0, &mut input),
+                GllmStatus::Ok as i32
+            );
             let input_data = vec![0.1f32; h];
             assert_eq!(
                 gllm_tensor_upload_f32(backend, input_data.as_ptr(), h, input),
@@ -499,7 +515,10 @@ mod tests {
 
             // Alloc positions tensor
             let mut positions: GllmTensor = std::ptr::null_mut();
-            assert_eq!(gllm_tensor_alloc(backend, 1, 0, &mut positions), GllmStatus::Ok as i32);
+            assert_eq!(
+                gllm_tensor_alloc(backend, 1, 0, &mut positions),
+                GllmStatus::Ok as i32
+            );
             let pos_data = [0.0f32];
             assert_eq!(
                 gllm_tensor_upload_f32(backend, pos_data.as_ptr(), 1, positions),
@@ -515,7 +534,10 @@ mod tests {
 
             // Alloc output tensor
             let mut output: GllmTensor = std::ptr::null_mut();
-            assert_eq!(gllm_tensor_alloc(backend, h, 0, &mut output), GllmStatus::Ok as i32);
+            assert_eq!(
+                gllm_tensor_alloc(backend, h, 0, &mut output),
+                GllmStatus::Ok as i32
+            );
 
             // Run decoder forward.
             //
@@ -538,8 +560,11 @@ mod tests {
                 1,
                 output,
             );
-            assert_eq!(rc, GllmStatus::RuntimeError as i32,
-                "decoder_forward must NOT fall back to Rust operators (NO-FALLBACK)");
+            assert_eq!(
+                rc,
+                GllmStatus::RuntimeError as i32,
+                "decoder_forward must NOT fall back to Rust operators (NO-FALLBACK)"
+            );
 
             // Cleanup
             gllm_tensor_free(input);
@@ -571,12 +596,7 @@ mod tests {
 
             // Null seq_lens with valid-looking (but fake) handles
             let fake = 1usize as *mut std::ffi::c_void;
-            let rc = gllm_decoder_forward(
-                fake, fake, fake, fake, fake,
-                std::ptr::null(),
-                1,
-                fake,
-            );
+            let rc = gllm_decoder_forward(fake, fake, fake, fake, fake, std::ptr::null(), 1, fake);
             assert_eq!(rc, GllmStatus::InvalidArg as i32);
         }
     }
@@ -713,7 +733,11 @@ mod tests {
         let gap_values: &[i32] = &[3, 4, 5, 6, 7, 8, 9, 22, -2, i32::MIN, i32::MAX];
         // Act & Assert
         for v in gap_values {
-            assert_eq!(GllmWeightField::from_i32(*v), None, "expected None for i32={v}");
+            assert_eq!(
+                GllmWeightField::from_i32(*v),
+                None,
+                "expected None for i32={v}"
+            );
         }
     }
 
@@ -722,7 +746,11 @@ mod tests {
         // Arrange
         let base = tiny_c_config();
         // Act — use struct update syntax to change only arch and dtype
-        let gemma_cfg = GllmModelConfig { arch: 5, dtype: 2, ..base };
+        let gemma_cfg = GllmModelConfig {
+            arch: 5,
+            dtype: 2,
+            ..base
+        };
         // Assert
         assert_eq!(gemma_cfg.arch, 5);
         assert_eq!(gemma_cfg.dtype, 2);
@@ -840,7 +868,10 @@ mod tests {
         assert!(!s.is_empty(), "version string should not be empty");
         // Verify it looks like a semver version (major.minor.patch)
         let parts: Vec<&str> = s.split('.').collect();
-        assert!(parts.len() >= 2, "version should have at least major.minor: {s}");
+        assert!(
+            parts.len() >= 2,
+            "version should have at least major.minor: {s}"
+        );
     }
 
     #[test]
@@ -931,7 +962,10 @@ mod tests {
         ];
         // Act & Assert
         for (dtype_val, expected_dtype) in dtype_expected {
-            let cfg = GllmModelConfig { dtype: dtype_val, ..tiny_c_config() };
+            let cfg = GllmModelConfig {
+                dtype: dtype_val,
+                ..tiny_c_config()
+            };
             let mc = cfg.to_model_config().unwrap();
             assert_eq!(mc.dtype, expected_dtype, "dtype={dtype_val} mismatch");
         }
@@ -948,7 +982,10 @@ mod tests {
         ];
         // Act & Assert
         for (qt_val, expected) in quant_cases {
-            let cfg = GllmModelConfig { quant_type: qt_val, ..tiny_c_config() };
+            let cfg = GllmModelConfig {
+                quant_type: qt_val,
+                ..tiny_c_config()
+            };
             let mc = cfg.to_model_config().unwrap();
             assert_eq!(mc.quant_type, expected, "quant_type={qt_val} mismatch");
         }
@@ -961,8 +998,14 @@ mod tests {
         // Act
         let mc = cfg.to_model_config().unwrap();
         // Assert
-        assert!(!mc.rope_interleaved, "rope_interleaved should always be false via C ABI");
-        assert!(mc.sliding_window.is_none(), "sliding_window should always be None via C ABI");
+        assert!(
+            !mc.rope_interleaved,
+            "rope_interleaved should always be false via C ABI"
+        );
+        assert!(
+            mc.sliding_window.is_none(),
+            "sliding_window should always be None via C ABI"
+        );
     }
 
     #[test]

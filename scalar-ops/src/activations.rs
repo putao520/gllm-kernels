@@ -54,12 +54,7 @@ pub unsafe extern "C" fn scalar_relu(x: *const f32, out: *mut f32, n: usize) {
 /// SwiGLU: `out[i] = silu(gate[i]) * up[i]`
 #[no_mangle]
 #[inline(never)]
-pub unsafe extern "C" fn scalar_swiglu(
-    gate: *const f32,
-    up: *const f32,
-    out: *mut f32,
-    n: usize,
-) {
+pub unsafe extern "C" fn scalar_swiglu(gate: *const f32, up: *const f32, out: *mut f32, n: usize) {
     for i in 0..n {
         unsafe {
             let g = *gate.add(i);
@@ -102,12 +97,7 @@ pub unsafe extern "C" fn scalar_swiglu_clipped(
 /// GeGLU: `out[i] = gelu(gate[i]) * up[i]`
 #[no_mangle]
 #[inline(never)]
-pub unsafe extern "C" fn scalar_geglu(
-    gate: *const f32,
-    up: *const f32,
-    out: *mut f32,
-    n: usize,
-) {
+pub unsafe extern "C" fn scalar_geglu(gate: *const f32, up: *const f32, out: *mut f32, n: usize) {
     const SQRT_2_OVER_PI: f32 = 0.7978845608_f32;
     const COEFF: f32 = 0.044715_f32;
     for i in 0..n {
@@ -180,10 +170,16 @@ mod tests {
     fn test_scalar_ops_swiglu_clipped() {
         // limit=7.0 behaves like unclipped for |x| <= 7, and saturates for |x| > 7.
         let gate = vec![0.0_f32, 1.0, 100.0, -100.0, 7.0, -7.0];
-        let up   = vec![1.0_f32, 2.0, 3.0,    4.0,   5.0, 6.0];
+        let up = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let mut out = vec![0.0_f32; 6];
         let limit = 7.0_f32;
-        scalar_swiglu_clipped(gate.as_ptr(), up.as_ptr(), out.as_mut_ptr(), gate.len(), limit);
+        scalar_swiglu_clipped(
+            gate.as_ptr(),
+            up.as_ptr(),
+            out.as_mut_ptr(),
+            gate.len(),
+            limit,
+        );
 
         // swiglu(0, 1) = silu(0) * 1 = 0
         assert!(out[0].abs() < 1e-6);
@@ -195,8 +191,12 @@ mod tests {
         // swiglu(100, 3) → gate clamped to +7, up stays at 3 (|3| <= 7).
         // out = silu(7) * 3
         let silu_7 = 7.0_f32 / (1.0 + (-7.0_f32).exp());
-        assert!((out[2] - silu_7 * 3.0).abs() < 1e-4,
-            "got={}, expected={}", out[2], silu_7 * 3.0);
+        assert!(
+            (out[2] - silu_7 * 3.0).abs() < 1e-4,
+            "got={}, expected={}",
+            out[2],
+            silu_7 * 3.0
+        );
 
         // swiglu(-100, 4) → gate clamped to -7, up stays at 4.
         // out = silu(-7) * 4
@@ -214,30 +214,37 @@ mod tests {
     fn test_scalar_ops_swiglu_clipped_up_saturates() {
         // Verify clamp on `up` operand (up=100 saturates to +limit).
         let gate = vec![1.0_f32];
-        let up   = vec![100.0_f32];
+        let up = vec![100.0_f32];
         let mut out = vec![0.0_f32; 1];
         let limit = 7.0_f32;
         scalar_swiglu_clipped(gate.as_ptr(), up.as_ptr(), out.as_mut_ptr(), 1, limit);
         let silu_1 = 1.0_f32 / (1.0 + (-1.0_f32).exp());
         // up clamped from 100 → 7
         let expected = silu_1 * 7.0;
-        assert!((out[0] - expected).abs() < 1e-5,
-            "got={}, expected={}", out[0], expected);
+        assert!(
+            (out[0] - expected).abs() < 1e-5,
+            "got={}, expected={}",
+            out[0],
+            expected
+        );
     }
 
     #[test]
     fn test_scalar_ops_swiglu_clipped_differs_from_unclipped() {
         // At large magnitudes, clipped result must differ from unclipped.
         let gate = vec![50.0_f32];
-        let up   = vec![50.0_f32];
+        let up = vec![50.0_f32];
         let mut out_clipped = vec![0.0_f32; 1];
         let mut out_unclipped = vec![0.0_f32; 1];
         scalar_swiglu(gate.as_ptr(), up.as_ptr(), out_unclipped.as_mut_ptr(), 1);
         scalar_swiglu_clipped(gate.as_ptr(), up.as_ptr(), out_clipped.as_mut_ptr(), 1, 7.0);
         // Unclipped ≈ 50 * 50 = 2500, clipped ≈ silu(7) * 7 ≈ 6.994 * 7 ≈ 48.96.
-        assert!((out_unclipped[0] - out_clipped[0]).abs() > 100.0,
+        assert!(
+            (out_unclipped[0] - out_clipped[0]).abs() > 100.0,
             "clipped must differ substantially: unclipped={}, clipped={}",
-            out_unclipped[0], out_clipped[0]);
+            out_unclipped[0],
+            out_clipped[0]
+        );
         // Clipped value bounded.
         assert!(out_clipped[0].abs() < 100.0);
     }

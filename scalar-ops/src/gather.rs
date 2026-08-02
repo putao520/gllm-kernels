@@ -102,8 +102,13 @@ pub unsafe extern "C" fn scalar_quant_gather(
     block_bytes: usize,
     header_bytes: usize,
 ) {
-    if seq_len == 0 || hidden_dim == 0 || block_size == 0 || block_bytes == 0
-        || indices.is_null() || table_quant.is_null() || output.is_null()
+    if seq_len == 0
+        || hidden_dim == 0
+        || block_size == 0
+        || block_bytes == 0
+        || indices.is_null()
+        || table_quant.is_null()
+        || output.is_null()
     {
         return;
     }
@@ -144,7 +149,7 @@ pub unsafe extern "C" fn scalar_quant_gather(
                     let byte = *data_ptr.add(j);
                     let lo = (byte & 0x0F) as f32 - 8.0;
                     let hi = ((byte >> 4) & 0x0F) as f32 - 8.0;
-                    *out_ptr.add(elem_base + j * 2)     = scale * lo;
+                    *out_ptr.add(elem_base + j * 2) = scale * lo;
                     *out_ptr.add(elem_base + j * 2 + 1) = scale * hi;
                 }
             }
@@ -160,9 +165,9 @@ mod tests {
     fn test_scalar_gather_basic() {
         // Table: 3 rows x 4 cols
         let table = vec![
-            1.0_f32, 2.0, 3.0, 4.0,  // row 0
-            5.0, 6.0, 7.0, 8.0,      // row 1
-            9.0, 10.0, 11.0, 12.0,   // row 2
+            1.0_f32, 2.0, 3.0, 4.0, // row 0
+            5.0, 6.0, 7.0, 8.0, // row 1
+            9.0, 10.0, 11.0, 12.0, // row 2
         ];
         let indices = vec![0.0_f32, 2.0, 1.0]; // lookup rows 0, 2, 1
         let mut output = vec![0.0_f32; 12];
@@ -171,21 +176,22 @@ mod tests {
             indices.as_ptr(),
             table.as_ptr(),
             output.as_mut_ptr(),
-            3,   // seq_len
-            4,   // embed_dim
-            3,   // table_rows
+            3, // seq_len
+            4, // embed_dim
+            3, // table_rows
         );
 
         let expected = vec![
-            1.0, 2.0, 3.0, 4.0,    // row 0
+            1.0, 2.0, 3.0, 4.0, // row 0
             9.0, 10.0, 11.0, 12.0, // row 2
-            5.0, 6.0, 7.0, 8.0,    // row 1
+            5.0, 6.0, 7.0, 8.0, // row 1
         ];
         for i in 0..12 {
             assert!(
                 (output[i] - expected[i]).abs() < 1e-6,
                 "gather[{i}]: got {}, expected {}",
-                output[i], expected[i]
+                output[i],
+                expected[i]
             );
         }
     }
@@ -194,32 +200,29 @@ mod tests {
     fn test_scalar_column_slice_basic() {
         // Input: 3 rows x 6 cols
         let input = vec![
-            1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0,   // row 0
-            7.0, 8.0, 9.0, 10.0, 11.0, 12.0,     // row 1
-            13.0, 14.0, 15.0, 16.0, 17.0, 18.0,  // row 2
+            1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, // row 0
+            7.0, 8.0, 9.0, 10.0, 11.0, 12.0, // row 1
+            13.0, 14.0, 15.0, 16.0, 17.0, 18.0, // row 2
         ];
         let mut output = vec![0.0_f32; 6]; // 3 rows x 2 cols
 
         scalar_column_slice(
             input.as_ptr(),
             output.as_mut_ptr(),
-            3,   // seq_len
-            6,   // input_inner
-            2,   // start
-            2,   // slice_dim
+            3, // seq_len
+            6, // input_inner
+            2, // start
+            2, // slice_dim
         );
 
         // Expected: columns [2, 3] from each row
-        let expected = vec![
-            3.0, 4.0,
-            9.0, 10.0,
-            15.0, 16.0,
-        ];
+        let expected = vec![3.0, 4.0, 9.0, 10.0, 15.0, 16.0];
         for i in 0..6 {
             assert!(
                 (output[i] - expected[i]).abs() < 1e-6,
                 "column_slice[{i}]: got {}, expected {}",
-                output[i], expected[i]
+                output[i],
+                expected[i]
             );
         }
     }

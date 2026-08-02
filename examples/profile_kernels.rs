@@ -8,7 +8,7 @@
 //!   /tmp/gllm-kernels-profile.html
 
 use gllm_kernels::cpu_kernels::CpuKernels;
-use gllm_kernels::profiling::{Profiler, counters};
+use gllm_kernels::profiling::{counters, Profiler};
 use gllm_kernels::traits::Kernels;
 
 fn rand_vec(n: usize) -> Vec<f32> {
@@ -16,7 +16,9 @@ fn rand_vec(n: usize) -> Vec<f32> {
     let mut v = vec![0.0f32; n];
     let mut state = 0x12345678u64;
     for x in v.iter_mut() {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *x = ((state >> 33) as f32) / (u32::MAX as f32) * 2.0 - 1.0;
     }
     v
@@ -26,8 +28,11 @@ fn main() {
     let kernels = CpuKernels::<f32>::new();
     let mut profiler = Profiler::new();
 
-    eprintln!("Hardware peak: {:.1} GFLOPS, {:.1} GB/s",
-        profiler.hw_peak().gflops, profiler.hw_peak().bandwidth_gbs);
+    eprintln!(
+        "Hardware peak: {:.1} GFLOPS, {:.1} GB/s",
+        profiler.hw_peak().gflops,
+        profiler.hw_peak().bandwidth_gbs
+    );
     eprintln!("HW counters available: {}", profiler.has_hw_counters());
     eprintln!();
 
@@ -128,8 +133,12 @@ fn main() {
     let json_path = "/tmp/gllm-kernels-profile.json";
     let html_path = "/tmp/gllm-kernels-profile.html";
 
-    report.write_json(json_path).expect("failed to write JSON report");
-    report.write_html(html_path).expect("failed to write HTML report");
+    report
+        .write_json(json_path)
+        .expect("failed to write JSON report");
+    report
+        .write_html(html_path)
+        .expect("failed to write HTML report");
 
     eprintln!("Reports written:");
     eprintln!("  JSON: {json_path}");

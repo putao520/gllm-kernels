@@ -8,9 +8,9 @@
 
 use super::instr::*;
 use super::isa_hook;
-use crate::compiler::trace::{QuantPrecision, TraceOp, ReduceKind, ValueId};
-use crate::types::CompilerError;
+use crate::compiler::trace::{QuantPrecision, ReduceKind, TraceOp, ValueId};
 use crate::dispatch::device_profile::DotProductCap;
+use crate::types::CompilerError;
 
 include!("moe_quant_fragments/moe_emit.inc.rs");
 include!("moe_quant_fragments/quant_gemm.inc.rs");

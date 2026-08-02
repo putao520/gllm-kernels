@@ -17,25 +17,21 @@ pub static GEMM_NAIVE: AlgoTemplate = AlgoTemplate {
     name: "GEMM_NAIVE",
     strategy: AlgoStrategy::GemmNaive,
     device_req: DeviceReq::CpuAny,
-    steps: &[
-        AlgoStep::Loop {
-            bound: "m",
-            step: "mr",
+    steps: &[AlgoStep::Loop {
+        bound: "m",
+        step: "mr",
+        body: &[AlgoStep::Loop {
+            bound: "n",
+            step: "nr",
             body: &[
-                AlgoStep::Loop {
-                    bound: "n",
-                    step: "nr",
-                    body: &[
-                        AlgoStep::MicroKernel,
-                        AlgoStep::StoreResult {
-                            rows_param: "mr",
-                            cols_param: "nr",
-                        },
-                    ],
+                AlgoStep::MicroKernel,
+                AlgoStep::StoreResult {
+                    rows_param: "mr",
+                    cols_param: "nr",
                 },
             ],
-        },
-    ],
+        }],
+    }],
     params: &[
         ("m", AlgoParam::FromGraph("m")),
         ("n", AlgoParam::FromGraph("n")),
@@ -62,63 +58,57 @@ pub static GEMM_BLIS: AlgoTemplate = AlgoTemplate {
     name: "GEMM_BLIS",
     strategy: AlgoStrategy::GemmBlis,
     device_req: DeviceReq::CpuAvx2,
-    steps: &[
-        AlgoStep::Loop {
-            bound: "mc",
-            step: "mc",
-            body: &[
-                AlgoStep::LoadPanel {
-                    matrix: MatrixRole::A,
-                    rows_param: "mc",
-                    cols_param: "kc",
-                },
-                AlgoStep::PackBuffer {
-                    buffer_name: "packed_a",
-                    rows_param: "mc",
-                    cols_param: "kc",
-                },
-                AlgoStep::Loop {
-                    bound: "nc",
-                    step: "nc",
-                    body: &[
-                        AlgoStep::LoadPanel {
-                            matrix: MatrixRole::B,
-                            rows_param: "kc",
-                            cols_param: "nc",
-                        },
-                        AlgoStep::PackBuffer {
-                            buffer_name: "packed_b",
-                            rows_param: "kc",
-                            cols_param: "nc",
-                        },
-                        AlgoStep::Loop {
-                            bound: "mc",
-                            step: "mr",
+    steps: &[AlgoStep::Loop {
+        bound: "mc",
+        step: "mc",
+        body: &[
+            AlgoStep::LoadPanel {
+                matrix: MatrixRole::A,
+                rows_param: "mc",
+                cols_param: "kc",
+            },
+            AlgoStep::PackBuffer {
+                buffer_name: "packed_a",
+                rows_param: "mc",
+                cols_param: "kc",
+            },
+            AlgoStep::Loop {
+                bound: "nc",
+                step: "nc",
+                body: &[
+                    AlgoStep::LoadPanel {
+                        matrix: MatrixRole::B,
+                        rows_param: "kc",
+                        cols_param: "nc",
+                    },
+                    AlgoStep::PackBuffer {
+                        buffer_name: "packed_b",
+                        rows_param: "kc",
+                        cols_param: "nc",
+                    },
+                    AlgoStep::Loop {
+                        bound: "mc",
+                        step: "mr",
+                        body: &[AlgoStep::Loop {
+                            bound: "nc",
+                            step: "nr",
                             body: &[
                                 AlgoStep::Loop {
-                                    bound: "nc",
-                                    step: "nr",
-                                    body: &[
-                                        AlgoStep::Loop {
-                                            bound: "kc",
-                                            step: "k_step",
-                                            body: &[
-                                                AlgoStep::MicroKernel,
-                                            ],
-                                        },
-                                        AlgoStep::StoreResult {
-                                            rows_param: "mr",
-                                            cols_param: "nr",
-                                        },
-                                    ],
+                                    bound: "kc",
+                                    step: "k_step",
+                                    body: &[AlgoStep::MicroKernel],
+                                },
+                                AlgoStep::StoreResult {
+                                    rows_param: "mr",
+                                    cols_param: "nr",
                                 },
                             ],
-                        },
-                    ],
-                },
-            ],
-        },
-    ],
+                        }],
+                    },
+                ],
+            },
+        ],
+    }],
     params: &[
         ("mc", AlgoParam::FromPressureModel("mc")),
         ("nc", AlgoParam::FromPressureModel("nc")),
@@ -148,39 +138,40 @@ pub static GEMM_AMX_TILE: AlgoTemplate = AlgoTemplate {
     strategy: AlgoStrategy::GemmHardwareTile,
     device_req: DeviceReq::CpuAmx,
     steps: &[
-        AlgoStep::TileConfig { rows: "16", cols: "16" },
+        AlgoStep::TileConfig {
+            rows: "16",
+            cols: "16",
+        },
         AlgoStep::Loop {
             bound: "m",
             step: "16",
-            body: &[
-                AlgoStep::Loop {
-                    bound: "n",
-                    step: "16",
-                    body: &[
-                        AlgoStep::Loop {
-                            bound: "k",
-                            step: "16",
-                            body: &[
-                                AlgoStep::LoadPanel {
-                                    matrix: MatrixRole::A,
-                                    rows_param: "16",
-                                    cols_param: "16",
-                                },
-                                AlgoStep::LoadPanel {
-                                    matrix: MatrixRole::B,
-                                    rows_param: "16",
-                                    cols_param: "16",
-                                },
-                                AlgoStep::TileMma,
-                            ],
-                        },
-                        AlgoStep::StoreResult {
-                            rows_param: "16",
-                            cols_param: "16",
-                        },
-                    ],
-                },
-            ],
+            body: &[AlgoStep::Loop {
+                bound: "n",
+                step: "16",
+                body: &[
+                    AlgoStep::Loop {
+                        bound: "k",
+                        step: "16",
+                        body: &[
+                            AlgoStep::LoadPanel {
+                                matrix: MatrixRole::A,
+                                rows_param: "16",
+                                cols_param: "16",
+                            },
+                            AlgoStep::LoadPanel {
+                                matrix: MatrixRole::B,
+                                rows_param: "16",
+                                cols_param: "16",
+                            },
+                            AlgoStep::TileMma,
+                        ],
+                    },
+                    AlgoStep::StoreResult {
+                        rows_param: "16",
+                        cols_param: "16",
+                    },
+                ],
+            }],
         },
         AlgoStep::TileRelease,
     ],
@@ -201,8 +192,14 @@ pub static GEMM_GPU_TILED: AlgoTemplate = AlgoTemplate {
     strategy: AlgoStrategy::GemmGpuTiled,
     device_req: DeviceReq::GpuSm80,
     steps: &[
-        AlgoStep::SharedMemDeclare { name: "smem_a", size_param: "smem_bytes" },
-        AlgoStep::SharedMemDeclare { name: "smem_b", size_param: "smem_bytes" },
+        AlgoStep::SharedMemDeclare {
+            name: "smem_a",
+            size_param: "smem_bytes",
+        },
+        AlgoStep::SharedMemDeclare {
+            name: "smem_b",
+            size_param: "smem_bytes",
+        },
         AlgoStep::Loop {
             bound: "k",
             step: "bk",
@@ -216,19 +213,17 @@ pub static GEMM_GPU_TILED: AlgoTemplate = AlgoTemplate {
                     size_param: "smem_tile_bytes",
                 },
                 AlgoStep::AsyncWait { group: 0 },
-                AlgoStep::Barrier { barrier_name: "load_done" },
+                AlgoStep::Barrier {
+                    barrier_name: "load_done",
+                },
                 AlgoStep::Loop {
                     bound: "bm",
                     step: "wm",
-                    body: &[
-                        AlgoStep::Loop {
-                            bound: "bn",
-                            step: "wn",
-                            body: &[
-                                AlgoStep::MicroKernel,
-                            ],
-                        },
-                    ],
+                    body: &[AlgoStep::Loop {
+                        bound: "bn",
+                        step: "wn",
+                        body: &[AlgoStep::MicroKernel],
+                    }],
                 },
             ],
         },
@@ -267,30 +262,54 @@ pub static GEMM_GPU_PIPELINED: AlgoTemplate = AlgoTemplate {
     strategy: AlgoStrategy::GemmGpuPipelined,
     device_req: DeviceReq::GpuSm90,
     steps: &[
-        AlgoStep::SharedMemDeclare { name: "smem_a_ping", size_param: "smem_half" },
-        AlgoStep::SharedMemDeclare { name: "smem_a_pong", size_param: "smem_half" },
-        AlgoStep::SharedMemDeclare { name: "smem_b_ping", size_param: "smem_half" },
-        AlgoStep::SharedMemDeclare { name: "smem_b_pong", size_param: "smem_half" },
+        AlgoStep::SharedMemDeclare {
+            name: "smem_a_ping",
+            size_param: "smem_half",
+        },
+        AlgoStep::SharedMemDeclare {
+            name: "smem_a_pong",
+            size_param: "smem_half",
+        },
+        AlgoStep::SharedMemDeclare {
+            name: "smem_b_ping",
+            size_param: "smem_half",
+        },
+        AlgoStep::SharedMemDeclare {
+            name: "smem_b_pong",
+            size_param: "smem_half",
+        },
         // Prefetch first tile
-        AlgoStep::AsyncCopyToSmem { buffer_name: "smem_a_ping", size_param: "smem_tile_bytes" },
-        AlgoStep::AsyncCopyToSmem { buffer_name: "smem_b_ping", size_param: "smem_tile_bytes" },
+        AlgoStep::AsyncCopyToSmem {
+            buffer_name: "smem_a_ping",
+            size_param: "smem_tile_bytes",
+        },
+        AlgoStep::AsyncCopyToSmem {
+            buffer_name: "smem_b_ping",
+            size_param: "smem_tile_bytes",
+        },
         AlgoStep::Loop {
             bound: "k",
             step: "bk",
             body: &[
                 AlgoStep::AsyncWait { group: 1 }, // wait for previous
-                AlgoStep::Barrier { barrier_name: "stage_done" },
+                AlgoStep::Barrier {
+                    barrier_name: "stage_done",
+                },
                 // Compute current tile
                 AlgoStep::Loop {
                     bound: "bm",
                     step: "wm",
-                    body: &[
-                        AlgoStep::MicroKernel,
-                    ],
+                    body: &[AlgoStep::MicroKernel],
                 },
                 // Prefetch next tile (overlapped)
-                AlgoStep::AsyncCopyToSmem { buffer_name: "smem_a_pong", size_param: "smem_tile_bytes" },
-                AlgoStep::AsyncCopyToSmem { buffer_name: "smem_b_pong", size_param: "smem_tile_bytes" },
+                AlgoStep::AsyncCopyToSmem {
+                    buffer_name: "smem_a_pong",
+                    size_param: "smem_tile_bytes",
+                },
+                AlgoStep::AsyncCopyToSmem {
+                    buffer_name: "smem_b_pong",
+                    size_param: "smem_tile_bytes",
+                },
             ],
         },
         AlgoStep::StoreResult {
@@ -311,9 +330,7 @@ pub static GEMM_GPU_PIPELINED: AlgoTemplate = AlgoTemplate {
         mr: "wm",
         nr: "wn",
         k_step: "bk",
-        steps: &[
-            MicroKernelStep::WarpMma,
-        ],
+        steps: &[MicroKernelStep::WarpMma],
     }),
 };
 
@@ -356,10 +373,16 @@ mod tests {
         // Verify param sources: m/n from graph, mr/nr from device profile
         for (name, param) in params {
             match *name {
-                "m" | "n" => assert!(matches!(param, AlgoParam::FromGraph(_)),
-                    "{} should be FromGraph", name),
-                "mr" | "nr" => assert!(matches!(param, AlgoParam::FromDeviceProfile(_)),
-                    "{} should be FromDeviceProfile", name),
+                "m" | "n" => assert!(
+                    matches!(param, AlgoParam::FromGraph(_)),
+                    "{} should be FromGraph",
+                    name
+                ),
+                "mr" | "nr" => assert!(
+                    matches!(param, AlgoParam::FromDeviceProfile(_)),
+                    "{} should be FromDeviceProfile",
+                    name
+                ),
                 _ => panic!("unexpected param {}", name),
             }
         }
@@ -381,18 +404,24 @@ mod tests {
             assert_eq!(*step, "mc");
 
             // Body must contain LoadPanel(A), PackBuffer, and a nested Loop over nc
-            let has_load_panel_a = body.iter().any(|s| matches!(
-                s,
-                AlgoStep::LoadPanel { matrix: MatrixRole::A, .. }
-            ));
-            let has_pack_buffer = body.iter().any(|s| matches!(
-                s,
-                AlgoStep::PackBuffer { .. }
-            ));
-            let has_nc_loop = body.iter().any(|s| matches!(
-                s,
-                AlgoStep::Loop { bound, .. } if *bound == "nc"
-            ));
+            let has_load_panel_a = body.iter().any(|s| {
+                matches!(
+                    s,
+                    AlgoStep::LoadPanel {
+                        matrix: MatrixRole::A,
+                        ..
+                    }
+                )
+            });
+            let has_pack_buffer = body
+                .iter()
+                .any(|s| matches!(s, AlgoStep::PackBuffer { .. }));
+            let has_nc_loop = body.iter().any(|s| {
+                matches!(
+                    s,
+                    AlgoStep::Loop { bound, .. } if *bound == "nc"
+                )
+            });
 
             assert!(has_load_panel_a, "BLIS must load A panel");
             assert!(has_pack_buffer, "BLIS must pack buffer");
@@ -411,8 +440,10 @@ mod tests {
 
         // Assert: BLIS requires at least AVX2
         assert_eq!(req, DeviceReq::CpuAvx2);
-        assert!(req.priority() > DeviceReq::CpuAny.priority(),
-            "BLIS must have higher priority than CpuAny");
+        assert!(
+            req.priority() > DeviceReq::CpuAny.priority(),
+            "BLIS must have higher priority than CpuAny"
+        );
     }
 
     // ── Test 5: GEMM_AMX_TILE has TileConfig and TileRelease ─────────
@@ -423,14 +454,18 @@ mod tests {
         let steps = GEMM_AMX_TILE.steps;
 
         // Act: find TileConfig and TileRelease
-        let has_tile_config = steps.iter().any(|s| matches!(s, AlgoStep::TileConfig { .. }));
+        let has_tile_config = steps
+            .iter()
+            .any(|s| matches!(s, AlgoStep::TileConfig { .. }));
         let has_tile_release = steps.iter().any(|s| matches!(s, AlgoStep::TileRelease));
 
         // Assert
         assert!(has_tile_config, "AMX must start with TileConfig");
         assert!(has_tile_release, "AMX must end with TileRelease");
-        assert!(GEMM_AMX_TILE.micro_kernel.is_none(),
-            "AMX uses TileMma, no micro-kernel definition");
+        assert!(
+            GEMM_AMX_TILE.micro_kernel.is_none(),
+            "AMX uses TileMma, no micro-kernel definition"
+        );
     }
 
     // ── Test 6: GEMM_AMX_TILE has no micro_kernel and uses 16x16 tiles
@@ -466,13 +501,20 @@ mod tests {
         let steps = GEMM_GPU_TILED.steps;
 
         // Act: count SharedMemDeclare steps
-        let smem_decls: Vec<&&str> = steps.iter().filter_map(|s| match s {
-            AlgoStep::SharedMemDeclare { name, .. } => Some(name),
-            _ => None,
-        }).collect();
+        let smem_decls: Vec<&&str> = steps
+            .iter()
+            .filter_map(|s| match s {
+                AlgoStep::SharedMemDeclare { name, .. } => Some(name),
+                _ => None,
+            })
+            .collect();
 
         // Assert: exactly 2 shared memory declarations for smem_a and smem_b
-        assert_eq!(smem_decls.len(), 2, "GPU tiled must declare smem_a and smem_b");
+        assert_eq!(
+            smem_decls.len(),
+            2,
+            "GPU tiled must declare smem_a and smem_b"
+        );
         assert!(smem_decls.contains(&&"smem_a"), "must declare smem_a");
         assert!(smem_decls.contains(&&"smem_b"), "must declare smem_b");
     }
@@ -490,7 +532,10 @@ mod tests {
                 AlgoParam::Const(val) => {
                     assert!(*val > 0, "param '{}' value {} must be positive", name, val);
                 }
-                _ => panic!("param '{}' must be Const for GPU tiled, got {:?}", name, param),
+                _ => panic!(
+                    "param '{}' must be Const for GPU tiled, got {:?}",
+                    name, param
+                ),
             }
         }
         assert_eq!(params.len(), 7, "GPU tiled has 7 const params");
@@ -504,17 +549,36 @@ mod tests {
         let steps = GEMM_GPU_PIPELINED.steps;
 
         // Act: collect all SharedMemDeclare names
-        let smem_names: Vec<&&str> = steps.iter().filter_map(|s| match s {
-            AlgoStep::SharedMemDeclare { name, .. } => Some(name),
-            _ => None,
-        }).collect();
+        let smem_names: Vec<&&str> = steps
+            .iter()
+            .filter_map(|s| match s {
+                AlgoStep::SharedMemDeclare { name, .. } => Some(name),
+                _ => None,
+            })
+            .collect();
 
         // Assert: 4 buffers (ping-pong for A and B)
-        assert_eq!(smem_names.len(), 4, "pipelined must have 4 shared mem buffers");
-        assert!(smem_names.contains(&&"smem_a_ping"), "must have smem_a_ping");
-        assert!(smem_names.contains(&&"smem_a_pong"), "must have smem_a_pong");
-        assert!(smem_names.contains(&&"smem_b_ping"), "must have smem_b_ping");
-        assert!(smem_names.contains(&&"smem_b_pong"), "must have smem_b_pong");
+        assert_eq!(
+            smem_names.len(),
+            4,
+            "pipelined must have 4 shared mem buffers"
+        );
+        assert!(
+            smem_names.contains(&&"smem_a_ping"),
+            "must have smem_a_ping"
+        );
+        assert!(
+            smem_names.contains(&&"smem_a_pong"),
+            "must have smem_a_pong"
+        );
+        assert!(
+            smem_names.contains(&&"smem_b_ping"),
+            "must have smem_b_ping"
+        );
+        assert!(
+            smem_names.contains(&&"smem_b_pong"),
+            "must have smem_b_pong"
+        );
     }
 
     // ── Test 10: All 5 templates have unique strategies ──────────────
@@ -533,9 +597,11 @@ mod tests {
         // Act & Assert: all strategies are distinct
         for i in 0..templates.len() {
             for j in (i + 1)..templates.len() {
-                assert_ne!(templates[i].1, templates[j].1,
+                assert_ne!(
+                    templates[i].1, templates[j].1,
                     "{} and {} must have different strategies",
-                    templates[i].0, templates[j].0);
+                    templates[i].0, templates[j].0
+                );
             }
         }
     }
@@ -557,9 +623,14 @@ mod tests {
         for i in 0..cases.len() - 1 {
             let pri_cur = cases[i].1.priority();
             let pri_next = cases[i + 1].1.priority();
-            assert!(pri_cur < pri_next,
+            assert!(
+                pri_cur < pri_next,
                 "{} (priority {}) must be less specialized than {} (priority {})",
-                cases[i].0, pri_cur, cases[i + 1].0, pri_next);
+                cases[i].0,
+                pri_cur,
+                cases[i + 1].0,
+                pri_next
+            );
         }
     }
 
@@ -584,7 +655,10 @@ mod tests {
             ("GEMM_NAIVE", GEMM_NAIVE.micro_kernel.unwrap()),
             ("GEMM_BLIS", GEMM_BLIS.micro_kernel.unwrap()),
             ("GEMM_GPU_TILED", GEMM_GPU_TILED.micro_kernel.unwrap()),
-            ("GEMM_GPU_PIPELINED", GEMM_GPU_PIPELINED.micro_kernel.unwrap()),
+            (
+                "GEMM_GPU_PIPELINED",
+                GEMM_GPU_PIPELINED.micro_kernel.unwrap(),
+            ),
         ];
 
         // Act & Assert: micro_kernel mr/nr/k_step must appear in the template params
@@ -597,16 +671,27 @@ mod tests {
                 _ => unreachable!(),
             };
 
-            assert!(params.contains(&&mk.mr),
-                "{}: micro_kernel.mr='{}' must be in params", tmpl_name, mk.mr);
-            assert!(params.contains(&&mk.nr),
-                "{}: micro_kernel.nr='{}' must be in params", tmpl_name, mk.nr);
+            assert!(
+                params.contains(&&mk.mr),
+                "{}: micro_kernel.mr='{}' must be in params",
+                tmpl_name,
+                mk.mr
+            );
+            assert!(
+                params.contains(&&mk.nr),
+                "{}: micro_kernel.nr='{}' must be in params",
+                tmpl_name,
+                mk.nr
+            );
             // k_step is either a param name or a numeric literal string
             let k_step_is_param = params.contains(&&mk.k_step);
             let k_step_is_literal = mk.k_step.chars().all(|c| c.is_ascii_digit());
-            assert!(k_step_is_param || k_step_is_literal,
+            assert!(
+                k_step_is_param || k_step_is_literal,
                 "{}: micro_kernel.k_step='{}' must be a param name or numeric literal",
-                tmpl_name, mk.k_step);
+                tmpl_name,
+                mk.k_step
+            );
         }
     }
 
@@ -615,19 +700,27 @@ mod tests {
     #[test]
     fn gemm_naive_micro_kernel_steps() {
         // Arrange
-        let mk = GEMM_NAIVE.micro_kernel.expect("NAIVE must have micro_kernel");
+        let mk = GEMM_NAIVE
+            .micro_kernel
+            .expect("NAIVE must have micro_kernel");
 
         // Act
         let steps = mk.steps;
 
         // Assert: must contain the canonical 3-step sequence
         assert_eq!(steps.len(), 3, "NAIVE micro kernel has 3 steps");
-        assert!(matches!(steps[0], MicroKernelStep::LoadARow),
-            "step 0 must be LoadARow");
-        assert!(matches!(steps[1], MicroKernelStep::LoadBCol),
-            "step 1 must be LoadBCol");
-        assert!(matches!(steps[2], MicroKernelStep::Fma),
-            "step 2 must be Fma");
+        assert!(
+            matches!(steps[0], MicroKernelStep::LoadARow),
+            "step 0 must be LoadARow"
+        );
+        assert!(
+            matches!(steps[1], MicroKernelStep::LoadBCol),
+            "step 1 must be LoadBCol"
+        );
+        assert!(
+            matches!(steps[2], MicroKernelStep::Fma),
+            "step 2 must be Fma"
+        );
     }
 
     // ── Test 15: GEMM_BLIS params come from PressureModel ─────────────
@@ -647,12 +740,18 @@ mod tests {
         let nc_param = nc.expect("must have nc param").1;
         let kc_param = kc.expect("must have kc param").1;
 
-        assert!(matches!(mc_param, AlgoParam::FromPressureModel("mc")),
-            "mc must be FromPressureModel(\"mc\")");
-        assert!(matches!(nc_param, AlgoParam::FromPressureModel("nc")),
-            "nc must be FromPressureModel(\"nc\")");
-        assert!(matches!(kc_param, AlgoParam::FromPressureModel("kc")),
-            "kc must be FromPressureModel(\"kc\")");
+        assert!(
+            matches!(mc_param, AlgoParam::FromPressureModel("mc")),
+            "mc must be FromPressureModel(\"mc\")"
+        );
+        assert!(
+            matches!(nc_param, AlgoParam::FromPressureModel("nc")),
+            "nc must be FromPressureModel(\"nc\")"
+        );
+        assert!(
+            matches!(kc_param, AlgoParam::FromPressureModel("kc")),
+            "kc must be FromPressureModel(\"kc\")"
+        );
     }
 
     // ── Test 16: GEMM_GPU_PIPELINED has AsyncWait and Barrier steps ───
@@ -663,10 +762,13 @@ mod tests {
         let steps = GEMM_GPU_PIPELINED.steps;
 
         // Act: find AsyncWait and Barrier inside the k-loop body
-        let k_loop = steps.iter().find_map(|s| match s {
-            AlgoStep::Loop { bound, .. } if *bound == "k" => Some(s),
-            _ => None,
-        }).expect("must have k-loop");
+        let k_loop = steps
+            .iter()
+            .find_map(|s| match s {
+                AlgoStep::Loop { bound, .. } if *bound == "k" => Some(s),
+                _ => None,
+            })
+            .expect("must have k-loop");
 
         let body = if let AlgoStep::Loop { body, .. } = k_loop {
             body
@@ -682,10 +784,13 @@ mod tests {
         assert!(has_barrier, "pipelined k-loop must have Barrier");
 
         // Verify AsyncWait group value
-        let wait_group = body.iter().find_map(|s| match s {
-            AlgoStep::AsyncWait { group } => Some(*group),
-            _ => None,
-        }).expect("must find AsyncWait");
+        let wait_group = body
+            .iter()
+            .find_map(|s| match s {
+                AlgoStep::AsyncWait { group } => Some(*group),
+                _ => None,
+            })
+            .expect("must find AsyncWait");
         assert_eq!(wait_group, 1, "pipelined uses group=1 for overlap");
     }
 
@@ -705,10 +810,19 @@ mod tests {
 
             // Body must contain another Loop over n
             assert_eq!(body.len(), 1, "outer body has one step");
-            if let AlgoStep::Loop { bound, step, body: inner_body } = &body[0] {
+            if let AlgoStep::Loop {
+                bound,
+                step,
+                body: inner_body,
+            } = &body[0]
+            {
                 assert_eq!(*bound, "n", "inner loop iterates over n");
                 assert_eq!(*step, "nr", "inner loop steps by nr");
-                assert_eq!(inner_body.len(), 2, "inner body has MicroKernel + StoreResult");
+                assert_eq!(
+                    inner_body.len(),
+                    2,
+                    "inner body has MicroKernel + StoreResult"
+                );
                 assert!(matches!(inner_body[0], AlgoStep::MicroKernel));
                 assert!(matches!(inner_body[1], AlgoStep::StoreResult { .. }));
             } else {
@@ -735,14 +849,30 @@ mod tests {
                 let k_loop = &body[0];
                 if let AlgoStep::Loop { body, .. } = k_loop {
                     // Assert: k-loop body has LoadPanel(A), LoadPanel(B), TileMma
-                    assert!(body.iter().any(|s| matches!(
-                        s, AlgoStep::LoadPanel { matrix: MatrixRole::A, .. }
-                    )), "k-loop must load panel A");
-                    assert!(body.iter().any(|s| matches!(
-                        s, AlgoStep::LoadPanel { matrix: MatrixRole::B, .. }
-                    )), "k-loop must load panel B");
-                    assert!(body.iter().any(|s| matches!(s, AlgoStep::TileMma)),
-                        "k-loop must have TileMma");
+                    assert!(
+                        body.iter().any(|s| matches!(
+                            s,
+                            AlgoStep::LoadPanel {
+                                matrix: MatrixRole::A,
+                                ..
+                            }
+                        )),
+                        "k-loop must load panel A"
+                    );
+                    assert!(
+                        body.iter().any(|s| matches!(
+                            s,
+                            AlgoStep::LoadPanel {
+                                matrix: MatrixRole::B,
+                                ..
+                            }
+                        )),
+                        "k-loop must load panel B"
+                    );
+                    assert!(
+                        body.iter().any(|s| matches!(s, AlgoStep::TileMma)),
+                        "k-loop must have TileMma"
+                    );
                 } else {
                     panic!("expected k-loop");
                 }
@@ -759,11 +889,31 @@ mod tests {
     #[test]
     fn algo_param_derived_construction_and_variants() {
         // Arrange: construct all 4 ParamArith variants via Derived
-        let ceil_div = AlgoParam::Derived { base: "mc", op: ParamArith::CeilDiv, operand: 4 };
-        let mul = AlgoParam::Derived { base: "nr", op: ParamArith::Mul, operand: 2 };
-        let div = AlgoParam::Derived { base: "kc", op: ParamArith::Div, operand: 8 };
-        let max = AlgoParam::Derived { base: "m", op: ParamArith::Max, operand: 1 };
-        let min = AlgoParam::Derived { base: "n", op: ParamArith::Min, operand: 64 };
+        let ceil_div = AlgoParam::Derived {
+            base: "mc",
+            op: ParamArith::CeilDiv,
+            operand: 4,
+        };
+        let mul = AlgoParam::Derived {
+            base: "nr",
+            op: ParamArith::Mul,
+            operand: 2,
+        };
+        let div = AlgoParam::Derived {
+            base: "kc",
+            op: ParamArith::Div,
+            operand: 8,
+        };
+        let max = AlgoParam::Derived {
+            base: "m",
+            op: ParamArith::Max,
+            operand: 1,
+        };
+        let min = AlgoParam::Derived {
+            base: "n",
+            op: ParamArith::Min,
+            operand: 64,
+        };
 
         // Act: format each with Debug
         let ceil_div_dbg = format!("{:?}", ceil_div);
@@ -800,10 +950,13 @@ mod tests {
         let steps = GEMM_GPU_TILED.steps;
 
         // Act: find the k-loop
-        let k_loop = steps.iter().find_map(|s| match s {
-            AlgoStep::Loop { bound, .. } if *bound == "k" => Some(s),
-            _ => None,
-        }).expect("must have k-loop");
+        let k_loop = steps
+            .iter()
+            .find_map(|s| match s {
+                AlgoStep::Loop { bound, .. } if *bound == "k" => Some(s),
+                _ => None,
+            })
+            .expect("must have k-loop");
 
         let body = if let AlgoStep::Loop { body, .. } = k_loop {
             body
@@ -811,15 +964,24 @@ mod tests {
             panic!("k-loop must be Loop variant");
         };
 
-        let async_copies: Vec<&&str> = body.iter().filter_map(|s| match s {
-            AlgoStep::AsyncCopyToSmem { buffer_name, .. } => Some(buffer_name),
-            _ => None,
-        }).collect();
+        let async_copies: Vec<&&str> = body
+            .iter()
+            .filter_map(|s| match s {
+                AlgoStep::AsyncCopyToSmem { buffer_name, .. } => Some(buffer_name),
+                _ => None,
+            })
+            .collect();
 
         // Assert: async copies for both smem_a and smem_b
         assert_eq!(async_copies.len(), 2, "must have 2 async copies");
-        assert!(async_copies.contains(&&"smem_a"), "must async copy to smem_a");
-        assert!(async_copies.contains(&&"smem_b"), "must async copy to smem_b");
+        assert!(
+            async_copies.contains(&&"smem_a"),
+            "must async copy to smem_a"
+        );
+        assert!(
+            async_copies.contains(&&"smem_b"),
+            "must async copy to smem_b"
+        );
     }
 
     // ── Test 21: GEMM_BLIS has LoadPanel for both A and B matrices ────
@@ -848,7 +1010,10 @@ mod tests {
         // Assert
         assert!(roles.contains(&MatrixRole::A), "BLIS must load panel A");
         assert!(roles.contains(&MatrixRole::B), "BLIS must load panel B");
-        assert!(roles.len() >= 2, "BLIS must have at least 2 LoadPanel steps");
+        assert!(
+            roles.len() >= 2,
+            "BLIS must have at least 2 LoadPanel steps"
+        );
     }
 
     // ── Test 22: GEMM_GPU_PIPELINED micro_kernel uses WarpMma only ────
@@ -856,12 +1021,16 @@ mod tests {
     #[test]
     fn gemm_gpu_pipelined_micro_kernel_warp_mma_only() {
         // Arrange
-        let mk = GEMM_GPU_PIPELINED.micro_kernel.expect("pipelined must have micro_kernel");
+        let mk = GEMM_GPU_PIPELINED
+            .micro_kernel
+            .expect("pipelined must have micro_kernel");
 
         // Assert: only WarpMma step, no LoadARow/LoadBCol/Fma
         assert_eq!(mk.steps.len(), 1, "pipelined MK has exactly 1 step");
-        assert!(matches!(mk.steps[0], MicroKernelStep::WarpMma),
-            "pipelined MK must be WarpMma only");
+        assert!(
+            matches!(mk.steps[0], MicroKernelStep::WarpMma),
+            "pipelined MK must be WarpMma only"
+        );
     }
 
     // ── Test 23: All GEMM templates have StoreResult step ──────────────
@@ -882,8 +1051,16 @@ mod tests {
             for step in steps {
                 match step {
                     AlgoStep::StoreResult { .. } => return true,
-                    AlgoStep::Loop { body, .. } => if has_store_result(body) { return true; },
-                    AlgoStep::Seq(body) => if has_store_result(body) { return true; },
+                    AlgoStep::Loop { body, .. } => {
+                        if has_store_result(body) {
+                            return true;
+                        }
+                    }
+                    AlgoStep::Seq(body) => {
+                        if has_store_result(body) {
+                            return true;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -892,8 +1069,11 @@ mod tests {
 
         // Assert
         for (name, tmpl) in templates {
-            assert!(has_store_result(tmpl.steps),
-                "{} must contain StoreResult step", name);
+            assert!(
+                has_store_result(tmpl.steps),
+                "{} must contain StoreResult step",
+                name
+            );
         }
     }
 
@@ -905,10 +1085,13 @@ mod tests {
         let steps = GEMM_GPU_TILED.steps;
 
         // Act: find the k-loop
-        let k_loop = steps.iter().find_map(|s| match s {
-            AlgoStep::Loop { bound, .. } if *bound == "k" => Some(s),
-            _ => None,
-        }).expect("must have k-loop");
+        let k_loop = steps
+            .iter()
+            .find_map(|s| match s {
+                AlgoStep::Loop { bound, .. } if *bound == "k" => Some(s),
+                _ => None,
+            })
+            .expect("must have k-loop");
 
         let body = if let AlgoStep::Loop { body, .. } = k_loop {
             body
@@ -924,10 +1107,13 @@ mod tests {
         assert!(has_barrier, "GPU tiled k-loop must have Barrier");
 
         // Verify AsyncWait group=0 (synchronous wait)
-        let wait_group = body.iter().find_map(|s| match s {
-            AlgoStep::AsyncWait { group } => Some(*group),
-            _ => None,
-        }).expect("must find AsyncWait");
+        let wait_group = body
+            .iter()
+            .find_map(|s| match s {
+                AlgoStep::AsyncWait { group } => Some(*group),
+                _ => None,
+            })
+            .expect("must find AsyncWait");
         assert_eq!(wait_group, 0, "tiled uses group=0 for synchronous wait");
     }
 
@@ -968,8 +1154,14 @@ mod tests {
 
         // Assert
         assert!(name_upper.contains("NAIVE"), "name must contain NAIVE");
-        assert!(strategy_dbg.contains("GemmNaive"), "strategy debug must contain GemmNaive");
-        assert!(strategy_dbg.contains("Naive"), "strategy debug must mention Naive");
+        assert!(
+            strategy_dbg.contains("GemmNaive"),
+            "strategy debug must contain GemmNaive"
+        );
+        assert!(
+            strategy_dbg.contains("Naive"),
+            "strategy debug must mention Naive"
+        );
     }
 
     // ── Test 27: GEMM_GPU_PIPELINED const param value boundaries ──────
@@ -980,7 +1172,8 @@ mod tests {
         let params = GEMM_GPU_PIPELINED.params;
 
         // Act: extract all Const params and their values
-        let const_vals: Vec<(&str, usize)> = params.iter()
+        let const_vals: Vec<(&str, usize)> = params
+            .iter()
             .filter_map(|(name, p)| match p {
                 AlgoParam::Const(v) => Some((*name, *v)),
                 _ => None,
@@ -991,7 +1184,12 @@ mod tests {
         assert!(!const_vals.is_empty(), "pipelined must have const params");
         for (name, val) in &const_vals {
             assert!(*val > 0, "param '{}' value must be positive", name);
-            assert!(*val % 2 == 0, "param '{}' value {} should be even", name, val);
+            assert!(
+                *val % 2 == 0,
+                "param '{}' value {} should be even",
+                name,
+                val
+            );
         }
     }
 
@@ -1052,8 +1250,16 @@ mod tests {
         let nr_in_params = param_names.iter().any(|n| **n == mk.nr);
 
         // Assert
-        assert!(mr_in_params, "micro_kernel.mr='{}' must exist in params", mk.mr);
-        assert!(nr_in_params, "micro_kernel.nr='{}' must exist in params", mk.nr);
+        assert!(
+            mr_in_params,
+            "micro_kernel.mr='{}' must exist in params",
+            mk.mr
+        );
+        assert!(
+            nr_in_params,
+            "micro_kernel.nr='{}' must exist in params",
+            mk.nr
+        );
         assert_eq!(mk.mr, "mr", "BLIS mk.mr must reference 'mr' param");
         assert_eq!(mk.nr, "nr", "BLIS mk.nr must reference 'nr' param");
     }
@@ -1063,22 +1269,38 @@ mod tests {
     #[test]
     fn gemm_gpu_tiled_smem_bytes_exceeds_tile_bytes() {
         // Arrange: extract Const values for smem_bytes and smem_tile_bytes
-        let smem_bytes = GEMM_GPU_TILED.params.iter()
+        let smem_bytes = GEMM_GPU_TILED
+            .params
+            .iter()
             .find(|(n, _)| *n == "smem_bytes")
-            .and_then(|(_, p)| match p { AlgoParam::Const(v) => Some(*v), _ => None })
+            .and_then(|(_, p)| match p {
+                AlgoParam::Const(v) => Some(*v),
+                _ => None,
+            })
             .expect("smem_bytes must be Const");
-        let smem_tile_bytes = GEMM_GPU_TILED.params.iter()
+        let smem_tile_bytes = GEMM_GPU_TILED
+            .params
+            .iter()
             .find(|(n, _)| *n == "smem_tile_bytes")
-            .and_then(|(_, p)| match p { AlgoParam::Const(v) => Some(*v), _ => None })
+            .and_then(|(_, p)| match p {
+                AlgoParam::Const(v) => Some(*v),
+                _ => None,
+            })
             .expect("smem_tile_bytes must be Const");
 
         // Assert: total shared memory must hold at least both tiles (A + B)
-        assert!(smem_bytes > smem_tile_bytes,
+        assert!(
+            smem_bytes > smem_tile_bytes,
             "smem_bytes ({}) must exceed smem_tile_bytes ({}) to hold A+B tiles",
-            smem_bytes, smem_tile_bytes);
-        assert!(smem_bytes >= smem_tile_bytes * 2,
+            smem_bytes,
+            smem_tile_bytes
+        );
+        assert!(
+            smem_bytes >= smem_tile_bytes * 2,
             "smem_bytes ({}) must be at least 2x tile bytes ({}) for A+B buffers",
-            smem_bytes, smem_tile_bytes);
+            smem_bytes,
+            smem_tile_bytes
+        );
     }
 
     // ── Test 32: DeviceReq::GpuSm80 vs GpuSm90 priorities are distinct ─
@@ -1095,7 +1317,12 @@ mod tests {
 
         // Assert: distinct and ordered
         assert_ne!(p80, p90, "SM80 and SM90 must have distinct priorities");
-        assert!(p80 < p90, "SM80 priority ({}) must be less than SM90 ({})", p80, p90);
+        assert!(
+            p80 < p90,
+            "SM80 priority ({}) must be less than SM90 ({})",
+            p80,
+            p90
+        );
     }
 
     // ── Test 33: GEMM_NAIVE has no LoadPanel or PackBuffer steps ──────
@@ -1108,12 +1335,18 @@ mod tests {
         // Act: recursively search for LoadPanel and PackBuffer steps
         fn has_step_kind(steps: &[AlgoStep], check: fn(&AlgoStep) -> bool) -> bool {
             for s in steps {
-                if check(s) { return true; }
+                if check(s) {
+                    return true;
+                }
                 if let AlgoStep::Loop { body, .. } = s {
-                    if has_step_kind(body, check) { return true; }
+                    if has_step_kind(body, check) {
+                        return true;
+                    }
                 }
                 if let AlgoStep::Seq(body) = s {
-                    if has_step_kind(body, check) { return true; }
+                    if has_step_kind(body, check) {
+                        return true;
+                    }
                 }
             }
             false
@@ -1132,19 +1365,23 @@ mod tests {
     #[test]
     fn gemm_gpu_tiled_k_loop_references_existing_param() {
         // Arrange: find the k-loop in GPU TILED steps
-        let k_loop = GEMM_GPU_TILED.steps.iter().find_map(|s| match s {
-            AlgoStep::Loop { bound, step, .. } if *bound == "k" => Some(*step),
-            _ => None,
-        }).expect("must have k-loop");
+        let k_loop = GEMM_GPU_TILED
+            .steps
+            .iter()
+            .find_map(|s| match s {
+                AlgoStep::Loop { bound, step, .. } if *bound == "k" => Some(*step),
+                _ => None,
+            })
+            .expect("must have k-loop");
 
         // Act: verify the k-loop step name exists in params
         let param_names: Vec<&&str> = GEMM_GPU_TILED.params.iter().map(|(n, _)| n).collect();
 
         // Assert: "bk" must be a defined param (the blocking factor for k)
         assert_eq!(k_loop, "bk", "k-loop step must be 'bk'");
-        assert!(param_names.iter().any(|n| **n == "bk"),
-            "k-loop step 'bk' must exist in template params");
+        assert!(
+            param_names.iter().any(|n| **n == "bk"),
+            "k-loop step 'bk' must exist in template params"
+        );
     }
 }
-
-

@@ -4,7 +4,7 @@
 //! all function pointers through `dlsym`. If the driver is not installed,
 //! `HipDriver::load()` returns `Err` instead of panicking.
 
-use std::ffi::{c_void, c_char, c_int, c_uint};
+use std::ffi::{c_char, c_int, c_uint, c_void};
 
 use crate::gpu::GpuError;
 
@@ -63,15 +63,20 @@ pub struct HipDriver {
     // ── Module / kernel ──
     pub hipModuleLoadData: unsafe extern "C" fn(*mut HipModule, *const c_void) -> HipResult,
     pub hipModuleUnload: unsafe extern "C" fn(HipModule) -> HipResult,
-    pub hipModuleGetFunction: unsafe extern "C" fn(*mut HipFunction, HipModule, *const c_char) -> HipResult,
+    pub hipModuleGetFunction:
+        unsafe extern "C" fn(*mut HipFunction, HipModule, *const c_char) -> HipResult,
     pub hipModuleLaunchKernel: unsafe extern "C" fn(
         HipFunction,
-        c_uint, c_uint, c_uint, // grid dim x, y, z
-        c_uint, c_uint, c_uint, // block dim x, y, z
-        c_uint,                 // shared mem bytes
-        HipStream,              // stream
-        *mut *mut c_void,       // kernel params
-        *mut *mut c_void,       // extra
+        c_uint,
+        c_uint,
+        c_uint, // grid dim x, y, z
+        c_uint,
+        c_uint,
+        c_uint,           // block dim x, y, z
+        c_uint,           // shared mem bytes
+        HipStream,        // stream
+        *mut *mut c_void, // kernel params
+        *mut *mut c_void, // extra
     ) -> HipResult,
 
     // ── GCN arch name (for gfx_arch detection) ──
@@ -171,17 +176,13 @@ impl HipDriver {
     /// Query device name string.
     pub fn device_name(&self, device: i32) -> Result<String, GpuError> {
         let mut buf = [0u8; 256];
-        let res = unsafe {
-            (self.hipDeviceGetName)(buf.as_mut_ptr() as *mut c_char, 256, device)
-        };
+        let res = unsafe { (self.hipDeviceGetName)(buf.as_mut_ptr() as *mut c_char, 256, device) };
         if res != HIP_SUCCESS {
             return Err(GpuError::Driver(format!(
                 "hipDeviceGetName failed with error {res}"
             )));
         }
-        let name = unsafe {
-            std::ffi::CStr::from_ptr(buf.as_ptr() as *const c_char)
-        };
+        let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const c_char) };
         Ok(name.to_string_lossy().into_owned())
     }
 
@@ -196,9 +197,7 @@ impl HipDriver {
         // hipDeviceProp_t is very large (3.5KB+ on ROCm 6.x). We allocate a
         // generous 8192-byte zeroed buffer to safely cover all ROCm versions.
         let mut buf = vec![0u8; 8192];
-        let res = unsafe {
-            (self.hipGetDeviceProperties)(buf.as_mut_ptr() as *mut c_void, device)
-        };
+        let res = unsafe { (self.hipGetDeviceProperties)(buf.as_mut_ptr() as *mut c_void, device) };
         if res != HIP_SUCCESS {
             return Err(GpuError::Driver(format!(
                 "hipGetDeviceProperties failed with error {res}"
@@ -227,7 +226,9 @@ impl HipDriver {
 impl Drop for HipDriver {
     fn drop(&mut self) {
         if !self._lib.is_null() {
-            unsafe { dlclose(self._lib); }
+            unsafe {
+                dlclose(self._lib);
+            }
         }
     }
 }
@@ -312,8 +313,14 @@ mod tests {
         // Hex suffix: gfx90a = MI200
         assert_eq!(parse_gfx_arch_from_str("gfx90a"), Some(0x90a));
         // Embedded in longer string
-        assert_eq!(parse_gfx_arch_from_str("AMD Instinct MI200 (gfx90a)"), Some(0x90a));
-        assert_eq!(parse_gfx_arch_from_str("some\0garbage\0gfx942\0more"), Some(0x942));
+        assert_eq!(
+            parse_gfx_arch_from_str("AMD Instinct MI200 (gfx90a)"),
+            Some(0x90a)
+        );
+        assert_eq!(
+            parse_gfx_arch_from_str("some\0garbage\0gfx942\0more"),
+            Some(0x942)
+        );
         // No match
         assert_eq!(parse_gfx_arch_from_str("no arch here"), None);
         assert_eq!(parse_gfx_arch_from_str("gfx"), None);

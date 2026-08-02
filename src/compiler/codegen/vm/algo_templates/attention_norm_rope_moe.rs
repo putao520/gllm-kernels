@@ -15,19 +15,34 @@ pub static ATTN_MHA: AlgoTemplate = AlgoTemplate {
         AlgoStep::TraceBody(&[
             AlgoTraceStep::LoadInput { name: "q" },
             AlgoTraceStep::LoadInput { name: "k" },
-            AlgoTraceStep::BinOp { op: TraceBinOp::Mul, dst: "qk", a: "q", b: "k" },
+            AlgoTraceStep::BinOp {
+                op: TraceBinOp::Mul,
+                dst: "qk",
+                a: "q",
+                b: "k",
+            },
         ]),
         // Scale by 1/sqrt(d_head)
         AlgoStep::TraceBody(&[
             AlgoTraceStep::LoadConst { value: 0.0 }, // filled from graph config
-            AlgoTraceStep::BinOp { op: TraceBinOp::Mul, dst: "qk_scaled", a: "qk", b: "scale" },
+            AlgoTraceStep::BinOp {
+                op: TraceBinOp::Mul,
+                dst: "qk_scaled",
+                a: "qk",
+                b: "scale",
+            },
         ]),
         // Softmax(QK^T / sqrt(d_head))
         AlgoStep::Softmax,
         // Attn_weights × V
         AlgoStep::TraceBody(&[
             AlgoTraceStep::LoadInput { name: "v" },
-            AlgoTraceStep::BinOp { op: TraceBinOp::Mul, dst: "attn_out", a: "attn_weights", b: "v" },
+            AlgoTraceStep::BinOp {
+                op: TraceBinOp::Mul,
+                dst: "attn_out",
+                a: "attn_weights",
+                b: "v",
+            },
         ]),
     ],
     params: &[
@@ -47,12 +62,22 @@ pub static ATTN_GQA: AlgoTemplate = AlgoTemplate {
         AlgoStep::TraceBody(&[
             AlgoTraceStep::LoadInput { name: "q" },
             AlgoTraceStep::LoadInput { name: "k" },
-            AlgoTraceStep::BinOp { op: TraceBinOp::Mul, dst: "qk", a: "q", b: "k" },
+            AlgoTraceStep::BinOp {
+                op: TraceBinOp::Mul,
+                dst: "qk",
+                a: "q",
+                b: "k",
+            },
         ]),
         AlgoStep::Softmax,
         AlgoStep::TraceBody(&[
             AlgoTraceStep::LoadInput { name: "v" },
-            AlgoTraceStep::BinOp { op: TraceBinOp::Mul, dst: "attn_out", a: "attn_weights", b: "v" },
+            AlgoTraceStep::BinOp {
+                op: TraceBinOp::Mul,
+                dst: "attn_out",
+                a: "attn_weights",
+                b: "v",
+            },
         ]),
     ],
     params: &[
@@ -60,7 +85,14 @@ pub static ATTN_GQA: AlgoTemplate = AlgoTemplate {
         ("num_q_heads", AlgoParam::FromGraph("num_q_heads")),
         ("num_kv_heads", AlgoParam::FromGraph("num_kv_heads")),
         ("head_dim", AlgoParam::FromGraph("head_dim")),
-        ("kv_group_size", AlgoParam::Derived { base: "num_q_heads", op: ParamArith::Div, operand: 0 }),
+        (
+            "kv_group_size",
+            AlgoParam::Derived {
+                base: "num_q_heads",
+                op: ParamArith::Div,
+                operand: 0,
+            },
+        ),
     ],
     micro_kernel: None,
 };
@@ -74,12 +106,22 @@ pub static ATTN_MLA: AlgoTemplate = AlgoTemplate {
         AlgoStep::TraceBody(&[
             AlgoTraceStep::LoadInput { name: "q_absorbed" },
             AlgoTraceStep::LoadInput { name: "c_kv" },
-            AlgoTraceStep::BinOp { op: TraceBinOp::Mul, dst: "qk", a: "q_absorbed", b: "c_kv" },
+            AlgoTraceStep::BinOp {
+                op: TraceBinOp::Mul,
+                dst: "qk",
+                a: "q_absorbed",
+                b: "c_kv",
+            },
         ]),
         AlgoStep::Softmax,
         AlgoStep::TraceBody(&[
             AlgoTraceStep::LoadInput { name: "v" },
-            AlgoTraceStep::BinOp { op: TraceBinOp::Mul, dst: "attn_out", a: "attn_weights", b: "v" },
+            AlgoTraceStep::BinOp {
+                op: TraceBinOp::Mul,
+                dst: "attn_out",
+                a: "attn_weights",
+                b: "v",
+            },
         ]),
     ],
     params: &[
@@ -101,17 +143,44 @@ pub static NORM_RMS: AlgoTemplate = AlgoTemplate {
         // Three-phase: reduce_sum(x^2) → rsqrt(sum/N + eps) → x * scale * rsqrt
         AlgoStep::TraceBody(&[
             AlgoTraceStep::LoadInput { name: "x" },
-            AlgoTraceStep::BinOp { op: TraceBinOp::Mul, dst: "x2", a: "x", b: "x" },
-            AlgoTraceStep::HReduce { src: "x2", op: ReduceKind::Sum },
+            AlgoTraceStep::BinOp {
+                op: TraceBinOp::Mul,
+                dst: "x2",
+                a: "x",
+                b: "x",
+            },
+            AlgoTraceStep::HReduce {
+                src: "x2",
+                op: ReduceKind::Sum,
+            },
         ]),
         AlgoStep::Reduce { op: ReduceOp::Sum },
         AlgoStep::TraceBody(&[
             AlgoTraceStep::LoadParam { name: "eps" }, // eps from NormSpec, resolved at instantiation
-            AlgoTraceStep::BinOp { op: TraceBinOp::Add, dst: "mean_eps", a: "sum", b: "eps" },
-            AlgoTraceStep::UnaryOp { op: TraceUnaryOp::Rsqrt, dst: "inv_rms", src: "mean_eps" },
-            AlgoTraceStep::BinOp { op: TraceBinOp::Mul, dst: "norm_out", a: "x", b: "inv_rms" },
+            AlgoTraceStep::BinOp {
+                op: TraceBinOp::Add,
+                dst: "mean_eps",
+                a: "sum",
+                b: "eps",
+            },
+            AlgoTraceStep::UnaryOp {
+                op: TraceUnaryOp::Rsqrt,
+                dst: "inv_rms",
+                src: "mean_eps",
+            },
+            AlgoTraceStep::BinOp {
+                op: TraceBinOp::Mul,
+                dst: "norm_out",
+                a: "x",
+                b: "inv_rms",
+            },
             AlgoTraceStep::LoadInput { name: "gamma" },
-            AlgoTraceStep::BinOp { op: TraceBinOp::Mul, dst: "out", a: "norm_out", b: "gamma" },
+            AlgoTraceStep::BinOp {
+                op: TraceBinOp::Mul,
+                dst: "out",
+                a: "norm_out",
+                b: "gamma",
+            },
         ]),
     ],
     params: &[
@@ -130,19 +199,53 @@ pub static NORM_LAYER: AlgoTemplate = AlgoTemplate {
         AlgoStep::Reduce { op: ReduceOp::Sum },
         AlgoStep::TraceBody(&[
             AlgoTraceStep::LoadInput { name: "x" },
-            AlgoTraceStep::BinOp { op: TraceBinOp::Sub, dst: "centered", a: "x", b: "mean" },
-            AlgoTraceStep::BinOp { op: TraceBinOp::Mul, dst: "var", a: "centered", b: "centered" },
+            AlgoTraceStep::BinOp {
+                op: TraceBinOp::Sub,
+                dst: "centered",
+                a: "x",
+                b: "mean",
+            },
+            AlgoTraceStep::BinOp {
+                op: TraceBinOp::Mul,
+                dst: "var",
+                a: "centered",
+                b: "centered",
+            },
         ]),
         AlgoStep::Reduce { op: ReduceOp::Sum },
         AlgoStep::TraceBody(&[
             AlgoTraceStep::LoadParam { name: "eps" }, // eps from NormSpec, resolved at instantiation
-            AlgoTraceStep::BinOp { op: TraceBinOp::Add, dst: "var_eps", a: "var", b: "eps" },
-            AlgoTraceStep::UnaryOp { op: TraceUnaryOp::Rsqrt, dst: "inv_std", src: "var_eps" },
-            AlgoTraceStep::BinOp { op: TraceBinOp::Mul, dst: "norm_out", a: "centered", b: "inv_std" },
+            AlgoTraceStep::BinOp {
+                op: TraceBinOp::Add,
+                dst: "var_eps",
+                a: "var",
+                b: "eps",
+            },
+            AlgoTraceStep::UnaryOp {
+                op: TraceUnaryOp::Rsqrt,
+                dst: "inv_std",
+                src: "var_eps",
+            },
+            AlgoTraceStep::BinOp {
+                op: TraceBinOp::Mul,
+                dst: "norm_out",
+                a: "centered",
+                b: "inv_std",
+            },
             AlgoTraceStep::LoadInput { name: "gamma" },
-            AlgoTraceStep::BinOp { op: TraceBinOp::Mul, dst: "scaled", a: "norm_out", b: "gamma" },
+            AlgoTraceStep::BinOp {
+                op: TraceBinOp::Mul,
+                dst: "scaled",
+                a: "norm_out",
+                b: "gamma",
+            },
             AlgoTraceStep::LoadInput { name: "beta" },
-            AlgoTraceStep::BinOp { op: TraceBinOp::Add, dst: "out", a: "scaled", b: "beta" },
+            AlgoTraceStep::BinOp {
+                op: TraceBinOp::Add,
+                dst: "out",
+                a: "scaled",
+                b: "beta",
+            },
         ]),
     ],
     params: &[
@@ -166,11 +269,30 @@ pub static ROPE_STANDARD: AlgoTemplate = AlgoTemplate {
             AlgoTraceStep::LoadInput { name: "x" },
             AlgoTraceStep::LoadInput { name: "cos" },
             AlgoTraceStep::LoadInput { name: "sin" },
-            AlgoTraceStep::BinOp { op: TraceBinOp::Mul, dst: "x_cos", a: "x", b: "cos" },
+            AlgoTraceStep::BinOp {
+                op: TraceBinOp::Mul,
+                dst: "x_cos",
+                a: "x",
+                b: "cos",
+            },
             // rotate_half: [-x2, x1] from [x1, x2]
-            AlgoTraceStep::UnaryOp { op: TraceUnaryOp::Neg, dst: "neg_x2", src: "x_half2" },
-            AlgoTraceStep::BinOp { op: TraceBinOp::Mul, dst: "rot_sin", a: "neg_x2", b: "sin" },
-            AlgoTraceStep::BinOp { op: TraceBinOp::Add, dst: "out", a: "x_cos", b: "rot_sin" },
+            AlgoTraceStep::UnaryOp {
+                op: TraceUnaryOp::Neg,
+                dst: "neg_x2",
+                src: "x_half2",
+            },
+            AlgoTraceStep::BinOp {
+                op: TraceBinOp::Mul,
+                dst: "rot_sin",
+                a: "neg_x2",
+                b: "sin",
+            },
+            AlgoTraceStep::BinOp {
+                op: TraceBinOp::Add,
+                dst: "out",
+                a: "x_cos",
+                b: "rot_sin",
+            },
         ]),
     ],
     params: &[
@@ -188,16 +310,29 @@ pub static ROPE_PARTIAL: AlgoTemplate = AlgoTemplate {
         // Partial RoPE: only first partial_dim gets rotation, rest passes through
         AlgoStep::Conditional {
             requirement: DeviceReq::CpuAny,
-            body: &[
-                AlgoStep::TraceBody(&[
-                    AlgoTraceStep::LoadInput { name: "x_rot" },
-                    AlgoTraceStep::LoadInput { name: "cos" },
-                    AlgoTraceStep::LoadInput { name: "sin" },
-                    AlgoTraceStep::BinOp { op: TraceBinOp::Mul, dst: "x_cos", a: "x_rot", b: "cos" },
-                    AlgoTraceStep::BinOp { op: TraceBinOp::Mul, dst: "rot_sin", a: "x_rot_neg", b: "sin" },
-                    AlgoTraceStep::BinOp { op: TraceBinOp::Add, dst: "rotated", a: "x_cos", b: "rot_sin" },
-                ]),
-            ],
+            body: &[AlgoStep::TraceBody(&[
+                AlgoTraceStep::LoadInput { name: "x_rot" },
+                AlgoTraceStep::LoadInput { name: "cos" },
+                AlgoTraceStep::LoadInput { name: "sin" },
+                AlgoTraceStep::BinOp {
+                    op: TraceBinOp::Mul,
+                    dst: "x_cos",
+                    a: "x_rot",
+                    b: "cos",
+                },
+                AlgoTraceStep::BinOp {
+                    op: TraceBinOp::Mul,
+                    dst: "rot_sin",
+                    a: "x_rot_neg",
+                    b: "sin",
+                },
+                AlgoTraceStep::BinOp {
+                    op: TraceBinOp::Add,
+                    dst: "rotated",
+                    a: "x_cos",
+                    b: "rot_sin",
+                },
+            ])],
         },
     ],
     params: &[
@@ -222,7 +357,9 @@ pub static MOE_ROUTER_TOPK: AlgoTemplate = AlgoTemplate {
             num_experts: "num_experts",
             hidden: "hidden_dim",
         },
-        AlgoStep::Activation { kind: ActivationKind::Relu },
+        AlgoStep::Activation {
+            kind: ActivationKind::Relu,
+        },
         AlgoStep::Softmax,
         AlgoStep::MoeTopK {
             num_experts: "num_experts",
@@ -241,15 +378,27 @@ pub static MOE_PACKED_DISPATCH: AlgoTemplate = AlgoTemplate {
     name: "MOE_PACKED_DISPATCH",
     strategy: AlgoStrategy::MoePackedDispatch,
     device_req: DeviceReq::CpuAvx2,
-    steps: &[
-        AlgoStep::TraceBody(&[
-            AlgoTraceStep::LoadInput { name: "hidden" },
-            AlgoTraceStep::LoadInput { name: "expert_weights" },
-            AlgoTraceStep::LoadInput { name: "router_weights" },
-            AlgoTraceStep::BinOp { op: TraceBinOp::Mul, dst: "gated", a: "hidden", b: "expert_weights" },
-            AlgoTraceStep::BinOp { op: TraceBinOp::Mul, dst: "weighted", a: "gated", b: "router_weights" },
-        ]),
-    ],
+    steps: &[AlgoStep::TraceBody(&[
+        AlgoTraceStep::LoadInput { name: "hidden" },
+        AlgoTraceStep::LoadInput {
+            name: "expert_weights",
+        },
+        AlgoTraceStep::LoadInput {
+            name: "router_weights",
+        },
+        AlgoTraceStep::BinOp {
+            op: TraceBinOp::Mul,
+            dst: "gated",
+            a: "hidden",
+            b: "expert_weights",
+        },
+        AlgoTraceStep::BinOp {
+            op: TraceBinOp::Mul,
+            dst: "weighted",
+            a: "gated",
+            b: "router_weights",
+        },
+    ])],
     params: &[
         ("hidden_dim", AlgoParam::FromGraph("hidden_dim")),
         ("num_experts", AlgoParam::FromGraph("num_experts")),
@@ -285,15 +434,24 @@ mod tests {
 
         // Assert: kv_group_size is a Derived param with Div arithmetic
         assert!(param_names.iter().any(|n| **n == "kv_group_size"));
-        let kv_group_param = ATTN_GQA.params.iter()
+        let kv_group_param = ATTN_GQA
+            .params
+            .iter()
             .find(|(name, _)| *name == "kv_group_size")
             .map(|(_, p)| p)
             .expect("kv_group_size param must exist");
         match kv_group_param {
-            AlgoParam::Derived { base, op: ParamArith::Div, operand: 0 } => {
+            AlgoParam::Derived {
+                base,
+                op: ParamArith::Div,
+                operand: 0,
+            } => {
                 assert_eq!(*base, "num_q_heads");
             }
-            _ => panic!("kv_group_size must be Derived with Div, got {:?}", kv_group_param),
+            _ => panic!(
+                "kv_group_size must be Derived with Div, got {:?}",
+                kv_group_param
+            ),
         }
     }
 
@@ -314,20 +472,26 @@ mod tests {
     fn norm_rms_steps_contain_reduce_and_trace_body() {
         // Arrange: NORM_RMS template
         // Act: classify step types
-        let step_types: Vec<String> = NORM_RMS.steps.iter().map(|s| {
-            match s {
+        let step_types: Vec<String> = NORM_RMS
+            .steps
+            .iter()
+            .map(|s| match s {
                 AlgoStep::TraceBody(_) => "TraceBody".to_string(),
                 AlgoStep::Reduce { .. } => "Reduce".to_string(),
                 AlgoStep::Softmax => "Softmax".to_string(),
                 other => format!("{:?}", other),
-            }
-        }).collect();
+            })
+            .collect();
 
         // Assert: has TraceBody and Reduce steps
-        assert!(step_types.iter().any(|t| t == "TraceBody"),
-            "NORM_RMS must have at least one TraceBody step");
-        assert!(step_types.iter().any(|t| t == "Reduce"),
-            "NORM_RMS must have at least one Reduce step");
+        assert!(
+            step_types.iter().any(|t| t == "TraceBody"),
+            "NORM_RMS must have at least one TraceBody step"
+        );
+        assert!(
+            step_types.iter().any(|t| t == "Reduce"),
+            "NORM_RMS must have at least one Reduce step"
+        );
     }
 
     // ── Test 5: NORM_RMS has eps param from graph ─────────────────────
@@ -336,7 +500,9 @@ mod tests {
     fn norm_rms_params_include_eps_from_graph() {
         // Arrange: NORM_RMS template
         // Act: find eps param
-        let eps_param = NORM_RMS.params.iter()
+        let eps_param = NORM_RMS
+            .params
+            .iter()
             .find(|(name, _)| *name == "eps")
             .map(|(_, p)| p);
 
@@ -366,10 +532,14 @@ mod tests {
         }
 
         // Assert: beta is loaded (LayerNorm has shift parameter, RMSNorm does not)
-        assert!(input_names.iter().any(|n| *n == "beta"),
-            "NORM_LAYER must load 'beta' input (shift parameter)");
-        assert!(input_names.iter().any(|n| *n == "gamma"),
-            "NORM_LAYER must load 'gamma' input (scale parameter)");
+        assert!(
+            input_names.iter().any(|n| *n == "beta"),
+            "NORM_LAYER must load 'beta' input (shift parameter)"
+        );
+        assert!(
+            input_names.iter().any(|n| *n == "gamma"),
+            "NORM_LAYER must load 'gamma' input (scale parameter)"
+        );
     }
 
     // ── Test 7: ROPE_STANDARD step contains rotate_half via Neg unary ──
@@ -381,7 +551,13 @@ mod tests {
         let has_neg = ROPE_STANDARD.steps.iter().any(|step| {
             if let AlgoStep::TraceBody(traces) = step {
                 traces.iter().any(|t| {
-                    matches!(t, AlgoTraceStep::UnaryOp { op: TraceUnaryOp::Neg, .. })
+                    matches!(
+                        t,
+                        AlgoTraceStep::UnaryOp {
+                            op: TraceUnaryOp::Neg,
+                            ..
+                        }
+                    )
                 })
             } else {
                 false
@@ -389,7 +565,10 @@ mod tests {
         });
 
         // Assert: rotate_half uses Neg for [-x2, x1] transform
-        assert!(has_neg, "ROPE_STANDARD must have Neg unary op for rotate_half");
+        assert!(
+            has_neg,
+            "ROPE_STANDARD must have Neg unary op for rotate_half"
+        );
     }
 
     // ── Test 8: ROPE_PARTIAL uses Conditional step structure ──────────
@@ -406,7 +585,10 @@ mod tests {
                 assert_eq!(*requirement, DeviceReq::CpuAny);
                 assert!(!body.is_empty(), "Conditional body must not be empty");
             }
-            other => panic!("ROPE_PARTIAL first step must be Conditional, got {:?}", other),
+            other => panic!(
+                "ROPE_PARTIAL first step must be Conditional, got {:?}",
+                other
+            ),
         }
     }
 
@@ -416,15 +598,30 @@ mod tests {
     fn moe_router_topk_step_variants() {
         // Arrange: MOE_ROUTER_TOPK template
         // Act: collect step variant names
-        let has_softmax = MOE_ROUTER_TOPK.steps.iter().any(|s| matches!(s, AlgoStep::Softmax));
-        let has_topk = MOE_ROUTER_TOPK.steps.iter().any(|s| matches!(s, AlgoStep::MoeTopK { .. }));
-        let has_activation = MOE_ROUTER_TOPK.steps.iter()
-            .any(|s| matches!(s, AlgoStep::Activation { kind: ActivationKind::Relu }));
+        let has_softmax = MOE_ROUTER_TOPK
+            .steps
+            .iter()
+            .any(|s| matches!(s, AlgoStep::Softmax));
+        let has_topk = MOE_ROUTER_TOPK
+            .steps
+            .iter()
+            .any(|s| matches!(s, AlgoStep::MoeTopK { .. }));
+        let has_activation = MOE_ROUTER_TOPK.steps.iter().any(|s| {
+            matches!(
+                s,
+                AlgoStep::Activation {
+                    kind: ActivationKind::Relu
+                }
+            )
+        });
 
         // Assert: router has softmax normalization and top-k selection
         assert!(has_softmax, "MOE_ROUTER_TOPK must have Softmax step");
         assert!(has_topk, "MOE_ROUTER_TOPK must have MoeTopK step");
-        assert!(has_activation, "MOE_ROUTER_TOPK must have Activation::Relu step");
+        assert!(
+            has_activation,
+            "MOE_ROUTER_TOPK must have Activation::Relu step"
+        );
     }
 
     // ── Test 10: MOE_ROUTER_TOPK MoeTopK step field extraction ────────
@@ -434,7 +631,11 @@ mod tests {
         // Arrange: MOE_ROUTER_TOPK template
         // Act: extract MoeRouterGemv and MoeTopK step fields
         let router_gemv = MOE_ROUTER_TOPK.steps.iter().find_map(|s| {
-            if let AlgoStep::MoeRouterGemv { num_experts, hidden } = s {
+            if let AlgoStep::MoeRouterGemv {
+                num_experts,
+                hidden,
+            } = s
+            {
                 Some((*num_experts, *hidden))
             } else {
                 None
@@ -510,8 +711,11 @@ mod tests {
 
         // Act & Assert: none should have a micro_kernel
         for (name, tmpl) in templates {
-            assert!(tmpl.micro_kernel.is_none(),
-                "{} should not have micro_kernel (attention/norm/rope/moe are not GEMM)", name);
+            assert!(
+                tmpl.micro_kernel.is_none(),
+                "{} should not have micro_kernel (attention/norm/rope/moe are not GEMM)",
+                name
+            );
         }
     }
 
@@ -525,16 +729,24 @@ mod tests {
             match param {
                 AlgoParam::FromGraph(graph_key) => {
                     // Assert: graph key is non-empty and matches a known dimension
-                    assert!(!graph_key.is_empty(),
-                        "ATTN_MHA param '{}' must have non-empty graph key", name);
+                    assert!(
+                        !graph_key.is_empty(),
+                        "ATTN_MHA param '{}' must have non-empty graph key",
+                        name
+                    );
                 }
                 other => panic!(
-                    "ATTN_MHA param '{}' should be FromGraph, got {:?}", name, other),
+                    "ATTN_MHA param '{}' should be FromGraph, got {:?}",
+                    name, other
+                ),
             }
         }
         // Assert: exactly 3 params (seq_len, num_heads, head_dim)
-        assert_eq!(ATTN_MHA.params.len(), 3,
-            "ATTN_MHA must have exactly 3 parameters");
+        assert_eq!(
+            ATTN_MHA.params.len(),
+            3,
+            "ATTN_MHA must have exactly 3 parameters"
+        );
     }
 
     // ── Test 15: NORM_RMS trace body contains HReduce with Sum ────────
@@ -546,7 +758,13 @@ mod tests {
         let has_hreduce_sum = NORM_RMS.steps.iter().any(|step| {
             if let AlgoStep::TraceBody(traces) = step {
                 traces.iter().any(|t| {
-                    matches!(t, AlgoTraceStep::HReduce { op: ReduceKind::Sum, .. })
+                    matches!(
+                        t,
+                        AlgoTraceStep::HReduce {
+                            op: ReduceKind::Sum,
+                            ..
+                        }
+                    )
                 })
             } else {
                 false
@@ -554,8 +772,10 @@ mod tests {
         });
 
         // Assert: RMS norm computes sum-of-squares via horizontal reduction
-        assert!(has_hreduce_sum,
-            "NORM_RMS must contain HReduce with Sum in its TraceBody");
+        assert!(
+            has_hreduce_sum,
+            "NORM_RMS must contain HReduce with Sum in its TraceBody"
+        );
     }
 
     // ── Test 16: NORM_LAYER has two Reduce steps (mean then variance) ─
@@ -564,13 +784,17 @@ mod tests {
     fn norm_layer_has_two_reduce_steps() {
         // Arrange: NORM_LAYER template
         // Act: count Reduce steps
-        let reduce_count = NORM_LAYER.steps.iter()
+        let reduce_count = NORM_LAYER
+            .steps
+            .iter()
             .filter(|s| matches!(s, AlgoStep::Reduce { .. }))
             .count();
 
         // Assert: LayerNorm has two phases — mean reduction and variance reduction
-        assert_eq!(reduce_count, 2,
-            "NORM_LAYER must have exactly 2 Reduce steps (mean + variance)");
+        assert_eq!(
+            reduce_count, 2,
+            "NORM_LAYER must have exactly 2 Reduce steps (mean + variance)"
+        );
     }
 
     // ── Test 17: ROPE_STANDARD trace body has Add as final op ─────────
@@ -579,27 +803,27 @@ mod tests {
     fn rope_standard_trace_body_final_binop_is_add() {
         // Arrange: ROPE_STANDARD template
         // Act: find the TraceBody and check the last BinOp
-        let last_binop = ROPE_STANDARD.steps.iter()
-            .find_map(|step| {
-                if let AlgoStep::TraceBody(traces) = step {
-                    traces.iter().rev().find_map(|t| {
-                        if let AlgoTraceStep::BinOp { op, .. } = t {
-                            Some(*op)
-                        } else {
-                            None
-                        }
-                    })
-                } else {
-                    None
-                }
-            });
+        let last_binop = ROPE_STANDARD.steps.iter().find_map(|step| {
+            if let AlgoStep::TraceBody(traces) = step {
+                traces.iter().rev().find_map(|t| {
+                    if let AlgoTraceStep::BinOp { op, .. } = t {
+                        Some(*op)
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            }
+        });
 
         // Assert: x_rot * cos + rotate_half(x) * sin is combined with Add
         match last_binop {
-            Some(TraceBinOp::Add) => {},
+            Some(TraceBinOp::Add) => {}
             other => panic!(
                 "ROPE_STANDARD final BinOp must be Add (cos + sin components), got {:?}",
-                other),
+                other
+            ),
         }
     }
 
@@ -609,7 +833,9 @@ mod tests {
     fn moe_router_topk_params_count_and_source() {
         // Arrange: MOE_ROUTER_TOPK template
         // Act: collect FromGraph param names
-        let from_graph_names: Vec<&str> = MOE_ROUTER_TOPK.params.iter()
+        let from_graph_names: Vec<&str> = MOE_ROUTER_TOPK
+            .params
+            .iter()
             .filter_map(|(name, param)| {
                 if let AlgoParam::FromGraph(_) = param {
                     Some(*name)
@@ -620,14 +846,23 @@ mod tests {
             .collect();
 
         // Assert: all three params come from graph metadata
-        assert_eq!(from_graph_names.len(), 3,
-            "MOE_ROUTER_TOPK must have exactly 3 FromGraph params");
-        assert!(from_graph_names.contains(&"num_experts"),
-            "must include num_experts param");
-        assert!(from_graph_names.contains(&"hidden_dim"),
-            "must include hidden_dim param");
-        assert!(from_graph_names.contains(&"top_k"),
-            "must include top_k param");
+        assert_eq!(
+            from_graph_names.len(),
+            3,
+            "MOE_ROUTER_TOPK must have exactly 3 FromGraph params"
+        );
+        assert!(
+            from_graph_names.contains(&"num_experts"),
+            "must include num_experts param"
+        );
+        assert!(
+            from_graph_names.contains(&"hidden_dim"),
+            "must include hidden_dim param"
+        );
+        assert!(
+            from_graph_names.contains(&"top_k"),
+            "must include top_k param"
+        );
     }
 
     // ── Test 19: ATTN_GQA has more params than ATTN_MHA ──────────────
@@ -640,10 +875,13 @@ mod tests {
         let gqa_count = ATTN_GQA.params.len();
 
         // Assert: GQA adds num_kv_heads and derived kv_group_size
-        assert!(gqa_count > mha_count,
+        assert!(
+            gqa_count > mha_count,
             "ATTN_GQA ({} params) must have more params than ATTN_MHA ({} params) \
              because GQA tracks num_kv_heads and derived kv_group_size",
-            gqa_count, mha_count);
+            gqa_count,
+            mha_count
+        );
     }
 
     // ── Test 20: ROPE_PARTIAL has partial_dim param ───────────────────
@@ -652,20 +890,25 @@ mod tests {
     fn rope_partial_params_include_partial_dim() {
         // Arrange: ROPE_PARTIAL template
         // Act: find the partial_dim parameter
-        let partial_dim_param = ROPE_PARTIAL.params.iter()
+        let partial_dim_param = ROPE_PARTIAL
+            .params
+            .iter()
             .find(|(name, _)| *name == "partial_dim");
 
         // Assert: partial_dim exists and is FromGraph
-        assert!(partial_dim_param.is_some(),
-            "ROPE_PARTIAL must have partial_dim parameter");
+        assert!(
+            partial_dim_param.is_some(),
+            "ROPE_PARTIAL must have partial_dim parameter"
+        );
         if let Some((_, param)) = partial_dim_param {
             match param {
                 AlgoParam::FromGraph(key) => {
-                    assert_eq!(*key, "partial_dim",
-                        "partial_dim must reference graph key 'partial_dim'");
+                    assert_eq!(
+                        *key, "partial_dim",
+                        "partial_dim must reference graph key 'partial_dim'"
+                    );
                 }
-                other => panic!(
-                    "partial_dim must be FromGraph, got {:?}", other),
+                other => panic!("partial_dim must be FromGraph, got {:?}", other),
             }
         }
     }
@@ -676,13 +919,17 @@ mod tests {
     fn norm_rms_has_exactly_one_reduce_step() {
         // Arrange: NORM_RMS template
         // Act: count Reduce steps
-        let reduce_count = NORM_RMS.steps.iter()
+        let reduce_count = NORM_RMS
+            .steps
+            .iter()
             .filter(|s| matches!(s, AlgoStep::Reduce { .. }))
             .count();
 
         // Assert: RMS norm has a single reduction (sum of squares)
-        assert_eq!(reduce_count, 1,
-            "NORM_RMS must have exactly 1 Reduce step (sum of x^2)");
+        assert_eq!(
+            reduce_count, 1,
+            "NORM_RMS must have exactly 1 Reduce step (sum of x^2)"
+        );
     }
 
     // ── Test 22: ATTN_MLA uses q_absorbed and c_kv inputs ─────────────
@@ -691,7 +938,9 @@ mod tests {
     fn attn_mla_loads_absorbed_inputs() {
         // Arrange: ATTN_MLA template
         // Act: collect all LoadInput names from TraceBody steps
-        let input_names: Vec<&str> = ATTN_MLA.steps.iter()
+        let input_names: Vec<&str> = ATTN_MLA
+            .steps
+            .iter()
             .filter_map(|step| {
                 if let AlgoStep::TraceBody(traces) = step {
                     Some(traces.iter().filter_map(|t| {
@@ -709,10 +958,14 @@ mod tests {
             .collect();
 
         // Assert: MLA uses compressed/absorbed inputs instead of raw Q/K
-        assert!(input_names.iter().any(|n| *n == "q_absorbed"),
-            "ATTN_MLA must load 'q_absorbed' input");
-        assert!(input_names.iter().any(|n| *n == "c_kv"),
-            "ATTN_MLA must load 'c_kv' (compressed KV) input");
+        assert!(
+            input_names.iter().any(|n| *n == "q_absorbed"),
+            "ATTN_MLA must load 'q_absorbed' input"
+        );
+        assert!(
+            input_names.iter().any(|n| *n == "c_kv"),
+            "ATTN_MLA must load 'c_kv' (compressed KV) input"
+        );
     }
 
     // ── Test 23: MOE_PACKED_DISPATCH has exactly one TraceBody step ───
@@ -721,15 +974,22 @@ mod tests {
     fn moe_packed_dispatch_single_trace_body_step() {
         // Arrange: MOE_PACKED_DISPATCH template
         // Act: count TraceBody steps
-        let trace_body_count = MOE_PACKED_DISPATCH.steps.iter()
+        let trace_body_count = MOE_PACKED_DISPATCH
+            .steps
+            .iter()
             .filter(|s| matches!(s, AlgoStep::TraceBody(_)))
             .count();
 
         // Assert: packed dispatch is a single fused trace body
-        assert_eq!(trace_body_count, 1,
-            "MOE_PACKED_DISPATCH must have exactly 1 TraceBody step");
-        assert_eq!(MOE_PACKED_DISPATCH.steps.len(), 1,
-            "MOE_PACKED_DISPATCH must have exactly 1 total step");
+        assert_eq!(
+            trace_body_count, 1,
+            "MOE_PACKED_DISPATCH must have exactly 1 TraceBody step"
+        );
+        assert_eq!(
+            MOE_PACKED_DISPATCH.steps.len(),
+            1,
+            "MOE_PACKED_DISPATCH must have exactly 1 total step"
+        );
     }
 
     // ── Test 24: All norm templates belong to StrategyFamily::Norm ────
@@ -737,15 +997,17 @@ mod tests {
     #[test]
     fn all_norm_templates_belong_to_norm_family() {
         // Arrange: both norm templates
-        let norm_templates: Vec<(&str, &AlgoTemplate)> = vec![
-            ("NORM_RMS", &NORM_RMS),
-            ("NORM_LAYER", &NORM_LAYER),
-        ];
+        let norm_templates: Vec<(&str, &AlgoTemplate)> =
+            vec![("NORM_RMS", &NORM_RMS), ("NORM_LAYER", &NORM_LAYER)];
 
         // Act & Assert: every norm template has Norm strategy family
         for (name, tmpl) in norm_templates {
-            assert_eq!(tmpl.strategy.family(), StrategyFamily::Norm,
-                "{} must belong to Norm family", name);
+            assert_eq!(
+                tmpl.strategy.family(),
+                StrategyFamily::Norm,
+                "{} must belong to Norm family",
+                name
+            );
         }
     }
 
@@ -759,8 +1021,12 @@ mod tests {
             ("ATTN_MLA", &ATTN_MLA),
         ];
         for (name, tmpl) in templates {
-            assert_eq!(tmpl.strategy.family(), StrategyFamily::Attention,
-                "{} must belong to Attention family", name);
+            assert_eq!(
+                tmpl.strategy.family(),
+                StrategyFamily::Attention,
+                "{} must belong to Attention family",
+                name
+            );
         }
     }
 
@@ -800,7 +1066,11 @@ mod tests {
 
     #[test]
     fn attn_mla_params_count() {
-        assert_eq!(ATTN_MLA.params.len(), 2, "ATTN_MLA must have 2 params (seq_len, kv_dim)");
+        assert_eq!(
+            ATTN_MLA.params.len(),
+            2,
+            "ATTN_MLA must have 2 params (seq_len, kv_dim)"
+        );
     }
 
     // ── Test 31: NORM_RMS trace body has Rsqrt unary op ────────────────
@@ -810,7 +1080,13 @@ mod tests {
         let has_rsqrt = NORM_RMS.steps.iter().any(|step| {
             if let AlgoStep::TraceBody(traces) = step {
                 traces.iter().any(|t| {
-                    matches!(t, AlgoTraceStep::UnaryOp { op: TraceUnaryOp::Rsqrt, .. })
+                    matches!(
+                        t,
+                        AlgoTraceStep::UnaryOp {
+                            op: TraceUnaryOp::Rsqrt,
+                            ..
+                        }
+                    )
                 })
             } else {
                 false
@@ -823,31 +1099,49 @@ mod tests {
 
     #[test]
     fn norm_rms_loads_gamma() {
-        let input_names: Vec<&str> = NORM_RMS.steps.iter()
+        let input_names: Vec<&str> = NORM_RMS
+            .steps
+            .iter()
             .filter_map(|step| {
                 if let AlgoStep::TraceBody(traces) = step {
                     Some(traces.iter().filter_map(|t| {
-                        if let AlgoTraceStep::LoadInput { name } = t { Some(*name) } else { None }
+                        if let AlgoTraceStep::LoadInput { name } = t {
+                            Some(*name)
+                        } else {
+                            None
+                        }
                     }))
-                } else { None }
+                } else {
+                    None
+                }
             })
             .flatten()
             .collect();
-        assert!(input_names.iter().any(|n| *n == "gamma"),
-            "NORM_RMS must load gamma (scale parameter)");
+        assert!(
+            input_names.iter().any(|n| *n == "gamma"),
+            "NORM_RMS must load gamma (scale parameter)"
+        );
     }
 
     // ── Test 33: MOE_PACKED_DISPATCH loads three inputs ────────────────
 
     #[test]
     fn moe_packed_dispatch_loads_three_inputs() {
-        let input_names: Vec<&str> = MOE_PACKED_DISPATCH.steps.iter()
+        let input_names: Vec<&str> = MOE_PACKED_DISPATCH
+            .steps
+            .iter()
             .filter_map(|step| {
                 if let AlgoStep::TraceBody(traces) = step {
                     Some(traces.iter().filter_map(|t| {
-                        if let AlgoTraceStep::LoadInput { name } = t { Some(*name) } else { None }
+                        if let AlgoTraceStep::LoadInput { name } = t {
+                            Some(*name)
+                        } else {
+                            None
+                        }
                     }))
-                } else { None }
+                } else {
+                    None
+                }
             })
             .flatten()
             .collect();
@@ -860,7 +1154,11 @@ mod tests {
 
     #[test]
     fn rope_standard_params_count() {
-        assert_eq!(ROPE_STANDARD.params.len(), 2, "ROPE_STANDARD must have 2 params");
+        assert_eq!(
+            ROPE_STANDARD.params.len(),
+            2,
+            "ROPE_STANDARD must have 2 params"
+        );
         let param_names: Vec<&&str> = ROPE_STANDARD.params.iter().map(|(n, _)| n).collect();
         assert!(param_names.contains(&&"seq_len"));
         assert!(param_names.contains(&&"head_dim"));
@@ -870,6 +1168,10 @@ mod tests {
 
     #[test]
     fn rope_partial_params_count() {
-        assert_eq!(ROPE_PARTIAL.params.len(), 3, "ROPE_PARTIAL must have 3 params");
+        assert_eq!(
+            ROPE_PARTIAL.params.len(),
+            3,
+            "ROPE_PARTIAL must have 3 params"
+        );
     }
 }

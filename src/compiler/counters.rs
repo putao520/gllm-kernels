@@ -71,10 +71,7 @@ impl fmt::Display for PhaseCounters {
         write!(
             f,
             "PhaseCounters(ops={}, fusions={}/{}, time={}us)",
-            self.ops_processed,
-            self.fusions_applied,
-            self.fusion_opportunities,
-            self.time_us
+            self.ops_processed, self.fusions_applied, self.fusion_opportunities, self.time_us
         )
     }
 }
@@ -120,10 +117,7 @@ impl CompileCounters {
 
     /// Get total time across all phases (microseconds).
     pub fn total_time_us(&self) -> u64 {
-        self.phase0.time_us
-            + self.phase1.time_us
-            + self.phase2.time_us
-            + self.phase3.time_us
+        self.phase0.time_us + self.phase1.time_us + self.phase2.time_us + self.phase3.time_us
     }
 
     /// Get total fusions applied across all phases.

@@ -75,10 +75,10 @@ pub enum Platform {
     X86_64 {
         // ── 基础 ISA ──
         has_avx512: bool,
-        has_bf16: bool,          // AVX-512 BF16 (VDPBF16PS)
-        has_vnni: bool,          // VNNI INT8 (vpdpbusd)
-        has_avx512fp16: bool,    // AVX-512 FP16
-        has_f16c: bool,          // F16C (vcvtph2ps/vcvtps2ph) — F16↔F32 转换 (Ivy Bridge+ 基线), REQ-HW-TIER-001
+        has_bf16: bool,       // AVX-512 BF16 (VDPBF16PS)
+        has_vnni: bool,       // VNNI INT8 (vpdpbusd)
+        has_avx512fp16: bool, // AVX-512 FP16
+        has_f16c: bool, // F16C (vcvtph2ps/vcvtps2ph) — F16↔F32 转换 (Ivy Bridge+ 基线), REQ-HW-TIER-001
         // ── AMX 世代 ──
         has_amx: bool,           // AMX-BF16 + AMX-INT8 (Sapphire Rapids)
         has_amx_fp16: bool,      // AMX-FP16 (Granite Rapids: TDPFP16PS)
@@ -86,60 +86,60 @@ pub enum Platform {
         has_amx_transpose: bool, // AMX-TRANSPOSE (Diamond Rapids: T2RPNTLVWZ)
         has_amx_fp8: bool,       // AMX-FP8 (Diamond Rapids)
         // ── AVX10 / APX ──
-        has_avx10_2: bool,       // AVX10.2 (256-bit 统一, VMINMAXPS)
-        has_apx: bool,           // APX 31 GPR (Extended GPR)
-        has_sparse_mask_intersect: bool,  // SPARSE_MASK_INTERSECT (sparse mask 硬件化)
+        has_avx10_2: bool,               // AVX10.2 (256-bit 统一, VMINMAXPS)
+        has_apx: bool,                   // APX 31 GPR (Extended GPR)
+        has_sparse_mask_intersect: bool, // SPARSE_MASK_INTERSECT (sparse mask 硬件化)
     },
     AArch64 {
         // ── NEON (基线) ──
-        has_bf16: bool,          // FEAT_BF16 (bfdot/bfmmla)
-        has_dotprod: bool,       // FEAT_DotProd (sdot/udot)
-        has_i8mm: bool,          // FEAT_I8MM (smmla/ummla)
+        has_bf16: bool,    // FEAT_BF16 (bfdot/bfmmla)
+        has_dotprod: bool, // FEAT_DotProd (sdot/udot)
+        has_i8mm: bool,    // FEAT_I8MM (smmla/ummla)
         // ── SVE ──
-        has_sve: bool,           // SVE 基础
-        has_sve2: bool,          // SVE2 (整数/浮点扩展)
-        sve_vl: usize,          // SVE 向量长度 (bytes, 16-256)
+        has_sve: bool,  // SVE 基础
+        has_sve2: bool, // SVE2 (整数/浮点扩展)
+        sve_vl: usize,  // SVE 向量长度 (bytes, 16-256)
         // ── SME ──
-        has_sme: bool,           // SME 基础 (ZA tile, SMSTART/SMSTOP)
-        has_sme2: bool,          // SME2 (multi-vec FMLA, streaming SVE mode)
-        has_sme_f16f16: bool,    // FEAT_SME_F16F16
-        has_sme_i16i64: bool,    // FEAT_SME_I16I64
-        sme_vl: usize,          // SME streaming 向量长度 (bytes)
+        has_sme: bool,        // SME 基础 (ZA tile, SMSTART/SMSTOP)
+        has_sme2: bool,       // SME2 (multi-vec FMLA, streaming SVE mode)
+        has_sme_f16f16: bool, // FEAT_SME_F16F16
+        has_sme_i16i64: bool, // FEAT_SME_I16I64
+        sme_vl: usize,        // SME streaming 向量长度 (bytes)
     },
     Cuda {
-        sm_version: u32,         // 70/75/80/86/89/90/100
-        warp_size: u32,          // 32
-        shared_mem_kb: usize,    // per-block SMEM (48-228 KB)
-        reg_file_per_sm: usize,  // 寄存器文件大小
+        sm_version: u32,        // 70/75/80/86/89/90/100
+        warp_size: u32,         // 32
+        shared_mem_kb: usize,   // per-block SMEM (48-228 KB)
+        reg_file_per_sm: usize, // 寄存器文件大小
         max_regs_per_thread: usize,
         // ── SM90 Hopper 特性 ──
-        has_wgmma: bool,         // Warpgroup MMA (16×16×64)
-        has_tma: bool,           // Tensor Memory Accelerator (2D/5D)
-        has_warp_spec: bool,     // Warp Specialization (producer/consumer)
-        has_fp8: bool,           // FP8 native Tensor Core
+        has_wgmma: bool,     // Warpgroup MMA (16×16×64)
+        has_tma: bool,       // Tensor Memory Accelerator (2D/5D)
+        has_warp_spec: bool, // Warp Specialization (producer/consumer)
+        has_fp8: bool,       // FP8 native Tensor Core
         // ── SM100+ Blackwell 特性 ──
-        has_tmem: bool,          // Tensor Memory (256KB/SM, 替代 SMEM)
-        has_block_scaled: bool,  // Block-scaled GEMM (per-block 缩放因子内置)
-        has_native_fp4: bool,    // FP4 native Tensor Core
-        has_native_fp6: bool,    // FP6 native Tensor Core
-        has_cluster: bool,       // Thread Block Cluster (跨 CTA 协同)
-        has_2cta_mma: bool,      // 2-CTA 协同 MMA
-        tmem_size_kb: usize,     // TMEM 大小 (0 if !has_tmem)
+        has_tmem: bool,         // Tensor Memory (256KB/SM, 替代 SMEM)
+        has_block_scaled: bool, // Block-scaled GEMM (per-block 缩放因子内置)
+        has_native_fp4: bool,   // FP4 native Tensor Core
+        has_native_fp6: bool,   // FP6 native Tensor Core
+        has_cluster: bool,      // Thread Block Cluster (跨 CTA 协同)
+        has_2cta_mma: bool,     // 2-CTA 协同 MMA
+        tmem_size_kb: usize,    // TMEM 大小 (0 if !has_tmem)
     },
     Hip {
-        gfx_arch: u32,          // 908/942/950/1100 (替代纯 wave_size)
-        wave_size: u32,          // 64 (CDNA) / 32 (RDNA)
-        has_mfma: bool,          // Matrix Fused Multiply-Add v1 (gfx908+)
-        has_mfma_v2: bool,       // MFMA v2 (gfx950: 更大 tile, FP8)
-        has_fp8_mfma: bool,      // FP8 MFMA (gfx950)
-        has_fp4_mfma: bool,      // FP4 MFMA (gfx950)
-        vgpr_per_cu: usize,     // 向量 GPR 数/CU
-        lds_size_kb: usize,     // Local Data Share (类 SMEM)
+        gfx_arch: u32,            // 908/942/950/1100 (替代纯 wave_size)
+        wave_size: u32,           // 64 (CDNA) / 32 (RDNA)
+        has_mfma: bool,           // Matrix Fused Multiply-Add v1 (gfx908+)
+        has_mfma_v2: bool,        // MFMA v2 (gfx950: 更大 tile, FP8)
+        has_fp8_mfma: bool,       // FP8 MFMA (gfx950)
+        has_fp4_mfma: bool,       // FP4 MFMA (gfx950)
+        vgpr_per_cu: usize,       // 向量 GPR 数/CU
+        lds_size_kb: usize,       // Local Data Share (类 SMEM)
         infinity_cache_mb: usize, // Infinity Cache 大小
     },
     Metal {
-        simd_width: u32,         // 32 (Apple GPU)
-        gpu_family: u32,         // Apple GPU family (7=M1, 8=M2, 9=M3, 10=M4)
+        simd_width: u32,            // 32 (Apple GPU)
+        gpu_family: u32,            // Apple GPU family (7=M1, 8=M2, 9=M3, 10=M4)
         has_simdgroup_matrix: bool, // simdgroup_matrix_multiply
         threadgroup_mem_kb: usize,  // Threadgroup memory
     },
@@ -164,7 +164,10 @@ impl Platform {
 
     /// 是否为 GPU 平台
     pub fn is_gpu(&self) -> bool {
-        matches!(self, Platform::Cuda { .. } | Platform::Hip { .. } | Platform::Metal { .. })
+        matches!(
+            self,
+            Platform::Cuda { .. } | Platform::Hip { .. } | Platform::Metal { .. }
+        )
     }
 }
 
@@ -203,10 +206,17 @@ pub enum IsaFeature {
     NativeFp8,
     NativeFp4,
     NativeFp6,
-    TileGemm { m: u8, n: u8, k: u8 },
+    TileGemm {
+        m: u8,
+        n: u8,
+        k: u8,
+    },
     AsyncCopy,
     PredicatedExec,
-    ScalableVector { min_vl: usize, max_vl: usize },
+    ScalableVector {
+        min_vl: usize,
+        max_vl: usize,
+    },
     WarpShuffle,
     HardwareTranscendental,
 
@@ -369,7 +379,9 @@ pub struct IsaProfile {
 impl IsaProfile {
     /// 检查是否有某个特性
     pub fn has_feature(&self, feat: &IsaFeature) -> bool {
-        self.features.iter().any(|f| std::mem::discriminant(f) == std::mem::discriminant(feat))
+        self.features
+            .iter()
+            .any(|f| std::mem::discriminant(f) == std::mem::discriminant(feat))
     }
 
     /// 派生 FeatureSet (CR-002: OpImpl.requires() 谓词子集匹配的能力位)。
@@ -384,8 +396,12 @@ impl IsaProfile {
     /// 最优 SIMD 宽度
     pub fn optimal_simd_width(&self) -> super::instr::SimdWidth {
         match &self.platform {
-            Platform::X86_64 { has_avx512: true, .. } => super::instr::SimdWidth::W512,
-            Platform::X86_64 { has_avx10_2: true, .. } => super::instr::SimdWidth::W256,
+            Platform::X86_64 {
+                has_avx512: true, ..
+            } => super::instr::SimdWidth::W512,
+            Platform::X86_64 {
+                has_avx10_2: true, ..
+            } => super::instr::SimdWidth::W256,
             Platform::X86_64 { .. } => super::instr::SimdWidth::W256,
             Platform::AArch64 { has_sve: true, .. } => super::instr::SimdWidth::Scalable,
             Platform::AArch64 { .. } => super::instr::SimdWidth::W128,
@@ -402,19 +418,19 @@ impl IsaProfile {
 
         // x86_64 System V ABI GPR 编号: rax=0 rcx=1 rdx=2 rbx=3 rsp=4 rbp=5 rsi=6 rdi=7 r8-r15=8-15
         let arg_regs = vec![
-            PhysGpr(7),  // rdi
-            PhysGpr(6),  // rsi
-            PhysGpr(2),  // rdx
-            PhysGpr(1),  // rcx
-            PhysGpr(8),  // r8
-            PhysGpr(9),  // r9
+            PhysGpr(7), // rdi
+            PhysGpr(6), // rsi
+            PhysGpr(2), // rdx
+            PhysGpr(1), // rcx
+            PhysGpr(8), // r8
+            PhysGpr(9), // r9
         ];
         let callee_saved = vec![
-            PhysGpr(3),   // rbx
-            PhysGpr(12),  // r12
-            PhysGpr(13),  // r13
-            PhysGpr(14),  // r14
-            PhysGpr(15),  // r15
+            PhysGpr(3),  // rbx
+            PhysGpr(12), // r12
+            PhysGpr(13), // r13
+            PhysGpr(14), // r14
+            PhysGpr(15), // r15
         ];
         // ARCH-ISA-SCRATCH: ISA Lower 独占 scratch (不进入 RegAllocator 可分配池)。
         // rax(0): OffsetExpr 求值主 scratch
@@ -427,12 +443,12 @@ impl IsaProfile {
         // caller_saved/callee_saved 必须剔除 scratch_gprs，否则 RegAllocator
         // 会把 scratch 分给普通 VReg，与 ISA Lower 的 scratch 使用冲突 (ARCH-ISA-SCRATCH)。
         let caller_saved = vec![
-            PhysGpr(1),   // rcx
-            PhysGpr(2),   // rdx
-            PhysGpr(6),   // rsi
-            PhysGpr(7),   // rdi
-            PhysGpr(8),   // r8
-            PhysGpr(9),   // r9
+            PhysGpr(1), // rcx
+            PhysGpr(2), // rdx
+            PhysGpr(6), // rsi
+            PhysGpr(7), // rdi
+            PhysGpr(8), // r8
+            PhysGpr(9), // r9
         ];
         let frame_gprs: Vec<u8> = vec![4, 5];
         let max_gpr = if kc.has_apx { 31u8 } else { 16u8 };
@@ -479,31 +495,63 @@ impl IsaProfile {
 
         // 特性
         let mut features = vec![IsaFeature::Fma];
-        if kc.use_avx512 { features.push(IsaFeature::PredicatedExec); }
-        if kc.has_bf16 { features.push(IsaFeature::NativeBf16); }
-        if kc.has_avx512fp16 { features.push(IsaFeature::NativeFp16); }
-        if kc.has_f16c { features.push(IsaFeature::F16c); }
-        if kc.has_vnni { features.push(IsaFeature::Vnni); }
+        if kc.use_avx512 {
+            features.push(IsaFeature::PredicatedExec);
+        }
+        if kc.has_bf16 {
+            features.push(IsaFeature::NativeBf16);
+        }
+        if kc.has_avx512fp16 {
+            features.push(IsaFeature::NativeFp16);
+        }
+        if kc.has_f16c {
+            features.push(IsaFeature::F16c);
+        }
+        if kc.has_vnni {
+            features.push(IsaFeature::Vnni);
+        }
         if kc.has_amx {
-            features.push(IsaFeature::TileGemm { m: 16, n: 16, k: 32 });
+            features.push(IsaFeature::TileGemm {
+                m: 16,
+                n: 16,
+                k: 32,
+            });
         }
         // AMX+ (Granite Rapids / Diamond Rapids)
-        if kc.has_amx_fp16 { features.push(IsaFeature::AmxFp16); }
-        if kc.has_amx_complex { features.push(IsaFeature::AmxComplex); }
-        if kc.has_amx_transpose { features.push(IsaFeature::AmxTranspose); }
+        if kc.has_amx_fp16 {
+            features.push(IsaFeature::AmxFp16);
+        }
+        if kc.has_amx_complex {
+            features.push(IsaFeature::AmxComplex);
+        }
+        if kc.has_amx_transpose {
+            features.push(IsaFeature::AmxTranspose);
+        }
         if kc.has_amx_fp8 {
             features.push(IsaFeature::AmxFp8);
             features.push(IsaFeature::NativeFp8);
         }
         // AVX10.2 / APX
-        if kc.has_avx10_2 { features.push(IsaFeature::Avx10_2); }
+        if kc.has_avx10_2 {
+            features.push(IsaFeature::Avx10_2);
+        }
         if kc.has_apx {
             features.push(IsaFeature::Apx31Gpr);
         }
-        if kc.has_sparse_mask_intersect { features.push(IsaFeature::SparseMaskIntersect); }
+        if kc.has_sparse_mask_intersect {
+            features.push(IsaFeature::SparseMaskIntersect);
+        }
 
-        let tile_regs = if kc.has_amx { (0..8).map(PhysTile).collect() } else { vec![] };
-        let mask_regs = if kc.use_avx512 { (0..8).map(PhysMask).collect() } else { vec![] };
+        let tile_regs = if kc.has_amx {
+            (0..8).map(PhysTile).collect()
+        } else {
+            vec![]
+        };
+        let mask_regs = if kc.use_avx512 {
+            (0..8).map(PhysMask).collect()
+        } else {
+            vec![]
+        };
 
         Self {
             platform: Platform::X86_64 {
@@ -559,24 +607,25 @@ impl IsaProfile {
         let warp_size = 32;
 
         let (smem_kb, reg_file, max_regs) = match sm_version {
-            100.. => (228, 65536, 255),  // Blackwell
-            90..=99 => (228, 65536, 255),  // Hopper
-            80..=89 => (164, 65536, 255),  // Ampere/Ada
-            70..=79 => (96, 65536, 255),   // Volta/Turing
-            60..=69 => (48, 65536, 255),   // Pascal (GTX 1060 = SM 6.1)
-            _ => (48, 65536, 255),         // Kepler/Maxwell (保守默认)
+            100.. => (228, 65536, 255),   // Blackwell
+            90..=99 => (228, 65536, 255), // Hopper
+            80..=89 => (164, 65536, 255), // Ampere/Ada
+            70..=79 => (96, 65536, 255),  // Volta/Turing
+            60..=69 => (48, 65536, 255),  // Pascal (GTX 1060 = SM 6.1)
+            _ => (48, 65536, 255),        // Kepler/Maxwell (保守默认)
         };
 
         let tmem_kb = if is_blackwell { 256 } else { 0 };
 
-        let mut features = vec![
-            IsaFeature::Fma,
-            IsaFeature::WarpShuffle,
-        ];
+        let mut features = vec![IsaFeature::Fma, IsaFeature::WarpShuffle];
 
         // SM70+: wmma (Tensor Core v1)
         if sm_version >= 70 {
-            features.push(IsaFeature::TileGemm { m: 16, n: 16, k: 16 });
+            features.push(IsaFeature::TileGemm {
+                m: 16,
+                n: 16,
+                k: 16,
+            });
         }
         // SM80+: mma.sync, cp.async, BF16/TF32
         if sm_version >= 80 {
@@ -624,11 +673,11 @@ impl IsaProfile {
                 has_2cta_mma: is_blackwell,
                 tmem_size_kb: tmem_kb,
             },
-            gpr_regs: vec![],   // GPU: 无 GPR 概念
+            gpr_regs: vec![],     // GPU: 无 GPR 概念
             scratch_gprs: vec![], // GPU: ISA Lower 不走 x86 scratch 路径
-            vec_regs: vec![],   // GPU: 由 reg_file 管理
+            vec_regs: vec![],     // GPU: 由 reg_file 管理
             scratch_vec_regs: vec![],
-            tile_regs: vec![],  // GPU: Tensor Core 由硬件调度
+            tile_regs: vec![], // GPU: Tensor Core 由硬件调度
             mask_regs: vec![],
             abi: AbiConvention {
                 arg_regs: vec![],
@@ -641,16 +690,22 @@ impl IsaProfile {
             },
             cache: CacheHierarchy {
                 l1d_bytes: smem_kb * 1024,
-                l1i_bytes: 8192,       // GPU L1i ~8KB
-                l2_bytes: 0,           // GPU L2 由 driver 管理
+                l1i_bytes: 8192, // GPU L1i ~8KB
+                l2_bytes: 0,     // GPU L2 由 driver 管理
                 l3_bytes: 0,
-                cacheline_bytes: 128,  // GPU cacheline 128B
+                cacheline_bytes: 128, // GPU cacheline 128B
                 tmem_bytes: tmem_kb * 1024,
                 smem_bytes: smem_kb * 1024,
                 lds_bytes: 0,
             },
             features,
-            k_unroll_factor: if sm_version >= 90 { 8 } else if sm_version >= 70 { 4 } else { 2 },
+            k_unroll_factor: if sm_version >= 90 {
+                8
+            } else if sm_version >= 70 {
+                4
+            } else {
+                2
+            },
             dot_cap: if sm_version >= 80 {
                 crate::dispatch::device_profile::DotProductCap::NativeBf16
             } else if sm_version >= 70 {
@@ -678,7 +733,6 @@ impl IsaProfile {
         }
     }
 
-
     pub fn hip(gfx_arch: u32) -> Self {
         let is_cdna = gfx_arch < 1100;
         let wave_size = if is_cdna { 64 } else { 32 };
@@ -692,13 +746,14 @@ impl IsaProfile {
             _ => (64, 256, 0),           // RDNA3
         };
 
-        let mut features = vec![
-            IsaFeature::Fma,
-            IsaFeature::WarpShuffle,
-        ];
+        let mut features = vec![IsaFeature::Fma, IsaFeature::WarpShuffle];
         if is_cdna && gfx_arch >= 908 {
             features.push(IsaFeature::Mfma);
-            features.push(IsaFeature::TileGemm { m: 16, n: 16, k: 16 });
+            features.push(IsaFeature::TileGemm {
+                m: 16,
+                n: 16,
+                k: 16,
+            });
         }
         if is_cdna3 {
             features.push(IsaFeature::XcdTopology);
@@ -763,16 +818,20 @@ impl IsaProfile {
     pub fn metal(gpu_family: u32) -> Self {
         let simd_width = 32; // Apple GPU SIMD width
         let threadgroup_kb: usize = match gpu_family {
-            10 => 64,  // M4
-            9 => 32,   // M3
-            8 => 32,   // M2
-            7 => 32,   // M1
+            10 => 64, // M4
+            9 => 32,  // M3
+            8 => 32,  // M2
+            7 => 32,  // M1
             _ => 32,
         };
         let mut features = vec![IsaFeature::Fma, IsaFeature::WarpShuffle];
         if gpu_family >= 7 {
             features.push(IsaFeature::SiMDGroupMatrix);
-            features.push(IsaFeature::TileGemm { m: 16, n: 16, k: 16 });
+            features.push(IsaFeature::TileGemm {
+                m: 16,
+                n: 16,
+                k: 16,
+            });
         }
         Self {
             platform: Platform::Metal {
@@ -828,7 +887,10 @@ impl IsaProfile {
         }
         features.push(IsaFeature::ArmDotProd);
         if has_sve {
-            features.push(IsaFeature::ScalableVector { min_vl: 16, max_vl: sve_vl });
+            features.push(IsaFeature::ScalableVector {
+                min_vl: 16,
+                max_vl: sve_vl,
+            });
             features.push(IsaFeature::PredicatedExec);
         }
         if has_sve2 {
@@ -836,7 +898,11 @@ impl IsaProfile {
         }
         if has_sme {
             features.push(IsaFeature::SmeTileOp);
-            features.push(IsaFeature::TileGemm { m: 16, n: 16, k: 16 });
+            features.push(IsaFeature::TileGemm {
+                m: 16,
+                n: 16,
+                k: 16,
+            });
         }
         if has_sme2 {
             features.push(IsaFeature::Sme2MultiVec);
@@ -853,14 +919,16 @@ impl IsaProfile {
         // ARCH-ISA-SCRATCH-VEC: v16-v23 保留为 transcendental scratch (emit_neon_exp/sve_exp 使用)
         //                       v29-v31 保留为通用 Lower scratch (spill/reduce/broadcast)
         // 共 11 个，RegAllocator 剩余 21 个可分配（仍充裕）
-        let scratch_vec_regs: Vec<PhysVec> = (16u8..=23).chain(29u8..=31)
-            .map(PhysVec)
-            .collect();
+        let scratch_vec_regs: Vec<PhysVec> = (16u8..=23).chain(29u8..=31).map(PhysVec).collect();
         let vec_regs: Vec<PhysVec> = (0..32)
             .filter(|&r| !scratch_vec_regs.iter().any(|s| s.0 == r))
             .map(PhysVec)
             .collect();
-        let tile_regs = if has_sme { (0..4).map(PhysTile).collect() } else { vec![] };
+        let tile_regs = if has_sme {
+            (0..4).map(PhysTile).collect()
+        } else {
+            vec![]
+        };
         // ARCH-ISA-SCRATCH-MASK: SVE p7 保留为 "all-true predicate" (emit_sve_exp 使用)
         let mask_regs = if has_sve {
             (0..7).map(PhysMask).collect() // p0-p6 (p7 保留)
@@ -898,17 +966,23 @@ impl IsaProfile {
                 red_zone_bytes: 0,
             },
             cache: CacheHierarchy {
-                l1d_bytes: 65536,    // 典型 64KB
+                l1d_bytes: 65536, // 典型 64KB
                 l1i_bytes: 65536,
-                l2_bytes: 524288,    // 典型 512KB
-                l3_bytes: 8388608,   // 典型 8MB
+                l2_bytes: 524288,  // 典型 512KB
+                l3_bytes: 8388608, // 典型 8MB
                 cacheline_bytes: 64,
                 tmem_bytes: 0,
                 smem_bytes: 0,
                 lds_bytes: 0,
             },
             features,
-            k_unroll_factor: if has_sme { 8 } else if has_sve { 4 } else { 4 },
+            k_unroll_factor: if has_sme {
+                8
+            } else if has_sve {
+                4
+            } else {
+                4
+            },
             dot_cap: if has_sve2 {
                 crate::dispatch::device_profile::DotProductCap::NativeInt8Simd
             } else {
@@ -934,28 +1008,63 @@ mod tests {
             profile.gpr_regs.iter().map(|r| r.0).collect();
         let scratch: std::collections::HashSet<u8> =
             profile.scratch_gprs.iter().map(|r| r.0).collect();
-        assert!(allocatable.is_disjoint(&scratch),
-            "ISA scratch 与可分配池重叠: alloc={:?} scratch={:?}", allocatable, scratch);
+        assert!(
+            allocatable.is_disjoint(&scratch),
+            "ISA scratch 与可分配池重叠: alloc={:?} scratch={:?}",
+            allocatable,
+            scratch
+        );
         // rsp=4, rbp=5 不能出现在两者中
         for frame in [4u8, 5u8] {
             assert!(!allocatable.contains(&frame), "rsp/rbp 不能进入可分配池");
             assert!(!scratch.contains(&frame), "rsp/rbp 不能作为 scratch");
         }
-        let max_gpr = if matches!(&profile.platform, Platform::X86_64 { has_apx: true, .. }) { 31 } else { 16 };
-        assert_eq!(profile.gpr_regs.len() + profile.scratch_gprs.len() + 2, max_gpr,
-            "GPR 守恒: allocatable + scratch + {{rsp,rbp}} = {}", max_gpr);
+        let max_gpr = if matches!(&profile.platform, Platform::X86_64 { has_apx: true, .. }) {
+            31
+        } else {
+            16
+        };
+        assert_eq!(
+            profile.gpr_regs.len() + profile.scratch_gprs.len() + 2,
+            max_gpr,
+            "GPR 守恒: allocatable + scratch + {{rsp,rbp}} = {}",
+            max_gpr
+        );
         // GEMM 微核 & 融合算子对可分配 GPR 数有最小预算: 基线 ≥11 (16-2-3 scratch),
         // APX ≥26 (31-2-3 scratch)。若 scratch 集合过度膨胀会破坏此保证。
-        let min_allocatable = if matches!(&profile.platform, Platform::X86_64 { has_apx: true, .. }) { 26 } else { 11 };
-        assert!(profile.gpr_regs.len() >= min_allocatable,
-            "可分配 GPR 不足: {} < {}, scratch 集合可能过度膨胀", profile.gpr_regs.len(), min_allocatable);
+        let min_allocatable = if matches!(&profile.platform, Platform::X86_64 { has_apx: true, .. })
+        {
+            26
+        } else {
+            11
+        };
+        assert!(
+            profile.gpr_regs.len() >= min_allocatable,
+            "可分配 GPR 不足: {} < {}, scratch 集合可能过度膨胀",
+            profile.gpr_regs.len(),
+            min_allocatable
+        );
 
         // ARCH-ISA-SCRATCH-VEC: vec_regs + scratch_vec_regs = vec_count (16 基线 / 32 AVX-512)。
         // scratch 末 6 条 ymm/zmm: 3 内部 scratch (HReduce/FWHT/broadcast) + 3 spill scratch (a/b/dst)
         assert_eq!(profile.scratch_vec_regs.len(), 6);
-        let vec_count = if matches!(&profile.platform, Platform::X86_64 { has_avx512: true, .. }) { 32 } else { 16 };
-        assert_eq!(profile.vec_regs.len() + profile.scratch_vec_regs.len(), vec_count,
-            "Vec 守恒: allocatable + scratch = {}", vec_count);
+        let vec_count = if matches!(
+            &profile.platform,
+            Platform::X86_64 {
+                has_avx512: true,
+                ..
+            }
+        ) {
+            32
+        } else {
+            16
+        };
+        assert_eq!(
+            profile.vec_regs.len() + profile.scratch_vec_regs.len(),
+            vec_count,
+            "Vec 守恒: allocatable + scratch = {}",
+            vec_count
+        );
 
         // ABI 常量 (SysV x86-64, 与 CPU 无关)
         assert_eq!(profile.abi.arg_regs.len(), 6);
@@ -1028,7 +1137,11 @@ mod tests {
         let profile = IsaProfile::hip(1100);
         // RDNA3: wave32, 无 MFMA
         match &profile.platform {
-            Platform::Hip { wave_size, has_mfma, .. } => {
+            Platform::Hip {
+                wave_size,
+                has_mfma,
+                ..
+            } => {
                 assert_eq!(*wave_size, 32);
                 assert!(!has_mfma);
             }
@@ -1052,24 +1165,36 @@ mod tests {
             profile.gpr_regs.iter().map(|r| r.0).collect();
         let scratch: std::collections::HashSet<u8> =
             profile.scratch_gprs.iter().map(|r| r.0).collect();
-        assert!(allocatable.is_disjoint(&scratch),
-            "AArch64 scratch 与可分配池重叠: alloc={:?} scratch={:?}", allocatable, scratch);
+        assert!(
+            allocatable.is_disjoint(&scratch),
+            "AArch64 scratch 与可分配池重叠: alloc={:?} scratch={:?}",
+            allocatable,
+            scratch
+        );
         for frame in [29u8, 30u8] {
             assert!(!allocatable.contains(&frame), "x29/x30 不能进入可分配池");
             assert!(!scratch.contains(&frame), "x29/x30 不能作为 scratch");
         }
-        assert_eq!(profile.gpr_regs.len() + profile.scratch_gprs.len() + 2, 31,
-            "AArch64 GPR 守恒: allocatable + scratch + {{fp,lr}} = 31");
+        assert_eq!(
+            profile.gpr_regs.len() + profile.scratch_gprs.len() + 2,
+            31,
+            "AArch64 GPR 守恒: allocatable + scratch + {{fp,lr}} = 31"
+        );
 
         // ARCH-ISA-SCRATCH-VEC: v0..v31 (32 个) = allocatable + scratch。
         let vec_alloc: std::collections::HashSet<u8> =
             profile.vec_regs.iter().map(|r| r.0).collect();
         let vec_scratch: std::collections::HashSet<u8> =
             profile.scratch_vec_regs.iter().map(|r| r.0).collect();
-        assert!(vec_alloc.is_disjoint(&vec_scratch),
-            "AArch64 vec scratch 与可分配池重叠");
-        assert_eq!(profile.vec_regs.len() + profile.scratch_vec_regs.len(), 32,
-            "AArch64 Vec 守恒: allocatable + scratch = 32");
+        assert!(
+            vec_alloc.is_disjoint(&vec_scratch),
+            "AArch64 vec scratch 与可分配池重叠"
+        );
+        assert_eq!(
+            profile.vec_regs.len() + profile.scratch_vec_regs.len(),
+            32,
+            "AArch64 Vec 守恒: allocatable + scratch = 32"
+        );
 
         // SVE predicate masks: 总数 8 (p0..p7),p7 保留 → 可分配 7
         assert_eq!(profile.mask_regs.len(), 7);
@@ -1265,11 +1390,26 @@ mod tests {
         // Arrange: IsaFeature derives PartialEq, Eq
         assert_eq!(IsaFeature::Fma, IsaFeature::Fma);
         assert_ne!(IsaFeature::Fma, IsaFeature::NativeBf16);
-        assert_eq!(IsaFeature::TileGemm { m: 16, n: 16, k: 16 }, IsaFeature::TileGemm { m: 16, n: 16, k: 16 });
+        assert_eq!(
+            IsaFeature::TileGemm {
+                m: 16,
+                n: 16,
+                k: 16
+            },
+            IsaFeature::TileGemm {
+                m: 16,
+                n: 16,
+                k: 16
+            }
+        );
 
         // TileGemm with different parameters is still equal (same discriminant used by has_feature)
         assert_ne!(
-            IsaFeature::TileGemm { m: 16, n: 16, k: 16 },
+            IsaFeature::TileGemm {
+                m: 16,
+                n: 16,
+                k: 16
+            },
             IsaFeature::TileGemm { m: 8, n: 8, k: 8 }
         );
 
@@ -1286,7 +1426,11 @@ mod tests {
         // Assert: SM70 baseline features
         assert!(profile.has_feature(&IsaFeature::Fma));
         assert!(profile.has_feature(&IsaFeature::WarpShuffle));
-        assert!(profile.has_feature(&IsaFeature::TileGemm { m: 16, n: 16, k: 16 }));
+        assert!(profile.has_feature(&IsaFeature::TileGemm {
+            m: 16,
+            n: 16,
+            k: 16
+        }));
         // SM70 lacks async copy and BF16
         assert!(!profile.has_feature(&IsaFeature::AsyncCopy));
         assert!(!profile.has_feature(&IsaFeature::NativeBf16));
@@ -1311,7 +1455,11 @@ mod tests {
         // Assert: SM80 adds async copy + BF16
         assert!(profile.has_feature(&IsaFeature::AsyncCopy));
         assert!(profile.has_feature(&IsaFeature::NativeBf16));
-        assert!(profile.has_feature(&IsaFeature::TileGemm { m: 16, n: 16, k: 16 }));
+        assert!(profile.has_feature(&IsaFeature::TileGemm {
+            m: 16,
+            n: 16,
+            k: 16
+        }));
         // SM80 lacks Hopper features
         assert!(!profile.has_feature(&IsaFeature::Wgmma));
         assert!(!profile.has_feature(&IsaFeature::Tma));
@@ -1338,7 +1486,11 @@ mod tests {
         assert!(!profile.has_feature(&IsaFeature::XcdTopology));
         // wave64 for CDNA
         match &profile.platform {
-            Platform::Hip { wave_size, gfx_arch, .. } => {
+            Platform::Hip {
+                wave_size,
+                gfx_arch,
+                ..
+            } => {
                 assert_eq!(*wave_size, 64);
                 assert_eq!(*gfx_arch, 908);
             }
@@ -1359,7 +1511,12 @@ mod tests {
         assert!(profile.has_feature(&IsaFeature::XcdTopology));
         // wave64
         match &profile.platform {
-            Platform::Hip { wave_size, gfx_arch, vgpr_per_cu, .. } => {
+            Platform::Hip {
+                wave_size,
+                gfx_arch,
+                vgpr_per_cu,
+                ..
+            } => {
                 assert_eq!(*wave_size, 64);
                 assert_eq!(*gfx_arch, 942);
                 assert_eq!(*vgpr_per_cu, 512);
@@ -1395,7 +1552,10 @@ mod tests {
         let original_k = base.k_unroll_factor;
 
         // Act: struct update syntax copies all fields except the specified ones
-        let modified = IsaProfile { k_unroll_factor: 1, ..base.clone() };
+        let modified = IsaProfile {
+            k_unroll_factor: 1,
+            ..base.clone()
+        };
 
         // Assert
         assert_eq!(modified.k_unroll_factor, 1);
@@ -1424,7 +1584,7 @@ mod tests {
         }
         // AArch64 NEON baseline = W128
         assert_eq!(aarch64_neon.optimal_simd_width().f32_lanes(), 4); // 128/32=4
-        // AArch64 SVE = Scalable
+                                                                      // AArch64 SVE = Scalable
         match aarch64_sve.optimal_simd_width() {
             super::super::instr::SimdWidth::Scalable => {}
             other => panic!("expected Scalable for SVE, got {:?}", other),
@@ -1468,7 +1628,10 @@ mod tests {
         // Assert: SVE2 features present
         assert!(profile.has_feature(&IsaFeature::Sve2));
         assert!(profile.has_feature(&IsaFeature::PredicatedExec));
-        assert!(profile.has_feature(&IsaFeature::ScalableVector { min_vl: 16, max_vl: 32 }));
+        assert!(profile.has_feature(&IsaFeature::ScalableVector {
+            min_vl: 16,
+            max_vl: 32
+        }));
         assert!(profile.has_feature(&IsaFeature::ArmBf16));
         assert!(profile.has_feature(&IsaFeature::NativeBf16));
         // No SME means no tile ops, no multi-vec
@@ -1481,7 +1644,10 @@ mod tests {
         // DotProd always present on AArch64
         assert!(profile.has_feature(&IsaFeature::ArmDotProd));
         // dot_cap for SVE2 = NativeInt8Simd
-        assert!(matches!(profile.dot_cap, crate::dispatch::device_profile::DotProductCap::NativeInt8Simd));
+        assert!(matches!(
+            profile.dot_cap,
+            crate::dispatch::device_profile::DotProductCap::NativeInt8Simd
+        ));
     }
 
     #[test]
@@ -1491,10 +1657,22 @@ mod tests {
 
         match &profile.platform {
             Platform::Cuda {
-                sm_version, warp_size, shared_mem_kb, reg_file_per_sm, max_regs_per_thread,
-                has_wgmma, has_tma, has_warp_spec, has_fp8,
-                has_tmem, has_block_scaled, has_native_fp4, has_native_fp6,
-                has_cluster, has_2cta_mma, tmem_size_kb,
+                sm_version,
+                warp_size,
+                shared_mem_kb,
+                reg_file_per_sm,
+                max_regs_per_thread,
+                has_wgmma,
+                has_tma,
+                has_warp_spec,
+                has_fp8,
+                has_tmem,
+                has_block_scaled,
+                has_native_fp4,
+                has_native_fp6,
+                has_cluster,
+                has_2cta_mma,
+                tmem_size_kb,
             } => {
                 // Assert: numeric fields
                 assert_eq!(*sm_version, 100);
@@ -1592,9 +1770,18 @@ mod tests {
         assert_eq!(cdna3.k_unroll_factor, 8);
         assert_eq!(cdna4.k_unroll_factor, 8);
         // All HIP profiles use NativeBf16 dot_cap
-        assert!(matches!(cdna2.dot_cap, crate::dispatch::device_profile::DotProductCap::NativeBf16));
-        assert!(matches!(cdna3.dot_cap, crate::dispatch::device_profile::DotProductCap::NativeBf16));
-        assert!(matches!(cdna4.dot_cap, crate::dispatch::device_profile::DotProductCap::NativeBf16));
+        assert!(matches!(
+            cdna2.dot_cap,
+            crate::dispatch::device_profile::DotProductCap::NativeBf16
+        ));
+        assert!(matches!(
+            cdna3.dot_cap,
+            crate::dispatch::device_profile::DotProductCap::NativeBf16
+        ));
+        assert!(matches!(
+            cdna4.dot_cap,
+            crate::dispatch::device_profile::DotProductCap::NativeBf16
+        ));
     }
 
     #[test]
@@ -1603,8 +1790,16 @@ mod tests {
         let profile = IsaProfile::cuda(70);
 
         // Act & Assert: has_feature uses discriminant, so TileGemm with any params matches
-        assert!(profile.has_feature(&IsaFeature::TileGemm { m: 16, n: 16, k: 16 }));
-        assert!(profile.has_feature(&IsaFeature::TileGemm { m: 99, n: 99, k: 99 }));
+        assert!(profile.has_feature(&IsaFeature::TileGemm {
+            m: 16,
+            n: 16,
+            k: 16
+        }));
+        assert!(profile.has_feature(&IsaFeature::TileGemm {
+            m: 99,
+            n: 99,
+            k: 99
+        }));
         // Non-matching discriminant returns false
         assert!(!profile.has_feature(&IsaFeature::Tmem));
         assert!(!profile.has_feature(&IsaFeature::SmeTileOp));
@@ -1668,7 +1863,11 @@ mod tests {
         assert!(scratch.contains(&17));
         // x29 (fp) and x30 (lr) must not appear in either pool
         for frame in [29u8, 30u8] {
-            assert!(!allocatable.contains(&frame), "x{} must not be allocatable", frame);
+            assert!(
+                !allocatable.contains(&frame),
+                "x{} must not be allocatable",
+                frame
+            );
             assert!(!scratch.contains(&frame), "x{} must not be scratch", frame);
         }
         // x31 (SP/ZR) must not appear in either pool
@@ -1754,7 +1953,10 @@ mod tests {
         assert!(!mask_dbg.is_empty(), "Mask Debug must not be empty");
         assert!(!spill_dbg.is_empty(), "Spilled Debug must not be empty");
         // Spilled variant contains the slot id
-        assert!(spill_dbg.contains("99"), "Spilled Debug should contain slot id");
+        assert!(
+            spill_dbg.contains("99"),
+            "Spilled Debug should contain slot id"
+        );
     }
 
     #[test]
@@ -1763,10 +1965,17 @@ mod tests {
         let features = [
             IsaFeature::Fma,
             IsaFeature::NativeBf16,
-            IsaFeature::TileGemm { m: 16, n: 16, k: 32 },
+            IsaFeature::TileGemm {
+                m: 16,
+                n: 16,
+                k: 32,
+            },
             IsaFeature::AsyncCopy,
             IsaFeature::PredicatedExec,
-            IsaFeature::ScalableVector { min_vl: 16, max_vl: 256 },
+            IsaFeature::ScalableVector {
+                min_vl: 16,
+                max_vl: 256,
+            },
             IsaFeature::Wgmma,
             IsaFeature::Tmem,
             IsaFeature::Mfma,
@@ -1780,14 +1989,37 @@ mod tests {
         // Act & Assert: every variant must produce non-empty Debug output
         for feat in &features {
             let dbg = format!("{:?}", feat);
-            assert!(!dbg.is_empty(), "IsaFeature {:?} Debug output is empty", feat);
+            assert!(
+                !dbg.is_empty(),
+                "IsaFeature {:?} Debug output is empty",
+                feat
+            );
         }
 
         // TileGemm and ScalableVector should contain their parameters
-        let tile_dbg = format!("{:?}", IsaFeature::TileGemm { m: 16, n: 16, k: 32 });
-        assert!(tile_dbg.contains("16"), "TileGemm Debug should contain m=16");
-        let sv_dbg = format!("{:?}", IsaFeature::ScalableVector { min_vl: 16, max_vl: 256 });
-        assert!(sv_dbg.contains("256"), "ScalableVector Debug should contain max_vl=256");
+        let tile_dbg = format!(
+            "{:?}",
+            IsaFeature::TileGemm {
+                m: 16,
+                n: 16,
+                k: 32
+            }
+        );
+        assert!(
+            tile_dbg.contains("16"),
+            "TileGemm Debug should contain m=16"
+        );
+        let sv_dbg = format!(
+            "{:?}",
+            IsaFeature::ScalableVector {
+                min_vl: 16,
+                max_vl: 256
+            }
+        );
+        assert!(
+            sv_dbg.contains("256"),
+            "ScalableVector Debug should contain max_vl=256"
+        );
     }
 
     #[test]
@@ -1844,16 +2076,32 @@ mod tests {
     fn test_platform_is_gpu_false_for_cpu_variants() {
         // Arrange: x86 and AArch64 platforms
         let x86 = Platform::X86_64 {
-            has_avx512: true, has_bf16: true, has_vnni: true, has_avx512fp16: false, has_f16c: true,
-            has_amx: false, has_amx_fp16: false, has_amx_complex: false,
-            has_amx_transpose: false, has_amx_fp8: false,
-            has_avx10_2: false, has_apx: false, has_sparse_mask_intersect: false,
+            has_avx512: true,
+            has_bf16: true,
+            has_vnni: true,
+            has_avx512fp16: false,
+            has_f16c: true,
+            has_amx: false,
+            has_amx_fp16: false,
+            has_amx_complex: false,
+            has_amx_transpose: false,
+            has_amx_fp8: false,
+            has_avx10_2: false,
+            has_apx: false,
+            has_sparse_mask_intersect: false,
         };
         let aarch64 = Platform::AArch64 {
-            has_bf16: false, has_dotprod: true, has_i8mm: false,
-            has_sve: false, has_sve2: false, sve_vl: 16,
-            has_sme: false, has_sme2: false, has_sme_f16f16: false,
-            has_sme_i16i64: false, sme_vl: 0,
+            has_bf16: false,
+            has_dotprod: true,
+            has_i8mm: false,
+            has_sve: false,
+            has_sve2: false,
+            sve_vl: 16,
+            has_sme: false,
+            has_sme2: false,
+            has_sme_f16f16: false,
+            has_sme_i16i64: false,
+            sme_vl: 0,
         };
 
         // Act & Assert
@@ -1872,7 +2120,13 @@ mod tests {
 
         // Assert: platform boolean fields
         match &profile.platform {
-            Platform::Cuda { has_fp8, has_wgmma, has_tma, has_tmem, .. } => {
+            Platform::Cuda {
+                has_fp8,
+                has_wgmma,
+                has_tma,
+                has_tmem,
+                ..
+            } => {
                 assert!(has_fp8, "SM89 must have FP8");
                 assert!(!has_wgmma, "SM89 must not have WGMMA");
                 assert!(!has_tma, "SM89 must not have TMA");
@@ -1890,8 +2144,14 @@ mod tests {
         // Assert: CDNA4 gfx950 — all MFMA flags true
         match &profile.platform {
             Platform::Hip {
-                gfx_arch, wave_size, has_mfma, has_mfma_v2,
-                has_fp8_mfma, has_fp4_mfma, vgpr_per_cu, lds_size_kb,
+                gfx_arch,
+                wave_size,
+                has_mfma,
+                has_mfma_v2,
+                has_fp8_mfma,
+                has_fp4_mfma,
+                vgpr_per_cu,
+                lds_size_kb,
                 infinity_cache_mb,
             } => {
                 assert_eq!(*gfx_arch, 950);
@@ -1914,10 +2174,13 @@ mod tests {
         let profile = IsaProfile::aarch64(false, false, 16, false, false, false);
 
         // Assert: NEON without SVE2 → SimdAssisted dot_cap
-        assert!(matches!(
-            profile.dot_cap,
-            crate::dispatch::device_profile::DotProductCap::SimdAssisted
-        ), "Baseline NEON must use SimdAssisted dot_cap");
+        assert!(
+            matches!(
+                profile.dot_cap,
+                crate::dispatch::device_profile::DotProductCap::SimdAssisted
+            ),
+            "Baseline NEON must use SimdAssisted dot_cap"
+        );
     }
 
     #[test]
@@ -1945,9 +2208,13 @@ mod tests {
     fn test_phys_newtype_hash_set_dedup_across_types() {
         // Arrange: collect mixed newtypes into individual HashSets
         use std::collections::HashSet;
-        let gprs: HashSet<PhysGpr> = [PhysGpr(0), PhysGpr(1), PhysGpr(0), PhysGpr(1)].into_iter().collect();
+        let gprs: HashSet<PhysGpr> = [PhysGpr(0), PhysGpr(1), PhysGpr(0), PhysGpr(1)]
+            .into_iter()
+            .collect();
         let vecs: HashSet<PhysVec> = [PhysVec(0), PhysVec(0), PhysVec(2)].into_iter().collect();
-        let tiles: HashSet<PhysTile> = [PhysTile(0), PhysTile(1), PhysTile(0)].into_iter().collect();
+        let tiles: HashSet<PhysTile> = [PhysTile(0), PhysTile(1), PhysTile(0)]
+            .into_iter()
+            .collect();
         let masks: HashSet<PhysMask> = [PhysMask(0), PhysMask(0)].into_iter().collect();
 
         // Act & Assert: HashSet dedup reflects unique values
@@ -1965,8 +2232,14 @@ mod tests {
         let profile = IsaProfile::aarch64(true, false, 64, false, false, false);
 
         // Act & Assert: has_feature uses discriminant, so different max_vl still matches
-        assert!(profile.has_feature(&IsaFeature::ScalableVector { min_vl: 16, max_vl: 64 }));
-        assert!(profile.has_feature(&IsaFeature::ScalableVector { min_vl: 1, max_vl: 999 }));
+        assert!(profile.has_feature(&IsaFeature::ScalableVector {
+            min_vl: 16,
+            max_vl: 64
+        }));
+        assert!(profile.has_feature(&IsaFeature::ScalableVector {
+            min_vl: 1,
+            max_vl: 999
+        }));
         // But a different feature kind does not match
         assert!(!profile.has_feature(&IsaFeature::WarpShuffle));
     }
@@ -1990,7 +2263,11 @@ mod tests {
         assert_eq!(profile.cache.lds_bytes, 128 * 1024);
         // wave64 for CDNA
         match &profile.platform {
-            Platform::Hip { wave_size, gfx_arch, .. } => {
+            Platform::Hip {
+                wave_size,
+                gfx_arch,
+                ..
+            } => {
                 assert_eq!(*wave_size, 64);
                 assert_eq!(*gfx_arch, 1000);
             }
@@ -2022,7 +2299,12 @@ mod tests {
 
         // Assert: legacy GPU parameters
         match &profile.platform {
-            Platform::Cuda { reg_file_per_sm, max_regs_per_thread, shared_mem_kb, .. } => {
+            Platform::Cuda {
+                reg_file_per_sm,
+                max_regs_per_thread,
+                shared_mem_kb,
+                ..
+            } => {
                 assert_eq!(*reg_file_per_sm, 65536);
                 assert_eq!(*max_regs_per_thread, 255);
                 assert_eq!(*shared_mem_kb, 96);
@@ -2038,10 +2320,19 @@ mod tests {
     fn test_x86_platform_cuda_sm_and_hip_gfx_return_none() {
         // Arrange: construct X86_64 platform directly
         let x86 = Platform::X86_64 {
-            has_avx512: true, has_bf16: true, has_vnni: true, has_avx512fp16: false, has_f16c: true,
-            has_amx: false, has_amx_fp16: false, has_amx_complex: false,
-            has_amx_transpose: false, has_amx_fp8: false,
-            has_avx10_2: false, has_apx: false, has_sparse_mask_intersect: false,
+            has_avx512: true,
+            has_bf16: true,
+            has_vnni: true,
+            has_avx512fp16: false,
+            has_f16c: true,
+            has_amx: false,
+            has_amx_fp16: false,
+            has_amx_complex: false,
+            has_amx_transpose: false,
+            has_amx_fp8: false,
+            has_avx10_2: false,
+            has_apx: false,
+            has_sparse_mask_intersect: false,
         };
 
         // Act & Assert: CPU platforms return None for GPU-specific queries
@@ -2075,14 +2366,22 @@ mod tests {
 
         // Assert: FEAT_SME_F16F16 and FEAT_SME_I16I64 only appear with SME2
         match &sme1.platform {
-            Platform::AArch64 { has_sme_f16f16, has_sme_i16i64, .. } => {
+            Platform::AArch64 {
+                has_sme_f16f16,
+                has_sme_i16i64,
+                ..
+            } => {
                 assert!(!has_sme_f16f16, "SME1 should not have F16F16");
                 assert!(!has_sme_i16i64, "SME1 should not have I16I64");
             }
             _ => panic!("expected AArch64"),
         }
         match &sme2.platform {
-            Platform::AArch64 { has_sme_f16f16, has_sme_i16i64, .. } => {
+            Platform::AArch64 {
+                has_sme_f16f16,
+                has_sme_i16i64,
+                ..
+            } => {
                 assert!(has_sme_f16f16, "SME2 should have F16F16");
                 assert!(has_sme_i16i64, "SME2 should have I16I64");
             }
@@ -2097,18 +2396,38 @@ mod tests {
         let profile = IsaProfile::from_device_profile(&dp);
 
         // Act & Assert: mask_regs non-empty only when use_avx512
-        let has_avx512 = matches!(&profile.platform, Platform::X86_64 { has_avx512: true, .. });
+        let has_avx512 = matches!(
+            &profile.platform,
+            Platform::X86_64 {
+                has_avx512: true,
+                ..
+            }
+        );
         if has_avx512 {
-            assert_eq!(profile.mask_regs.len(), 8, "AVX-512 must provide 8 mask regs (k0-k7)");
+            assert_eq!(
+                profile.mask_regs.len(),
+                8,
+                "AVX-512 must provide 8 mask regs (k0-k7)"
+            );
         } else {
-            assert!(profile.mask_regs.is_empty(), "Non-AVX-512 must have no mask regs");
+            assert!(
+                profile.mask_regs.is_empty(),
+                "Non-AVX-512 must have no mask regs"
+            );
         }
         // tile_regs non-empty only when AMX
         let has_amx = matches!(&profile.platform, Platform::X86_64 { has_amx: true, .. });
         if has_amx {
-            assert_eq!(profile.tile_regs.len(), 8, "AMX must provide 8 tile regs (tmm0-tmm7)");
+            assert_eq!(
+                profile.tile_regs.len(),
+                8,
+                "AMX must provide 8 tile regs (tmm0-tmm7)"
+            );
         } else {
-            assert!(profile.tile_regs.is_empty(), "Non-AMX must have no tile regs");
+            assert!(
+                profile.tile_regs.is_empty(),
+                "Non-AMX must have no tile regs"
+            );
         }
     }
 
@@ -2182,10 +2501,19 @@ mod tests {
         // Arrange: construct IsaProfile with an empty features list
         let profile = IsaProfile {
             platform: Platform::X86_64 {
-                has_avx512: false, has_bf16: false, has_vnni: false, has_avx512fp16: false, has_f16c: false,
-                has_amx: false, has_amx_fp16: false, has_amx_complex: false,
-                has_amx_transpose: false, has_amx_fp8: false,
-                has_avx10_2: false, has_apx: false, has_sparse_mask_intersect: false,
+                has_avx512: false,
+                has_bf16: false,
+                has_vnni: false,
+                has_avx512fp16: false,
+                has_f16c: false,
+                has_amx: false,
+                has_amx_fp16: false,
+                has_amx_complex: false,
+                has_amx_transpose: false,
+                has_amx_fp8: false,
+                has_avx10_2: false,
+                has_apx: false,
+                has_sparse_mask_intersect: false,
             },
             gpr_regs: vec![],
             scratch_gprs: vec![],
@@ -2194,13 +2522,23 @@ mod tests {
             tile_regs: vec![],
             mask_regs: vec![],
             abi: AbiConvention {
-                arg_regs: vec![], stack_arg_offset: 0, callee_saved: vec![],
-                caller_saved: vec![], callee_saved_vec: vec![],
-                stack_alignment: 0, red_zone_bytes: 0,
+                arg_regs: vec![],
+                stack_arg_offset: 0,
+                callee_saved: vec![],
+                caller_saved: vec![],
+                callee_saved_vec: vec![],
+                stack_alignment: 0,
+                red_zone_bytes: 0,
             },
             cache: CacheHierarchy {
-                l1d_bytes: 0, l1i_bytes: 0, l2_bytes: 0, l3_bytes: 0,
-                cacheline_bytes: 64, tmem_bytes: 0, smem_bytes: 0, lds_bytes: 0,
+                l1d_bytes: 0,
+                l1i_bytes: 0,
+                l2_bytes: 0,
+                l3_bytes: 0,
+                cacheline_bytes: 64,
+                tmem_bytes: 0,
+                smem_bytes: 0,
+                lds_bytes: 0,
             },
             features: vec![],
             k_unroll_factor: 1,
@@ -2209,7 +2547,11 @@ mod tests {
 
         // Act & Assert: no feature matches on empty list
         assert!(!profile.has_feature(&IsaFeature::Fma));
-        assert!(!profile.has_feature(&IsaFeature::TileGemm { m: 16, n: 16, k: 16 }));
+        assert!(!profile.has_feature(&IsaFeature::TileGemm {
+            m: 16,
+            n: 16,
+            k: 16
+        }));
         assert!(!profile.has_feature(&IsaFeature::WarpShuffle));
     }
 
@@ -2275,7 +2617,11 @@ mod tests {
         // Assert: has SVE predication and SME tile, but lacks SVE2
         assert!(profile.has_feature(&IsaFeature::PredicatedExec));
         assert!(profile.has_feature(&IsaFeature::SmeTileOp));
-        assert!(profile.has_feature(&IsaFeature::TileGemm { m: 16, n: 16, k: 16 }));
+        assert!(profile.has_feature(&IsaFeature::TileGemm {
+            m: 16,
+            n: 16,
+            k: 16
+        }));
         assert!(!profile.has_feature(&IsaFeature::Sve2));
         assert!(!profile.has_feature(&IsaFeature::Sme2MultiVec));
         // Tile regs present from SME
@@ -2284,7 +2630,9 @@ mod tests {
         assert_eq!(profile.mask_regs.len(), 7);
         // has_i8mm = has_sve2 = false
         match &profile.platform {
-            Platform::AArch64 { has_i8mm, has_sme2, .. } => {
+            Platform::AArch64 {
+                has_i8mm, has_sme2, ..
+            } => {
                 assert!(!has_i8mm);
                 assert!(!has_sme2);
             }
@@ -2354,7 +2702,13 @@ mod tests {
         // Assert: exactly 8 callee-saved vec regs, contiguous range
         assert_eq!(profile.abi.callee_saved_vec.len(), 8);
         for (i, reg) in profile.abi.callee_saved_vec.iter().enumerate() {
-            assert_eq!(reg.0, 8 + i as u8, "callee_saved_vec[{}] should be v{}", i, 8 + i);
+            assert_eq!(
+                reg.0,
+                8 + i as u8,
+                "callee_saved_vec[{}] should be v{}",
+                i,
+                8 + i
+            );
         }
         // caller_saved = x0..x18 (19 regs)
         assert_eq!(profile.abi.caller_saved.len(), 19);
@@ -2391,12 +2745,24 @@ mod tests {
 
         // Act & Assert: feature count strictly non-decreasing across generations
         assert!(sm70.features.len() > 0, "SM70 must have baseline features");
-        assert!(sm80.features.len() >= sm70.features.len(),
-            "SM80 feature count ({}) must >= SM70 ({})", sm80.features.len(), sm70.features.len());
-        assert!(sm90.features.len() >= sm80.features.len(),
-            "SM90 feature count ({}) must >= SM80 ({})", sm90.features.len(), sm80.features.len());
-        assert!(sm100.features.len() >= sm90.features.len(),
-            "SM100 feature count ({}) must >= SM90 ({})", sm100.features.len(), sm90.features.len());
+        assert!(
+            sm80.features.len() >= sm70.features.len(),
+            "SM80 feature count ({}) must >= SM70 ({})",
+            sm80.features.len(),
+            sm70.features.len()
+        );
+        assert!(
+            sm90.features.len() >= sm80.features.len(),
+            "SM90 feature count ({}) must >= SM80 ({})",
+            sm90.features.len(),
+            sm80.features.len()
+        );
+        assert!(
+            sm100.features.len() >= sm90.features.len(),
+            "SM100 feature count ({}) must >= SM90 ({})",
+            sm100.features.len(),
+            sm90.features.len()
+        );
 
         // AsyncCopy appears at SM80+, never on SM70
         assert!(!sm70.has_feature(&IsaFeature::AsyncCopy));
@@ -2413,9 +2779,18 @@ mod tests {
         let rdna3 = IsaProfile::hip(1100);
 
         // Act & Assert: CDNA = wave64, RDNA = wave32
-        let cdna2_ws = match &cdna2.platform { Platform::Hip { wave_size, .. } => *wave_size, _ => 0 };
-        let cdna3_ws = match &cdna3.platform { Platform::Hip { wave_size, .. } => *wave_size, _ => 0 };
-        let rdna3_ws = match &rdna3.platform { Platform::Hip { wave_size, .. } => *wave_size, _ => 0 };
+        let cdna2_ws = match &cdna2.platform {
+            Platform::Hip { wave_size, .. } => *wave_size,
+            _ => 0,
+        };
+        let cdna3_ws = match &cdna3.platform {
+            Platform::Hip { wave_size, .. } => *wave_size,
+            _ => 0,
+        };
+        let rdna3_ws = match &rdna3.platform {
+            Platform::Hip { wave_size, .. } => *wave_size,
+            _ => 0,
+        };
 
         assert_eq!(cdna2_ws, 64);
         assert_eq!(cdna3_ws, 64);
@@ -2472,7 +2847,11 @@ mod tests {
         assert!(profile.has_feature(&IsaFeature::Fma));
         assert!(profile.has_feature(&IsaFeature::AsyncCopy));
         assert!(profile.has_feature(&IsaFeature::NativeBf16));
-        assert!(profile.has_feature(&IsaFeature::TileGemm { m: 16, n: 16, k: 16 }));
+        assert!(profile.has_feature(&IsaFeature::TileGemm {
+            m: 16,
+            n: 16,
+            k: 16
+        }));
         // SM86 < 89 → no FP8
         assert!(!profile.has_feature(&IsaFeature::NativeFp8));
         // SM86 < 90 → no Hopper features
@@ -2480,7 +2859,11 @@ mod tests {
         assert!(!profile.has_feature(&IsaFeature::WarpSpecialization));
         // SM86 shared memory = 164 KB (same as SM80 range)
         match &profile.platform {
-            Platform::Cuda { shared_mem_kb, sm_version, .. } => {
+            Platform::Cuda {
+                shared_mem_kb,
+                sm_version,
+                ..
+            } => {
                 assert_eq!(*shared_mem_kb, 164);
                 assert_eq!(*sm_version, 86);
             }
@@ -2505,7 +2888,10 @@ mod tests {
         // p7 is not in the allocatable set
         let mask_ids: std::collections::HashSet<u8> =
             sve_profile.mask_regs.iter().map(|m| m.0).collect();
-        assert!(!mask_ids.contains(&7), "p7 must not be allocatable (reserved for all-true)");
+        assert!(
+            !mask_ids.contains(&7),
+            "p7 must not be allocatable (reserved for all-true)"
+        );
 
         // NEON has no predicate masks
         assert!(neon_profile.mask_regs.is_empty());
@@ -2547,29 +2933,63 @@ mod tests {
         let scratch_ids: Vec<u8> = profile.scratch_vec_regs.iter().map(|r| r.0).collect();
         // All scratch IDs must be distinct
         let unique: std::collections::HashSet<u8> = scratch_ids.iter().copied().collect();
-        assert_eq!(unique.len(), 6, "scratch_vec_regs must have 6 unique entries");
+        assert_eq!(
+            unique.len(),
+            6,
+            "scratch_vec_regs must have 6 unique entries"
+        );
 
         // No scratch reg may appear in the allocatable vec_regs
         let alloc_ids: std::collections::HashSet<u8> =
             profile.vec_regs.iter().map(|r| r.0).collect();
         for sid in &scratch_ids {
-            assert!(!alloc_ids.contains(sid), "scratch vec {} must not be in allocatable pool", sid);
+            assert!(
+                !alloc_ids.contains(sid),
+                "scratch vec {} must not be in allocatable pool",
+                sid
+            );
         }
 
         // The highest scratch reg + 1 should equal the total vec count (contiguous from top)
         let max_scratch = *scratch_ids.iter().max().unwrap();
-        let vec_count = if matches!(&profile.platform, Platform::X86_64 { has_avx512: true, .. }) { 32 } else { 16 };
-        assert_eq!(max_scratch + 1, vec_count, "highest scratch reg should be vec_count - 1");
+        let vec_count = if matches!(
+            &profile.platform,
+            Platform::X86_64 {
+                has_avx512: true,
+                ..
+            }
+        ) {
+            32
+        } else {
+            16
+        };
+        assert_eq!(
+            max_scratch + 1,
+            vec_count,
+            "highest scratch reg should be vec_count - 1"
+        );
 
         // BCE-20260702-REGALLOC-AVX2-OOB: S 类 / V 类 scratch 分区不变量。
         // 内部 scratch [0..3] (HReduce/FWHT/broadcast/ScalarLoad — 走 SSE scalar 指令
         // vmovss/vmovsd, iced_x86 编码只支持 xmm0..15) 必须 ≤15; spill scratch [3..6]
         // (vmovups ymm/zmm, AVX-512 支持 16..31) AVX-512 下应 ≥16 (把低位让给 RegAllocator)。
-        assert!(profile.scratch_vec_regs[0..3].iter().all(|p| p.0 <= 15),
-            "S 类内部 scratch 必须 ≤15 (SSE scalar 编码约束), got {:?}", &profile.scratch_vec_regs[0..3]);
-        if matches!(&profile.platform, Platform::X86_64 { has_avx512: true, .. }) {
-            assert!(profile.scratch_vec_regs[3..6].iter().all(|p| p.0 >= 16),
-                "V 类 spill scratch AVX-512 下应 ≥16, got {:?}", &profile.scratch_vec_regs[3..6]);
+        assert!(
+            profile.scratch_vec_regs[0..3].iter().all(|p| p.0 <= 15),
+            "S 类内部 scratch 必须 ≤15 (SSE scalar 编码约束), got {:?}",
+            &profile.scratch_vec_regs[0..3]
+        );
+        if matches!(
+            &profile.platform,
+            Platform::X86_64 {
+                has_avx512: true,
+                ..
+            }
+        ) {
+            assert!(
+                profile.scratch_vec_regs[3..6].iter().all(|p| p.0 >= 16),
+                "V 类 spill scratch AVX-512 下应 ≥16, got {:?}",
+                &profile.scratch_vec_regs[3..6]
+            );
         }
     }
 

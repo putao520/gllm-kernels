@@ -8,9 +8,9 @@
 //! via the Phase 3 codegen pipeline, maps it into executable memory, and
 //! benchmarks it with the specified tuning parameters.
 
-use std::time::Instant;
-use crate::autotuning::search_space::{TuningConfig, JitParams};
+use crate::autotuning::search_space::{JitParams, TuningConfig};
 use crate::types::CompilerError;
+use std::time::Instant;
 
 /// Result of benchmarking a single configuration.
 #[derive(Debug, Clone)]
@@ -31,7 +31,9 @@ pub struct BenchResult {
 
 impl std::fmt::Display for BenchResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "median={:.1}us IQR={:.1}us min={:.1}us",
+        write!(
+            f,
+            "median={:.1}us IQR={:.1}us min={:.1}us",
             self.median_ns / 1000.0,
             self.iqr_ns / 1000.0,
             self.min_ns / 1000.0,
@@ -67,7 +69,7 @@ impl Default for BenchConfig {
             warmup_iters: 3,
             min_iters: 7,
             max_iters: 100,
-            min_time_ns: 50_000_000,   // 50ms minimum
+            min_time_ns: 50_000_000,    // 50ms minimum
             max_time_ns: 2_000_000_000, // 2s timeout
         }
     }
@@ -80,8 +82,8 @@ impl BenchConfig {
             warmup_iters: 2,
             min_iters: 5,
             max_iters: 30,
-            min_time_ns: 20_000_000,    // 20ms
-            max_time_ns: 500_000_000,   // 500ms timeout
+            min_time_ns: 20_000_000,  // 20ms
+            max_time_ns: 500_000_000, // 500ms timeout
         }
     }
 
@@ -271,7 +273,8 @@ fn generate_jit_gemm_code(
         return Err(format!(
             "NR variant {} not aligned to SIMD width {}",
             effective_nr, simd_w
-        ).into());
+        )
+        .into());
     }
     let nr_vecs = effective_nr / simd_w;
     let num_acc = mr * nr_vecs;
@@ -280,8 +283,13 @@ fn generate_jit_gemm_code(
     if num_acc + scratch_needed > total_regs {
         return Err(format!(
             "Register overflow: {}*{} accumulators + {} scratch = {} > {} available",
-            mr, nr_vecs, scratch_needed, num_acc + scratch_needed, total_regs
-        ).into());
+            mr,
+            nr_vecs,
+            scratch_needed,
+            num_acc + scratch_needed,
+            total_regs
+        )
+        .into());
     }
 
     let mut codegen = X86CodeGen::new(profile, crate::types::DType::F32);
@@ -367,11 +375,11 @@ impl ExecutableGemmBuffer {
             std::ptr::copy_nonoverlapping(code.as_ptr(), ptr, code.len());
         }
 
-        let ret = unsafe {
-            libc::mprotect(ptr as *mut _, len, libc::PROT_READ | libc::PROT_EXEC)
-        };
+        let ret = unsafe { libc::mprotect(ptr as *mut _, len, libc::PROT_READ | libc::PROT_EXEC) };
         if ret != 0 {
-            unsafe { libc::munmap(ptr as *mut _, len); }
+            unsafe {
+                libc::munmap(ptr as *mut _, len);
+            }
             return Err("mprotect failed for JIT GEMM buffer".into());
         }
 
@@ -381,13 +389,7 @@ impl ExecutableGemmBuffer {
     /// Call the JIT-generated GEMM function.
     ///
     /// ABI: rdi=A, rsi=B, rdx=C, rcx=scratchpad
-    unsafe fn call(
-        &self,
-        a: *const f32,
-        b: *const f32,
-        c: *mut f32,
-        scratchpad: *mut u8,
-    ) {
+    unsafe fn call(&self, a: *const f32, b: *const f32, c: *mut f32, scratchpad: *mut u8) {
         type GemmFn = unsafe extern "C" fn(*const f32, *const f32, *mut f32, *mut u8);
         let f: GemmFn = std::mem::transmute(self.ptr);
         f(a, b, c, scratchpad);
@@ -519,7 +521,9 @@ mod tests {
 
     #[test]
     fn test_stats_correctness() {
-        let mut times = vec![100.0, 200.0, 150.0, 120.0, 180.0, 130.0, 160.0, 140.0, 170.0, 110.0];
+        let mut times = vec![
+            100.0, 200.0, 150.0, 120.0, 180.0, 130.0, 160.0, 140.0, 170.0, 110.0,
+        ];
         let result = compute_stats(&mut times);
         // Median of sorted [100,110,120,130,140,150,160,170,180,200] trimmed to 9 = [100..180]
         // Median of 9 elements = element at index 4 = 140
@@ -713,14 +717,18 @@ mod tests {
         // Arrange: 20 elements with one massive outlier at the end
         let mut times: Vec<f64> = (1..=19).map(|v| v as f64 * 10.0).collect();
         times.push(999_999.0); // outlier
-        // sorted: [10, 20, ..., 190, 999999]
-        // trimmed to 18 (20*9/10=18): [10, 20, ..., 180]
+                               // sorted: [10, 20, ..., 190, 999999]
+                               // trimmed to 18 (20*9/10=18): [10, 20, ..., 180]
         let result = compute_stats(&mut times);
         // Assert: min should be the smallest (10.0), not affected by outlier
         assert_eq!(result.min_ns, 10.0);
         // Median of 18 elements (even) = (trimmed[8] + trimmed[9]) / 2 = (90 + 100) / 2 = 95
         assert_eq!(result.median_ns, 95.0);
-        assert!(result.iqr_ns < 500.0, "IQR should not be inflated by outlier: got {}", result.iqr_ns);
+        assert!(
+            result.iqr_ns < 500.0,
+            "IQR should not be inflated by outlier: got {}",
+            result.iqr_ns
+        );
     }
 
     #[test]
@@ -779,8 +787,8 @@ mod tests {
             warmup_iters: 2,
             min_iters: 5,
             max_iters: 10,
-            min_time_ns: 0,                // hit min_iters immediately
-            max_time_ns: 10_000_000_000,   // effectively infinite
+            min_time_ns: 0,              // hit min_iters immediately
+            max_time_ns: 10_000_000_000, // effectively infinite
         };
         let mut count = 0usize;
         // Act
@@ -788,17 +796,21 @@ mod tests {
             count += 1;
         });
         // Assert: warmup_iters + min_iters = 2 + 5 = 7 minimum invocations
-        assert!(count >= config.warmup_iters + config.min_iters,
-            "Expected at least {} invocations, got {}", config.warmup_iters + config.min_iters, count);
+        assert!(
+            count >= config.warmup_iters + config.min_iters,
+            "Expected at least {} invocations, got {}",
+            config.warmup_iters + config.min_iters,
+            count
+        );
     }
 
     #[test]
     fn test_bench_result_display_format_values() {
         // Arrange
         let result = BenchResult {
-            median_ns: 1_500_000.0,  // 1500 us
-            iqr_ns: 200_000.0,        // 200 us
-            min_ns: 1_200_000.0,      // 1200 us
+            median_ns: 1_500_000.0, // 1500 us
+            iqr_ns: 200_000.0,      // 200 us
+            min_ns: 1_200_000.0,    // 1200 us
             samples: 10,
             gflops: Some(42.5),
             bandwidth_gbs: None,
@@ -806,11 +818,26 @@ mod tests {
         // Act
         let s = format!("{result}");
         // Assert: check that values are formatted in microseconds
-        assert!(s.contains("median=1500.0us"), "display should contain median in us: got {s}");
-        assert!(s.contains("IQR=200.0us"), "display should contain IQR in us: got {s}");
-        assert!(s.contains("min=1200.0us"), "display should contain min in us: got {s}");
-        assert!(s.contains("42.5GFLOPS"), "display should contain GFLOPS: got {s}");
-        assert!(!s.contains("GB/s"), "display should not contain bandwidth when None");
+        assert!(
+            s.contains("median=1500.0us"),
+            "display should contain median in us: got {s}"
+        );
+        assert!(
+            s.contains("IQR=200.0us"),
+            "display should contain IQR in us: got {s}"
+        );
+        assert!(
+            s.contains("min=1200.0us"),
+            "display should contain min in us: got {s}"
+        );
+        assert!(
+            s.contains("42.5GFLOPS"),
+            "display should contain GFLOPS: got {s}"
+        );
+        assert!(
+            !s.contains("GB/s"),
+            "display should not contain bandwidth when None"
+        );
     }
 
     #[test]
@@ -855,7 +882,10 @@ mod tests {
         let ps = page_size();
         // Assert: page size must be a positive power of 2
         assert!(ps > 0, "page size should be positive, got {ps}");
-        assert!(ps.is_power_of_two(), "page size should be a power of 2, got {ps}");
+        assert!(
+            ps.is_power_of_two(),
+            "page size should be a power of 2, got {ps}"
+        );
     }
 
     #[cfg(feature = "jit-x86")]
@@ -921,11 +951,15 @@ mod tests {
             black_box(sum);
         });
         // Assert: gflops = flops / median_ns (GFLOPS = 1e9 flops / 1e9 ns)
-        let gflops = result.gflops.expect("gflops should be computed when median > 0");
+        let gflops = result
+            .gflops
+            .expect("gflops should be computed when median > 0");
         assert!(gflops > 0.0, "GFLOPS should be positive, got {gflops}");
         let expected = flops as f64 / result.median_ns;
-        assert!((gflops - expected).abs() < 1e-6,
-            "GFLOPS formula mismatch: got {gflops}, expected {expected}");
+        assert!(
+            (gflops - expected).abs() < 1e-6,
+            "GFLOPS formula mismatch: got {gflops}, expected {expected}"
+        );
     }
 
     #[test]
@@ -948,11 +982,15 @@ mod tests {
             black_box(sum);
         });
         // Assert: bandwidth_gbs = bytes / median_ns (GB/s = bytes / ns since 1e9 ns/s, no 1e9 factor)
-        let bw = result.bandwidth_gbs.expect("bandwidth should be computed when median > 0");
+        let bw = result
+            .bandwidth_gbs
+            .expect("bandwidth should be computed when median > 0");
         assert!(bw > 0.0, "bandwidth should be positive, got {bw}");
         let expected = bytes as f64 / result.median_ns;
-        assert!((bw - expected).abs() < 1e-12,
-            "bandwidth formula mismatch: got {bw}, expected {expected}");
+        assert!(
+            (bw - expected).abs() < 1e-12,
+            "bandwidth formula mismatch: got {bw}, expected {expected}"
+        );
     }
 
     #[test]
@@ -961,7 +999,10 @@ mod tests {
         let t0 = precise_now_ns();
         let t1 = precise_now_ns();
         // Assert: time is non-decreasing
-        assert!(t1 >= t0, "precise_now_ns should be non-decreasing: t0={t0}, t1={t1}");
+        assert!(
+            t1 >= t0,
+            "precise_now_ns should be non-decreasing: t0={t0}, t1={t1}"
+        );
     }
 
     #[test]
@@ -981,7 +1022,10 @@ mod tests {
         assert!(s.contains("MC=64"), "should contain MC: got {s}");
         assert!(s.contains("NC=256"), "should contain NC: got {s}");
         assert!(s.contains("threads=4"), "should contain threads: got {s}");
-        assert!(!s.contains("|"), "should not contain JIT separator when jit is None");
+        assert!(
+            !s.contains("|"),
+            "should not contain JIT separator when jit is None"
+        );
     }
 
     #[test]
@@ -1009,7 +1053,10 @@ mod tests {
         // Assert
         assert_eq!(params.k_unroll, 4);
         assert_eq!(params.prefetch_distance, 8);
-        assert_eq!(params.reg_alloc_strategy, crate::autotuning::search_space::RegAllocStrategy::Balanced);
+        assert_eq!(
+            params.reg_alloc_strategy,
+            crate::autotuning::search_space::RegAllocStrategy::Balanced
+        );
         assert_eq!(params.sw_pipeline_depth, 0);
         assert_eq!(params.nr_variant, 16);
     }
@@ -1043,8 +1090,11 @@ mod tests {
         for variant in all {
             let idx = variant.to_index();
             let recovered = RegAllocStrategy::from_index(idx);
-            assert_eq!(*variant, recovered,
-                "roundtrip failed for {:?}: index={} recovered={:?}", variant, idx, recovered);
+            assert_eq!(
+                *variant, recovered,
+                "roundtrip failed for {:?}: index={} recovered={:?}",
+                variant, idx, recovered
+            );
         }
     }
 

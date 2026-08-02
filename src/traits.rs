@@ -1,6 +1,6 @@
-use std::fmt::Debug;
-use half::{f16, bf16};
 use crate::quant::QuantType;
+use half::{bf16, f16};
+use std::fmt::Debug;
 
 /// Activation function selector for fused GEMM+activation epilogue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +35,14 @@ impl<T> DeviceRepr for T where T: Debug + Clone + Send + Sync + 'static {}
 /// Provides a unified interface for scalar operations across precisions (f32, f16, bf16).
 /// Compile-time monomorphization, zero runtime overhead.
 pub trait Element:
-    Debug + Clone + Copy + Send + Sync + Default + 'static + DeviceRepr
+    Debug
+    + Clone
+    + Copy
+    + Send
+    + Sync
+    + Default
+    + 'static
+    + DeviceRepr
     + std::ops::Add<Output = Self>
     + std::ops::Sub<Output = Self>
     + std::ops::Mul<Output = Self>
@@ -89,33 +96,84 @@ impl Element for f32 {
     const ONE: Self = 1.0;
     const ELEM_ID: u8 = 0;
 
-    #[inline(always)] fn from_f32(v: f32) -> Self { v }
-    #[inline(always)] fn to_f32(self) -> f32 { self }
-    #[inline(always)] fn mul_add(self, a: Self, b: Self) -> Self { f32::mul_add(a, b, self) }
-
-    #[inline(always)] fn elem_add(self, other: Self) -> Self { self + other }
-    #[inline(always)] fn elem_sub(self, other: Self) -> Self { self - other }
-    #[inline(always)] fn elem_mul(self, other: Self) -> Self { self * other }
-    #[inline(always)] fn elem_div(self, other: Self) -> Self { self / other }
-    #[inline(always)] fn neg(self) -> Self { -self }
-
-    #[inline(always)] fn max(self, other: Self) -> Self { f32::max(self, other) }
-    #[inline(always)] fn min(self, other: Self) -> Self { f32::min(self, other) }
-
-    #[inline(always)] fn sqrt(self) -> Self { f32::sqrt(self) }
-    #[inline(always)] fn exp(self) -> Self { f32::exp(self) }
-    #[inline(always)] fn recip(self) -> Self { 1.0 / self }
-    #[inline(always)] fn abs(self) -> Self { f32::abs(self) }
-    #[inline(always)] fn tanh(self) -> Self { f32::tanh(self) }
+    #[inline(always)]
+    fn from_f32(v: f32) -> Self {
+        v
+    }
+    #[inline(always)]
+    fn to_f32(self) -> f32 {
+        self
+    }
+    #[inline(always)]
+    fn mul_add(self, a: Self, b: Self) -> Self {
+        f32::mul_add(a, b, self)
+    }
 
     #[inline(always)]
-    fn as_f32_slice(s: &[Self]) -> Option<&[f32]> { Some(s) }
+    fn elem_add(self, other: Self) -> Self {
+        self + other
+    }
+    #[inline(always)]
+    fn elem_sub(self, other: Self) -> Self {
+        self - other
+    }
+    #[inline(always)]
+    fn elem_mul(self, other: Self) -> Self {
+        self * other
+    }
+    #[inline(always)]
+    fn elem_div(self, other: Self) -> Self {
+        self / other
+    }
+    #[inline(always)]
+    fn neg(self) -> Self {
+        -self
+    }
 
     #[inline(always)]
-    fn as_f32_slice_mut(s: &mut [Self]) -> Option<&mut [f32]> { Some(s) }
+    fn max(self, other: Self) -> Self {
+        f32::max(self, other)
+    }
+    #[inline(always)]
+    fn min(self, other: Self) -> Self {
+        f32::min(self, other)
+    }
 
     #[inline(always)]
-    fn as_f32_ref(v: &Self) -> Option<&f32> { Some(v) }
+    fn sqrt(self) -> Self {
+        f32::sqrt(self)
+    }
+    #[inline(always)]
+    fn exp(self) -> Self {
+        f32::exp(self)
+    }
+    #[inline(always)]
+    fn recip(self) -> Self {
+        1.0 / self
+    }
+    #[inline(always)]
+    fn abs(self) -> Self {
+        f32::abs(self)
+    }
+    #[inline(always)]
+    fn tanh(self) -> Self {
+        f32::tanh(self)
+    }
+
+    #[inline(always)]
+    fn as_f32_slice(s: &[Self]) -> Option<&[f32]> {
+        Some(s)
+    }
+
+    #[inline(always)]
+    fn as_f32_slice_mut(s: &mut [Self]) -> Option<&mut [f32]> {
+        Some(s)
+    }
+
+    #[inline(always)]
+    fn as_f32_ref(v: &Self) -> Option<&f32> {
+        Some(v)
+    }
 }
 
 impl Element for f16 {
@@ -123,30 +181,90 @@ impl Element for f16 {
     const ONE: Self = f16::ONE;
     const ELEM_ID: u8 = 1;
 
-    #[inline(always)] fn from_f32(v: f32) -> Self { f16::from_f32(v) }
-    #[inline(always)] fn to_f32(self) -> f32 { f16::to_f32(self) }
-    #[inline(always)] fn mul_add(self, a: Self, b: Self) -> Self {
+    #[inline(always)]
+    fn from_f32(v: f32) -> Self {
+        f16::from_f32(v)
+    }
+    #[inline(always)]
+    fn to_f32(self) -> f32 {
+        f16::to_f32(self)
+    }
+    #[inline(always)]
+    fn mul_add(self, a: Self, b: Self) -> Self {
         f16::from_f32(f32::mul_add(a.to_f32(), b.to_f32(), self.to_f32()))
     }
 
-    #[inline(always)] fn elem_add(self, other: Self) -> Self { f16::from_f32(self.to_f32() + other.to_f32()) }
-    #[inline(always)] fn elem_sub(self, other: Self) -> Self { f16::from_f32(self.to_f32() - other.to_f32()) }
-    #[inline(always)] fn elem_mul(self, other: Self) -> Self { f16::from_f32(self.to_f32() * other.to_f32()) }
-    #[inline(always)] fn elem_div(self, other: Self) -> Self { f16::from_f32(self.to_f32() / other.to_f32()) }
-    #[inline(always)] fn neg(self) -> Self { f16::from_f32(-self.to_f32()) }
+    #[inline(always)]
+    fn elem_add(self, other: Self) -> Self {
+        f16::from_f32(self.to_f32() + other.to_f32())
+    }
+    #[inline(always)]
+    fn elem_sub(self, other: Self) -> Self {
+        f16::from_f32(self.to_f32() - other.to_f32())
+    }
+    #[inline(always)]
+    fn elem_mul(self, other: Self) -> Self {
+        f16::from_f32(self.to_f32() * other.to_f32())
+    }
+    #[inline(always)]
+    fn elem_div(self, other: Self) -> Self {
+        f16::from_f32(self.to_f32() / other.to_f32())
+    }
+    #[inline(always)]
+    fn neg(self) -> Self {
+        f16::from_f32(-self.to_f32())
+    }
 
-    #[inline(always)] fn max(self, other: Self) -> Self { if self.to_f32() >= other.to_f32() { self } else { other } }
-    #[inline(always)] fn min(self, other: Self) -> Self { if self.to_f32() <= other.to_f32() { self } else { other } }
+    #[inline(always)]
+    fn max(self, other: Self) -> Self {
+        if self.to_f32() >= other.to_f32() {
+            self
+        } else {
+            other
+        }
+    }
+    #[inline(always)]
+    fn min(self, other: Self) -> Self {
+        if self.to_f32() <= other.to_f32() {
+            self
+        } else {
+            other
+        }
+    }
 
-    #[inline(always)] fn sqrt(self) -> Self { f16::from_f32(self.to_f32().sqrt()) }
-    #[inline(always)] fn exp(self) -> Self { f16::from_f32(self.to_f32().exp()) }
-    #[inline(always)] fn recip(self) -> Self { f16::from_f32(1.0 / self.to_f32()) }
-    #[inline(always)] fn abs(self) -> Self { f16::from_f32(self.to_f32().abs()) }
-    #[inline(always)] fn tanh(self) -> Self { f16::from_f32(self.to_f32().tanh()) }
+    #[inline(always)]
+    fn sqrt(self) -> Self {
+        f16::from_f32(self.to_f32().sqrt())
+    }
+    #[inline(always)]
+    fn exp(self) -> Self {
+        f16::from_f32(self.to_f32().exp())
+    }
+    #[inline(always)]
+    fn recip(self) -> Self {
+        f16::from_f32(1.0 / self.to_f32())
+    }
+    #[inline(always)]
+    fn abs(self) -> Self {
+        f16::from_f32(self.to_f32().abs())
+    }
+    #[inline(always)]
+    fn tanh(self) -> Self {
+        f16::from_f32(self.to_f32().tanh())
+    }
 
-    #[inline(always)] fn as_f32_slice(_s: &[Self]) -> Option<&[f32]> { None }
-    #[inline(always)] fn as_f32_slice_mut(_s: &mut [Self]) -> Option<&mut [f32]> { None }
-    #[inline(always)] fn as_f32_ref(_v: &Self) -> Option<&f32> { None }
+    #[inline(always)]
+    fn as_f32_slice(_s: &[Self]) -> Option<&[f32]> {
+        None
+    }
+    #[inline(always)]
+    fn as_f32_slice_mut(_s: &mut [Self]) -> Option<&mut [f32]> {
+        None
+    }
+    #[inline(always)]
+    fn as_f32_ref(_v: &Self) -> Option<&f32> {
+        None
+    }
 }
 
 impl Element for bf16 {
@@ -154,30 +272,90 @@ impl Element for bf16 {
     const ONE: Self = bf16::ONE;
     const ELEM_ID: u8 = 2;
 
-    #[inline(always)] fn from_f32(v: f32) -> Self { bf16::from_f32(v) }
-    #[inline(always)] fn to_f32(self) -> f32 { bf16::to_f32(self) }
-    #[inline(always)] fn mul_add(self, a: Self, b: Self) -> Self {
+    #[inline(always)]
+    fn from_f32(v: f32) -> Self {
+        bf16::from_f32(v)
+    }
+    #[inline(always)]
+    fn to_f32(self) -> f32 {
+        bf16::to_f32(self)
+    }
+    #[inline(always)]
+    fn mul_add(self, a: Self, b: Self) -> Self {
         bf16::from_f32(f32::mul_add(a.to_f32(), b.to_f32(), self.to_f32()))
     }
 
-    #[inline(always)] fn elem_add(self, other: Self) -> Self { bf16::from_f32(self.to_f32() + other.to_f32()) }
-    #[inline(always)] fn elem_sub(self, other: Self) -> Self { bf16::from_f32(self.to_f32() - other.to_f32()) }
-    #[inline(always)] fn elem_mul(self, other: Self) -> Self { bf16::from_f32(self.to_f32() * other.to_f32()) }
-    #[inline(always)] fn elem_div(self, other: Self) -> Self { bf16::from_f32(self.to_f32() / other.to_f32()) }
-    #[inline(always)] fn neg(self) -> Self { bf16::from_f32(-self.to_f32()) }
+    #[inline(always)]
+    fn elem_add(self, other: Self) -> Self {
+        bf16::from_f32(self.to_f32() + other.to_f32())
+    }
+    #[inline(always)]
+    fn elem_sub(self, other: Self) -> Self {
+        bf16::from_f32(self.to_f32() - other.to_f32())
+    }
+    #[inline(always)]
+    fn elem_mul(self, other: Self) -> Self {
+        bf16::from_f32(self.to_f32() * other.to_f32())
+    }
+    #[inline(always)]
+    fn elem_div(self, other: Self) -> Self {
+        bf16::from_f32(self.to_f32() / other.to_f32())
+    }
+    #[inline(always)]
+    fn neg(self) -> Self {
+        bf16::from_f32(-self.to_f32())
+    }
 
-    #[inline(always)] fn max(self, other: Self) -> Self { if self.to_f32() >= other.to_f32() { self } else { other } }
-    #[inline(always)] fn min(self, other: Self) -> Self { if self.to_f32() <= other.to_f32() { self } else { other } }
+    #[inline(always)]
+    fn max(self, other: Self) -> Self {
+        if self.to_f32() >= other.to_f32() {
+            self
+        } else {
+            other
+        }
+    }
+    #[inline(always)]
+    fn min(self, other: Self) -> Self {
+        if self.to_f32() <= other.to_f32() {
+            self
+        } else {
+            other
+        }
+    }
 
-    #[inline(always)] fn sqrt(self) -> Self { bf16::from_f32(self.to_f32().sqrt()) }
-    #[inline(always)] fn exp(self) -> Self { bf16::from_f32(self.to_f32().exp()) }
-    #[inline(always)] fn recip(self) -> Self { bf16::from_f32(1.0 / self.to_f32()) }
-    #[inline(always)] fn abs(self) -> Self { bf16::from_f32(self.to_f32().abs()) }
-    #[inline(always)] fn tanh(self) -> Self { bf16::from_f32(self.to_f32().tanh()) }
+    #[inline(always)]
+    fn sqrt(self) -> Self {
+        bf16::from_f32(self.to_f32().sqrt())
+    }
+    #[inline(always)]
+    fn exp(self) -> Self {
+        bf16::from_f32(self.to_f32().exp())
+    }
+    #[inline(always)]
+    fn recip(self) -> Self {
+        bf16::from_f32(1.0 / self.to_f32())
+    }
+    #[inline(always)]
+    fn abs(self) -> Self {
+        bf16::from_f32(self.to_f32().abs())
+    }
+    #[inline(always)]
+    fn tanh(self) -> Self {
+        bf16::from_f32(self.to_f32().tanh())
+    }
 
-    #[inline(always)] fn as_f32_slice(_s: &[Self]) -> Option<&[f32]> { None }
-    #[inline(always)] fn as_f32_slice_mut(_s: &mut [Self]) -> Option<&mut [f32]> { None }
-    #[inline(always)] fn as_f32_ref(_v: &Self) -> Option<&f32> { None }
+    #[inline(always)]
+    fn as_f32_slice(_s: &[Self]) -> Option<&[f32]> {
+        None
+    }
+    #[inline(always)]
+    fn as_f32_slice_mut(_s: &mut [Self]) -> Option<&mut [f32]> {
+        None
+    }
+    #[inline(always)]
+    fn as_f32_ref(_v: &Self) -> Option<&f32> {
+        None
+    }
 }
 
 // ==========================================================================
@@ -207,7 +385,6 @@ pub trait Backend: Send + Sync + 'static {
 /// — every `impl Kernels` must provide a real implementation (NO-PRAGMATIC-HACKS:
 /// no `unimplemented!` stubs allowed). `CpuKernels` implements all of them.
 pub trait Kernels<E: Element>: Send + Sync {
-
     // ======================================================================
     // BLAS-1: Vector operations
     // ======================================================================
@@ -234,10 +411,29 @@ pub trait Kernels<E: Element>: Send + Sync {
     fn gemm_bias(&self, a: &[E], b: &[E], bias: &[E], c: &mut [E], m: usize, n: usize, k: usize);
     /// Fused GEMM+bias+activation: C = act(A*B + bias)
     /// Activation is applied in-register before writeback, avoiding an extra C read/write pass.
-    fn gemm_bias_act(&self, a: &[E], b: &[E], bias: &[E], c: &mut [E], m: usize, n: usize, k: usize, act: Activation);
+    fn gemm_bias_act(
+        &self,
+        a: &[E],
+        b: &[E],
+        bias: &[E],
+        c: &mut [E],
+        m: usize,
+        n: usize,
+        k: usize,
+        act: Activation,
+    );
     fn pack_b(&self, b: &[E], n: usize, k: usize) -> Vec<E>;
     fn gemm_prepacked(&self, a: &[E], packed_b: &[E], c: &mut [E], m: usize, n: usize, k: usize);
-    fn gemm_bias_prepacked(&self, a: &[E], packed_b: &[E], bias: &[E], c: &mut [E], m: usize, n: usize, k: usize);
+    fn gemm_bias_prepacked(
+        &self,
+        a: &[E],
+        packed_b: &[E],
+        bias: &[E],
+        c: &mut [E],
+        m: usize,
+        n: usize,
+        k: usize,
+    );
 
     // ======================================================================
     // Activation functions
@@ -263,7 +459,15 @@ pub trait Kernels<E: Element>: Send + Sync {
     // ======================================================================
 
     fn rope(&self, qk: &mut [E], cos: &[E], sin: &[E], head_dim: usize, interleaved: bool);
-    fn rope_with_pos(&self, qk: &mut [E], cos: &[E], sin: &[E], head_dim: usize, position: usize, interleaved: bool);
+    fn rope_with_pos(
+        &self,
+        qk: &mut [E],
+        cos: &[E],
+        sin: &[E],
+        head_dim: usize,
+        position: usize,
+        interleaved: bool,
+    );
 
     // ======================================================================
     // Dequantization (output fixed f32)
@@ -297,8 +501,26 @@ pub trait Kernels<E: Element>: Send + Sync {
     fn gemv_q4(&self, weight: &[u8], input: &[E], scale: f32, n: usize) -> E;
     fn gemv_q2(&self, weight: &[u8], input: &[E], scale: f32, n: usize) -> E;
     fn gemv_q1(&self, weight: &[u8], input: &[E], scale: f32, n: usize) -> E;
-    fn gemm_q8(&self, weight: &[i8], input: &[E], output: &mut [E], scales: &[f32], m: usize, n: usize, k: usize);
-    fn gemm_q4(&self, weight: &[u8], input: &[E], output: &mut [E], scales: &[f32], m: usize, n: usize, k: usize);
+    fn gemm_q8(
+        &self,
+        weight: &[i8],
+        input: &[E],
+        output: &mut [E],
+        scales: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    );
+    fn gemm_q4(
+        &self,
+        weight: &[u8],
+        input: &[E],
+        output: &mut [E],
+        scales: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    );
 
     // ======================================================================
     // IQ Quantized operations
@@ -319,37 +541,71 @@ pub trait Kernels<E: Element>: Send + Sync {
     // ======================================================================
 
     fn kquant_matmul(
-        &self, weight_blocks: &[u8], input: &[E], output: &mut [E],
-        quant_type: QuantType, m: usize, n: usize, k: usize,
+        &self,
+        weight_blocks: &[u8],
+        input: &[E],
+        output: &mut [E],
+        quant_type: QuantType,
+        m: usize,
+        n: usize,
+        k: usize,
     );
 
     fn classic_matmul(
-        &self, weight_blocks: &[u8], input: &[E], output: &mut [E],
-        quant_type: QuantType, m: usize, n: usize, k: usize,
+        &self,
+        weight_blocks: &[u8],
+        input: &[E],
+        output: &mut [E],
+        quant_type: QuantType,
+        m: usize,
+        n: usize,
+        k: usize,
     );
 
     fn iq_matmul(
-        &self, weight_blocks: &[u8], input: &[E], output: &mut [E],
-        quant_type: QuantType, m: usize, n: usize, k: usize,
+        &self,
+        weight_blocks: &[u8],
+        input: &[E],
+        output: &mut [E],
+        quant_type: QuantType,
+        m: usize,
+        n: usize,
+        k: usize,
     );
 
     fn awq_matmul(
-        &self, weight: &[u8], zeros: &[u8], scales: &[f16],
-        input: &[E], output: &mut [E],
-        m: usize, n: usize, k: usize,
+        &self,
+        weight: &[u8],
+        zeros: &[u8],
+        scales: &[f16],
+        input: &[E],
+        output: &mut [E],
+        m: usize,
+        n: usize,
+        k: usize,
     );
 
     fn gptq_matmul(
-        &self, weight: &[u8], g_idx: &[i32], scales: &[f16],
-        input: &[E], output: &mut [E],
-        m: usize, n: usize, k: usize,
+        &self,
+        weight: &[u8],
+        g_idx: &[i32],
+        scales: &[f16],
+        input: &[E],
+        output: &mut [E],
+        m: usize,
+        n: usize,
+        k: usize,
     );
 
     fn squeeze_matmul(
-        &self, weight_blocks: &[u8], input: &[E], output: &mut [E],
-        m: usize, n: usize, k: usize,
+        &self,
+        weight_blocks: &[u8],
+        input: &[E],
+        output: &mut [E],
+        m: usize,
+        n: usize,
+        k: usize,
     );
-
 }
 
 #[cfg(test)]
@@ -367,7 +623,13 @@ mod tests {
 
     #[test]
     fn activation_count() {
-        let all = [Activation::None, Activation::Relu, Activation::Silu, Activation::Gelu, Activation::GeGlu];
+        let all = [
+            Activation::None,
+            Activation::Relu,
+            Activation::Silu,
+            Activation::Gelu,
+            Activation::GeGlu,
+        ];
         assert_eq!(all.len(), 5);
     }
 
@@ -393,7 +655,7 @@ mod tests {
         assert!((a.elem_add(b) - 8.0).abs() < 1e-6);
         assert!((a.elem_sub(b) - 2.0).abs() < 1e-6);
         assert!((a.elem_mul(b) - 15.0).abs() < 1e-6);
-        assert!((a.elem_div(b) - 5.0/3.0).abs() < 1e-6);
+        assert!((a.elem_div(b) - 5.0 / 3.0).abs() < 1e-6);
         assert!((a.neg() - (-5.0)).abs() < 1e-6);
     }
 
@@ -546,8 +808,11 @@ mod tests {
     fn activation_equality_all_pairs() {
         // Verify each variant equals itself and differs from others.
         let variants = [
-            Activation::None, Activation::Relu, Activation::Silu,
-            Activation::Gelu, Activation::GeGlu,
+            Activation::None,
+            Activation::Relu,
+            Activation::Silu,
+            Activation::Gelu,
+            Activation::GeGlu,
         ];
         for (i, vi) in variants.iter().enumerate() {
             for (j, vj) in variants.iter().enumerate() {

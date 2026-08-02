@@ -8,7 +8,6 @@ use crate::compiler::graph::CompilerGraph;
 use crate::compiler::trace::{QuantPrecision, TraceOp, ValueId};
 use crate::types::CompilerError;
 
-
 // PerLayerEmbed lower functions removed — replaced by AltUpPredict/AltUpCorrect/AltUpInject
 // (Injective ops dispatched via emit_injective_inline, no dedicated lower needed)
 
@@ -29,27 +28,39 @@ pub(crate) fn lower_depthwise_conv1d(
 ) -> Result<(), CompilerError> {
     if op.inputs.len() != 2 {
         return Err(CompilerError::CodegenViolation(format!(
-            "DepthwiseConv1D: 需要 2 输入 [x, weight], 实际 {}", op.inputs.len(),
+            "DepthwiseConv1D: 需要 2 输入 [x, weight], 实际 {}",
+            op.inputs.len(),
         )));
     }
     if op.outputs.len() != 1 {
         return Err(CompilerError::CodegenViolation(format!(
-            "DepthwiseConv1D: 需要 1 输出, 实际 {}", op.outputs.len(),
+            "DepthwiseConv1D: 需要 1 输出, 实际 {}",
+            op.outputs.len(),
         )));
     }
 
     // ── 物化指针 ──
-    let x_ptr = resolver.materialize(prog, op.inputs[0], abi)
-        .ok_or_else(|| CompilerError::CodegenViolation(
-            "DepthwiseConv1D: inputs[0] (x) 无法定位".into()))?;
-    let w_ptr = resolver.materialize(prog, op.inputs[1], abi)
-        .ok_or_else(|| CompilerError::CodegenViolation(
-            "DepthwiseConv1D: inputs[1] (weight) 无法定位".into()))?;
-    let out_ptr = resolver.materialize(prog, op.outputs[0], abi)
-        .ok_or_else(|| CompilerError::CodegenViolation(
-            "DepthwiseConv1D: outputs[0] 无法定位".into()))?;
-    let scratch_base = abi.scratch_ptr.ok_or_else(|| CompilerError::CodegenViolation(
-        "DepthwiseConv1D: scratchpad 未初始化 (needs_scratch 应在 dwc_req 存在时为 true)".into()))?;
+    let x_ptr = resolver
+        .materialize(prog, op.inputs[0], abi)
+        .ok_or_else(|| {
+            CompilerError::CodegenViolation("DepthwiseConv1D: inputs[0] (x) 无法定位".into())
+        })?;
+    let w_ptr = resolver
+        .materialize(prog, op.inputs[1], abi)
+        .ok_or_else(|| {
+            CompilerError::CodegenViolation("DepthwiseConv1D: inputs[1] (weight) 无法定位".into())
+        })?;
+    let out_ptr = resolver
+        .materialize(prog, op.outputs[0], abi)
+        .ok_or_else(|| {
+            CompilerError::CodegenViolation("DepthwiseConv1D: outputs[0] 无法定位".into())
+        })?;
+    let scratch_base = abi.scratch_ptr.ok_or_else(|| {
+        CompilerError::CodegenViolation(
+            "DepthwiseConv1D: scratchpad 未初始化 (needs_scratch 应在 dwc_req 存在时为 true)"
+                .into(),
+        )
+    })?;
 
     // Padded buffer base = scratch_base + req.padded_offset
     let padded_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -67,8 +78,9 @@ pub(crate) fn lower_depthwise_conv1d(
 
     // ── 推导运行时 seq_bound (Symbolic 或 Concrete) ──
     let out_tid = op.outputs[0];
-    let out_tensor = graph.tensor(out_tid).ok_or_else(|| CompilerError::CodegenViolation(
-        "DepthwiseConv1D: 输出张量不存在".into()))?;
+    let out_tensor = graph
+        .tensor(out_tid)
+        .ok_or_else(|| CompilerError::CodegenViolation("DepthwiseConv1D: 输出张量不存在".into()))?;
     let seq_dim = out_tensor.shape.first().cloned().ok_or_else(|| {
         CompilerError::CodegenViolation("DepthwiseConv1D: 输出 shape 为空".into())
     })?;
@@ -94,7 +106,15 @@ pub(crate) fn lower_depthwise_conv1d(
     } else {
         padded_ptr
     };
-    emit_row_copy(prog, x_ptr, copy_dst_ptr, seq_bound.clone(), channels, width, input_dtype)?;
+    emit_row_copy(
+        prog,
+        x_ptr,
+        copy_dst_ptr,
+        seq_bound.clone(),
+        channels,
+        width,
+        input_dtype,
+    )?;
 
     // ── Stage 3: Conv 主循环: output[t, c] = Σ_k padded[t+k, c] * w[c, k] ──
     // 循环结构 (ARCH-NO-LOOP-UNROLL 合规):
@@ -120,7 +140,12 @@ pub(crate) fn lower_depthwise_conv1d(
     prog.emit_loop(seq_bound, channel_row_bytes, |prog, _t_ctr, t_off| {
         prog.emit_loop(BoundExpr::Const(channels), elem, |prog, c_ctr, c_off| {
             // acc = 0 (accumulator 恒 F32)
-            prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::Const(0.0), width: s_width, dtype: acc_dtype, });
+            prog.emit(VmInstr::Broadcast {
+                dst: acc,
+                src: ScalarExpr::Const(0.0),
+                width: s_width,
+                dtype: acc_dtype,
+            });
             for k in 0..kernel_size {
                 // x_val = padded[t+k, c] (激活链 → input_dtype)
                 let padded_off = OffsetExpr::Add(
@@ -131,8 +156,12 @@ pub(crate) fn lower_depthwise_conv1d(
                     )),
                 );
                 prog.emit(VmInstr::VecLoad {
-                    dst: x_val, base: padded_ptr, offset: padded_off, width: s_width,
-                    dtype: input_dtype, predicate: None,
+                    dst: x_val,
+                    base: padded_ptr,
+                    offset: padded_off,
+                    width: s_width,
+                    dtype: input_dtype,
+                    predicate: None,
                 });
                 // w_val = w[c,k] (weight 表 → weight_dtype; 用 c_ctr × weight_elem 解耦 input/weight elem 步进)
                 let w_byte_off = OffsetExpr::Add(
@@ -151,11 +180,20 @@ pub(crate) fn lower_depthwise_conv1d(
                 // acc += x_val * w_val (accumulator F32)
                 {
                     let dwc_fma_body: Vec<TraceOp> = vec![
-                        TraceOp::Input(0), TraceOp::Input(1), TraceOp::Input(2),
+                        TraceOp::Input(0),
+                        TraceOp::Input(1),
+                        TraceOp::Input(2),
                         TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2)),
                     ];
-                    super::auto_select::auto_lower_trace_into(prog, &dwc_fma_body, &[x_val, w_val, acc], acc, s_width, acc_dtype)
-                        .expect("lower_depthwise_conv1d: FMA auto_lower invariant violation");
+                    super::auto_select::auto_lower_trace_into(
+                        prog,
+                        &dwc_fma_body,
+                        &[x_val, w_val, acc],
+                        acc,
+                        s_width,
+                        acc_dtype,
+                    )
+                    .expect("lower_depthwise_conv1d: FMA auto_lower invariant violation");
                 }
             }
             // output[t,c] = acc → input_dtype
@@ -164,8 +202,12 @@ pub(crate) fn lower_depthwise_conv1d(
                 Box::new(OffsetExpr::LoopOffset(c_off)),
             );
             prog.emit(VmInstr::VecStore {
-                base: out_ptr, offset: out_off, src: acc, width: s_width,
-                dtype: input_dtype, predicate: None,
+                base: out_ptr,
+                offset: out_off,
+                src: acc,
+                width: s_width,
+                dtype: input_dtype,
+                predicate: None,
             });
         });
     });
@@ -256,17 +298,17 @@ pub(crate) fn lower_patch_embed(
     let acc_dtype = input_dtype.accumulator_dtype();
 
     // image byte-offset 缩放 (input_elem, 配 byte_offset 按 input_elem 步进):
-    let scale_image_row   = patch_size * image_size;
-    let scale_image_col   = patch_size;
-    let scale_image_chan  = image_size * image_size;
-    let scale_image_kr    = image_size;
+    let scale_image_row = patch_size * image_size;
+    let scale_image_col = patch_size;
+    let scale_image_chan = image_size * image_size;
+    let scale_image_kr = image_size;
     // kernel byte-offset 缩放 (weight_elem, 配 counter — 解耦 input/weight elem):
-    let scale_kernel_e    = in_channels * patch_size * patch_size * weight_elem;
-    let scale_kernel_c    = patch_size * patch_size * weight_elem;
-    let scale_kernel_kr   = patch_size * weight_elem;
+    let scale_kernel_e = in_channels * patch_size * patch_size * weight_elem;
+    let scale_kernel_c = patch_size * patch_size * weight_elem;
+    let scale_kernel_kr = patch_size * weight_elem;
     // patches output 缩放 (input_elem):
-    let scale_out_p_row   = num_patches_side * embed_dim;
-    let scale_out_p_col   = embed_dim;
+    let scale_out_p_row = num_patches_side * embed_dim;
+    let scale_out_p_col = embed_dim;
 
     prog.emit_loop(BoundExpr::Const(num_patches_side), elem, |prog, _p_row_ctr, p_row_off| {
         prog.emit_loop(BoundExpr::Const(num_patches_side), elem, |prog, _p_col_ctr, p_col_off| {
@@ -365,29 +407,52 @@ pub(crate) fn emit_zero_fill_bytes(
     width: SimdWidth,
     dtype: QuantPrecision,
 ) -> Result<(), CompilerError> {
-    if total_bytes == 0 { return Ok(()); }
-    let step_bytes = width.bytes();
+    if total_bytes == 0 {
+        return Ok(());
+    }
+    let lanes = width.f32_lanes().max(1);
+    // VecStore with a narrow dtype writes `lanes * elem_bytes`, not the
+    // register's F32-sized byte width (W512 BF16 writes 32B).
+    let step_bytes = lanes * dtype.elem_bytes();
     let vec_count = total_bytes / step_bytes;
     let tail_bytes = total_bytes - vec_count * step_bytes;
 
     let zero_vec = prog.alloc_vreg(VRegKind::Vec, width);
-    prog.emit(VmInstr::Broadcast { dst: zero_vec, src: ScalarExpr::Const(0.0), width, dtype, });
+    prog.emit(VmInstr::Broadcast {
+        dst: zero_vec,
+        src: ScalarExpr::Const(0.0),
+        width,
+        dtype,
+    });
 
     if vec_count > 0 {
-        prog.emit_loop(BoundExpr::Const(vec_count), step_bytes, |prog, _ctr, off| {
-            prog.emit(VmInstr::VecStore {
-                base: ptr, offset: OffsetExpr::LoopOffset(off), src: zero_vec, width,
-                dtype, predicate: None,
-            });
-        });
+        prog.emit_loop(
+            BoundExpr::Const(vec_count),
+            step_bytes,
+            |prog, _ctr, off| {
+                prog.emit(VmInstr::VecStore {
+                    base: ptr,
+                    offset: OffsetExpr::LoopOffset(off),
+                    src: zero_vec,
+                    width,
+                    dtype,
+                    predicate: None,
+                });
+            },
+        );
     }
-    // Scalar tail: tail_bytes / elem 次 4B 写
+    // Scalar tail: one scalar store per remaining source element.
     let elem = dtype.elem_bytes();
     if tail_bytes > 0 {
         let tail_elems = tail_bytes / elem;
         let s_width = SimdWidth::Scalar;
         let zero_scalar = prog.alloc_vreg(VRegKind::Vec, s_width);
-        prog.emit(VmInstr::Broadcast { dst: zero_scalar, src: ScalarExpr::Const(0.0), width: s_width, dtype, });
+        prog.emit(VmInstr::Broadcast {
+            dst: zero_scalar,
+            src: ScalarExpr::Const(0.0),
+            width: s_width,
+            dtype,
+        });
         let tail_base = vec_count * step_bytes;
         if tail_elems > 0 {
             prog.emit_loop(BoundExpr::Const(tail_elems), elem, |prog, _ctr, off| {
@@ -396,8 +461,12 @@ pub(crate) fn emit_zero_fill_bytes(
                     Box::new(OffsetExpr::Const(tail_base)),
                 );
                 prog.emit(VmInstr::VecStore {
-                    base: ptr, offset: full_off, src: zero_scalar, width: s_width,
-                    dtype, predicate: None,
+                    base: ptr,
+                    offset: full_off,
+                    src: zero_scalar,
+                    width: s_width,
+                    dtype,
+                    predicate: None,
                 });
             });
         }
@@ -418,8 +487,11 @@ pub(crate) fn emit_row_copy(
 ) -> Result<(), CompilerError> {
     let elem = dtype.elem_bytes();
     let lanes = width.f32_lanes().max(1);
-    let step_bytes = width.bytes();
-    let row_bytes = inner * dtype.elem_bytes();
+    // VecLoad/VecStore use the register's F32 lane count, but narrow dtypes
+    // consume only `lanes * elem` bytes (W512 BF16 = 16 × 2B = 32B).
+    // Using width.bytes() here would skip every other narrow-dtype chunk.
+    let step_bytes = lanes * elem;
+    let row_bytes = inner * elem;
     let vec_count = inner / lanes;
     let tail = inner - vec_count * lanes;
 
@@ -427,20 +499,38 @@ pub(crate) fn emit_row_copy(
     prog.emit_loop(seq_bound, row_bytes, |prog, _r_ctr, r_off| {
         let row_src = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let row_dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        prog.emit(VmInstr::LoadPtr { dst: row_src, src: PtrExpr::VRegPlusVReg(src_ptr, r_off) });
-        prog.emit(VmInstr::LoadPtr { dst: row_dst, src: PtrExpr::VRegPlusVReg(dst_ptr, r_off) });
+        prog.emit(VmInstr::LoadPtr {
+            dst: row_src,
+            src: PtrExpr::VRegPlusVReg(src_ptr, r_off),
+        });
+        prog.emit(VmInstr::LoadPtr {
+            dst: row_dst,
+            src: PtrExpr::VRegPlusVReg(dst_ptr, r_off),
+        });
 
         if vec_count > 0 {
-            prog.emit_loop(BoundExpr::Const(vec_count), step_bytes, |prog, _c_ctr, c_off| {
-                prog.emit(VmInstr::VecLoad {
-                    dst: tmp, base: row_src, offset: OffsetExpr::LoopOffset(c_off), width,
-                    dtype, predicate: None,
-                });
-                prog.emit(VmInstr::VecStore {
-                    base: row_dst, offset: OffsetExpr::LoopOffset(c_off), src: tmp, width,
-                    dtype, predicate: None,
-                });
-            });
+            prog.emit_loop(
+                BoundExpr::Const(vec_count),
+                step_bytes,
+                |prog, _c_ctr, c_off| {
+                    prog.emit(VmInstr::VecLoad {
+                        dst: tmp,
+                        base: row_src,
+                        offset: OffsetExpr::LoopOffset(c_off),
+                        width,
+                        dtype,
+                        predicate: None,
+                    });
+                    prog.emit(VmInstr::VecStore {
+                        base: row_dst,
+                        offset: OffsetExpr::LoopOffset(c_off),
+                        src: tmp,
+                        width,
+                        dtype,
+                        predicate: None,
+                    });
+                },
+            );
         }
         if tail > 0 {
             let s_width = SimdWidth::Scalar;
@@ -452,12 +542,20 @@ pub(crate) fn emit_row_copy(
                     Box::new(OffsetExpr::Const(tail_base)),
                 );
                 prog.emit(VmInstr::VecLoad {
-                    dst: s_tmp, base: row_src, offset: off.clone(), width: s_width,
-                    dtype, predicate: None,
+                    dst: s_tmp,
+                    base: row_src,
+                    offset: off.clone(),
+                    width: s_width,
+                    dtype,
+                    predicate: None,
                 });
                 prog.emit(VmInstr::VecStore {
-                    base: row_dst, offset: off, src: s_tmp, width: s_width,
-                    dtype, predicate: None,
+                    base: row_dst,
+                    offset: off,
+                    src: s_tmp,
+                    width: s_width,
+                    dtype,
+                    predicate: None,
                 });
             });
         }
@@ -481,7 +579,11 @@ mod tests {
 
     #[test]
     fn add_offsets_multiple_consts_produces_nested_add() {
-        let result = add_offsets(vec![OffsetExpr::Const(10), OffsetExpr::Const(20), OffsetExpr::Const(30)]);
+        let result = add_offsets(vec![
+            OffsetExpr::Const(10),
+            OffsetExpr::Const(20),
+            OffsetExpr::Const(30),
+        ]);
         let expected = OffsetExpr::Add(
             Box::new(OffsetExpr::Add(
                 Box::new(OffsetExpr::Const(10)),
@@ -494,14 +596,21 @@ mod tests {
 
     #[test]
     fn add_offsets_filters_zero_const() {
-        let result = add_offsets(vec![OffsetExpr::Const(0), OffsetExpr::Const(100), OffsetExpr::Const(0)]);
+        let result = add_offsets(vec![
+            OffsetExpr::Const(0),
+            OffsetExpr::Const(100),
+            OffsetExpr::Const(0),
+        ]);
         assert_eq!(result, OffsetExpr::Const(100));
     }
 
     #[test]
     fn add_offsets_filters_zero_scale_mul() {
         let vreg = VRegId(5);
-        let result = add_offsets(vec![OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(vreg)), 0), OffsetExpr::Const(77)]);
+        let result = add_offsets(vec![
+            OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(vreg)), 0),
+            OffsetExpr::Const(77),
+        ]);
         assert_eq!(result, OffsetExpr::Const(77));
     }
 
@@ -514,7 +623,10 @@ mod tests {
     #[test]
     fn add_offsets_preserves_non_zero_mul() {
         let vreg = VRegId(3);
-        let result = add_offsets(vec![OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(vreg)), 64), OffsetExpr::Const(8)]);
+        let result = add_offsets(vec![
+            OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(vreg)), 64),
+            OffsetExpr::Const(8),
+        ]);
         let expected = OffsetExpr::Add(
             Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(vreg)), 64)),
             Box::new(OffsetExpr::Const(8)),
@@ -537,7 +649,10 @@ mod tests {
     #[test]
     fn is_zero_offset_mul_zero_scale() {
         let vreg = VRegId(0);
-        assert!(is_zero_offset(&OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(vreg)), 0)));
+        assert!(is_zero_offset(&OffsetExpr::Mul(
+            Box::new(OffsetExpr::LoopOffset(vreg)),
+            0
+        )));
     }
 
     // ── emit_zero_fill_bytes ──
@@ -557,8 +672,14 @@ mod tests {
         let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         // 64 bytes / 32 bytes per W256 vector = 2 vec stores, no tail
         emit_zero_fill_bytes(&mut prog, ptr, 64, SimdWidth::W256, QuantPrecision::F32).unwrap();
-        let has_broadcast = prog.instrs.iter().any(|i| matches!(i, VmInstr::Broadcast { .. }));
-        let has_vec_store = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecStore { .. }));
+        let has_broadcast = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::Broadcast { .. }));
+        let has_vec_store = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecStore { .. }));
         assert!(has_broadcast, "expected Broadcast for zero value");
         assert!(has_vec_store, "expected VecStore instructions");
     }
@@ -571,10 +692,24 @@ mod tests {
         let img = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let ker = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let out = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let result = lower_patch_embed(&mut prog, 0, 64, 3, 224, img, ker, out, QuantPrecision::F32, QuantPrecision::F32);
+        let result = lower_patch_embed(
+            &mut prog,
+            0,
+            64,
+            3,
+            224,
+            img,
+            ker,
+            out,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("invalid dims"), "expected 'invalid dims' in error, got: {msg}");
+        assert!(
+            msg.contains("invalid dims"),
+            "expected 'invalid dims' in error, got: {msg}"
+        );
     }
 
     #[test]
@@ -583,10 +718,24 @@ mod tests {
         let img = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let ker = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let out = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let result = lower_patch_embed(&mut prog, 14, 64, 3, 225, img, ker, out, QuantPrecision::F32, QuantPrecision::F32);
+        let result = lower_patch_embed(
+            &mut prog,
+            14,
+            64,
+            3,
+            225,
+            img,
+            ker,
+            out,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("patch_size"), "expected patch_size mention in error, got: {msg}");
+        assert!(
+            msg.contains("patch_size"),
+            "expected patch_size mention in error, got: {msg}"
+        );
     }
 
     // ── lower_patch_embed: zero embed_dim ──
@@ -598,10 +747,24 @@ mod tests {
         let img = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let ker = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let out = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let result = lower_patch_embed(&mut prog, 14, 0, 3, 224, img, ker, out, QuantPrecision::F32, QuantPrecision::F32);
+        let result = lower_patch_embed(
+            &mut prog,
+            14,
+            0,
+            3,
+            224,
+            img,
+            ker,
+            out,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("invalid dims"), "expected 'invalid dims' for zero embed_dim, got: {msg}");
+        assert!(
+            msg.contains("invalid dims"),
+            "expected 'invalid dims' for zero embed_dim, got: {msg}"
+        );
     }
 
     // ── lower_patch_embed: zero in_channels ──
@@ -613,10 +776,24 @@ mod tests {
         let img = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let ker = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let out = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let result = lower_patch_embed(&mut prog, 14, 64, 0, 224, img, ker, out, QuantPrecision::F32, QuantPrecision::F32);
+        let result = lower_patch_embed(
+            &mut prog,
+            14,
+            64,
+            0,
+            224,
+            img,
+            ker,
+            out,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("invalid dims"), "expected 'invalid dims' for zero in_channels, got: {msg}");
+        assert!(
+            msg.contains("invalid dims"),
+            "expected 'invalid dims' for zero in_channels, got: {msg}"
+        );
     }
 
     // ── lower_patch_embed: zero image_size ──
@@ -628,10 +805,24 @@ mod tests {
         let img = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let ker = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let out = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let result = lower_patch_embed(&mut prog, 14, 64, 3, 0, img, ker, out, QuantPrecision::F32, QuantPrecision::F32);
+        let result = lower_patch_embed(
+            &mut prog,
+            14,
+            64,
+            3,
+            0,
+            img,
+            ker,
+            out,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        );
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("invalid dims"), "expected 'invalid dims' for zero image_size, got: {msg}");
+        assert!(
+            msg.contains("invalid dims"),
+            "expected 'invalid dims' for zero image_size, got: {msg}"
+        );
     }
 
     // ── lower_patch_embed: valid smallest case produces well-formed program ──
@@ -644,10 +835,27 @@ mod tests {
         let ker = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let out = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         // patch_size=2, embed_dim=4, in_channels=1, image_size=2 → 1 patch, 4 output elements
-        lower_patch_embed(&mut prog, 2, 4, 1, 2, img, ker, out, QuantPrecision::F32, QuantPrecision::F32).unwrap();
-        prog.validate_structure().expect("structure should be valid");
-        prog.validate_provenance().expect("provenance should be valid");
-        assert!(!prog.instrs.is_empty(), "expected instructions to be emitted");
+        lower_patch_embed(
+            &mut prog,
+            2,
+            4,
+            1,
+            2,
+            img,
+            ker,
+            out,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        )
+        .unwrap();
+        prog.validate_structure()
+            .expect("structure should be valid");
+        prog.validate_provenance()
+            .expect("provenance should be valid");
+        assert!(
+            !prog.instrs.is_empty(),
+            "expected instructions to be emitted"
+        );
     }
 
     // ── lower_patch_embed: patch_size == image_size (single patch) ──
@@ -660,11 +868,31 @@ mod tests {
         let ker = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let out = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         // patch_size=4, image_size=4 → num_patches_side=1, single patch
-        lower_patch_embed(&mut prog, 4, 8, 3, 4, img, ker, out, QuantPrecision::F32, QuantPrecision::F32).unwrap();
-        prog.validate_structure().expect("structure should be valid");
+        lower_patch_embed(
+            &mut prog,
+            4,
+            8,
+            3,
+            4,
+            img,
+            ker,
+            out,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        )
+        .unwrap();
+        prog.validate_structure()
+            .expect("structure should be valid");
         // Should have 5 nested loops (p_row, p_col, e, c, kr)
-        let loop_begins = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
-        assert_eq!(loop_begins, 5, "expected 5 nested loops for p_row/p_col/e/c/kr");
+        let loop_begins = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::LoopBegin { .. }))
+            .count();
+        assert_eq!(
+            loop_begins, 5,
+            "expected 5 nested loops for p_row/p_col/e/c/kr"
+        );
     }
 
     // ── BCE-20260630-MIXED-P5: 混合精度 dtype 感知结构断言（三段式）──
@@ -675,25 +903,49 @@ mod tests {
         let img = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let ker = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let out = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        lower_patch_embed(&mut prog, 2, 4, 1, 2, img, ker, out,
-            QuantPrecision::F32, QuantPrecision::BF16).unwrap();
-        prog.validate_structure().expect("structure should be valid");
+        lower_patch_embed(
+            &mut prog,
+            2,
+            4,
+            1,
+            2,
+            img,
+            ker,
+            out,
+            QuantPrecision::F32,
+            QuantPrecision::BF16,
+        )
+        .unwrap();
+        prog.validate_structure()
+            .expect("structure should be valid");
         let kernel_bf16_loads = prog.instrs.iter().filter(|i| {
             matches!(i, VmInstr::VecLoad { base, dtype: QuantPrecision::BF16, .. } if *base == ker)
         }).count();
-        assert!(kernel_bf16_loads > 0, "expected kernel VecLoad with BF16 dtype (weight mixed precision)");
+        assert!(
+            kernel_bf16_loads > 0,
+            "expected kernel VecLoad with BF16 dtype (weight mixed precision)"
+        );
         let image_f32_loads = prog.instrs.iter().filter(|i| {
             matches!(i, VmInstr::VecLoad { base, dtype: QuantPrecision::F32, .. } if *base == img)
         }).count();
-        assert!(image_f32_loads > 0, "expected image VecLoad with F32 dtype (input activation)");
+        assert!(
+            image_f32_loads > 0,
+            "expected image VecLoad with F32 dtype (input activation)"
+        );
         let patches_f32_stores = prog.instrs.iter().filter(|i| {
             matches!(i, VmInstr::VecStore { base, dtype: QuantPrecision::F32, .. } if *base == out)
         }).count();
-        assert!(patches_f32_stores > 0, "expected patches VecStore with F32 dtype (output = input_dtype)");
+        assert!(
+            patches_f32_stores > 0,
+            "expected patches VecStore with F32 dtype (output = input_dtype)"
+        );
         let kernel_f32_loads = prog.instrs.iter().filter(|i| {
             matches!(i, VmInstr::VecLoad { base, dtype: QuantPrecision::F32, .. } if *base == ker)
         }).count();
-        assert_eq!(kernel_f32_loads, 0, "kernel VecLoad must NOT use F32 — weight is BF16 (ARCH-BLOB-YIELDS-WEIGHT)");
+        assert_eq!(
+            kernel_f32_loads, 0,
+            "kernel VecLoad must NOT use F32 — weight is BF16 (ARCH-BLOB-YIELDS-WEIGHT)"
+        );
     }
 
     // @trace TEST-VAE-MIXED-02 [req:REQ-DTYPE-013] [level:unit]
@@ -703,17 +955,46 @@ mod tests {
         let img = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let ker = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let out = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        lower_patch_embed(&mut prog, 2, 4, 1, 2, img, ker, out,
-            QuantPrecision::F32, QuantPrecision::F32).unwrap();
-        prog.validate_structure().expect("structure should be valid");
-        let all_loads_f32 = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { dtype: QuantPrecision::F32, .. })
-        }).count();
-        let any_non_f32_load = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::VecLoad { dtype, .. } if *dtype != QuantPrecision::F32)
-        });
-        assert!(all_loads_f32 > 0, "expected F32 VecLoads for homogeneous F32 model");
-        assert!(!any_non_f32_load, "homogeneous F32 must not emit non-F32 loads");
+        lower_patch_embed(
+            &mut prog,
+            2,
+            4,
+            1,
+            2,
+            img,
+            ker,
+            out,
+            QuantPrecision::F32,
+            QuantPrecision::F32,
+        )
+        .unwrap();
+        prog.validate_structure()
+            .expect("structure should be valid");
+        let all_loads_f32 = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecLoad {
+                        dtype: QuantPrecision::F32,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let any_non_f32_load = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecLoad { dtype, .. } if *dtype != QuantPrecision::F32));
+        assert!(
+            all_loads_f32 > 0,
+            "expected F32 VecLoads for homogeneous F32 model"
+        );
+        assert!(
+            !any_non_f32_load,
+            "homogeneous F32 must not emit non-F32 loads"
+        );
     }
 
     // ── emit_zero_fill_bytes: non-aligned total produces tail ──
@@ -725,14 +1006,37 @@ mod tests {
         let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         // 100 bytes / 32 bytes per W256 = 3 vec stores + 4 bytes tail (1 scalar store)
         emit_zero_fill_bytes(&mut prog, ptr, 100, SimdWidth::W256, QuantPrecision::F32).unwrap();
-        let vec_stores = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecStore { width: SimdWidth::W256, .. })
-        }).count();
-        let scalar_stores = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecStore { width: SimdWidth::Scalar, .. })
-        }).count();
+        let vec_stores = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecStore {
+                        width: SimdWidth::W256,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let scalar_stores = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecStore {
+                        width: SimdWidth::Scalar,
+                        ..
+                    }
+                )
+            })
+            .count();
         assert!(vec_stores >= 1, "expected at least one W256 VecStore");
-        assert!(scalar_stores >= 1, "expected at least one Scalar VecStore for tail");
+        assert!(
+            scalar_stores >= 1,
+            "expected at least one Scalar VecStore for tail"
+        );
     }
 
     // ── emit_zero_fill_bytes: exact SIMD-aligned total has no tail ──
@@ -744,10 +1048,23 @@ mod tests {
         let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         // 32 bytes exactly = 1 × W256, no tail
         emit_zero_fill_bytes(&mut prog, ptr, 32, SimdWidth::W256, QuantPrecision::F32).unwrap();
-        let scalar_stores = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecStore { width: SimdWidth::Scalar, .. })
-        }).count();
-        assert_eq!(scalar_stores, 0, "expected no scalar tail stores for aligned total");
+        let scalar_stores = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecStore {
+                        width: SimdWidth::Scalar,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            scalar_stores, 0,
+            "expected no scalar tail stores for aligned total"
+        );
     }
 
     // ── emit_zero_fill_bytes: Scalar width path ──
@@ -759,7 +1076,11 @@ mod tests {
         let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         // 12 bytes with Scalar (4B per element) = 3 scalar stores, no vec path
         emit_zero_fill_bytes(&mut prog, ptr, 12, SimdWidth::Scalar, QuantPrecision::F32).unwrap();
-        let stores = prog.instrs.iter().filter(|i| matches!(i, VmInstr::VecStore { .. })).count();
+        let stores = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::VecStore { .. }))
+            .count();
         assert!(stores > 0, "expected VecStore instructions for scalar fill");
     }
 
@@ -772,10 +1093,28 @@ mod tests {
         let src = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         // 2 rows × 8 channels (W256-aligned), no tail
-        emit_row_copy(&mut prog, src, dst, BoundExpr::Const(2), 8, SimdWidth::W256, QuantPrecision::F32).unwrap();
-        prog.validate_structure().expect("structure should be valid");
-        let loads = prog.instrs.iter().filter(|i| matches!(i, VmInstr::VecLoad { .. })).count();
-        let stores = prog.instrs.iter().filter(|i| matches!(i, VmInstr::VecStore { .. })).count();
+        emit_row_copy(
+            &mut prog,
+            src,
+            dst,
+            BoundExpr::Const(2),
+            8,
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
+        prog.validate_structure()
+            .expect("structure should be valid");
+        let loads = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::VecLoad { .. }))
+            .count();
+        let stores = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::VecStore { .. }))
+            .count();
         assert!(loads > 0, "expected VecLoad instructions in row copy");
         assert!(stores > 0, "expected VecStore instructions in row copy");
         assert_eq!(loads, stores, "VecLoad and VecStore count should match");
@@ -790,12 +1129,35 @@ mod tests {
         let src = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         // 5 channels with W256 (8 lanes): 0 vec stores, 5 scalar tail stores per row
-        emit_row_copy(&mut prog, src, dst, BoundExpr::Const(1), 5, SimdWidth::W256, QuantPrecision::F32).unwrap();
-        prog.validate_structure().expect("structure should be valid");
-        let scalar_stores = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecStore { width: SimdWidth::Scalar, .. })
-        }).count();
-        assert!(scalar_stores > 0, "expected scalar tail stores for non-aligned inner");
+        emit_row_copy(
+            &mut prog,
+            src,
+            dst,
+            BoundExpr::Const(1),
+            5,
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
+        prog.validate_structure()
+            .expect("structure should be valid");
+        let scalar_stores = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::VecStore {
+                        width: SimdWidth::Scalar,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(
+            scalar_stores > 0,
+            "expected scalar tail stores for non-aligned inner"
+        );
     }
 
     // ── is_zero_offset: Mul with non-zero scale returns false ──
@@ -804,7 +1166,10 @@ mod tests {
     #[test]
     fn is_zero_offset_mul_nonzero_scale_returns_false() {
         let vreg = VRegId(7);
-        assert!(!is_zero_offset(&OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(vreg)), 16)));
+        assert!(!is_zero_offset(&OffsetExpr::Mul(
+            Box::new(OffsetExpr::LoopOffset(vreg)),
+            16
+        )));
     }
 
     // ── is_zero_offset: Add branch returns false (non-zero, non-Mul-zero) ──
@@ -812,7 +1177,10 @@ mod tests {
     // @trace TEST-VAE-12 [req:REQ-CG] [level:unit]
     #[test]
     fn is_zero_offset_add_returns_false() {
-        let expr = OffsetExpr::Add(Box::new(OffsetExpr::Const(1)), Box::new(OffsetExpr::Const(2)));
+        let expr = OffsetExpr::Add(
+            Box::new(OffsetExpr::Const(1)),
+            Box::new(OffsetExpr::Const(2)),
+        );
         assert!(!is_zero_offset(&expr));
     }
 
@@ -876,9 +1244,18 @@ mod tests {
             hidden: 512,
         };
         let debug_str = format!("{:?}", req);
-        assert!(debug_str.contains("ctx_offset"), "Debug should contain ctx_offset");
-        assert!(debug_str.contains("post_mlp_offset"), "Debug should contain post_mlp_offset");
-        assert!(debug_str.contains("total_bytes"), "Debug should contain total_bytes");
+        assert!(
+            debug_str.contains("ctx_offset"),
+            "Debug should contain ctx_offset"
+        );
+        assert!(
+            debug_str.contains("post_mlp_offset"),
+            "Debug should contain post_mlp_offset"
+        );
+        assert!(
+            debug_str.contains("total_bytes"),
+            "Debug should contain total_bytes"
+        );
     }
 
     // ── DwcScratchRequirement: construction and trait derivation ──
@@ -920,9 +1297,72 @@ mod tests {
             left_pad: 1,
         };
         let debug_str = format!("{:?}", req);
-        assert!(debug_str.contains("padded_offset"), "Debug should contain padded_offset");
-        assert!(debug_str.contains("kernel_size"), "Debug should contain kernel_size");
+        assert!(
+            debug_str.contains("padded_offset"),
+            "Debug should contain padded_offset"
+        );
+        assert!(
+            debug_str.contains("kernel_size"),
+            "Debug should contain kernel_size"
+        );
         assert!(debug_str.contains("causal"), "Debug should contain causal");
     }
 
+    #[test]
+    fn emit_row_copy_w512_bf16_advances_by_loaded_bytes() {
+        let mut prog = VmProgram::new();
+        let src = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+
+        emit_row_copy(
+            &mut prog,
+            src,
+            dst,
+            BoundExpr::Const(1),
+            32,
+            SimdWidth::W512,
+            QuantPrecision::BF16,
+        )
+        .unwrap();
+
+        let stride = prog.instrs.iter().find_map(|instr| match instr {
+            VmInstr::LoopBegin {
+                offsets,
+                bound: BoundExpr::Const(2),
+                ..
+            } => offsets
+                .first()
+                .and_then(|offset| offset.stride.as_fixed_bytes()),
+            _ => None,
+        });
+        assert_eq!(
+            stride,
+            Some(32),
+            "W512 BF16 loads 16 elements = 32 bytes per iteration"
+        );
+    }
+
+    #[test]
+    fn emit_zero_fill_w512_bf16_advances_by_loaded_bytes() {
+        let mut prog = VmProgram::new();
+        let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+
+        emit_zero_fill_bytes(&mut prog, ptr, 64, SimdWidth::W512, QuantPrecision::BF16).unwrap();
+
+        let stride = prog.instrs.iter().find_map(|instr| match instr {
+            VmInstr::LoopBegin {
+                offsets,
+                bound: BoundExpr::Const(2),
+                ..
+            } => offsets
+                .first()
+                .and_then(|offset| offset.stride.as_fixed_bytes()),
+            _ => None,
+        });
+        assert_eq!(
+            stride,
+            Some(32),
+            "W512 BF16 stores 16 elements = 32 bytes per iteration"
+        );
+    }
 }

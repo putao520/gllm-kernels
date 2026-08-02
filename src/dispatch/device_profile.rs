@@ -4,9 +4,9 @@
 //! and peak performance estimates into a single `DeviceProfile` used by the
 //! inference compiler for code generation and tuning decisions.
 
-use crate::microarch::{MicroArch, KernelConfig};
-use crate::numa::NumaTopology;
 use crate::autotuning::HwInfo;
+use crate::microarch::{KernelConfig, MicroArch};
+use crate::numa::NumaTopology;
 
 /// GEMM BLIS three-level blocking parameters.
 #[derive(Debug, Clone, Copy)]
@@ -204,7 +204,11 @@ impl DeviceProfile {
     /// Cache sizes (L1D, L2, L3) in bytes.
     #[inline]
     pub fn cache_sizes(&self) -> (usize, usize, usize) {
-        (self.kernel_config.l1d, self.kernel_config.l2, self.kernel_config.l3)
+        (
+            self.kernel_config.l1d,
+            self.kernel_config.l2,
+            self.kernel_config.l3,
+        )
     }
 
     /// Number of SIMD registers available for the detected ISA.
@@ -255,19 +259,25 @@ impl DeviceProfile {
             DType::F32 => self.peak_gflops_f32,
             DType::F16 | DType::BF16 => match self.isa {
                 IsaLevel::Avx512 | IsaLevel::Avx512Amx => self.peak_gflops_f32 * 2.0,
-                IsaLevel::Neon | IsaLevel::NeonAmx | IsaLevel::Sve | IsaLevel::Sve2 => self.peak_gflops_f32 * 2.0,
+                IsaLevel::Neon | IsaLevel::NeonAmx | IsaLevel::Sve | IsaLevel::Sve2 => {
+                    self.peak_gflops_f32 * 2.0
+                }
                 _ => self.peak_gflops_f32,
             },
             // FP8: sub-byte types processed via quantized GEMM; throughput >= FP16
             DType::F8E4M3 | DType::F8E5M2 => match self.isa {
                 IsaLevel::Avx512 | IsaLevel::Avx512Amx => self.peak_gflops_f32 * 4.0,
-                IsaLevel::Neon | IsaLevel::NeonAmx | IsaLevel::Sve | IsaLevel::Sve2 => self.peak_gflops_f32 * 4.0,
+                IsaLevel::Neon | IsaLevel::NeonAmx | IsaLevel::Sve | IsaLevel::Sve2 => {
+                    self.peak_gflops_f32 * 4.0
+                }
                 _ => self.peak_gflops_f32 * 2.0,
             },
             // FP6/FP4: sub-byte packed; throughput modeled as >= FP8
             DType::F6E3M2 | DType::F6E2M3 | DType::F4E2M1 => match self.isa {
                 IsaLevel::Avx512 | IsaLevel::Avx512Amx => self.peak_gflops_f32 * 4.0,
-                IsaLevel::Neon | IsaLevel::NeonAmx | IsaLevel::Sve | IsaLevel::Sve2 => self.peak_gflops_f32 * 4.0,
+                IsaLevel::Neon | IsaLevel::NeonAmx | IsaLevel::Sve | IsaLevel::Sve2 => {
+                    self.peak_gflops_f32 * 4.0
+                }
                 _ => self.peak_gflops_f32 * 2.0,
             },
             DType::U8 => self.peak_gflops_f32,
@@ -291,7 +301,13 @@ impl DeviceProfile {
     ///
     /// Alignment: KC to 4 (SIMD), MC to MR, NC to NR.
     /// Small matrices (m*n*k < 4096) use direct path to avoid packing overhead.
-    pub fn gemm_blocking(&self, m: usize, n: usize, k: usize, dtype: crate::types::DType) -> GemmBlocking {
+    pub fn gemm_blocking(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        dtype: crate::types::DType,
+    ) -> GemmBlocking {
         let (mr, nr) = self.microkernel_mr_nr();
         let elem_bytes = dtype.size_bytes();
 
@@ -370,7 +386,13 @@ impl DeviceProfile {
     }
 
     /// Analytical heuristic for GEMM blocking with dtype awareness.
-    fn gemm_blocking_heuristic(&self, m: usize, n: usize, k: usize, dtype: crate::types::DType) -> GemmBlocking {
+    fn gemm_blocking_heuristic(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        dtype: crate::types::DType,
+    ) -> GemmBlocking {
         let (l1, l2, l3) = self.cache_sizes();
         let (mr, nr) = self.microkernel_mr_nr();
         let elem_size = dtype.size_bytes();
@@ -402,7 +424,11 @@ impl DeviceProfile {
         // At least 2×MR to amortize pack_a overhead (when m allows).
         let mc = (l2 * 4 / 5) / (elem_size * kc);
         let mc = (mc / mr) * mr; // align down to MR
-        let mc = if m >= 2 * mr { mc.max(2 * mr) } else { mc.max(mr) };
+        let mc = if m >= 2 * mr {
+            mc.max(2 * mr)
+        } else {
+            mc.max(mr)
+        };
         let mc = mc.min(m);
         // Safety cap: pack_a buffer must fit within 85% of L2
         let mc = if mc * kc * elem_size > l2 * 85 / 100 {
@@ -422,7 +448,11 @@ impl DeviceProfile {
         };
         let nc = nc_budget / (elem_size * kc);
         let nc = (nc / nr) * nr; // align down to NR
-        let nc = if n >= 2 * nr { nc.max(2 * nr) } else { nc.max(nr) };
+        let nc = if n >= 2 * nr {
+            nc.max(2 * nr)
+        } else {
+            nc.max(nr)
+        };
         let nc = nc.min(n);
 
         GemmBlocking { kc, mc, nc, mr, nr }
@@ -436,10 +466,16 @@ impl DeviceProfile {
     pub fn prefetch_distance(&self) -> usize {
         match self.arch {
             // Intel: deeper pipelines, higher memory latency → prefetch further ahead
-            MicroArch::SkylakeClient | MicroArch::SkylakeX | MicroArch::CascadeLake |
-            MicroArch::IceLakeClient | MicroArch::IceLakeServer |
-            MicroArch::TigerLake | MicroArch::AlderLake | MicroArch::RaptorLake |
-            MicroArch::SapphireRapids | MicroArch::GraniteRapids => 12,
+            MicroArch::SkylakeClient
+            | MicroArch::SkylakeX
+            | MicroArch::CascadeLake
+            | MicroArch::IceLakeClient
+            | MicroArch::IceLakeServer
+            | MicroArch::TigerLake
+            | MicroArch::AlderLake
+            | MicroArch::RaptorLake
+            | MicroArch::SapphireRapids
+            | MicroArch::GraniteRapids => 12,
             // AMD Zen: shorter memory pipeline → closer prefetch
             MicroArch::Zen3 | MicroArch::Zen4 | MicroArch::Zen5 | MicroArch::Zen2 => 8,
             // Conservative default
@@ -454,28 +490,40 @@ impl DeviceProfile {
         let simd_w = self.simd_width_f32();
         // 2 buffers (input + output) in L1, use 75%
         let elems = (l1 * 3 / 4) / (2 * std::mem::size_of::<f32>()); // 2 buffers × sizeof(f32)
-        // Align to SIMD width
+                                                                     // Align to SIMD width
         (elems / simd_w) * simd_w
     }
 
     /// Whether hardware has efficient 2D transpose instructions.
     /// AVX-512: VPERM*. NEON: TRN*. SVE: compact/unsqueeze.
     pub fn has_hw_transpose(&self) -> bool {
-        matches!(self.isa, IsaLevel::Avx512 | IsaLevel::Avx512Amx | IsaLevel::Sve | IsaLevel::Sve2)
+        matches!(
+            self.isa,
+            IsaLevel::Avx512 | IsaLevel::Avx512Amx | IsaLevel::Sve | IsaLevel::Sve2
+        )
     }
 
     /// Whether hardware has efficient arbitrary-lane shuffle/permute.
     /// AVX-512: VPERMI2*. AVX2: VPERMD (limited). NEON: TBL.
     pub fn has_hw_permute(&self) -> bool {
-        matches!(self.isa, IsaLevel::Avx512 | IsaLevel::Avx512Amx | IsaLevel::Sve | IsaLevel::Sve2)
+        matches!(
+            self.isa,
+            IsaLevel::Avx512 | IsaLevel::Avx512Amx | IsaLevel::Sve | IsaLevel::Sve2
+        )
     }
 
     /// Whether hardware supports memory-level broadcast without explicit replication.
     /// AVX-512: VBROADCAST*. NEON: DUP. SVE: DUP.
     pub fn has_hw_broadcast(&self) -> bool {
-        matches!(self.isa,
-            IsaLevel::Avx2 | IsaLevel::Avx512 | IsaLevel::Avx512Amx |
-            IsaLevel::Neon | IsaLevel::NeonAmx | IsaLevel::Sve | IsaLevel::Sve2
+        matches!(
+            self.isa,
+            IsaLevel::Avx2
+                | IsaLevel::Avx512
+                | IsaLevel::Avx512Amx
+                | IsaLevel::Neon
+                | IsaLevel::NeonAmx
+                | IsaLevel::Sve
+                | IsaLevel::Sve2
         )
     }
 
@@ -530,7 +578,7 @@ impl DeviceProfile {
         match self.isa {
             // BLIS-style MR×NR tiling uses MR*NR accumulators
             IsaLevel::Avx512 | IsaLevel::Avx512Amx => 14 * 4, // mr=14, packed 4-wide
-            IsaLevel::Avx2 => 6 * 3, // mr=6, packed 3-wide
+            IsaLevel::Avx2 => 6 * 3,                          // mr=6, packed 3-wide
             IsaLevel::Neon | IsaLevel::NeonAmx => 8 * 4,
             IsaLevel::Sve | IsaLevel::Sve2 => 4 * 4,
             IsaLevel::Scalar => 1,
@@ -636,16 +684,24 @@ fn detect_isa_level(arch: MicroArch) -> IsaLevel {
 fn detect_isv_capabilities(isa: IsaLevel) -> IsvCapabilities {
     let onednn_available = {
         #[cfg(feature = "onednn")]
-        { crate::isv::onednn::OneDnnBackend::is_available() }
+        {
+            crate::isv::onednn::OneDnnBackend::is_available()
+        }
         #[cfg(not(feature = "onednn"))]
-        { false }
+        {
+            false
+        }
     };
 
     let accelerate_available = {
         #[cfg(feature = "accelerate")]
-        { crate::isv::accelerate::AccelerateBackend::is_available() }
+        {
+            crate::isv::accelerate::AccelerateBackend::is_available()
+        }
         #[cfg(not(feature = "accelerate"))]
-        { false }
+        {
+            false
+        }
     };
 
     IsvCapabilities {
@@ -659,11 +715,7 @@ fn detect_isv_capabilities(isa: IsaLevel) -> IsvCapabilities {
 /// Determines which `QuantType` formats have native dot-product support
 /// and which require software-assisted paths. Also detects tensor core
 /// generation (AMX gen, GPU SM version).
-fn detect_quant_capabilities(
-    arch: &MicroArch,
-    hw_info: &HwInfo,
-    isa: IsaLevel,
-) -> QuantCapability {
+fn detect_quant_capabilities(arch: &MicroArch, hw_info: &HwInfo, isa: IsaLevel) -> QuantCapability {
     let mut native = Vec::new();
     let mut assisted = Vec::new();
 
@@ -793,7 +845,10 @@ mod tests {
         let profile = DeviceProfile::detect();
         let regs = profile.num_simd_regs();
         #[cfg(target_arch = "x86_64")]
-        assert!(regs == 16 || regs == 32, "x86_64 should have 16 or 32 SIMD regs, got {regs}");
+        assert!(
+            regs == 16 || regs == 32,
+            "x86_64 should have 16 or 32 SIMD regs, got {regs}"
+        );
         #[cfg(target_arch = "aarch64")]
         assert_eq!(regs, 32);
     }
@@ -802,7 +857,10 @@ mod tests {
     fn test_simd_width() {
         let profile = DeviceProfile::detect();
         let width = profile.simd_width_bytes();
-        assert!(width >= 16, "SIMD width should be at least 16 bytes, got {width}");
+        assert!(
+            width >= 16,
+            "SIMD width should be at least 16 bytes, got {width}"
+        );
         let f32_width = profile.simd_width_f32();
         assert!(f32_width >= 4);
     }
@@ -813,15 +871,30 @@ mod tests {
         let blocking = profile.gemm_blocking(1024, 1024, 1024, crate::types::DType::F32);
         let (mr, nr) = profile.microkernel_mr_nr();
 
-        assert_eq!(blocking.mc % mr, 0, "MC={} not aligned to MR={}", blocking.mc, mr);
-        assert_eq!(blocking.nc % nr, 0, "NC={} not aligned to NR={}", blocking.nc, nr);
+        assert_eq!(
+            blocking.mc % mr,
+            0,
+            "MC={} not aligned to MR={}",
+            blocking.mc,
+            mr
+        );
+        assert_eq!(
+            blocking.nc % nr,
+            0,
+            "NC={} not aligned to NR={}",
+            blocking.nc,
+            nr
+        );
         assert_eq!(blocking.kc % 4, 0, "KC={} not aligned to 4", blocking.kc);
         assert!(blocking.kc > 0);
         assert!(blocking.mc <= 1024);
         assert!(blocking.nc <= 1024);
         assert!(blocking.kc <= 1024);
 
-        eprintln!("GEMM blocking 1024x1024x1024: KC={} MC={} NC={}", blocking.kc, blocking.mc, blocking.nc);
+        eprintln!(
+            "GEMM blocking 1024x1024x1024: KC={} MC={} NC={}",
+            blocking.kc, blocking.mc, blocking.nc
+        );
     }
 
     #[test]
@@ -835,7 +908,10 @@ mod tests {
 
         // Volume = 25*40*64 = 64000 > 4096 -> normal blocking
         let b = profile.gemm_blocking(25, 40, 64, crate::types::DType::F32);
-        eprintln!("m=25,n=40,k=64 => kc={}, mc={}, nc={}, mr={}, nr={}", b.kc, b.mc, b.nc, b.mr, b.nr);
+        eprintln!(
+            "m=25,n=40,k=64 => kc={}, mc={}, nc={}, mr={}, nr={}",
+            b.kc, b.mc, b.nc, b.mr, b.nr
+        );
         assert!(b.mc <= 25);
         assert!(b.nc <= 40);
         assert!(b.kc <= 64);
@@ -888,17 +964,29 @@ mod tests {
             // Alignment: MC % MR == 0, NC % NR == 0
             // (only when blocking is smaller than the full dimension)
             if b.mc < m {
-                assert_eq!(b.mc % mr, 0,
-                    "m={m} n={n} k={k}: MC={} not aligned to MR={mr}", b.mc);
+                assert_eq!(
+                    b.mc % mr,
+                    0,
+                    "m={m} n={n} k={k}: MC={} not aligned to MR={mr}",
+                    b.mc
+                );
             }
             if b.nc < n {
-                assert_eq!(b.nc % nr, 0,
-                    "m={m} n={n} k={k}: NC={} not aligned to NR={nr}", b.nc);
+                assert_eq!(
+                    b.nc % nr,
+                    0,
+                    "m={m} n={n} k={k}: NC={} not aligned to NR={nr}",
+                    b.nc
+                );
             }
 
             // KC aligned to 4
-            assert_eq!(b.kc % 4, 0,
-                "m={m} n={n} k={k}: KC={} not aligned to 4", b.kc);
+            assert_eq!(
+                b.kc % 4,
+                0,
+                "m={m} n={n} k={k}: KC={} not aligned to 4",
+                b.kc
+            );
         }
     }
 
@@ -909,7 +997,9 @@ mod tests {
 
         for &(m, n, k) in &[(1, 1, 1), (2, 4, 8), (4, 8, 16), (8, 8, 8), (10, 10, 10)] {
             let vol = m * n * k;
-            if vol >= 4096 { continue; }
+            if vol >= 4096 {
+                continue;
+            }
             let b = profile.gemm_blocking(m, n, k, crate::types::DType::F32);
             assert_eq!(b.kc, k, "direct path: KC should equal k={k}, got {}", b.kc);
             assert_eq!(b.mc, m, "direct path: MC should equal m={m}, got {}", b.mc);
@@ -924,16 +1014,22 @@ mod tests {
         let (mr, _) = profile.microkernel_mr_nr();
 
         let b = profile.gemm_blocking(1024, 1024, 1024, crate::types::DType::F32);
-        assert!(b.mc >= 2 * mr,
-            "MC={} should be >= 2*MR={} for large matrices", b.mc, 2 * mr);
+        assert!(
+            b.mc >= 2 * mr,
+            "MC={} should be >= 2*MR={} for large matrices",
+            b.mc,
+            2 * mr
+        );
     }
 
     #[test]
     fn test_prefetch_distance() {
         let profile = DeviceProfile::detect();
         let dist = profile.prefetch_distance();
-        assert!(dist >= 4 && dist <= 16,
-            "prefetch distance {dist} out of expected range [4, 16]");
+        assert!(
+            dist >= 4 && dist <= 16,
+            "prefetch distance {dist} out of expected range [4, 16]"
+        );
         eprintln!("Prefetch distance: {dist} cache lines");
     }
 
@@ -961,7 +1057,11 @@ mod tests {
         let tile = profile.elem_tile_size();
         let simd_w = profile.simd_width_f32();
         assert!(tile > 0);
-        assert_eq!(tile % simd_w, 0, "tile={tile} not aligned to SIMD width={simd_w}");
+        assert_eq!(
+            tile % simd_w,
+            0,
+            "tile={tile} not aligned to SIMD width={simd_w}"
+        );
         eprintln!("Elem tile size: {tile} f32 elements");
     }
 
@@ -995,13 +1095,23 @@ mod tests {
             IsaLevel::Avx512Amx => {
                 // AMX implies at least NativeInt8Tile or NativeBf16
                 assert!(
-                    matches!(cap, DotProductCap::NativeBf16 | DotProductCap::NativeInt8Tile | DotProductCap::NativeInt8Simd),
+                    matches!(
+                        cap,
+                        DotProductCap::NativeBf16
+                            | DotProductCap::NativeInt8Tile
+                            | DotProductCap::NativeInt8Simd
+                    ),
                     "Avx512Amx should have NativeBf16/NativeInt8Tile/NativeInt8Simd, got {cap:?}"
                 );
             }
             IsaLevel::Avx512 => {
                 assert!(
-                    matches!(cap, DotProductCap::NativeBf16 | DotProductCap::NativeInt8Simd | DotProductCap::SimdAssisted),
+                    matches!(
+                        cap,
+                        DotProductCap::NativeBf16
+                            | DotProductCap::NativeInt8Simd
+                            | DotProductCap::SimdAssisted
+                    ),
                     "Avx512 should have NativeBf16/NativeInt8Simd/SimdAssisted, got {cap:?}"
                 );
             }
@@ -1023,7 +1133,13 @@ mod tests {
 
     #[test]
     fn test_gemm_blocking_copy_derives() {
-        let original = GemmBlocking { kc: 256, mc: 128, nc: 512, mr: 6, nr: 16 };
+        let original = GemmBlocking {
+            kc: 256,
+            mc: 128,
+            nc: 512,
+            mr: 6,
+            nr: 16,
+        };
         let copied = original;
         assert_eq!(original.kc, copied.kc);
         assert_eq!(original.mc, copied.mc);
@@ -1036,9 +1152,14 @@ mod tests {
     fn test_isa_level_equality_and_hash() {
         use std::collections::HashSet;
         let levels = [
-            IsaLevel::Scalar, IsaLevel::Avx2, IsaLevel::Avx512,
-            IsaLevel::Avx512Amx, IsaLevel::Neon, IsaLevel::Sve,
-            IsaLevel::Sve2, IsaLevel::NeonAmx,
+            IsaLevel::Scalar,
+            IsaLevel::Avx2,
+            IsaLevel::Avx512,
+            IsaLevel::Avx512Amx,
+            IsaLevel::Neon,
+            IsaLevel::Sve,
+            IsaLevel::Sve2,
+            IsaLevel::NeonAmx,
         ];
         let set: HashSet<IsaLevel> = levels.iter().copied().collect();
         assert_eq!(set.len(), levels.len());
@@ -1055,7 +1176,11 @@ mod tests {
                 assert!(profile.arch.has_bf16());
             }
             DotProductCap::NativeInt8Simd => {
-                assert!(profile.arch.has_vnni() || profile.hw_info.isa.avx512vnni || matches!(profile.isa, IsaLevel::Sve2));
+                assert!(
+                    profile.arch.has_vnni()
+                        || profile.hw_info.isa.avx512vnni
+                        || matches!(profile.isa, IsaLevel::Sve2)
+                );
             }
             DotProductCap::NativeInt8Tile => {
                 assert!(profile.arch.has_amx());
@@ -1116,9 +1241,12 @@ mod tests {
         let profile = DeviceProfile::detect();
         let b_f32 = profile.gemm_blocking(2048, 2048, 2048, crate::types::DType::F32);
         let b_bf16 = profile.gemm_blocking(2048, 2048, 2048, crate::types::DType::BF16);
-        assert!(b_bf16.kc >= b_f32.kc,
+        assert!(
+            b_bf16.kc >= b_f32.kc,
             "BF16 KC={} should be >= F32 KC={} (2x smaller elements in same cache budget)",
-            b_bf16.kc, b_f32.kc);
+            b_bf16.kc,
+            b_f32.kc
+        );
     }
 
     #[test]
@@ -1145,8 +1273,10 @@ mod tests {
     fn test_l1_budget_ratio_range() {
         let profile = DeviceProfile::detect();
         let ratio = profile.l1_budget_ratio();
-        assert!(ratio >= 0.75 && ratio <= 0.90,
-            "L1 budget ratio {ratio} should be in [0.75, 0.90]");
+        assert!(
+            ratio >= 0.75 && ratio <= 0.90,
+            "L1 budget ratio {ratio} should be in [0.75, 0.90]"
+        );
     }
 
     #[test]
@@ -1165,8 +1295,13 @@ mod tests {
     #[test]
     fn test_quant_capabilities_always_contains_f32() {
         let profile = DeviceProfile::detect();
-        assert!(profile.quant_capabilities.native_formats.contains(&crate::quant::QuantType::F32),
-            "F32 must always be in native_formats");
+        assert!(
+            profile
+                .quant_capabilities
+                .native_formats
+                .contains(&crate::quant::QuantType::F32),
+            "F32 must always be in native_formats"
+        );
     }
 
     #[test]
@@ -1205,8 +1340,11 @@ mod tests {
             profile.isa,
             IsaLevel::Avx512 | IsaLevel::Avx512Amx | IsaLevel::Sve | IsaLevel::Sve2
         );
-        assert_eq!(result, expected,
-            "has_hw_transpose={result} inconsistent with isa={:?}", profile.isa);
+        assert_eq!(
+            result, expected,
+            "has_hw_transpose={result} inconsistent with isa={:?}",
+            profile.isa
+        );
     }
 
     /// Test has_hw_permute: mirrors has_hw_transpose on current ISA variants.
@@ -1223,8 +1361,11 @@ mod tests {
             profile.isa,
             IsaLevel::Avx512 | IsaLevel::Avx512Amx | IsaLevel::Sve | IsaLevel::Sve2
         );
-        assert_eq!(result, expected,
-            "has_hw_permute={result} inconsistent with isa={:?}", profile.isa);
+        assert_eq!(
+            result, expected,
+            "has_hw_permute={result} inconsistent with isa={:?}",
+            profile.isa
+        );
     }
 
     /// Test has_hw_broadcast: all SIMD-capable ISAs (except Scalar) should broadcast.
@@ -1255,7 +1396,10 @@ mod tests {
         let factor = profile.reg_cost_factor();
 
         // Assert
-        assert!(factor > 0.0, "reg_cost_factor must be positive, got {factor}");
+        assert!(
+            factor > 0.0,
+            "reg_cost_factor must be positive, got {factor}"
+        );
         let expected = match profile.isa {
             IsaLevel::Avx512 | IsaLevel::Avx512Amx => 0.0005,
             IsaLevel::Avx2 => 0.001,
@@ -1263,8 +1407,11 @@ mod tests {
             IsaLevel::Sve | IsaLevel::Sve2 => 0.0006,
             IsaLevel::Scalar => 0.002,
         };
-        assert!((factor - expected).abs() < 1e-15,
-            "reg_cost_factor={factor} != expected={expected} for {:?}", profile.isa);
+        assert!(
+            (factor - expected).abs() < 1e-15,
+            "reg_cost_factor={factor} != expected={expected} for {:?}",
+            profile.isa
+        );
     }
 
     /// Test gemm_accumulator_regs: must be positive and consistent with ISA.
@@ -1286,8 +1433,11 @@ mod tests {
             IsaLevel::Sve | IsaLevel::Sve2 => 4 * 4,
             IsaLevel::Scalar => 1,
         };
-        assert_eq!(regs, expected,
-            "accumulator regs={regs} != expected={expected} for {:?}", profile.isa);
+        assert_eq!(
+            regs, expected,
+            "accumulator regs={regs} != expected={expected} for {:?}",
+            profile.isa
+        );
     }
 
     /// Test peak_gflops for sub-byte types (FP8, FP6, FP4).
@@ -1305,18 +1455,27 @@ mod tests {
 
         // Assert
         let multiplier = match profile.isa {
-            IsaLevel::Avx512 | IsaLevel::Avx512Amx |
-            IsaLevel::Neon | IsaLevel::NeonAmx |
-            IsaLevel::Sve | IsaLevel::Sve2 => 4.0,
+            IsaLevel::Avx512
+            | IsaLevel::Avx512Amx
+            | IsaLevel::Neon
+            | IsaLevel::NeonAmx
+            | IsaLevel::Sve
+            | IsaLevel::Sve2 => 4.0,
             _ => 2.0,
         };
         let expected = f32_gflops * multiplier;
-        assert!((fp8 - expected).abs() < 1e-6,
-            "FP8 gflops={fp8} != expected={expected}");
-        assert!((fp6 - expected).abs() < 1e-6,
-            "FP6 gflops={fp6} != expected={expected}");
-        assert!((fp4 - expected).abs() < 1e-6,
-            "FP4 gflops={fp4} != expected={expected}");
+        assert!(
+            (fp8 - expected).abs() < 1e-6,
+            "FP8 gflops={fp8} != expected={expected}"
+        );
+        assert!(
+            (fp6 - expected).abs() < 1e-6,
+            "FP6 gflops={fp6} != expected={expected}"
+        );
+        assert!(
+            (fp4 - expected).abs() < 1e-6,
+            "FP4 gflops={fp4} != expected={expected}"
+        );
     }
 
     /// Test that quant_capabilities assisted_formats is non-empty on any SIMD-capable ISA.
@@ -1331,16 +1490,34 @@ mod tests {
 
         // Assert
         if matches!(profile.isa, IsaLevel::Scalar) {
-            assert!(assisted.is_empty(),
-                "Scalar should have no assisted formats, got {} entries", assisted.len());
+            assert!(
+                assisted.is_empty(),
+                "Scalar should have no assisted formats, got {} entries",
+                assisted.len()
+            );
         } else {
-            assert!(!assisted.is_empty(),
-                "{:?} should have assisted quant formats", profile.isa);
+            assert!(
+                !assisted.is_empty(),
+                "{:?} should have assisted quant formats",
+                profile.isa
+            );
             // Verify specific entries exist: Q4_0, Q8_0, AWQ4, GPTQ4
-            assert!(assisted.contains(&crate::quant::QuantType::Q4_0), "Q4_0 missing");
-            assert!(assisted.contains(&crate::quant::QuantType::Q8_0), "Q8_0 missing");
-            assert!(assisted.contains(&crate::quant::QuantType::AWQ4), "AWQ4 missing");
-            assert!(assisted.contains(&crate::quant::QuantType::GPTQ4), "GPTQ4 missing");
+            assert!(
+                assisted.contains(&crate::quant::QuantType::Q4_0),
+                "Q4_0 missing"
+            );
+            assert!(
+                assisted.contains(&crate::quant::QuantType::Q8_0),
+                "Q8_0 missing"
+            );
+            assert!(
+                assisted.contains(&crate::quant::QuantType::AWQ4),
+                "AWQ4 missing"
+            );
+            assert!(
+                assisted.contains(&crate::quant::QuantType::GPTQ4),
+                "GPTQ4 missing"
+            );
         }
     }
 
@@ -1358,14 +1535,22 @@ mod tests {
         let has_amx = profile.arch.has_amx();
         let has_amx_fp16 = profile.arch.has_amx_fp16();
         if has_amx_fp16 {
-            assert_eq!(tc_gen, Some(2),
-                "AMX FP16 arch should report tensor_core_gen=2, got {tc_gen:?}");
+            assert_eq!(
+                tc_gen,
+                Some(2),
+                "AMX FP16 arch should report tensor_core_gen=2, got {tc_gen:?}"
+            );
         } else if has_amx {
-            assert_eq!(tc_gen, Some(1),
-                "AMX arch should report tensor_core_gen=1, got {tc_gen:?}");
+            assert_eq!(
+                tc_gen,
+                Some(1),
+                "AMX arch should report tensor_core_gen=1, got {tc_gen:?}"
+            );
         } else {
-            assert_eq!(tc_gen, None,
-                "Non-AMX CPU arch should have None tensor_core_gen, got {tc_gen:?}");
+            assert_eq!(
+                tc_gen, None,
+                "Non-AMX CPU arch should have None tensor_core_gen, got {tc_gen:?}"
+            );
         }
     }
 
@@ -1381,9 +1566,15 @@ mod tests {
 
         // Assert: without explicit feature enablement, both should be false
         #[cfg(not(feature = "onednn"))]
-        assert!(!isv.onednn_available, "oneDNN should not be available without feature flag");
+        assert!(
+            !isv.onednn_available,
+            "oneDNN should not be available without feature flag"
+        );
         #[cfg(not(feature = "accelerate"))]
-        assert!(!isv.accelerate_available, "Accelerate should not be available without feature flag");
+        assert!(
+            !isv.accelerate_available,
+            "Accelerate should not be available without feature flag"
+        );
     }
 
     /// Test GemmBlocking Debug derive produces non-empty output.
@@ -1434,7 +1625,11 @@ mod tests {
         let set: HashSet<DotProductCap> = all_variants.iter().copied().collect();
 
         // Assert: all 10 variants are distinct (HashSet deduplicates on Eq)
-        assert_eq!(set.len(), 10, "All 10 DotProductCap variants should be distinct");
+        assert_eq!(
+            set.len(),
+            10,
+            "All 10 DotProductCap variants should be distinct"
+        );
 
         // Assert: reflexivity
         assert_eq!(DotProductCap::NativeBf16, DotProductCap::NativeBf16);
@@ -1462,8 +1657,12 @@ mod tests {
             assert!(b.nc > 0, "NC must be > 0 for m={m} n={n} k={k}");
             assert!(b.mr > 0, "MR must be > 0");
             assert!(b.nr > 0, "NR must be > 0");
-            assert_eq!(b.kc % 4, 0,
-                "KC={} must be aligned to 4 for m={m} n={n} k={k}", b.kc);
+            assert_eq!(
+                b.kc % 4,
+                0,
+                "KC={} must be aligned to 4 for m={m} n={n} k={k}",
+                b.kc
+            );
         }
     }
 
@@ -1477,12 +1676,18 @@ mod tests {
         let (l1, l2, l3) = profile.cache_sizes();
 
         // Assert: must match kernel_config exactly
-        assert_eq!(l1, profile.kernel_config.l1d,
-            "cache_sizes L1D should match kernel_config.l1d");
-        assert_eq!(l2, profile.kernel_config.l2,
-            "cache_sizes L2 should match kernel_config.l2");
-        assert_eq!(l3, profile.kernel_config.l3,
-            "cache_sizes L3 should match kernel_config.l3");
+        assert_eq!(
+            l1, profile.kernel_config.l1d,
+            "cache_sizes L1D should match kernel_config.l1d"
+        );
+        assert_eq!(
+            l2, profile.kernel_config.l2,
+            "cache_sizes L2 should match kernel_config.l2"
+        );
+        assert_eq!(
+            l3, profile.kernel_config.l3,
+            "cache_sizes L3 should match kernel_config.l3"
+        );
     }
 
     /// Test simd_width_f32 is exactly simd_width_bytes / 4.
@@ -1496,8 +1701,12 @@ mod tests {
         let f32_lanes = profile.simd_width_f32();
 
         // Assert: mathematical identity
-        assert_eq!(f32_lanes, bytes / 4,
-            "simd_width_f32={f32_lanes} should equal simd_width_bytes/4={}", bytes / 4);
+        assert_eq!(
+            f32_lanes,
+            bytes / 4,
+            "simd_width_f32={f32_lanes} should equal simd_width_bytes/4={}",
+            bytes / 4
+        );
     }
 
     /// Test parallel_threshold scales with physical_cores.
@@ -1511,8 +1720,10 @@ mod tests {
 
         // Assert: threshold = 4096 * physical_cores
         let expected = 4096 * profile.physical_cores;
-        assert_eq!(threshold, expected,
-            "parallel_threshold={threshold} should equal 4096 * physical_cores={expected}");
+        assert_eq!(
+            threshold, expected,
+            "parallel_threshold={threshold} should equal 4096 * physical_cores={expected}"
+        );
     }
 
     /// Test microkernel_mr_nr returns values from kernel_config.
@@ -1525,10 +1736,16 @@ mod tests {
         let (mr, nr) = profile.microkernel_mr_nr();
 
         // Assert
-        assert_eq!(mr, profile.kernel_config.mr,
-            "microkernel_mr_nr MR={mr} should match kernel_config.mr={}", profile.kernel_config.mr);
-        assert_eq!(nr, profile.kernel_config.nr,
-            "microkernel_mr_nr NR={nr} should match kernel_config.nr={}", profile.kernel_config.nr);
+        assert_eq!(
+            mr, profile.kernel_config.mr,
+            "microkernel_mr_nr MR={mr} should match kernel_config.mr={}",
+            profile.kernel_config.mr
+        );
+        assert_eq!(
+            nr, profile.kernel_config.nr,
+            "microkernel_mr_nr NR={nr} should match kernel_config.nr={}",
+            profile.kernel_config.nr
+        );
     }
 
     /// Test peak_gflops returns positive values for all DType variants.
@@ -1538,17 +1755,24 @@ mod tests {
         use crate::types::DType;
         let profile = DeviceProfile::detect();
         let dtypes = [
-            DType::F32, DType::F16, DType::BF16,
-            DType::F8E4M3, DType::F8E5M2,
-            DType::F6E3M2, DType::F6E2M3, DType::F4E2M1,
+            DType::F32,
+            DType::F16,
+            DType::BF16,
+            DType::F8E4M3,
+            DType::F8E5M2,
+            DType::F6E3M2,
+            DType::F6E2M3,
+            DType::F4E2M1,
             DType::U8,
         ];
 
         // Act & Assert
         for &dt in &dtypes {
             let gflops = profile.peak_gflops(dt);
-            assert!(gflops > 0.0,
-                "peak_gflops for {dt:?} must be positive, got {gflops}");
+            assert!(
+                gflops > 0.0,
+                "peak_gflops for {dt:?} must be positive, got {gflops}"
+            );
         }
     }
 
@@ -1559,8 +1783,14 @@ mod tests {
         let isv = IsvCapabilities::default();
 
         // Assert
-        assert!(!isv.onednn_available, "default onednn_available should be false");
-        assert!(!isv.accelerate_available, "default accelerate_available should be false");
+        assert!(
+            !isv.onednn_available,
+            "default onednn_available should be false"
+        );
+        assert!(
+            !isv.accelerate_available,
+            "default accelerate_available should be false"
+        );
     }
 
     /// Test query_wisdom_jit_params returns None for a shape not in WisdomDb.
@@ -1573,8 +1803,10 @@ mod tests {
         let result = profile.query_wisdom_jit_params(12345, 67890, 11111, crate::types::DType::F32);
 
         // Assert: no cached JIT params for this shape
-        assert!(result.is_none(),
-            "query_wisdom_jit_params should return None for uncached shape");
+        assert!(
+            result.is_none(),
+            "query_wisdom_jit_params should return None for uncached shape"
+        );
     }
 
     /// Test GemmBlocking with BF16 dtype: MC should be aligned to MR,
@@ -1590,16 +1822,19 @@ mod tests {
 
         // Assert: same alignment contracts as F32
         if b.mc < 2048 {
-            assert_eq!(b.mc % mr, 0,
-                "BF16 MC={} must be aligned to MR={mr}", b.mc);
+            assert_eq!(b.mc % mr, 0, "BF16 MC={} must be aligned to MR={mr}", b.mc);
         }
         if b.nc < 2048 {
-            assert_eq!(b.nc % nr, 0,
-                "BF16 NC={} must be aligned to NR={nr}", b.nc);
+            assert_eq!(b.nc % nr, 0, "BF16 NC={} must be aligned to NR={nr}", b.nc);
         }
         assert_eq!(b.kc % 4, 0, "BF16 KC={} must be aligned to 4", b.kc);
-        assert!(b.kc > 0 && b.mc > 0 && b.nc > 0,
-            "All blocking params must be positive: KC={} MC={} NC={}", b.kc, b.mc, b.nc);
+        assert!(
+            b.kc > 0 && b.mc > 0 && b.nc > 0,
+            "All blocking params must be positive: KC={} MC={} NC={}",
+            b.kc,
+            b.mc,
+            b.nc
+        );
     }
 
     // ── Additional tests for uncovered logic paths ──
@@ -1607,7 +1842,13 @@ mod tests {
     /// Test GemmBlocking Clone derive works correctly.
     #[test]
     fn test_gemm_blocking_clone_independent() {
-        let original = GemmBlocking { kc: 128, mc: 64, nc: 256, mr: 6, nr: 16 };
+        let original = GemmBlocking {
+            kc: 128,
+            mc: 64,
+            nc: 256,
+            mr: 6,
+            nr: 16,
+        };
         let cloned = original.clone();
         assert_eq!(original.kc, cloned.kc);
         assert_eq!(original.mc, cloned.mc);
@@ -1620,9 +1861,14 @@ mod tests {
     #[test]
     fn test_isa_level_debug_output() {
         let levels = [
-            IsaLevel::Scalar, IsaLevel::Avx2, IsaLevel::Avx512,
-            IsaLevel::Avx512Amx, IsaLevel::Neon, IsaLevel::Sve,
-            IsaLevel::Sve2, IsaLevel::NeonAmx,
+            IsaLevel::Scalar,
+            IsaLevel::Avx2,
+            IsaLevel::Avx512,
+            IsaLevel::Avx512Amx,
+            IsaLevel::Neon,
+            IsaLevel::Sve,
+            IsaLevel::Sve2,
+            IsaLevel::NeonAmx,
         ];
         for level in levels {
             let debug_str = format!("{level:?}");
@@ -1634,15 +1880,23 @@ mod tests {
     #[test]
     fn test_dot_product_cap_debug_output() {
         let caps = [
-            DotProductCap::NativeBf16, DotProductCap::NativeFp16,
-            DotProductCap::NativeInt4x8, DotProductCap::NativeFp4,
-            DotProductCap::NativeInt8Tc, DotProductCap::NativeInt8Simd,
-            DotProductCap::NativeInt8Tile, DotProductCap::SimdAssisted,
-            DotProductCap::SimdBasic, DotProductCap::None,
+            DotProductCap::NativeBf16,
+            DotProductCap::NativeFp16,
+            DotProductCap::NativeInt4x8,
+            DotProductCap::NativeFp4,
+            DotProductCap::NativeInt8Tc,
+            DotProductCap::NativeInt8Simd,
+            DotProductCap::NativeInt8Tile,
+            DotProductCap::SimdAssisted,
+            DotProductCap::SimdBasic,
+            DotProductCap::None,
         ];
         for cap in caps {
             let debug_str = format!("{cap:?}");
-            assert!(!debug_str.is_empty(), "DotProductCap Debug should not be empty");
+            assert!(
+                !debug_str.is_empty(),
+                "DotProductCap Debug should not be empty"
+            );
         }
     }
 
@@ -1653,16 +1907,20 @@ mod tests {
         let display = format!("{profile}");
         // Must contain the arch name from MicroArch Display
         let arch_display = profile.arch.to_string();
-        assert!(display.contains(&arch_display),
-            "DeviceProfile Display should contain arch name '{arch_display}'");
+        assert!(
+            display.contains(&arch_display),
+            "DeviceProfile Display should contain arch name '{arch_display}'"
+        );
     }
 
     /// Test DeviceProfile.arch matches kernel_config.arch (consistency).
     #[test]
     fn test_device_profile_arch_consistency() {
         let profile = DeviceProfile::detect();
-        assert_eq!(profile.arch, profile.kernel_config.arch,
-            "DeviceProfile.arch must match kernel_config.arch");
+        assert_eq!(
+            profile.arch, profile.kernel_config.arch,
+            "DeviceProfile.arch must match kernel_config.arch"
+        );
     }
 
     /// Test peak_gflops F16 and BF16 are equal (same throughput class).
@@ -1671,8 +1929,10 @@ mod tests {
         let profile = DeviceProfile::detect();
         let f16_gflops = profile.peak_gflops(crate::types::DType::F16);
         let bf16_gflops = profile.peak_gflops(crate::types::DType::BF16);
-        assert!((f16_gflops - bf16_gflops).abs() < 1e-10,
-            "F16 and BF16 should have same peak GFLOPS, got F16={f16_gflops} BF16={bf16_gflops}");
+        assert!(
+            (f16_gflops - bf16_gflops).abs() < 1e-10,
+            "F16 and BF16 should have same peak GFLOPS, got F16={f16_gflops} BF16={bf16_gflops}"
+        );
     }
 
     /// Test peak_gflops F8E4M3 equals F8E5M2 (same throughput class).
@@ -1681,8 +1941,10 @@ mod tests {
         let profile = DeviceProfile::detect();
         let e4m3 = profile.peak_gflops(crate::types::DType::F8E4M3);
         let e5m2 = profile.peak_gflops(crate::types::DType::F8E5M2);
-        assert!((e4m3 - e5m2).abs() < 1e-10,
-            "FP8 E4M3 and E5M2 should have same peak GFLOPS");
+        assert!(
+            (e4m3 - e5m2).abs() < 1e-10,
+            "FP8 E4M3 and E5M2 should have same peak GFLOPS"
+        );
     }
 
     /// Test QuantCapability Debug derive produces output.
@@ -1690,8 +1952,14 @@ mod tests {
     fn test_quant_capability_debug() {
         let profile = DeviceProfile::detect();
         let debug_str = format!("{:?}", profile.quant_capabilities);
-        assert!(debug_str.contains("native_formats"), "Debug should contain native_formats");
-        assert!(debug_str.contains("assisted_formats"), "Debug should contain assisted_formats");
+        assert!(
+            debug_str.contains("native_formats"),
+            "Debug should contain native_formats"
+        );
+        assert!(
+            debug_str.contains("assisted_formats"),
+            "Debug should contain assisted_formats"
+        );
     }
 
     /// Test IsvCapabilities Clone derive.
@@ -1700,7 +1968,10 @@ mod tests {
         let profile = DeviceProfile::detect();
         let cloned = profile.isv.clone();
         assert_eq!(profile.isv.onednn_available, cloned.onednn_available);
-        assert_eq!(profile.isv.accelerate_available, cloned.accelerate_available);
+        assert_eq!(
+            profile.isv.accelerate_available,
+            cloned.accelerate_available
+        );
     }
 
     /// Test elem_tile_size is SIMD-aligned and fits in L1 budget.
@@ -1713,8 +1984,10 @@ mod tests {
 
         // tile * 2 * sizeof(f32) should fit in 75% of L1
         let bytes_used = tile * 2 * 4;
-        assert!(bytes_used <= l1 * 3 / 4 + simd_w * 4, // allow rounding
-            "elem_tile bytes {bytes_used} should fit in 75% of L1={l1}");
+        assert!(
+            bytes_used <= l1 * 3 / 4 + simd_w * 4, // allow rounding
+            "elem_tile bytes {bytes_used} should fit in 75% of L1={l1}"
+        );
         assert_eq!(tile % simd_w, 0, "tile must be SIMD-aligned");
     }
 
@@ -1724,9 +1997,14 @@ mod tests {
         use crate::types::DType;
         let profile = DeviceProfile::detect();
         let dtypes = [
-            DType::F32, DType::F16, DType::BF16,
-            DType::F8E4M3, DType::F8E5M2,
-            DType::F6E3M2, DType::F6E2M3, DType::F4E2M1,
+            DType::F32,
+            DType::F16,
+            DType::BF16,
+            DType::F8E4M3,
+            DType::F8E5M2,
+            DType::F6E3M2,
+            DType::F6E2M3,
+            DType::F4E2M1,
             DType::U8,
         ];
         for &dt in &dtypes {
@@ -1745,8 +2023,10 @@ mod tests {
         let profile = DeviceProfile::detect();
         let ratio = profile.l1_budget_ratio();
         // Ratio must be in the documented range.
-        assert!(ratio >= 0.75 && ratio <= 0.90,
-            "l1_budget_ratio {ratio} outside [0.75, 0.90]");
+        assert!(
+            ratio >= 0.75 && ratio <= 0.90,
+            "l1_budget_ratio {ratio} outside [0.75, 0.90]"
+        );
         // Verify exact match with ISA level.
         let expected = match profile.isa {
             IsaLevel::Avx512Amx => 0.90,
@@ -1756,7 +2036,9 @@ mod tests {
             IsaLevel::Sve | IsaLevel::Sve2 => 0.85,
             IsaLevel::Scalar => 0.75,
         };
-        assert!((ratio - expected).abs() < 1e-15,
-            "ratio {ratio} != expected {expected}");
+        assert!(
+            (ratio - expected).abs() < 1e-15,
+            "ratio {ratio} != expected {expected}"
+        );
     }
 }

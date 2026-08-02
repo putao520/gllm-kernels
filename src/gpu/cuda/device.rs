@@ -5,8 +5,8 @@
 
 use std::sync::Arc;
 
-use crate::gpu::{GpuDevice, GpuBuffer, GpuStream, GpuError};
 use super::driver::*;
+use crate::gpu::{GpuBuffer, GpuDevice, GpuError, GpuStream};
 
 pub use super::driver::CUevent;
 
@@ -32,7 +32,9 @@ impl GpuBuffer for CudaBuffer {
 impl Drop for CudaBuffer {
     fn drop(&mut self) {
         if self.ptr != 0 {
-            unsafe { (self.driver.cuMemFree_v2)(self.ptr); }
+            unsafe {
+                (self.driver.cuMemFree_v2)(self.ptr);
+            }
         }
     }
 }
@@ -67,7 +69,9 @@ impl CudaStream {
 impl Drop for CudaStream {
     fn drop(&mut self) {
         if self.handle != 0 {
-            unsafe { (self.driver.cuStreamDestroy_v2)(self.handle); }
+            unsafe {
+                (self.driver.cuStreamDestroy_v2)(self.handle);
+            }
         }
     }
 }
@@ -113,12 +117,15 @@ impl CudaDevice {
         }
 
         // Query SM version
-        let major = driver.device_attribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device_id)?;
-        let minor = driver.device_attribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device_id)?;
+        let major =
+            driver.device_attribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device_id)?;
+        let minor =
+            driver.device_attribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device_id)?;
         let sm_version = (major * 10 + minor) as u32;
 
         // Build device name from SM version (we avoid cuDeviceGetName for simplicity)
-        let sm_count = driver.device_attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device_id)?;
+        let sm_count =
+            driver.device_attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device_id)?;
         let name = format!("CUDA device {ordinal} (sm_{sm_version}, {sm_count} SMs)");
 
         // Create default stream (handle=0 is the CUDA default/legacy stream)
@@ -131,7 +138,11 @@ impl CudaDevice {
             let mut free: usize = 0;
             let mut total: usize = 0;
             let res = unsafe { (driver.cuMemGetInfo_v2)(&mut free, &mut total) };
-            if res == CUDA_SUCCESS { total } else { 0 }
+            if res == CUDA_SUCCESS {
+                total
+            } else {
+                0
+            }
         };
 
         Ok(Self {
@@ -168,8 +179,10 @@ impl CudaDevice {
         let d = &self.driver;
         let id = self.device_id;
 
-        let compute_units = d.device_attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, id)? as u32;
-        let shared_mem = d.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK, id)? as u32;
+        let compute_units =
+            d.device_attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, id)? as u32;
+        let shared_mem =
+            d.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK, id)? as u32;
         let max_regs = d.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_BLOCK, id)? as u32;
         let warp_size = d.device_attribute(CU_DEVICE_ATTRIBUTE_WARP_SIZE, id)? as u32;
         let max_threads = d.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, id)? as u32;
@@ -189,16 +202,29 @@ impl CudaDevice {
         let clock_mhz = clock_khz / 1000;
 
         // Memory bandwidth estimate: mem_clock (MHz) * bus_width (bits) * 2 (DDR) / 8 (bytes)
-        let mem_clock_khz = d.device_attribute(CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE, id).unwrap_or(0) as f64;
-        let bus_width = d.device_attribute(CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH, id).unwrap_or(0) as f64;
+        let mem_clock_khz = d
+            .device_attribute(CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE, id)
+            .unwrap_or(0) as f64;
+        let bus_width = d
+            .device_attribute(CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH, id)
+            .unwrap_or(0) as f64;
         let memory_bandwidth_gbs = (mem_clock_khz * 1e-6) * (bus_width / 8.0) * 2.0;
 
         // Peak GFLOPS estimate: SMs * cores/SM * 2 (FMA) * clock_GHz
-        let cores_per_sm: f64 = if self.sm_version >= 80 { 128.0 } else if self.sm_version >= 70 { 64.0 } else { 128.0 };
-        let peak_gflops_f32 = (compute_units as f64) * cores_per_sm * 2.0 * (clock_mhz as f64 / 1000.0);
+        let cores_per_sm: f64 = if self.sm_version >= 80 {
+            128.0
+        } else if self.sm_version >= 70 {
+            64.0
+        } else {
+            128.0
+        };
+        let peak_gflops_f32 =
+            (compute_units as f64) * cores_per_sm * 2.0 * (clock_mhz as f64 / 1000.0);
 
         Ok(crate::gpu::GpuDeviceProfile {
-            platform: Platform::Cuda { sm_version: self.sm_version },
+            platform: Platform::Cuda {
+                sm_version: self.sm_version,
+            },
             compute_units,
             shared_mem_per_block: shared_mem,
             max_registers_per_thread: max_regs / max_threads.max(1),
@@ -209,14 +235,23 @@ impl CudaDevice {
             total_memory: self.total_memory,
             memory_bandwidth_gbs,
             peak_gflops_f32,
-            peak_gflops_f16: if self.sm_version >= 70 { peak_gflops_f32 * 2.0 } else { peak_gflops_f32 },
+            peak_gflops_f16: if self.sm_version >= 70 {
+                peak_gflops_f32 * 2.0
+            } else {
+                peak_gflops_f32
+            },
             has_matrix_unit: self.sm_version >= 70,
             clock_mhz,
             isv: crate::gpu::GpuIsvCapabilities {
-                tensor_core_gen: if self.sm_version >= 90 { 3 }
-                    else if self.sm_version >= 80 { 2 }
-                    else if self.sm_version >= 70 { 1 }
-                    else { 0 },
+                tensor_core_gen: if self.sm_version >= 90 {
+                    3
+                } else if self.sm_version >= 80 {
+                    2
+                } else if self.sm_version >= 70 {
+                    1
+                } else {
+                    0
+                },
                 ..Default::default()
             },
         })
@@ -265,9 +300,8 @@ impl GpuDevice for CudaDevice {
         let buf = self.alloc(bytes)?;
         // Zero-fill via host→device of zeroed buffer
         let zeros = vec![0u8; bytes];
-        let res = unsafe {
-            (self.driver.cuMemcpyHtoD_v2)(buf.ptr, zeros.as_ptr() as *const _, bytes)
-        };
+        let res =
+            unsafe { (self.driver.cuMemcpyHtoD_v2)(buf.ptr, zeros.as_ptr() as *const _, bytes) };
         if res != CUDA_SUCCESS {
             return Err(GpuError::Transfer(format!(
                 "cuMemcpyHtoD_v2 (zero-fill) failed with error {res}"
@@ -282,9 +316,8 @@ impl GpuDevice for CudaDevice {
         dst: &mut Self::Buffer,
         _stream: &Self::Stream,
     ) -> Result<(), GpuError> {
-        let res = unsafe {
-            (self.driver.cuMemcpyHtoD_v2)(dst.ptr, src.as_ptr() as *const _, src.len())
-        };
+        let res =
+            unsafe { (self.driver.cuMemcpyHtoD_v2)(dst.ptr, src.as_ptr() as *const _, src.len()) };
         if res != CUDA_SUCCESS {
             return Err(GpuError::Transfer(format!(
                 "cuMemcpyHtoD_v2 failed with error {res}"
@@ -411,7 +444,9 @@ impl CudaDevice {
 impl Drop for CudaDevice {
     fn drop(&mut self) {
         if self.context != 0 {
-            unsafe { (self.driver.cuCtxDestroy_v2)(self.context); }
+            unsafe {
+                (self.driver.cuCtxDestroy_v2)(self.context);
+            }
         }
     }
 }
@@ -428,13 +463,11 @@ impl CudaModule {
     /// Look up a kernel function by name.
     pub fn get_function(&self, name: &str) -> Result<CUfunction, GpuError> {
         use std::ffi::CString;
-        let cname = CString::new(name).map_err(|e| {
-            GpuError::Driver(format!("invalid function name '{name}': {e}"))
-        })?;
+        let cname = CString::new(name)
+            .map_err(|e| GpuError::Driver(format!("invalid function name '{name}': {e}")))?;
         let mut func: CUfunction = 0;
-        let res = unsafe {
-            (self.driver.cuModuleGetFunction)(&mut func, self.module, cname.as_ptr())
-        };
+        let res =
+            unsafe { (self.driver.cuModuleGetFunction)(&mut func, self.module, cname.as_ptr()) };
         if res != CUDA_SUCCESS {
             return Err(GpuError::Driver(format!(
                 "cuModuleGetFunction('{name}') failed with error {res}"
@@ -447,7 +480,9 @@ impl CudaModule {
 impl Drop for CudaModule {
     fn drop(&mut self) {
         if self.module != 0 {
-            unsafe { (self.driver.cuModuleUnload)(self.module); }
+            unsafe {
+                (self.driver.cuModuleUnload)(self.module);
+            }
         }
     }
 }
@@ -461,9 +496,8 @@ impl CudaDevice {
     /// `ptx_bytes` must be a null-terminated PTX string or a cubin blob.
     pub fn load_ptx(&self, ptx_bytes: &[u8]) -> Result<CudaModule, GpuError> {
         let mut module: CUmodule = 0;
-        let res = unsafe {
-            (self.driver.cuModuleLoadData)(&mut module, ptx_bytes.as_ptr() as *const _)
-        };
+        let res =
+            unsafe { (self.driver.cuModuleLoadData)(&mut module, ptx_bytes.as_ptr() as *const _) };
         if res != CUDA_SUCCESS {
             return Err(GpuError::Driver(format!(
                 "cuModuleLoadData failed with error {res}"
@@ -490,12 +524,16 @@ impl CudaDevice {
         let res = unsafe {
             (self.driver.cuLaunchKernel)(
                 func,
-                grid.0, grid.1, grid.2,
-                block.0, block.1, block.2,
-                0,                              // shared mem bytes
+                grid.0,
+                grid.1,
+                grid.2,
+                block.0,
+                block.1,
+                block.2,
+                0, // shared mem bytes
                 stream.handle(),
                 args.as_ptr() as *mut *mut _,
-                std::ptr::null_mut(),           // extra
+                std::ptr::null_mut(), // extra
             )
         };
         if res != CUDA_SUCCESS {
@@ -555,7 +593,10 @@ mod tests {
         let len = buffer.len();
 
         // Assert
-        assert_eq!(ptr, 0xDEADBEEFu64, "as_device_ptr must return the raw CUdeviceptr");
+        assert_eq!(
+            ptr, 0xDEADBEEFu64,
+            "as_device_ptr must return the raw CUdeviceptr"
+        );
         assert_eq!(len, 4096, "len must return the allocated size in bytes");
 
         forget_all!(buffer, driver);
@@ -685,9 +726,19 @@ mod tests {
         // Assert
         assert_eq!(sm, 80, "sm_version() must return 80");
         assert_eq!(ctx, 0, "context() must return the raw context handle");
-        assert_eq!(name, "Test CUDA sm_80", "name() must return the device name");
-        assert_eq!(total, 40 * 1024 * 1024 * 1024, "total_memory must return 40 GB");
-        assert!(Arc::ptr_eq(drv, &driver), "driver() must return the same Arc");
+        assert_eq!(
+            name, "Test CUDA sm_80",
+            "name() must return the device name"
+        );
+        assert_eq!(
+            total,
+            40 * 1024 * 1024 * 1024,
+            "total_memory must return 40 GB"
+        );
+        assert!(
+            Arc::ptr_eq(drv, &driver),
+            "driver() must return the same Arc"
+        );
 
         forget_all!(device, driver);
     }
@@ -714,7 +765,11 @@ mod tests {
         let stream: &<CudaDevice as GpuDevice>::Stream = device.default_stream();
 
         // Assert — the returned stream is the same one embedded in the device
-        assert_eq!(stream.handle(), 42, "default stream handle must match the embedded stream");
+        assert_eq!(
+            stream.handle(),
+            42,
+            "default stream handle must match the embedded stream"
+        );
 
         forget_all!(device, driver);
     }
@@ -778,7 +833,10 @@ mod tests {
         let count = Arc::strong_count(&driver);
 
         // Assert
-        assert_eq!(count, 4, "driver Arc must be shared by stub + stream + device + buffer");
+        assert_eq!(
+            count, 4,
+            "driver Arc must be shared by stub + stream + device + buffer"
+        );
         assert!(Arc::ptr_eq(device.driver(), &driver));
         assert_eq!(buffer.as_device_ptr(), 0x2000);
         assert_eq!(buffer.len(), 512);

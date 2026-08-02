@@ -18,7 +18,11 @@ struct Mat {
 
 impl Mat {
     fn zeros(rows: usize, cols: usize) -> Self {
-        Self { rows, cols, data: vec![0.0; rows * cols] }
+        Self {
+            rows,
+            cols,
+            data: vec![0.0; rows * cols],
+        }
     }
 
     fn from_fn(rows: usize, cols: usize, mut f: impl FnMut(usize, usize) -> f32) -> Self {
@@ -68,7 +72,9 @@ impl Mat {
 fn make_rng(seed: u64) -> impl FnMut() -> f32 {
     let mut state = seed;
     move || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let x = ((state >> 33) as u32) as f32 / u32::MAX as f32;
         x * 2.0 - 1.0
     }
@@ -91,7 +97,10 @@ fn cos_sim(a: &[f32], b: &[f32]) -> f32 {
 /// Max absolute error between two vectors.
 fn max_abs_error(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
-    a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
 }
 
 /// Online softmax: computes softmax incrementally.
@@ -123,9 +132,9 @@ fn online_softmax(scores: &[f32]) -> Vec<f32> {
 ///   attn_weights = softmax(scores)
 ///   output = attn_weights × V
 fn standard_attention(
-    q: &[f32],     // [head_dim]
-    k: &Mat,       // [kv_len, head_dim]
-    v: &Mat,       // [kv_len, head_dim]
+    q: &[f32], // [head_dim]
+    k: &Mat,   // [kv_len, head_dim]
+    v: &Mat,   // [kv_len, head_dim]
     head_dim: usize,
 ) -> Vec<f32> {
     let kv_len = k.rows;
@@ -157,9 +166,9 @@ fn standard_attention(
 ///   for each pos: V_h = W_UV_h × c_KV[pos]
 ///   output = sum(attn_weights[pos] * V_h[pos])
 fn absorbed_mla_attention(
-    q_absorbed: &[f32],  // [d_c]
-    c_kv: &Mat,          // [kv_len, d_c]
-    w_uv_h: &Mat,        // [head_dim, d_c]  (W_UV for this head)
+    q_absorbed: &[f32], // [d_c]
+    c_kv: &Mat,         // [kv_len, d_c]
+    w_uv_h: &Mat,       // [head_dim, d_c]  (W_UV for this head)
     d_c: usize,
     head_dim: usize,
 ) -> Vec<f32> {
@@ -237,41 +246,41 @@ fn test_mla_standard_vs_absorbed_cos_sim() {
 
     // Standard path: compute full K, V from c_KV
     let k_full = c_kv.matmul(&w_uk); // [kv_len, head_dim]
-    let w_uv_t = w_uv.transpose();   // [head_dim*NUM_HEADS, d_c]
+    let w_uv_t = w_uv.transpose(); // [head_dim*NUM_HEADS, d_c]
 
     let mut standard_outputs = Vec::new();
     let mut absorbed_outputs = Vec::new();
 
     for h in 0..NUM_HEADS {
         // Q_h = X × W_Q_h
-        let q_h: Vec<f32> = (0..HEAD_DIM).map(|d| {
-            let mut sum = 0.0f32;
-            for i in 0..D_MODEL {
-                sum += x[i] * w_q.row(i)[d];
-            }
-            sum
-        }).collect();
+        let q_h: Vec<f32> = (0..HEAD_DIM)
+            .map(|d| {
+                let mut sum = 0.0f32;
+                for i in 0..D_MODEL {
+                    sum += x[i] * w_q.row(i)[d];
+                }
+                sum
+            })
+            .collect();
 
         // Standard path V_h = W_UV_h × c_KV[pos] for each position
-        let w_uv_h = Mat::from_fn(HEAD_DIM, D_C, |r, c| {
-            w_uv_t.row(h * HEAD_DIM + r)[c]
-        });
-        let v_h = Mat::from_fn(KV_LEN, HEAD_DIM, |pos, d| {
-            gemv(&w_uv_h, c_kv.row(pos))[d]
-        });
+        let w_uv_h = Mat::from_fn(HEAD_DIM, D_C, |r, c| w_uv_t.row(h * HEAD_DIM + r)[c]);
+        let v_h = Mat::from_fn(KV_LEN, HEAD_DIM, |pos, d| gemv(&w_uv_h, c_kv.row(pos))[d]);
 
         let std_out = standard_attention(&q_h, &k_full, &v_h, HEAD_DIM);
         standard_outputs.extend_from_slice(&std_out);
 
         // Absorbed path: Q_absorbed_h = Q_h × W_UK^T
         let w_uk_t = w_uk.transpose(); // [head_dim, d_c]
-        let q_absorbed_h: Vec<f32> = (0..D_C).map(|c| {
-            let mut sum = 0.0f32;
-            for d in 0..HEAD_DIM {
-                sum += q_h[d] * w_uk_t.row(d)[c];
-            }
-            sum
-        }).collect();
+        let q_absorbed_h: Vec<f32> = (0..D_C)
+            .map(|c| {
+                let mut sum = 0.0f32;
+                for d in 0..HEAD_DIM {
+                    sum += q_h[d] * w_uk_t.row(d)[c];
+                }
+                sum
+            })
+            .collect();
 
         let abs_out = absorbed_mla_attention(&q_absorbed_h, &c_kv, &w_uv_h, D_C, HEAD_DIM);
         absorbed_outputs.extend_from_slice(&abs_out);
@@ -349,26 +358,31 @@ fn test_mla_rope_merge_attention_score_error() {
 
     // Score with merged key (MLA compressed space)
     let scale_mla = 1.0 / ((D_C + D_ROPE) as f32).sqrt();
-    let scores_merged: Vec<f32> = (0..KV_LEN).map(|pos| {
-        let mut dot = 0.0f32;
-        for d in 0..D_C + D_ROPE {
-            dot += q[d] * merged_key.row(pos)[d];
-        }
-        dot * scale_mla
-    }).collect();
+    let scores_merged: Vec<f32> = (0..KV_LEN)
+        .map(|pos| {
+            let mut dot = 0.0f32;
+            for d in 0..D_C + D_ROPE {
+                dot += q[d] * merged_key.row(pos)[d];
+            }
+            dot * scale_mla
+        })
+        .collect();
 
     // Score with only c_KV (without RoPE merge)
     let scale_c = 1.0 / (D_C as f32).sqrt();
-    let scores_no_rope: Vec<f32> = (0..KV_LEN).map(|pos| {
-        let mut dot = 0.0f32;
-        for d in 0..D_C {
-            dot += q[d] * c_kv.row(pos)[d];
-        }
-        dot * scale_c
-    }).collect();
+    let scores_no_rope: Vec<f32> = (0..KV_LEN)
+        .map(|pos| {
+            let mut dot = 0.0f32;
+            for d in 0..D_C {
+                dot += q[d] * c_kv.row(pos)[d];
+            }
+            dot * scale_c
+        })
+        .collect();
 
     // The merged scores should differ from non-merged scores (RoPE has an effect)
-    let score_diff: f32 = scores_merged.iter()
+    let score_diff: f32 = scores_merged
+        .iter()
         .zip(scores_no_rope.iter())
         .map(|(a, b)| (a - b).abs())
         .sum();
@@ -404,13 +418,15 @@ fn test_mla_per_head_cos_sim_threshold() {
         let std_out = standard_attention(&q_h, &k_full, &v_full, HEAD_DIM);
 
         let w_uk_t = w_uk.transpose();
-        let q_absorbed: Vec<f32> = (0..D_C).map(|c| {
-            let mut sum = 0.0f32;
-            for d in 0..HEAD_DIM {
-                sum += q_h[d] * w_uk_t.row(d)[c];
-            }
-            sum
-        }).collect();
+        let q_absorbed: Vec<f32> = (0..D_C)
+            .map(|c| {
+                let mut sum = 0.0f32;
+                for d in 0..HEAD_DIM {
+                    sum += q_h[d] * w_uk_t.row(d)[c];
+                }
+                sum
+            })
+            .collect();
 
         let w_uv_h_mat = Mat::from_fn(HEAD_DIM, D_C, |r, c| w_uv.row(c)[r]);
         let abs_out = absorbed_mla_attention(&q_absorbed, &c_kv, &w_uv_h_mat, D_C, HEAD_DIM);
@@ -429,7 +445,10 @@ fn test_mla_per_head_cos_sim_threshold() {
 fn test_mla_paged_kv_stride() {
     // SPEC 33: MLA page stride = d_c + d_rope (not standard 2*head_dim)
     let page_stride = D_C + D_ROPE;
-    assert_eq!(page_stride, 576, "MLA page stride = d_c({D_C}) + d_rope({D_ROPE}) = {page_stride}");
+    assert_eq!(
+        page_stride, 576,
+        "MLA page stride = d_c({D_C}) + d_rope({D_ROPE}) = {page_stride}"
+    );
 
     // Standard MHA page stride would be 2 * head_dim = 256
     let standard_stride = 2 * HEAD_DIM;
@@ -450,7 +469,7 @@ fn test_mla_paged_kv_stride() {
 fn test_mla_compression_ratio_56x() {
     // SPEC 33: 56.9× compression for DeepSeek V3
     let mla_bytes = (D_C + D_ROPE) * 2; // 576 * 2 = 1152 bytes
-    let mha_bytes = 2 * 128 * 128 * 2;  // 2 * n_h * d * 2 = 65536 bytes
+    let mha_bytes = 2 * 128 * 128 * 2; // 2 * n_h * d * 2 = 65536 bytes
     let ratio = mha_bytes as f64 / mla_bytes as f64;
     assert!(
         (ratio - 56.9).abs() < 0.5,

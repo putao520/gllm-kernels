@@ -57,11 +57,12 @@ pub unsafe extern "C" fn scalar_patch_embed(
                             // image[c, p_row*patch_size + kr, p_col*patch_size + kc]
                             let img_row = p_row * patch_size + kr;
                             let img_col = p_col * patch_size + kc;
-                            let img_idx =
-                                c * image_plane + img_row * image_size + img_col;
+                            let img_idx = c * image_plane + img_row * image_size + img_col;
                             // kernel[e, c, kr, kc]
-                            let ker_idx =
-                                e * in_channels * kernel_plane + c * kernel_plane + kr * patch_size + kc;
+                            let ker_idx = e * in_channels * kernel_plane
+                                + c * kernel_plane
+                                + kr * patch_size
+                                + kc;
                             acc += *image.add(img_idx) * *kernel.add(ker_idx);
                         }
                     }

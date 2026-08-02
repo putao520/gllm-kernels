@@ -3,8 +3,8 @@
 
 use super::instr::*;
 use super::plan_lower::SymDimSlotMap;
-use crate::compiler::trace::{QuantPrecision, TraceOp, ReduceKind, ValueId};
 use crate::compiler::graph::SymDim;
+use crate::compiler::trace::{QuantPrecision, ReduceKind, TraceOp, ValueId};
 use crate::types::CompilerError;
 
 pub(crate) fn emit_gemm_row_stats_telemetry(
@@ -25,32 +25,76 @@ pub(crate) fn emit_gemm_row_stats_telemetry(
 
     // Load telemetry buffer pointer
     let telemetry_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    let tel_expr = sym_map.resolve("telemetry")
-        .ok_or_else(|| CompilerError::CodegenViolation(
-            "emit_gemm_row_stats_telemetry: 'telemetry' ABI arg not found in sym_map".into(),
-        ))?
+    let tel_expr = sym_map
+        .resolve("telemetry")
+        .ok_or_else(|| {
+            CompilerError::CodegenViolation(
+                "emit_gemm_row_stats_telemetry: 'telemetry' ABI arg not found in sym_map".into(),
+            )
+        })?
         .clone();
-    prog.emit(VmInstr::LoadPtr { dst: telemetry_ptr, src: tel_expr });
+    prog.emit(VmInstr::LoadPtr {
+        dst: telemetry_ptr,
+        src: tel_expr,
+    });
 
     // Helper: build body, run auto_lower, store result at offset
-    let hreduce_store = |prog: &mut VmProgram, body: &[TraceOp], result_idx: usize, offset: usize| -> Result<(), CompilerError> {
+    let hreduce_store = |prog: &mut VmProgram,
+                         body: &[TraceOp],
+                         result_idx: usize,
+                         offset: usize|
+     -> Result<(), CompilerError> {
         let slots = super::auto_select::auto_lower_trace_raw(prog, body, &[acc], width, acc_dtype)?;
-        prog.emit(VmInstr::VecStore { base: telemetry_ptr, offset: OffsetExpr::Const(offset), src: slots[result_idx], width: SimdWidth::Scalar, dtype , predicate: None });
+        prog.emit(VmInstr::VecStore {
+            base: telemetry_ptr,
+            offset: OffsetExpr::Const(offset),
+            src: slots[result_idx],
+            width: SimdWidth::Scalar,
+            dtype,
+            predicate: None,
+        });
         Ok(())
     };
     // L1 norm: abs(acc) → HReduce(Sum)
-    hreduce_store(prog, &[
-        TraceOp::Input(0), TraceOp::Abs(ValueId(0)),
-        TraceOp::HReduce { src: ValueId(1), op: ReduceKind::Sum },
-    ], 2, crate::compiler::graph::telemetry_offsets::GEMM_ROW_NORM_L1_OFFSET)?;
+    hreduce_store(
+        prog,
+        &[
+            TraceOp::Input(0),
+            TraceOp::Abs(ValueId(0)),
+            TraceOp::HReduce {
+                src: ValueId(1),
+                op: ReduceKind::Sum,
+            },
+        ],
+        2,
+        crate::compiler::graph::telemetry_offsets::GEMM_ROW_NORM_L1_OFFSET,
+    )?;
     // Max
-    hreduce_store(prog, &[
-        TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Max },
-    ], 1, crate::compiler::graph::telemetry_offsets::GEMM_ROW_MAX_OFFSET)?;
+    hreduce_store(
+        prog,
+        &[
+            TraceOp::Input(0),
+            TraceOp::HReduce {
+                src: ValueId(0),
+                op: ReduceKind::Max,
+            },
+        ],
+        1,
+        crate::compiler::graph::telemetry_offsets::GEMM_ROW_MAX_OFFSET,
+    )?;
     // Min
-    hreduce_store(prog, &[
-        TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Min },
-    ], 1, crate::compiler::graph::telemetry_offsets::GEMM_ROW_MIN_OFFSET)?;
+    hreduce_store(
+        prog,
+        &[
+            TraceOp::Input(0),
+            TraceOp::HReduce {
+                src: ValueId(0),
+                op: ReduceKind::Min,
+            },
+        ],
+        1,
+        crate::compiler::graph::telemetry_offsets::GEMM_ROW_MIN_OFFSET,
+    )?;
 
     Ok(())
 }
@@ -87,53 +131,83 @@ pub(crate) fn emit_rmsnorm_channel_scale_telemetry(
     }
 
     let vec_count = feature_dim / lanes;
-    let step_bytes = width.bytes();
+    // VecLoad consumes `lanes` elements in the source dtype, not always a
+    // full F32-width register in memory (W512 BF16 = 32B per load).
+    let step_bytes = lanes * dtype.elem_bytes();
     if vec_count == 0 {
         return Ok(());
     }
 
     // Load telemetry buffer pointer
     let telemetry_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    let tel_expr = sym_map.resolve("telemetry")
-        .ok_or_else(|| CompilerError::CodegenViolation(
-            "emit_rmsnorm_channel_scale_telemetry: 'telemetry' ABI arg not found in sym_map".into(),
-        ))?
+    let tel_expr = sym_map
+        .resolve("telemetry")
+        .ok_or_else(|| {
+            CompilerError::CodegenViolation(
+                "emit_rmsnorm_channel_scale_telemetry: 'telemetry' ABI arg not found in sym_map"
+                    .into(),
+            )
+        })?
         .clone();
-    prog.emit(VmInstr::LoadPtr { dst: telemetry_ptr, src: tel_expr });
+    prog.emit(VmInstr::LoadPtr {
+        dst: telemetry_ptr,
+        src: tel_expr,
+    });
 
     // Load indirect pointer: channel_scale_buf = *(telemetry_ptr + CHANNEL_SCALE_PTR_OFFSET)
     let channel_scale_buf = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     prog.emit(VmInstr::LoadPtr {
         dst: channel_scale_buf,
-        src: PtrExpr::VRegPlusConst(telemetry_ptr, crate::compiler::graph::telemetry_offsets::CHANNEL_SCALE_PTR_OFFSET),
+        src: PtrExpr::VRegPlusConst(
+            telemetry_ptr,
+            crate::compiler::graph::telemetry_offsets::CHANNEL_SCALE_PTR_OFFSET,
+        ),
     });
 
     // Initialize running max to zero (broadcast)
     let running_max = prog.alloc_vreg(VRegKind::Vec, width);
-    prog.emit(VmInstr::Broadcast { dst: running_max, src: ScalarExpr::Const(0.0), width, dtype, });
+    prog.emit(VmInstr::Broadcast {
+        dst: running_max,
+        src: ScalarExpr::Const(0.0),
+        width,
+        dtype,
+    });
 
     // Scan input row: for each vector group, compute |x| and update running max
     // TraceOp body: running_max = Max(running_max, Abs(input_val))
     let ch_scale_body: Vec<TraceOp> = vec![
-        TraceOp::Input(0),  // [0] input_val
-        TraceOp::Abs(ValueId(0)),    // [1] abs_val
-        TraceOp::Input(1),  // [2] running_max
+        TraceOp::Input(0),                    // [0] input_val
+        TraceOp::Abs(ValueId(0)),             // [1] abs_val
+        TraceOp::Input(1),                    // [2] running_max
         TraceOp::Max(ValueId(1), ValueId(2)), // [3] new_max
     ];
 
     // input_ptr already points to the current row base (set by lower_norm caller).
     // Scan from offset 0..feature_dim bytes.
     let input_val = prog.alloc_vreg(VRegKind::Vec, width);
-    prog.emit_loop(BoundExpr::Const(vec_count), step_bytes, |prog, _ctr, byte_off| {
-        prog.emit(VmInstr::VecLoad {
-            dst: input_val, base: input_ptr,
-            offset: OffsetExpr::LoopOffset(byte_off), width,
-            dtype, predicate: None,
-        });
-        super::auto_select::auto_lower_trace_into(
-            prog, &ch_scale_body, &[input_val, running_max], running_max, width, acc_dtype,
-        ).expect("emit_rmsnorm_channel_scale_telemetry: auto_lower_trace invariant violation");
-    });
+    prog.emit_loop(
+        BoundExpr::Const(vec_count),
+        step_bytes,
+        |prog, _ctr, byte_off| {
+            prog.emit(VmInstr::VecLoad {
+                dst: input_val,
+                base: input_ptr,
+                offset: OffsetExpr::LoopOffset(byte_off),
+                width,
+                dtype,
+                predicate: None,
+            });
+            super::auto_select::auto_lower_trace_into(
+                prog,
+                &ch_scale_body,
+                &[input_val, running_max],
+                running_max,
+                width,
+                acc_dtype,
+            )
+            .expect("emit_rmsnorm_channel_scale_telemetry: auto_lower_trace invariant violation");
+        },
+    );
 
     // Store the per-channel absolute max vector to channel_scale_buf[0..lanes]
     // This gives the caller a representative per-channel scale estimate
@@ -142,7 +216,8 @@ pub(crate) fn emit_rmsnorm_channel_scale_telemetry(
         offset: OffsetExpr::Const(0),
         src: running_max,
         width,
-        dtype, predicate: None,
+        dtype,
+        predicate: None,
     });
 
     Ok(())
@@ -181,28 +256,42 @@ pub(crate) fn emit_silu_dead_neuron_telemetry(
 
     // Load telemetry buffer pointer from ABI arg "telemetry"
     let telemetry_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    let tel_expr = sym_map.resolve("telemetry")
-        .ok_or_else(|| CompilerError::CodegenViolation(
-            "emit_silu_dead_neuron_telemetry: 'telemetry' ABI arg not found in sym_map".into(),
-        ))?
+    let tel_expr = sym_map
+        .resolve("telemetry")
+        .ok_or_else(|| {
+            CompilerError::CodegenViolation(
+                "emit_silu_dead_neuron_telemetry: 'telemetry' ABI arg not found in sym_map".into(),
+            )
+        })?
         .clone();
-    prog.emit(VmInstr::LoadPtr { dst: telemetry_ptr, src: tel_expr });
+    prog.emit(VmInstr::LoadPtr {
+        dst: telemetry_ptr,
+        src: tel_expr,
+    });
 
     // Compute total elements and loop structure (same as emit_elementwise_inline)
-    let feature_dim: usize = output_shape.iter()
+    let feature_dim: usize = output_shape
+        .iter()
         .filter(|d| !d.is_symbolic())
         .map(|d| d.as_concrete().expect("inner dim must be Concrete"))
         .product::<usize>()
         .max(1);
     let feature_vecs = feature_dim / lanes;
-    let step_bytes = width.bytes();
+    // The source row is laid out in `dtype`, so a vector loop advances by
+    // lanes × element bytes (not the F32 register width).
+    let step_bytes = lanes * dtype.elem_bytes();
     let row_bytes = feature_dim * dtype.elem_bytes();
 
     let outer_sym = output_shape.iter().find(|d| d.is_symbolic());
 
     // Allocate accumulator for dead neuron count (as f32 for SIMD accumulation)
     let dead_count = prog.alloc_vreg(VRegKind::Vec, width);
-    prog.emit(VmInstr::Broadcast { dst: dead_count, src: ScalarExpr::Const(0.0), width, dtype, });
+    prog.emit(VmInstr::Broadcast {
+        dst: dead_count,
+        src: ScalarExpr::Const(0.0),
+        width,
+        dtype,
+    });
 
     // Threshold broadcast
     let threshold = prog.alloc_vreg(VRegKind::Vec, width);
@@ -215,22 +304,27 @@ pub(crate) fn emit_silu_dead_neuron_telemetry(
 
     // One-vec constant for counting (used to convert comparison mask to count)
     let ones = prog.alloc_vreg(VRegKind::Vec, width);
-    prog.emit(VmInstr::Broadcast { dst: ones, src: ScalarExpr::Const(1.0), width, dtype, });
+    prog.emit(VmInstr::Broadcast {
+        dst: ones,
+        src: ScalarExpr::Const(1.0),
+        width,
+        dtype,
+    });
 
     let input_val = prog.alloc_vreg(VRegKind::Vec, width);
 
     // Dead neuron detection: Min(Max(threshold - input, 0), 1) * ones + dead_count
     let dead_detect_body: Vec<TraceOp> = vec![
-        TraceOp::Input(0), // 0: threshold
-        TraceOp::Input(1), // 1: input_val
+        TraceOp::Input(0),                    // 0: threshold
+        TraceOp::Input(1),                    // 1: input_val
         TraceOp::Sub(ValueId(0), ValueId(1)), // 2: diff = threshold - input
-        TraceOp::Const(0.0), // 3: zero
+        TraceOp::Const(0.0),                  // 3: zero
         TraceOp::Max(ValueId(2), ValueId(3)), // 4: positive part
-        TraceOp::Const(1.0), // 5: one
+        TraceOp::Const(1.0),                  // 5: one
         TraceOp::Min(ValueId(4), ValueId(5)), // 6: clamped [0,1]
-        TraceOp::Input(2), // 7: ones
+        TraceOp::Input(2),                    // 7: ones
         TraceOp::Mul(ValueId(6), ValueId(7)), // 8: count_lane
-        TraceOp::Input(3), // 9: dead_count
+        TraceOp::Input(3),                    // 9: dead_count
         TraceOp::Add(ValueId(8), ValueId(9)), // 10: new dead_count
     ];
 
@@ -242,32 +336,67 @@ pub(crate) fn emit_silu_dead_neuron_telemetry(
     };
     let scan_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     prog.emit_loop(outer_bound, row_bytes, |prog, _row_ctr, row_off| {
-        prog.emit(VmInstr::LoadPtr { dst: scan_base, src: PtrExpr::VRegPlusVReg(input_ptr, row_off) });
+        prog.emit(VmInstr::LoadPtr {
+            dst: scan_base,
+            src: PtrExpr::VRegPlusVReg(input_ptr, row_off),
+        });
         if feature_vecs > 0 {
-            prog.emit_loop(BoundExpr::Const(feature_vecs), step_bytes, |prog, _ctr, col_off| {
-                prog.emit(VmInstr::VecLoad { dst: input_val, base: scan_base, offset: OffsetExpr::LoopOffset(col_off), width, dtype , predicate: None });
-                super::auto_select::auto_lower_trace_into(
-                    prog, &dead_detect_body, &[threshold, input_val, ones, dead_count], dead_count, width, acc_dtype,
-                ).expect("dead neuron detect auto_lower failed");
-            });
+            prog.emit_loop(
+                BoundExpr::Const(feature_vecs),
+                step_bytes,
+                |prog, _ctr, col_off| {
+                    prog.emit(VmInstr::VecLoad {
+                        dst: input_val,
+                        base: scan_base,
+                        offset: OffsetExpr::LoopOffset(col_off),
+                        width,
+                        dtype,
+                        predicate: None,
+                    });
+                    super::auto_select::auto_lower_trace_into(
+                        prog,
+                        &dead_detect_body,
+                        &[threshold, input_val, ones, dead_count],
+                        dead_count,
+                        width,
+                        acc_dtype,
+                    )
+                    .expect("dead neuron detect auto_lower failed");
+                },
+            );
         }
     });
 
     // Horizontal reduce: sum all lanes of dead_count into a single scalar
-    let hr_body = vec![TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Sum }];
-    let hr_slots = super::auto_select::auto_lower_trace_raw(prog, &hr_body, &[dead_count], width, acc_dtype)
-        .expect("dead neuron HReduce auto_lower failed");
+    let hr_body = vec![
+        TraceOp::Input(0),
+        TraceOp::HReduce {
+            src: ValueId(0),
+            op: ReduceKind::Sum,
+        },
+    ];
+    let hr_slots =
+        super::auto_select::auto_lower_trace_raw(prog, &hr_body, &[dead_count], width, acc_dtype)
+            .expect("dead neuron HReduce auto_lower failed");
     let dead_count_scalar = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
-    prog.emit(VmInstr::Broadcast { dst: dead_count_scalar, src: ScalarExpr::ExtractLane0(hr_slots[1]), width: SimdWidth::Scalar, dtype, });
+    prog.emit(VmInstr::Broadcast {
+        dst: dead_count_scalar,
+        src: ScalarExpr::ExtractLane0(hr_slots[1]),
+        width: SimdWidth::Scalar,
+        dtype,
+    });
 
     // Store the count to telemetry[0] (SILU_DEAD_NEURON_COUNT offset = 0)
     // Use Scalar store: telemetry_ptr + 0, dead_count_scalar (lane 0 has the sum)
     prog.emit(VmInstr::VecStore {
         base: telemetry_ptr,
-        offset: OffsetExpr::Const(crate::compiler::graph::telemetry_offsets::SILU_DEAD_NEURON_COUNT),
+        offset: OffsetExpr::Const(
+            crate::compiler::graph::telemetry_offsets::SILU_DEAD_NEURON_COUNT,
+        ),
         src: dead_count_scalar,
         width: SimdWidth::Scalar,
-        dtype, predicate: None,
+        dtype,
+        predicate: None,
     });
 
     Ok(())
@@ -298,9 +427,9 @@ pub(crate) fn emit_residual_with_telemetry(
     out_shape: &[SymDim],
     feature_dim: usize,
     width: SimdWidth,
-    input_ptr: VRegId,   // x_in (first operand)
-    weight_ptr: VRegId,  // x_out (second operand — "weight" slot for binary ops)
-    output_ptr: VRegId,  // result: x_in + x_out
+    input_ptr: VRegId,  // x_in (first operand)
+    weight_ptr: VRegId, // x_out (second operand — "weight" slot for binary ops)
+    output_ptr: VRegId, // result: x_in + x_out
     sym_map: &SymDimSlotMap,
     telemetry_ptr: Option<VRegId>,
     seq_bound_override: Option<&BoundExpr>,
@@ -310,8 +439,10 @@ pub(crate) fn emit_residual_with_telemetry(
     let acc_dtype = dtype.accumulator_dtype();
     let lanes = width.f32_lanes().max(1);
     let elem = dtype.elem_bytes();
-    let row_bytes = feature_dim * dtype.elem_bytes();
-    let step_bytes = width.bytes();
+    let row_bytes = feature_dim * elem;
+    // Residual inputs are laid out in `dtype`; advance by the bytes consumed
+    // by one vector load rather than the full F32 register width.
+    let step_bytes = lanes * elem;
     let feature_vecs = feature_dim / lanes;
     let tail = feature_dim - feature_vecs * lanes;
 
@@ -336,97 +467,166 @@ pub(crate) fn emit_residual_with_telemetry(
     let has_telemetry = telemetry_ptr.is_some() && feature_vecs > 0;
     let dot_acc = if has_telemetry {
         let acc = prog.alloc_vreg(VRegKind::Vec, width);
-        prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::Const(0.0), width, dtype, });
+        prog.emit(VmInstr::Broadcast {
+            dst: acc,
+            src: ScalarExpr::Const(0.0),
+            width,
+            dtype,
+        });
         Some(acc)
     } else {
         None
     };
     let norm_sq_in_acc = if has_telemetry {
         let acc = prog.alloc_vreg(VRegKind::Vec, width);
-        prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::Const(0.0), width, dtype, });
+        prog.emit(VmInstr::Broadcast {
+            dst: acc,
+            src: ScalarExpr::Const(0.0),
+            width,
+            dtype,
+        });
         Some(acc)
     } else {
         None
     };
     let norm_sq_out_acc = if has_telemetry {
         let acc = prog.alloc_vreg(VRegKind::Vec, width);
-        prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::Const(0.0), width, dtype, });
+        prog.emit(VmInstr::Broadcast {
+            dst: acc,
+            src: ScalarExpr::Const(0.0),
+            width,
+            dtype,
+        });
         Some(acc)
     } else {
         None
     };
 
-    prog.emit(VmInstr::Comment("Residual Add: out = x_in + x_out (+ §13.11 cosine telemetry)".into()));
+    prog.emit(VmInstr::Comment(
+        "Residual Add: out = x_in + x_out (+ §13.11 cosine telemetry)".into(),
+    ));
 
     // Main loop: outer (seq) × inner (feature_vecs)
     prog.emit_loop(outer_bound, row_bytes, |prog, _row_ctr, row_off| {
         let row_in = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let row_out = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let row_res = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        prog.emit(VmInstr::LoadPtr { dst: row_in, src: PtrExpr::VRegPlusVReg(input_ptr, row_off) });
-        prog.emit(VmInstr::LoadPtr { dst: row_out, src: PtrExpr::VRegPlusVReg(weight_ptr, row_off) });
-        prog.emit(VmInstr::LoadPtr { dst: row_res, src: PtrExpr::VRegPlusVReg(output_ptr, row_off) });
+        prog.emit(VmInstr::LoadPtr {
+            dst: row_in,
+            src: PtrExpr::VRegPlusVReg(input_ptr, row_off),
+        });
+        prog.emit(VmInstr::LoadPtr {
+            dst: row_out,
+            src: PtrExpr::VRegPlusVReg(weight_ptr, row_off),
+        });
+        prog.emit(VmInstr::LoadPtr {
+            dst: row_res,
+            src: PtrExpr::VRegPlusVReg(output_ptr, row_off),
+        });
 
         if feature_vecs > 0 {
-            prog.emit_loop(BoundExpr::Const(feature_vecs), step_bytes, |prog, _col_ctr, col_off| {
-                let a_vec = prog.alloc_vreg(VRegKind::Vec, width);
-                let b_vec = prog.alloc_vreg(VRegKind::Vec, width);
-                let sum_vec = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit_loop(
+                BoundExpr::Const(feature_vecs),
+                step_bytes,
+                |prog, _col_ctr, col_off| {
+                    let a_vec = prog.alloc_vreg(VRegKind::Vec, width);
+                    let b_vec = prog.alloc_vreg(VRegKind::Vec, width);
+                    let sum_vec = prog.alloc_vreg(VRegKind::Vec, width);
 
-                prog.emit(VmInstr::VecLoad {
-                    dst: a_vec, base: row_in, offset: OffsetExpr::LoopOffset(col_off), width,
-                    dtype, predicate: None,
-                });
-                prog.emit(VmInstr::VecLoad {
-                    dst: b_vec, base: row_out, offset: OffsetExpr::LoopOffset(col_off), width,
-                    dtype, predicate: None,
-                });
+                    prog.emit(VmInstr::VecLoad {
+                        dst: a_vec,
+                        base: row_in,
+                        offset: OffsetExpr::LoopOffset(col_off),
+                        width,
+                        dtype,
+                        predicate: None,
+                    });
+                    prog.emit(VmInstr::VecLoad {
+                        dst: b_vec,
+                        base: row_out,
+                        offset: OffsetExpr::LoopOffset(col_off),
+                        width,
+                        dtype,
+                        predicate: None,
+                    });
 
-                // Residual add: sum = a + b (via auto_select)
-                super::auto_select::auto_lower_trace_into(
-                    prog,
-                    &[TraceOp::Input(0), TraceOp::Input(1), TraceOp::Add(ValueId(0), ValueId(1))],
-                    &[a_vec, b_vec],
-                    sum_vec,
-                    width,
-                    acc_dtype,
-                ).expect("emit_residual_with_telemetry: residual add auto_lower_trace_into");
-                prog.emit(VmInstr::VecStore {
-                    base: row_res, offset: OffsetExpr::LoopOffset(col_off), src: sum_vec, width,
-                    dtype, predicate: None,
-                });
-
-                // §13.11 telemetry accumulation (in-register, no extra loads, via auto_select)
-                if let (Some(dot), Some(ni), Some(no)) = (dot_acc, norm_sq_in_acc, norm_sq_out_acc) {
-                    // dot += a * b
+                    // Residual add: sum = a + b (via auto_select)
                     super::auto_select::auto_lower_trace_into(
                         prog,
-                        &[TraceOp::Input(0), TraceOp::Input(1), TraceOp::Input(2), TraceOp::Fma(ValueId(1), ValueId(2), ValueId(0))],
-                        &[dot, a_vec, b_vec],
-                        dot,
+                        &[
+                            TraceOp::Input(0),
+                            TraceOp::Input(1),
+                            TraceOp::Add(ValueId(0), ValueId(1)),
+                        ],
+                        &[a_vec, b_vec],
+                        sum_vec,
                         width,
                         acc_dtype,
-                    ).expect("emit_residual_with_telemetry: dot fma auto_lower_trace_into");
-                    // norm_sq_in += a²
-                    super::auto_select::auto_lower_trace_into(
-                        prog,
-                        &[TraceOp::Input(0), TraceOp::Input(1), TraceOp::Fma(ValueId(1), ValueId(1), ValueId(0))],
-                        &[ni, a_vec],
-                        ni,
+                    )
+                    .expect("emit_residual_with_telemetry: residual add auto_lower_trace_into");
+                    prog.emit(VmInstr::VecStore {
+                        base: row_res,
+                        offset: OffsetExpr::LoopOffset(col_off),
+                        src: sum_vec,
                         width,
-                        acc_dtype,
-                    ).expect("emit_residual_with_telemetry: norm_sq_in fma auto_lower_trace_into");
-                    // norm_sq_out += b²
-                    super::auto_select::auto_lower_trace_into(
-                        prog,
-                        &[TraceOp::Input(0), TraceOp::Input(1), TraceOp::Fma(ValueId(1), ValueId(1), ValueId(0))],
-                        &[no, b_vec],
-                        no,
-                        width,
-                        acc_dtype,
-                    ).expect("emit_residual_with_telemetry: norm_sq_out fma auto_lower_trace_into");
-                }
-            });
+                        dtype,
+                        predicate: None,
+                    });
+
+                    // §13.11 telemetry accumulation (in-register, no extra loads, via auto_select)
+                    if let (Some(dot), Some(ni), Some(no)) =
+                        (dot_acc, norm_sq_in_acc, norm_sq_out_acc)
+                    {
+                        // dot += a * b
+                        super::auto_select::auto_lower_trace_into(
+                            prog,
+                            &[
+                                TraceOp::Input(0),
+                                TraceOp::Input(1),
+                                TraceOp::Input(2),
+                                TraceOp::Fma(ValueId(1), ValueId(2), ValueId(0)),
+                            ],
+                            &[dot, a_vec, b_vec],
+                            dot,
+                            width,
+                            acc_dtype,
+                        )
+                        .expect("emit_residual_with_telemetry: dot fma auto_lower_trace_into");
+                        // norm_sq_in += a²
+                        super::auto_select::auto_lower_trace_into(
+                            prog,
+                            &[
+                                TraceOp::Input(0),
+                                TraceOp::Input(1),
+                                TraceOp::Fma(ValueId(1), ValueId(1), ValueId(0)),
+                            ],
+                            &[ni, a_vec],
+                            ni,
+                            width,
+                            acc_dtype,
+                        )
+                        .expect(
+                            "emit_residual_with_telemetry: norm_sq_in fma auto_lower_trace_into",
+                        );
+                        // norm_sq_out += b²
+                        super::auto_select::auto_lower_trace_into(
+                            prog,
+                            &[
+                                TraceOp::Input(0),
+                                TraceOp::Input(1),
+                                TraceOp::Fma(ValueId(1), ValueId(1), ValueId(0)),
+                            ],
+                            &[no, b_vec],
+                            no,
+                            width,
+                            acc_dtype,
+                        )
+                        .expect(
+                            "emit_residual_with_telemetry: norm_sq_out fma auto_lower_trace_into",
+                        );
+                    }
+                },
+            );
         }
 
         // Tail: scalar-wide copy for remaining elements
@@ -442,53 +642,91 @@ pub(crate) fn emit_residual_with_telemetry(
                     Box::new(OffsetExpr::Const(tail_base_bytes)),
                 );
                 prog.emit(VmInstr::VecLoad {
-                    dst: s_a, base: row_in, offset: off.clone(), width: s_width,
-                    dtype, predicate: None,
+                    dst: s_a,
+                    base: row_in,
+                    offset: off.clone(),
+                    width: s_width,
+                    dtype,
+                    predicate: None,
                 });
                 prog.emit(VmInstr::VecLoad {
-                    dst: s_b, base: row_out, offset: off.clone(), width: s_width,
-                    dtype, predicate: None,
+                    dst: s_b,
+                    base: row_out,
+                    offset: off.clone(),
+                    width: s_width,
+                    dtype,
+                    predicate: None,
                 });
                 // Tail residual add: s_sum = s_a + s_b (via auto_select)
                 super::auto_select::auto_lower_trace_into(
                     prog,
-                    &[TraceOp::Input(0), TraceOp::Input(1), TraceOp::Add(ValueId(0), ValueId(1))],
+                    &[
+                        TraceOp::Input(0),
+                        TraceOp::Input(1),
+                        TraceOp::Add(ValueId(0), ValueId(1)),
+                    ],
                     &[s_a, s_b],
                     s_sum,
                     s_width,
                     acc_dtype,
-                ).expect("emit_residual_with_telemetry: tail residual add auto_lower_trace_into");
+                )
+                .expect("emit_residual_with_telemetry: tail residual add auto_lower_trace_into");
                 prog.emit(VmInstr::VecStore {
-                    base: row_res, offset: off, src: s_sum, width: s_width,
-                    dtype, predicate: None,
+                    base: row_res,
+                    offset: off,
+                    src: s_sum,
+                    width: s_width,
+                    dtype,
+                    predicate: None,
                 });
 
                 // §13.11 telemetry for tail elements (via auto_select)
-                if let (Some(dot), Some(ni), Some(no)) = (dot_acc, norm_sq_in_acc, norm_sq_out_acc) {
+                if let (Some(dot), Some(ni), Some(no)) = (dot_acc, norm_sq_in_acc, norm_sq_out_acc)
+                {
                     super::auto_select::auto_lower_trace_into(
                         prog,
-                        &[TraceOp::Input(0), TraceOp::Input(1), TraceOp::Input(2), TraceOp::Fma(ValueId(1), ValueId(2), ValueId(0))],
+                        &[
+                            TraceOp::Input(0),
+                            TraceOp::Input(1),
+                            TraceOp::Input(2),
+                            TraceOp::Fma(ValueId(1), ValueId(2), ValueId(0)),
+                        ],
                         &[dot, s_a, s_b],
                         dot,
                         s_width,
                         acc_dtype,
-                    ).expect("emit_residual_with_telemetry: tail dot fma auto_lower_trace_into");
+                    )
+                    .expect("emit_residual_with_telemetry: tail dot fma auto_lower_trace_into");
                     super::auto_select::auto_lower_trace_into(
                         prog,
-                        &[TraceOp::Input(0), TraceOp::Input(1), TraceOp::Fma(ValueId(1), ValueId(1), ValueId(0))],
+                        &[
+                            TraceOp::Input(0),
+                            TraceOp::Input(1),
+                            TraceOp::Fma(ValueId(1), ValueId(1), ValueId(0)),
+                        ],
                         &[ni, s_a],
                         ni,
                         s_width,
                         acc_dtype,
-                    ).expect("emit_residual_with_telemetry: tail norm_sq_in fma auto_lower_trace_into");
+                    )
+                    .expect(
+                        "emit_residual_with_telemetry: tail norm_sq_in fma auto_lower_trace_into",
+                    );
                     super::auto_select::auto_lower_trace_into(
                         prog,
-                        &[TraceOp::Input(0), TraceOp::Input(1), TraceOp::Fma(ValueId(1), ValueId(1), ValueId(0))],
+                        &[
+                            TraceOp::Input(0),
+                            TraceOp::Input(1),
+                            TraceOp::Fma(ValueId(1), ValueId(1), ValueId(0)),
+                        ],
                         &[no, s_b],
                         no,
                         s_width,
                         acc_dtype,
-                    ).expect("emit_residual_with_telemetry: tail norm_sq_out fma auto_lower_trace_into");
+                    )
+                    .expect(
+                        "emit_residual_with_telemetry: tail norm_sq_out fma auto_lower_trace_into",
+                    );
                 }
             });
         }
@@ -501,14 +739,32 @@ pub(crate) fn emit_residual_with_telemetry(
         use crate::compiler::graph::telemetry_offsets;
         use crate::compiler::graph::RESIDUAL_NORM_EPSILON;
 
-        prog.emit(VmInstr::Comment("§13.11 Residual cosine similarity telemetry".into()));
+        prog.emit(VmInstr::Comment(
+            "§13.11 Residual cosine similarity telemetry".into(),
+        ));
 
         let hreduce_broadcast = |prog: &mut VmProgram, src: VRegId| -> VRegId {
             let raw = super::auto_select::auto_lower_trace_raw(
-                prog, &[TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Sum }], &[src], width, QuantPrecision::F32,
-            ).expect("hreduce_broadcast");
+                prog,
+                &[
+                    TraceOp::Input(0),
+                    TraceOp::HReduce {
+                        src: ValueId(0),
+                        op: ReduceKind::Sum,
+                    },
+                ],
+                &[src],
+                width,
+                QuantPrecision::F32,
+            )
+            .expect("hreduce_broadcast");
             let dst = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Broadcast { dst, src: ScalarExpr::ExtractLane0(raw[0]), width, dtype });
+            prog.emit(VmInstr::Broadcast {
+                dst,
+                src: ScalarExpr::ExtractLane0(raw[0]),
+                width,
+                dtype,
+            });
             dst
         };
         let dot_scalar = hreduce_broadcast(prog, dot);
@@ -524,7 +780,8 @@ pub(crate) fn emit_residual_with_telemetry(
             norm_in,
             width,
             acc_dtype,
-        ).expect("emit_residual_with_telemetry: norm_in sqrt auto_lower_trace_into");
+        )
+        .expect("emit_residual_with_telemetry: norm_in sqrt auto_lower_trace_into");
 
         // norm_out = sqrt(\xce\xa3 x_out\xc2\xb2) (via auto_select)
         let norm_out = prog.alloc_vreg(VRegKind::Vec, width);
@@ -535,31 +792,47 @@ pub(crate) fn emit_residual_with_telemetry(
             norm_out,
             width,
             acc_dtype,
-        ).expect("emit_residual_with_telemetry: norm_out sqrt auto_lower_trace_into");
+        )
+        .expect("emit_residual_with_telemetry: norm_out sqrt auto_lower_trace_into");
 
         // delta = norm_out / norm_in (with epsilon guard)
         // norm_in_safe = Max(norm_in, epsilon) to avoid division by zero
         let eps = prog.alloc_vreg(VRegKind::Vec, width);
-        prog.emit(VmInstr::Broadcast { dst: eps, src: ScalarExpr::Const(RESIDUAL_NORM_EPSILON), width, dtype, });
+        prog.emit(VmInstr::Broadcast {
+            dst: eps,
+            src: ScalarExpr::Const(RESIDUAL_NORM_EPSILON),
+            width,
+            dtype,
+        });
         let norm_in_safe = prog.alloc_vreg(VRegKind::Vec, width);
         super::auto_select::auto_lower_trace_into(
             prog,
-            &[TraceOp::Input(0), TraceOp::Input(1), TraceOp::Max(ValueId(0), ValueId(1))],
+            &[
+                TraceOp::Input(0),
+                TraceOp::Input(1),
+                TraceOp::Max(ValueId(0), ValueId(1)),
+            ],
             &[norm_in, eps],
             norm_in_safe,
             width,
             acc_dtype,
-        ).expect("emit_residual_with_telemetry: norm_in_safe max auto_lower_trace_into");
+        )
+        .expect("emit_residual_with_telemetry: norm_in_safe max auto_lower_trace_into");
 
         let delta = prog.alloc_vreg(VRegKind::Vec, width);
         super::auto_select::auto_lower_trace_into(
             prog,
-            &[TraceOp::Input(0), TraceOp::Input(1), TraceOp::Div(ValueId(0), ValueId(1))],
+            &[
+                TraceOp::Input(0),
+                TraceOp::Input(1),
+                TraceOp::Div(ValueId(0), ValueId(1)),
+            ],
             &[norm_out, norm_in_safe],
             delta,
             width,
             acc_dtype,
-        ).expect("emit_residual_with_telemetry: delta div auto_lower_trace_into");
+        )
+        .expect("emit_residual_with_telemetry: delta div auto_lower_trace_into");
 
         // Store delta to telemetry[RESIDUAL_DELTA_OFFSET]
         prog.emit(VmInstr::VecStore {
@@ -567,7 +840,8 @@ pub(crate) fn emit_residual_with_telemetry(
             offset: OffsetExpr::Const(telemetry_offsets::RESIDUAL_DELTA_OFFSET),
             src: delta,
             width: SimdWidth::Scalar,
-            dtype, predicate: None,
+            dtype,
+            predicate: None,
         });
 
         // cosine = dot / (norm_in * norm_out) (with epsilon guard on denominator)
@@ -575,33 +849,53 @@ pub(crate) fn emit_residual_with_telemetry(
         let denom = prog.alloc_vreg(VRegKind::Vec, width);
         super::auto_select::auto_lower_trace_into(
             prog,
-            &[TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))],
+            &[
+                TraceOp::Input(0),
+                TraceOp::Input(1),
+                TraceOp::Mul(ValueId(0), ValueId(1)),
+            ],
             &[norm_in, norm_out],
             denom,
             width,
             acc_dtype,
-        ).expect("emit_residual_with_telemetry: denom mul auto_lower_trace_into");
+        )
+        .expect("emit_residual_with_telemetry: denom mul auto_lower_trace_into");
         let eps_sq = prog.alloc_vreg(VRegKind::Vec, width);
-        prog.emit(VmInstr::Broadcast { dst: eps_sq, src: ScalarExpr::Const(RESIDUAL_NORM_EPSILON * RESIDUAL_NORM_EPSILON), width, dtype, });
+        prog.emit(VmInstr::Broadcast {
+            dst: eps_sq,
+            src: ScalarExpr::Const(RESIDUAL_NORM_EPSILON * RESIDUAL_NORM_EPSILON),
+            width,
+            dtype,
+        });
         let denom_safe = prog.alloc_vreg(VRegKind::Vec, width);
         super::auto_select::auto_lower_trace_into(
             prog,
-            &[TraceOp::Input(0), TraceOp::Input(1), TraceOp::Max(ValueId(0), ValueId(1))],
+            &[
+                TraceOp::Input(0),
+                TraceOp::Input(1),
+                TraceOp::Max(ValueId(0), ValueId(1)),
+            ],
             &[denom, eps_sq],
             denom_safe,
             width,
             acc_dtype,
-        ).expect("emit_residual_with_telemetry: denom_safe max auto_lower_trace_into");
+        )
+        .expect("emit_residual_with_telemetry: denom_safe max auto_lower_trace_into");
 
         let cosine = prog.alloc_vreg(VRegKind::Vec, width);
         super::auto_select::auto_lower_trace_into(
             prog,
-            &[TraceOp::Input(0), TraceOp::Input(1), TraceOp::Div(ValueId(0), ValueId(1))],
+            &[
+                TraceOp::Input(0),
+                TraceOp::Input(1),
+                TraceOp::Div(ValueId(0), ValueId(1)),
+            ],
             &[dot_scalar, denom_safe],
             cosine,
             width,
             acc_dtype,
-        ).expect("emit_residual_with_telemetry: cosine div auto_lower_trace_into");
+        )
+        .expect("emit_residual_with_telemetry: cosine div auto_lower_trace_into");
 
         // Store cosine to telemetry[COSINE_SIMILARITY_OFFSET]
         prog.emit(VmInstr::VecStore {
@@ -609,7 +903,8 @@ pub(crate) fn emit_residual_with_telemetry(
             offset: OffsetExpr::Const(telemetry_offsets::COSINE_SIMILARITY_OFFSET),
             src: cosine,
             width: SimdWidth::Scalar,
-            dtype, predicate: None,
+            dtype,
+            predicate: None,
         });
     }
 
@@ -657,7 +952,10 @@ mod tests {
             QuantPrecision::F32,
         );
 
-        assert!(result.is_err(), "should return error when 'telemetry' not in sym_map");
+        assert!(
+            result.is_err(),
+            "should return error when 'telemetry' not in sym_map"
+        );
         if let Err(CompilerError::CodegenViolation(msg)) = result {
             assert!(
                 msg.contains("telemetry"),
@@ -688,7 +986,10 @@ mod tests {
             QuantPrecision::F32,
         );
 
-        assert!(result.is_err(), "should return error when 'telemetry' not in sym_map");
+        assert!(
+            result.is_err(),
+            "should return error when 'telemetry' not in sym_map"
+        );
         if let Err(CompilerError::CodegenViolation(msg)) = result {
             assert!(
                 msg.contains("telemetry"),
@@ -717,7 +1018,10 @@ mod tests {
             QuantPrecision::F32,
         );
 
-        assert!(result.is_ok(), "zero feature_dim should return Ok immediately");
+        assert!(
+            result.is_ok(),
+            "zero feature_dim should return Ok immediately"
+        );
         assert_eq!(
             prog.len(),
             initial_len,
@@ -803,7 +1107,10 @@ mod tests {
             QuantPrecision::F32,
         );
 
-        assert!(result.is_err(), "should return error when 'telemetry' not in sym_map");
+        assert!(
+            result.is_err(),
+            "should return error when 'telemetry' not in sym_map"
+        );
         if let Err(CompilerError::CodegenViolation(msg)) = result {
             assert!(
                 msg.contains("telemetry"),
@@ -892,11 +1199,7 @@ mod tests {
         ];
 
         for &offset in &offsets {
-            assert_eq!(
-                offset % 4,
-                0,
-                "offset {offset} is not 4-byte aligned"
-            );
+            assert_eq!(offset % 4, 0, "offset {offset} is not 4-byte aligned");
         }
 
         // TELEMETRY_BUFFER_MIN_BYTES must cover the last offset + sizeof(f32)
@@ -1028,7 +1331,8 @@ mod tests {
                 None,
                 None,
                 QuantPrecision::F32,
-            ).unwrap();
+            )
+            .unwrap();
             len_without_telemetry = prog2.len();
         }
 
@@ -1086,8 +1390,14 @@ mod tests {
         );
 
         // Assert: 65 % 8 = 1 tail element, should still succeed with telemetry
-        assert!(result.is_ok(), "unaligned feature_dim=65 should succeed with tail handling");
-        assert!(!prog.is_empty(), "should emit instructions for unaligned feature_dim");
+        assert!(
+            result.is_ok(),
+            "unaligned feature_dim=65 should succeed with tail handling"
+        );
+        assert!(
+            !prog.is_empty(),
+            "should emit instructions for unaligned feature_dim"
+        );
     }
 
     // ── Test 16: residual telemetry with seq_bound_override overrides symbolic dimension ──
@@ -1101,7 +1411,10 @@ mod tests {
         let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![
-            SymDim::Symbolic { name: "seq_len".into(), max_value: Some(2048) },
+            SymDim::Symbolic {
+                name: "seq_len".into(),
+                max_value: Some(2048),
+            },
             SymDim::Concrete(64),
         ];
         let sym_map = SymDimSlotMap::mega_kernel_abi();
@@ -1123,8 +1436,14 @@ mod tests {
         );
 
         // Assert: seq_bound_override should take precedence over symbolic shape
-        assert!(result.is_ok(), "seq_bound_override should work even with symbolic shape");
-        assert!(!prog.is_empty(), "should emit instructions with overridden bound");
+        assert!(
+            result.is_ok(),
+            "seq_bound_override should work even with symbolic shape"
+        );
+        assert!(
+            !prog.is_empty(),
+            "should emit instructions with overridden bound"
+        );
     }
 
     // ── Test 17: residual telemetry with concrete multi-dimensional shape (outer_dim > 1) ──
@@ -1160,7 +1479,10 @@ mod tests {
         // Assert: multi-dimensional concrete shape with telemetry should succeed
         // The VmProgram records loop structures with bounds, and the outer loop
         // bound is Const(4) for shape [4, 64] vs Const(1) for single-row shapes.
-        assert!(result.is_ok(), "multi-dimensional concrete shape should succeed");
+        assert!(
+            result.is_ok(),
+            "multi-dimensional concrete shape should succeed"
+        );
         assert!(
             !prog.is_empty(),
             "should emit residual add and telemetry instructions for multi-dim shape"
@@ -1198,7 +1520,10 @@ mod tests {
 
         // Assert: 1D with telemetry should work and emit telemetry finalization
         assert!(result.is_ok(), "1D shape with telemetry should succeed");
-        assert!(!prog.is_empty(), "should emit residual add and telemetry instructions");
+        assert!(
+            !prog.is_empty(),
+            "should emit residual add and telemetry instructions"
+        );
     }
 
     // ── Test 19: rmsnorm channel scale returns Ok when feature_dim < lanes (vec_count=0) ──
@@ -1223,7 +1548,10 @@ mod tests {
         );
 
         // Assert: vec_count = 0 should return Ok with no instructions
-        assert!(result.is_ok(), "feature_dim < lanes should return Ok (vec_count=0)");
+        assert!(
+            result.is_ok(),
+            "feature_dim < lanes should return Ok (vec_count=0)"
+        );
         assert_eq!(
             prog.len(),
             initial_len,
@@ -1434,7 +1762,10 @@ mod tests {
         );
 
         // Assert
-        assert!(result_aligned.is_ok(), "aligned feature_dim should succeed with telemetry");
+        assert!(
+            result_aligned.is_ok(),
+            "aligned feature_dim should succeed with telemetry"
+        );
         assert!(
             !prog_aligned.is_empty(),
             "should emit instructions for aligned feature_dim with telemetry"
@@ -1620,8 +1951,14 @@ mod tests {
         );
 
         // Assert: Scalar width should work for single-element operations
-        assert!(result.is_ok(), "Scalar SIMD width with telemetry should succeed");
-        assert!(!prog.is_empty(), "should emit scalar residual add + telemetry instructions");
+        assert!(
+            result.is_ok(),
+            "Scalar SIMD width with telemetry should succeed"
+        );
+        assert!(
+            !prog.is_empty(),
+            "should emit scalar residual add + telemetry instructions"
+        );
     }
 
     // ── Test 33: gemm_row_stats produces VmProgram with LoadPtr as first emitted instruction ──
@@ -1641,10 +1978,14 @@ mod tests {
             SimdWidth::W256,
             &sym_map,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Assert: at least one LoadPtr instruction should be emitted (loading telemetry pointer)
-        let has_loadptr = prog.instrs.iter().any(|i| matches!(i, VmInstr::LoadPtr { .. }));
+        let has_loadptr = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::LoadPtr { .. }));
         assert!(
             has_loadptr,
             "emit_gemm_row_stats_telemetry should emit LoadPtr for telemetry buffer",
@@ -1702,7 +2043,10 @@ mod tests {
         );
 
         // Assert
-        assert!(result.is_ok(), "feature_dim=8 with W256 should succeed (vec_count=1)");
+        assert!(
+            result.is_ok(),
+            "feature_dim=8 with W256 should succeed (vec_count=1)"
+        );
         assert!(
             prog.len() > initial_len,
             "should emit instructions for exactly 1 vector iteration"
@@ -1740,10 +2084,7 @@ mod tests {
         );
 
         // Assert: should succeed with BF16 dtype (the function propagates dtype to VmInstr)
-        assert!(
-            result.is_ok(),
-            "BF16 dtype should propagate without error"
-        );
+        assert!(result.is_ok(), "BF16 dtype should propagate without error");
         assert!(
             !prog.is_empty(),
             "should emit residual add instructions with BF16 dtype"
@@ -1772,7 +2113,10 @@ mod tests {
         );
 
         // Assert
-        assert!(result.is_ok(), "BF16 dtype should propagate without error in gemm_row_stats");
+        assert!(
+            result.is_ok(),
+            "BF16 dtype should propagate without error in gemm_row_stats"
+        );
         assert!(
             prog.len() > initial_len,
             "should emit instructions with BF16 dtype"
@@ -1802,7 +2146,10 @@ mod tests {
         );
 
         // Assert
-        assert!(result.is_ok(), "BF16 dtype should propagate without error in rmsnorm_channel_scale");
+        assert!(
+            result.is_ok(),
+            "BF16 dtype should propagate without error in rmsnorm_channel_scale"
+        );
         assert!(
             prog.len() > initial_len,
             "should emit instructions with BF16 dtype"
@@ -1833,7 +2180,10 @@ mod tests {
         );
 
         // Assert
-        assert!(result.is_ok(), "BF16 dtype should propagate without error in silu_dead_neuron");
+        assert!(
+            result.is_ok(),
+            "BF16 dtype should propagate without error in silu_dead_neuron"
+        );
         assert!(
             prog.len() > initial_len,
             "should emit instructions with BF16 dtype"
@@ -1858,11 +2208,14 @@ mod tests {
             SimdWidth::W256,
             &sym_map,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Assert: should emit at least 2 LoadPtr instructions:
         // one for telemetry buffer, one for the indirect channel_scale_buf
-        let loadptr_count = prog.instrs.iter()
+        let loadptr_count = prog
+            .instrs
+            .iter()
             .filter(|i| matches!(i, VmInstr::LoadPtr { .. }))
             .count();
         assert!(
@@ -1891,11 +2244,14 @@ mod tests {
             SimdWidth::W256,
             &sym_map,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Assert: should emit at least 3 Broadcast instructions:
         // dead_count=0.0, threshold=-4.5951, ones=1.0
-        let broadcast_count = prog.instrs.iter()
+        let broadcast_count = prog
+            .instrs
+            .iter()
             .filter(|i| matches!(i, VmInstr::Broadcast { .. }))
             .count();
         assert!(
@@ -1931,12 +2287,14 @@ mod tests {
             None,
             None,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Assert: should emit at least one Comment instruction describing residual add
-        let has_residual_comment = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::Comment(text) if text.contains("Residual Add"))
-        });
+        let has_residual_comment = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::Comment(text) if text.contains("Residual Add")));
         assert!(
             has_residual_comment,
             "should emit a Comment instruction describing the residual add operation"
@@ -1960,13 +2318,20 @@ mod tests {
             SimdWidth::W256,
             &sym_map,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Assert: should emit VecStore instructions at GEMM_ROW_NORM_L1_OFFSET,
         // GEMM_ROW_MAX_OFFSET, and GEMM_ROW_MIN_OFFSET
-        let vecstore_offsets: Vec<usize> = prog.instrs.iter()
+        let vecstore_offsets: Vec<usize> = prog
+            .instrs
+            .iter()
             .filter_map(|i| {
-                if let VmInstr::VecStore { offset: OffsetExpr::Const(off), .. } = i {
+                if let VmInstr::VecStore {
+                    offset: OffsetExpr::Const(off),
+                    ..
+                } = i
+                {
                     Some(*off)
                 } else {
                     None
@@ -2022,7 +2387,10 @@ mod tests {
 
         // Assert: should succeed with FP16 dtype
         assert!(result.is_ok(), "FP16 dtype should propagate without error");
-        assert!(!prog.is_empty(), "should emit residual add instructions with FP16 dtype");
+        assert!(
+            !prog.is_empty(),
+            "should emit residual add instructions with FP16 dtype"
+        );
     }
 
     // ── Test 45: silu_dead_neuron emits VecStore at SILU_DEAD_NEURON_COUNT offset ──
@@ -2044,15 +2412,25 @@ mod tests {
             SimdWidth::W256,
             &sym_map,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Assert: final VecStore should be at SILU_DEAD_NEURON_COUNT offset (0)
-        let last_vecstore = prog.instrs.iter().rev().find(|i| matches!(i, VmInstr::VecStore { .. }));
+        let last_vecstore = prog
+            .instrs
+            .iter()
+            .rev()
+            .find(|i| matches!(i, VmInstr::VecStore { .. }));
         assert!(
             last_vecstore.is_some(),
             "should emit at least one VecStore instruction"
         );
-        if let Some(VmInstr::VecStore { offset: OffsetExpr::Const(off), width, .. }) = last_vecstore {
+        if let Some(VmInstr::VecStore {
+            offset: OffsetExpr::Const(off),
+            width,
+            ..
+        }) = last_vecstore
+        {
             assert_eq!(
                 *off,
                 telemetry_offsets::SILU_DEAD_NEURON_COUNT,
@@ -2094,12 +2472,19 @@ mod tests {
             Some(telemetry_ptr_vreg),
             None,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Assert: VecStore instructions should target RESIDUAL_DELTA_OFFSET and COSINE_SIMILARITY_OFFSET
-        let vecstore_offsets: Vec<usize> = prog.instrs.iter()
+        let vecstore_offsets: Vec<usize> = prog
+            .instrs
+            .iter()
             .filter_map(|i| {
-                if let VmInstr::VecStore { offset: OffsetExpr::Const(off), .. } = i {
+                if let VmInstr::VecStore {
+                    offset: OffsetExpr::Const(off),
+                    ..
+                } = i
+                {
                     Some(*off)
                 } else {
                     None
@@ -2141,7 +2526,10 @@ mod tests {
         );
 
         // Assert
-        assert!(result.is_ok(), "FP16 dtype should propagate without error in gemm_row_stats");
+        assert!(
+            result.is_ok(),
+            "FP16 dtype should propagate without error in gemm_row_stats"
+        );
         assert!(
             prog.len() > initial_len,
             "should emit instructions with FP16 dtype"
@@ -2171,7 +2559,10 @@ mod tests {
         );
 
         // Assert
-        assert!(result.is_ok(), "FP16 dtype should propagate without error in rmsnorm_channel_scale");
+        assert!(
+            result.is_ok(),
+            "FP16 dtype should propagate without error in rmsnorm_channel_scale"
+        );
         assert!(
             prog.len() > initial_len,
             "should emit instructions with FP16 dtype"
@@ -2202,7 +2593,10 @@ mod tests {
         );
 
         // Assert
-        assert!(result.is_ok(), "FP16 dtype should propagate without error in silu_dead_neuron");
+        assert!(
+            result.is_ok(),
+            "FP16 dtype should propagate without error in silu_dead_neuron"
+        );
         assert!(
             prog.len() > initial_len,
             "should emit instructions with FP16 dtype"
@@ -2240,12 +2634,21 @@ mod tests {
 
         // Assert: W128 with telemetry should succeed and emit cosine similarity finalization
         assert!(result.is_ok(), "W128 with telemetry should succeed");
-        assert!(!prog.is_empty(), "should emit residual add + telemetry instructions");
+        assert!(
+            !prog.is_empty(),
+            "should emit residual add + telemetry instructions"
+        );
 
         // Verify telemetry stores at delta and cosine offsets
-        let vecstore_offsets: Vec<usize> = prog.instrs.iter()
+        let vecstore_offsets: Vec<usize> = prog
+            .instrs
+            .iter()
             .filter_map(|i| {
-                if let VmInstr::VecStore { offset: OffsetExpr::Const(off), .. } = i {
+                if let VmInstr::VecStore {
+                    offset: OffsetExpr::Const(off),
+                    ..
+                } = i
+                {
                     Some(*off)
                 } else {
                     None
@@ -2315,7 +2718,10 @@ mod tests {
         );
 
         // Assert
-        assert!(result.is_ok(), "W128 SIMD width should succeed for silu_dead_neuron");
+        assert!(
+            result.is_ok(),
+            "W128 SIMD width should succeed for silu_dead_neuron"
+        );
         assert!(
             prog.len() > initial_len,
             "should emit instructions with W128 SIMD width"
@@ -2339,10 +2745,13 @@ mod tests {
             SimdWidth::W256,
             &sym_map,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Assert: should emit exactly 3 VecStore instructions (L1 norm, max, min)
-        let vecstore_count = prog.instrs.iter()
+        let vecstore_count = prog
+            .instrs
+            .iter()
             .filter(|i| matches!(i, VmInstr::VecStore { .. }))
             .count();
         assert!(
@@ -2385,13 +2794,25 @@ mod tests {
         // Assert: has_telemetry = telemetry_ptr.is_some() && feature_vecs > 0
         // feature_vecs = 3/8 = 0, so has_telemetry=false → no telemetry accumulators
         // But tail=3 so the tail loop should still emit scalar residual add instructions.
-        assert!(result.is_ok(), "feature_dim < lanes with telemetry_ptr should succeed");
-        assert!(!prog.is_empty(), "should emit scalar tail loop for residual add");
+        assert!(
+            result.is_ok(),
+            "feature_dim < lanes with telemetry_ptr should succeed"
+        );
+        assert!(
+            !prog.is_empty(),
+            "should emit scalar tail loop for residual add"
+        );
 
         // Should NOT emit VecStore at telemetry offsets (no accumulators → no finalization)
-        let vecstore_offsets: Vec<usize> = prog.instrs.iter()
+        let vecstore_offsets: Vec<usize> = prog
+            .instrs
+            .iter()
             .filter_map(|i| {
-                if let VmInstr::VecStore { offset: OffsetExpr::Const(off), .. } = i {
+                if let VmInstr::VecStore {
+                    offset: OffsetExpr::Const(off),
+                    ..
+                } = i
+                {
                     Some(*off)
                 } else {
                     None
@@ -2427,7 +2848,10 @@ mod tests {
         );
 
         // Assert
-        assert!(result.is_ok(), "Warp(32) NVIDIA GPU width should succeed for silu_dead_neuron");
+        assert!(
+            result.is_ok(),
+            "Warp(32) NVIDIA GPU width should succeed for silu_dead_neuron"
+        );
         assert!(
             prog.len() > initial_len,
             "should emit instructions with Warp(32) width"
@@ -2467,9 +2891,15 @@ mod tests {
         assert!(!prog.is_empty(), "should emit residual add instructions");
 
         // Should NOT emit VecStore at telemetry offsets
-        let vecstore_offsets: Vec<usize> = prog.instrs.iter()
+        let vecstore_offsets: Vec<usize> = prog
+            .instrs
+            .iter()
             .filter_map(|i| {
-                if let VmInstr::VecStore { offset: OffsetExpr::Const(off), .. } = i {
+                if let VmInstr::VecStore {
+                    offset: OffsetExpr::Const(off),
+                    ..
+                } = i
+                {
                     Some(*off)
                 } else {
                     None
@@ -2498,7 +2928,10 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let telemetry_ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![
-            SymDim::Symbolic { name: "seq_len".into(), max_value: Some(2048) },
+            SymDim::Symbolic {
+                name: "seq_len".into(),
+                max_value: Some(2048),
+            },
             SymDim::Concrete(64),
         ];
         let sym_map = SymDimSlotMap::mega_kernel_abi();
@@ -2519,10 +2952,19 @@ mod tests {
         );
 
         // Assert: symbolic outer + telemetry should produce cosine similarity stores
-        assert!(result.is_ok(), "symbolic outer with telemetry should succeed");
-        let vecstore_offsets: Vec<usize> = prog.instrs.iter()
+        assert!(
+            result.is_ok(),
+            "symbolic outer with telemetry should succeed"
+        );
+        let vecstore_offsets: Vec<usize> = prog
+            .instrs
+            .iter()
             .filter_map(|i| {
-                if let VmInstr::VecStore { offset: OffsetExpr::Const(off), .. } = i {
+                if let VmInstr::VecStore {
+                    offset: OffsetExpr::Const(off),
+                    ..
+                } = i
+                {
                     Some(*off)
                 } else {
                     None
@@ -2557,15 +2999,24 @@ mod tests {
             SimdWidth::W256,
             &sym_map,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Assert: the final VecStore should be at offset 0 (into the indirect channel_scale_buf)
-        let last_vecstore = prog.instrs.iter().rev().find(|i| matches!(i, VmInstr::VecStore { .. }));
+        let last_vecstore = prog
+            .instrs
+            .iter()
+            .rev()
+            .find(|i| matches!(i, VmInstr::VecStore { .. }));
         assert!(
             last_vecstore.is_some(),
             "should emit at least one VecStore instruction"
         );
-        if let Some(VmInstr::VecStore { offset: OffsetExpr::Const(off), .. }) = last_vecstore {
+        if let Some(VmInstr::VecStore {
+            offset: OffsetExpr::Const(off),
+            ..
+        }) = last_vecstore
+        {
             assert_eq!(
                 *off, 0,
                 "final VecStore should target offset 0 of the indirect channel_scale_buf"
@@ -2592,10 +3043,14 @@ mod tests {
             SimdWidth::W256,
             &sym_map,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Assert: first emitted instruction should be LoadPtr for the telemetry buffer
-        let first_loadptr = prog.instrs.iter().find(|i| matches!(i, VmInstr::LoadPtr { .. }));
+        let first_loadptr = prog
+            .instrs
+            .iter()
+            .find(|i| matches!(i, VmInstr::LoadPtr { .. }));
         assert!(
             first_loadptr.is_some(),
             "silu dead neuron should emit LoadPtr to load telemetry buffer pointer"
@@ -2614,7 +3069,10 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let telemetry_ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![
-            SymDim::Symbolic { name: "seq_len".into(), max_value: Some(2048) },
+            SymDim::Symbolic {
+                name: "seq_len".into(),
+                max_value: Some(2048),
+            },
             SymDim::Concrete(64),
         ];
         let sym_map = SymDimSlotMap::mega_kernel_abi();
@@ -2636,12 +3094,21 @@ mod tests {
         );
 
         // Assert: both features combined should still produce correct telemetry
-        assert!(result.is_ok(), "seq_bound_override + telemetry should work together");
+        assert!(
+            result.is_ok(),
+            "seq_bound_override + telemetry should work together"
+        );
         assert!(!prog.is_empty(), "should emit instructions");
 
-        let vecstore_offsets: Vec<usize> = prog.instrs.iter()
+        let vecstore_offsets: Vec<usize> = prog
+            .instrs
+            .iter()
             .filter_map(|i| {
-                if let VmInstr::VecStore { offset: OffsetExpr::Const(off), .. } = i {
+                if let VmInstr::VecStore {
+                    offset: OffsetExpr::Const(off),
+                    ..
+                } = i
+                {
                     Some(*off)
                 } else {
                     None
@@ -2676,31 +3143,46 @@ mod tests {
             SimdWidth::W256,
             &sym_map,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Assert: all 3 telemetry stat VecStore instructions should use Scalar width
-        let stat_vecstores: Vec<SimdWidth> = prog.instrs.iter()
+        let stat_vecstores: Vec<SimdWidth> = prog
+            .instrs
+            .iter()
             .filter_map(|i| {
-                if let VmInstr::VecStore { offset: OffsetExpr::Const(off), width, .. } = i {
+                if let VmInstr::VecStore {
+                    offset: OffsetExpr::Const(off),
+                    width,
+                    ..
+                } = i
+                {
                     let is_telemetry_off = *off == telemetry_offsets::GEMM_ROW_NORM_L1_OFFSET
                         || *off == telemetry_offsets::GEMM_ROW_MAX_OFFSET
                         || *off == telemetry_offsets::GEMM_ROW_MIN_OFFSET;
-                    if is_telemetry_off { Some(*width) } else { None }
+                    if is_telemetry_off {
+                        Some(*width)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
             })
             .collect();
         assert_eq!(
-            stat_vecstores.len(), 3,
+            stat_vecstores.len(),
+            3,
             "should have exactly 3 telemetry stat VecStore instructions, found {}",
             stat_vecstores.len(),
         );
         for (idx, &w) in stat_vecstores.iter().enumerate() {
             assert_eq!(
-                w, SimdWidth::Scalar,
+                w,
+                SimdWidth::Scalar,
                 "stat store #{} should use Scalar width (HReduce result), got {:?}",
-                idx, w,
+                idx,
+                w,
             );
         }
     }
@@ -2727,7 +3209,10 @@ mod tests {
         );
 
         // Assert
-        assert!(result.is_ok(), "W128 SIMD width should succeed for rmsnorm_channel_scale");
+        assert!(
+            result.is_ok(),
+            "W128 SIMD width should succeed for rmsnorm_channel_scale"
+        );
         assert!(
             prog.len() > initial_len,
             "should emit instructions with W128 SIMD width"
@@ -2763,13 +3248,25 @@ mod tests {
         );
 
         // Assert: Scalar width + no telemetry should succeed and emit scalar add ops
-        assert!(result.is_ok(), "Scalar width without telemetry should succeed");
-        assert!(!prog.is_empty(), "should emit scalar residual add instructions");
+        assert!(
+            result.is_ok(),
+            "Scalar width without telemetry should succeed"
+        );
+        assert!(
+            !prog.is_empty(),
+            "should emit scalar residual add instructions"
+        );
 
         // Should NOT emit at telemetry offsets since telemetry_ptr is None
-        let vecstore_offsets: Vec<usize> = prog.instrs.iter()
+        let vecstore_offsets: Vec<usize> = prog
+            .instrs
+            .iter()
             .filter_map(|i| {
-                if let VmInstr::VecStore { offset: OffsetExpr::Const(off), .. } = i {
+                if let VmInstr::VecStore {
+                    offset: OffsetExpr::Const(off),
+                    ..
+                } = i
+                {
                     Some(*off)
                 } else {
                     None
@@ -2792,7 +3289,10 @@ mod tests {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![
-            SymDim::Symbolic { name: "seq_len".into(), max_value: Some(512) },
+            SymDim::Symbolic {
+                name: "seq_len".into(),
+                max_value: Some(512),
+            },
             SymDim::Concrete(64),
         ];
         let sym_map = SymDimSlotMap::mega_kernel_abi();
@@ -2846,13 +3346,25 @@ mod tests {
         );
 
         // Assert: large outer dim should produce full telemetry pipeline
-        assert!(result.is_ok(), "large outer dim with telemetry should succeed");
-        assert!(!prog.is_empty(), "should emit full residual + telemetry pipeline");
+        assert!(
+            result.is_ok(),
+            "large outer dim with telemetry should succeed"
+        );
+        assert!(
+            !prog.is_empty(),
+            "should emit full residual + telemetry pipeline"
+        );
 
         // Verify both telemetry offsets are present
-        let vecstore_offsets: Vec<usize> = prog.instrs.iter()
+        let vecstore_offsets: Vec<usize> = prog
+            .instrs
+            .iter()
             .filter_map(|i| {
-                if let VmInstr::VecStore { offset: OffsetExpr::Const(off), .. } = i {
+                if let VmInstr::VecStore {
+                    offset: OffsetExpr::Const(off),
+                    ..
+                } = i
+                {
                     Some(*off)
                 } else {
                     None
@@ -2887,10 +3399,13 @@ mod tests {
             SimdWidth::W256,
             &sym_map,
             QuantPrecision::F32,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Assert: should emit at least one VecLoad to scan the input row
-        let vecload_count = prog.instrs.iter()
+        let vecload_count = prog
+            .instrs
+            .iter()
             .filter(|i| matches!(i, VmInstr::VecLoad { .. }))
             .count();
         assert!(
@@ -2909,7 +3424,10 @@ mod tests {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![
-            SymDim::Symbolic { name: "batch".into(), max_value: Some(32) },
+            SymDim::Symbolic {
+                name: "batch".into(),
+                max_value: Some(32),
+            },
             SymDim::Concrete(2),
             SymDim::Concrete(64),
         ];
@@ -2918,12 +3436,23 @@ mod tests {
 
         // Act
         let result = emit_silu_dead_neuron_telemetry(
-            &mut prog, input_ptr, &shape, SimdWidth::W256, &sym_map, QuantPrecision::F32,
+            &mut prog,
+            input_ptr,
+            &shape,
+            SimdWidth::W256,
+            &sym_map,
+            QuantPrecision::F32,
         );
 
         // Assert: 3D shape with symbolic batch should succeed
-        assert!(result.is_ok(), "3D shape with symbolic batch should succeed");
-        assert!(prog.len() > initial_len, "should emit instructions for 3D shape");
+        assert!(
+            result.is_ok(),
+            "3D shape with symbolic batch should succeed"
+        );
+        assert!(
+            prog.len() > initial_len,
+            "should emit instructions for 3D shape"
+        );
     }
 
     // ── Test 68: gemm_row_stats first emitted instruction is LoadPtr for telemetry ──
@@ -2938,12 +3467,22 @@ mod tests {
 
         // Act
         let result = emit_gemm_row_stats_telemetry(
-            &mut prog, acc, SimdWidth::W256, &sym_map, QuantPrecision::F32,
+            &mut prog,
+            acc,
+            SimdWidth::W256,
+            &sym_map,
+            QuantPrecision::F32,
         );
 
         // Assert
-        assert!(result.is_ok(), "should succeed with default ABI (has telemetry slot)");
-        assert!(!prog.instrs.is_empty(), "should emit at least one instruction");
+        assert!(
+            result.is_ok(),
+            "should succeed with default ABI (has telemetry slot)"
+        );
+        assert!(
+            !prog.instrs.is_empty(),
+            "should emit at least one instruction"
+        );
     }
 
     // ── Test 69: rmsnorm_channel_scale emits Broadcast to initialize running_max ──
@@ -2958,12 +3497,24 @@ mod tests {
 
         // Act
         emit_rmsnorm_channel_scale_telemetry(
-            &mut prog, input_ptr, 256, SimdWidth::W256, &sym_map, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            input_ptr,
+            256,
+            SimdWidth::W256,
+            &sym_map,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: should emit at least one Broadcast to zero-initialize running_max
         let broadcast_zero = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::Broadcast { src: ScalarExpr::Const(0.0), .. })
+            matches!(
+                i,
+                VmInstr::Broadcast {
+                    src: ScalarExpr::Const(0.0),
+                    ..
+                }
+            )
         });
         assert!(
             broadcast_zero,
@@ -2985,12 +3536,20 @@ mod tests {
 
         // Act
         let result = emit_silu_dead_neuron_telemetry(
-            &mut prog, input_ptr, &shape, SimdWidth::W256, &sym_map, QuantPrecision::F32,
+            &mut prog,
+            input_ptr,
+            &shape,
+            SimdWidth::W256,
+            &sym_map,
+            QuantPrecision::F32,
         );
 
         // Assert: feature_dim == lanes should produce exactly 1 inner vec loop iteration
         assert!(result.is_ok(), "feature_dim == lanes should succeed");
-        assert!(prog.len() > initial_len, "should emit instructions for single vec iteration");
+        assert!(
+            prog.len() > initial_len,
+            "should emit instructions for single vec iteration"
+        );
     }
 
     // ── Test 71: residual_with_telemetry produces deterministic instruction count ──
@@ -3008,16 +3567,29 @@ mod tests {
             let op = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
             let tp = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
             emit_residual_with_telemetry(
-                &mut prog, &shape, 64, SimdWidth::W256, ip, wp, op,
-                &sym_map, Some(tp), None, QuantPrecision::F32,
-            ).unwrap();
+                &mut prog,
+                &shape,
+                64,
+                SimdWidth::W256,
+                ip,
+                wp,
+                op,
+                &sym_map,
+                Some(tp),
+                None,
+                QuantPrecision::F32,
+            )
+            .unwrap();
             prog.len()
         };
 
         // Act & Assert: two runs should produce identical instruction counts
         let count1 = run_emit();
         let count2 = run_emit();
-        assert_eq!(count1, count2, "identical inputs should produce identical instruction counts");
+        assert_eq!(
+            count1, count2,
+            "identical inputs should produce identical instruction counts"
+        );
     }
 
     // ── Test 72: residual_with_telemetry W512 width with telemetry produces cosine stores ──
@@ -3036,15 +3608,34 @@ mod tests {
 
         // Act
         let result = emit_residual_with_telemetry(
-            &mut prog, &shape, 64, SimdWidth::W512, input_ptr, weight_ptr, output_ptr,
-            &sym_map, Some(telemetry_ptr_vreg), None, QuantPrecision::F32,
+            &mut prog,
+            &shape,
+            64,
+            SimdWidth::W512,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            &sym_map,
+            Some(telemetry_ptr_vreg),
+            None,
+            QuantPrecision::F32,
         );
 
         // Assert: W512 + telemetry should emit cosine similarity stores
         assert!(result.is_ok(), "W512 with telemetry should succeed");
-        let vecstore_offsets: Vec<usize> = prog.instrs.iter()
+        let vecstore_offsets: Vec<usize> = prog
+            .instrs
+            .iter()
             .filter_map(|i| {
-                if let VmInstr::VecStore { offset: OffsetExpr::Const(off), .. } = i { Some(*off) } else { None }
+                if let VmInstr::VecStore {
+                    offset: OffsetExpr::Const(off),
+                    ..
+                } = i
+                {
+                    Some(*off)
+                } else {
+                    None
+                }
             })
             .collect();
         assert!(vecstore_offsets.contains(&telemetry_offsets::RESIDUAL_DELTA_OFFSET));
@@ -3064,12 +3655,23 @@ mod tests {
 
         // Act
         let result = emit_rmsnorm_channel_scale_telemetry(
-            &mut prog, input_ptr, 128, SimdWidth::Warp(16), &sym_map, QuantPrecision::F32,
+            &mut prog,
+            input_ptr,
+            128,
+            SimdWidth::Warp(16),
+            &sym_map,
+            QuantPrecision::F32,
         );
 
         // Assert
-        assert!(result.is_ok(), "Warp(16) should succeed for rmsnorm_channel_scale");
-        assert!(prog.len() > initial_len, "should emit instructions with Warp(16)");
+        assert!(
+            result.is_ok(),
+            "Warp(16) should succeed for rmsnorm_channel_scale"
+        );
+        assert!(
+            prog.len() > initial_len,
+            "should emit instructions with Warp(16)"
+        );
     }
 
     // ── Test 74: silu_dead_neuron 3D all-concrete shape produces instructions ──
@@ -3081,18 +3683,30 @@ mod tests {
         // feature_dim = product of non-symbolic = 2*4*32 = 256, outer_bound = Const(1)
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let shape = vec![SymDim::Concrete(2), SymDim::Concrete(4), SymDim::Concrete(32)];
+        let shape = vec![
+            SymDim::Concrete(2),
+            SymDim::Concrete(4),
+            SymDim::Concrete(32),
+        ];
         let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
         let result = emit_silu_dead_neuron_telemetry(
-            &mut prog, input_ptr, &shape, SimdWidth::W256, &sym_map, QuantPrecision::F32,
+            &mut prog,
+            input_ptr,
+            &shape,
+            SimdWidth::W256,
+            &sym_map,
+            QuantPrecision::F32,
         );
 
         // Assert: 3D all-concrete should use outer_bound=Const(1) path and emit instructions
         assert!(result.is_ok(), "3D all-concrete shape should succeed");
-        assert!(prog.len() > initial_len, "should emit instructions for 3D concrete shape");
+        assert!(
+            prog.len() > initial_len,
+            "should emit instructions for 3D concrete shape"
+        );
     }
 
     // ── Test 75: residual_with_telemetry with large tail count and telemetry enabled ──
@@ -3111,16 +3725,38 @@ mod tests {
 
         // Act
         let result = emit_residual_with_telemetry(
-            &mut prog, &shape, 71, SimdWidth::W256, input_ptr, weight_ptr, output_ptr,
-            &sym_map, Some(telemetry_ptr_vreg), None, QuantPrecision::F32,
+            &mut prog,
+            &shape,
+            71,
+            SimdWidth::W256,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            &sym_map,
+            Some(telemetry_ptr_vreg),
+            None,
+            QuantPrecision::F32,
         );
 
         // Assert: large tail with telemetry should succeed and produce full telemetry pipeline
         assert!(result.is_ok(), "large tail with telemetry should succeed");
-        assert!(!prog.is_empty(), "should emit vec + tail residual add with telemetry");
-        let vecstore_offsets: Vec<usize> = prog.instrs.iter()
+        assert!(
+            !prog.is_empty(),
+            "should emit vec + tail residual add with telemetry"
+        );
+        let vecstore_offsets: Vec<usize> = prog
+            .instrs
+            .iter()
             .filter_map(|i| {
-                if let VmInstr::VecStore { offset: OffsetExpr::Const(off), .. } = i { Some(*off) } else { None }
+                if let VmInstr::VecStore {
+                    offset: OffsetExpr::Const(off),
+                    ..
+                } = i
+                {
+                    Some(*off)
+                } else {
+                    None
+                }
             })
             .collect();
         assert!(
@@ -3141,11 +3777,18 @@ mod tests {
 
         // Act
         emit_gemm_row_stats_telemetry(
-            &mut prog, acc, SimdWidth::W256, &sym_map, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            acc,
+            SimdWidth::W256,
+            &sym_map,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: should emit exactly 1 LoadPtr (for the telemetry buffer pointer)
-        let loadptr_count = prog.instrs.iter()
+        let loadptr_count = prog
+            .instrs
+            .iter()
             .filter(|i| matches!(i, VmInstr::LoadPtr { .. }))
             .count();
         assert_eq!(
@@ -3167,12 +3810,30 @@ mod tests {
         let cfg = EpilogueTelemetryConfig::default();
 
         // Assert: default config should have all telemetry flags disabled
-        assert!(!cfg.silu_dead_neuron, "default silu_dead_neuron should be false");
-        assert!(!cfg.moe_hit_counter, "default moe_hit_counter should be false");
-        assert!(!cfg.rmsnorm_channel_scale, "default rmsnorm_channel_scale should be false");
-        assert!(!cfg.softmax_sharpness, "default softmax_sharpness should be false");
-        assert!(!cfg.residual_cosine_sim, "default residual_cosine_sim should be false");
-        assert!(!cfg.gemm_row_stats, "default gemm_row_stats should be false");
+        assert!(
+            !cfg.silu_dead_neuron,
+            "default silu_dead_neuron should be false"
+        );
+        assert!(
+            !cfg.moe_hit_counter,
+            "default moe_hit_counter should be false"
+        );
+        assert!(
+            !cfg.rmsnorm_channel_scale,
+            "default rmsnorm_channel_scale should be false"
+        );
+        assert!(
+            !cfg.softmax_sharpness,
+            "default softmax_sharpness should be false"
+        );
+        assert!(
+            !cfg.residual_cosine_sim,
+            "default residual_cosine_sim should be false"
+        );
+        assert!(
+            !cfg.gemm_row_stats,
+            "default gemm_row_stats should be false"
+        );
         assert!(!cfg.embed_l2_norm, "default embed_l2_norm should be false");
     }
 
@@ -3192,8 +3853,18 @@ mod tests {
         assert_ne!(max, min, "Max and Min offsets must be distinct");
 
         // Offsets should be ascending: L1 < Max < Min (by layout convention)
-        assert!(l1 < max, "GEMM_ROW_NORM_L1_OFFSET ({}) < GEMM_ROW_MAX_OFFSET ({})", l1, max);
-        assert!(max < min, "GEMM_ROW_MAX_OFFSET ({}) < GEMM_ROW_MIN_OFFSET ({})", max, min);
+        assert!(
+            l1 < max,
+            "GEMM_ROW_NORM_L1_OFFSET ({}) < GEMM_ROW_MAX_OFFSET ({})",
+            l1,
+            max
+        );
+        assert!(
+            max < min,
+            "GEMM_ROW_MAX_OFFSET ({}) < GEMM_ROW_MIN_OFFSET ({})",
+            max,
+            min
+        );
     }
 
     // ── Test 79: gemm_row_stats instruction sequence starts with LoadPtr then has VecStore at 3 offsets ──
@@ -3208,15 +3879,20 @@ mod tests {
 
         // Act
         emit_gemm_row_stats_telemetry(
-            &mut prog, acc, SimdWidth::W256, &sym_map, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            acc,
+            SimdWidth::W256,
+            &sym_map,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: should contain a LoadPtr for telemetry buffer (may not be first due to DeclareVReg)
-        let has_loadptr = prog.instrs.iter().any(|i| matches!(i, VmInstr::LoadPtr { .. }));
-        assert!(
-            has_loadptr,
-            "should contain LoadPtr for telemetry buffer",
-        );
+        let has_loadptr = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::LoadPtr { .. }));
+        assert!(has_loadptr, "should contain LoadPtr for telemetry buffer",);
 
         // Should contain exactly 3 VecStore instructions at telemetry offsets
         let tel_offsets = [
@@ -3224,13 +3900,22 @@ mod tests {
             telemetry_offsets::GEMM_ROW_MAX_OFFSET,
             telemetry_offsets::GEMM_ROW_MIN_OFFSET,
         ];
-        let store_offsets: Vec<usize> = prog.instrs.iter()
+        let store_offsets: Vec<usize> = prog
+            .instrs
+            .iter()
             .filter_map(|i| match i {
-                VmInstr::VecStore { offset: OffsetExpr::Const(off), .. } if tel_offsets.contains(off) => Some(*off),
+                VmInstr::VecStore {
+                    offset: OffsetExpr::Const(off),
+                    ..
+                } if tel_offsets.contains(off) => Some(*off),
                 _ => None,
             })
             .collect();
-        assert_eq!(store_offsets.len(), 3, "should have exactly 3 telemetry VecStore instructions");
+        assert_eq!(
+            store_offsets.len(),
+            3,
+            "should have exactly 3 telemetry VecStore instructions"
+        );
     }
 
     // ── Test 80: rmsnorm_channel_scale with feature_dim=1 and Scalar width emits minimal instructions ──
@@ -3246,11 +3931,19 @@ mod tests {
 
         // Act
         let result = emit_rmsnorm_channel_scale_telemetry(
-            &mut prog, input_ptr, 1, SimdWidth::Scalar, &sym_map, QuantPrecision::F32,
+            &mut prog,
+            input_ptr,
+            1,
+            SimdWidth::Scalar,
+            &sym_map,
+            QuantPrecision::F32,
         );
 
         // Assert: feature_dim=1 with Scalar (1 lane) → vec_count=1, should emit instructions
-        assert!(result.is_ok(), "feature_dim=1 with Scalar width should succeed");
+        assert!(
+            result.is_ok(),
+            "feature_dim=1 with Scalar width should succeed"
+        );
         assert!(
             prog.len() > initial_len,
             "should emit instructions for single scalar element channel scale"
@@ -3271,11 +3964,19 @@ mod tests {
 
         // Act
         let result = emit_silu_dead_neuron_telemetry(
-            &mut prog, input_ptr, &shape, SimdWidth::Scalar, &sym_map, QuantPrecision::F32,
+            &mut prog,
+            input_ptr,
+            &shape,
+            SimdWidth::Scalar,
+            &sym_map,
+            QuantPrecision::F32,
         );
 
         // Assert: single element with scalar width should succeed
-        assert!(result.is_ok(), "feature_dim=1 with Scalar width should succeed");
+        assert!(
+            result.is_ok(),
+            "feature_dim=1 with Scalar width should succeed"
+        );
         assert!(
             prog.len() > initial_len,
             "should emit instructions for single element dead neuron detection"
@@ -3298,13 +3999,28 @@ mod tests {
 
         // Act
         let result = emit_residual_with_telemetry(
-            &mut prog, &shape, 1, SimdWidth::Scalar,
-            input_ptr, weight_ptr, output_ptr, &sym_map, Some(tp), None, QuantPrecision::F32,
+            &mut prog,
+            &shape,
+            1,
+            SimdWidth::Scalar,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            &sym_map,
+            Some(tp),
+            None,
+            QuantPrecision::F32,
         );
 
         // Assert: single element with telemetry should succeed
-        assert!(result.is_ok(), "feature_dim=1 Scalar with telemetry should succeed");
-        assert!(!prog.is_empty(), "should emit residual add + telemetry instructions");
+        assert!(
+            result.is_ok(),
+            "feature_dim=1 Scalar with telemetry should succeed"
+        );
+        assert!(
+            !prog.is_empty(),
+            "should emit residual add + telemetry instructions"
+        );
     }
 
     // ── Test 83: EpilogueTelemetryConfig with all flags enabled is not default ──
@@ -3330,7 +4046,10 @@ mod tests {
         // Assert: all-enabled config must differ from default on every field
         assert_ne!(all_enabled.silu_dead_neuron, default_cfg.silu_dead_neuron);
         assert_ne!(all_enabled.gemm_row_stats, default_cfg.gemm_row_stats);
-        assert_ne!(all_enabled.residual_cosine_sim, default_cfg.residual_cosine_sim);
+        assert_ne!(
+            all_enabled.residual_cosine_sim,
+            default_cfg.residual_cosine_sim
+        );
     }
 
     // ── Test 84: TELEMETRY_BUFFER_MIN_BYTES covers all known offsets ──
@@ -3340,17 +4059,47 @@ mod tests {
     fn telemetry_buffer_min_bytes_covers_all_stat_offsets() {
         // Arrange: collect all telemetry offsets that store f32 values
         let f32_offsets: Vec<(usize, &str)> = vec![
-            (telemetry_offsets::SILU_DEAD_NEURON_COUNT, "SILU_DEAD_NEURON_COUNT"),
-            (telemetry_offsets::RESIDUAL_DELTA_OFFSET, "RESIDUAL_DELTA_OFFSET"),
-            (telemetry_offsets::COSINE_SIMILARITY_OFFSET, "COSINE_SIMILARITY_OFFSET"),
-            (telemetry_offsets::GEMM_ROW_NORM_L1_OFFSET, "GEMM_ROW_NORM_L1_OFFSET"),
-            (telemetry_offsets::GEMM_ROW_MAX_OFFSET, "GEMM_ROW_MAX_OFFSET"),
-            (telemetry_offsets::GEMM_ROW_MIN_OFFSET, "GEMM_ROW_MIN_OFFSET"),
-            (telemetry_offsets::SOFTMAX_SHARPNESS_OFFSET, "SOFTMAX_SHARPNESS_OFFSET"),
+            (
+                telemetry_offsets::SILU_DEAD_NEURON_COUNT,
+                "SILU_DEAD_NEURON_COUNT",
+            ),
+            (
+                telemetry_offsets::RESIDUAL_DELTA_OFFSET,
+                "RESIDUAL_DELTA_OFFSET",
+            ),
+            (
+                telemetry_offsets::COSINE_SIMILARITY_OFFSET,
+                "COSINE_SIMILARITY_OFFSET",
+            ),
+            (
+                telemetry_offsets::GEMM_ROW_NORM_L1_OFFSET,
+                "GEMM_ROW_NORM_L1_OFFSET",
+            ),
+            (
+                telemetry_offsets::GEMM_ROW_MAX_OFFSET,
+                "GEMM_ROW_MAX_OFFSET",
+            ),
+            (
+                telemetry_offsets::GEMM_ROW_MIN_OFFSET,
+                "GEMM_ROW_MIN_OFFSET",
+            ),
+            (
+                telemetry_offsets::SOFTMAX_SHARPNESS_OFFSET,
+                "SOFTMAX_SHARPNESS_OFFSET",
+            ),
             (telemetry_offsets::SOFTMAX_MAX_OFFSET, "SOFTMAX_MAX_OFFSET"),
-            (telemetry_offsets::EFFECTIVE_CONTEXT_LEN_OFFSET, "EFFECTIVE_CONTEXT_LEN_OFFSET"),
-            (telemetry_offsets::IS_ATTENTION_SINK_OFFSET, "IS_ATTENTION_SINK_OFFSET"),
-            (telemetry_offsets::EMBED_L2_NORM_OFFSET, "EMBED_L2_NORM_OFFSET"),
+            (
+                telemetry_offsets::EFFECTIVE_CONTEXT_LEN_OFFSET,
+                "EFFECTIVE_CONTEXT_LEN_OFFSET",
+            ),
+            (
+                telemetry_offsets::IS_ATTENTION_SINK_OFFSET,
+                "IS_ATTENTION_SINK_OFFSET",
+            ),
+            (
+                telemetry_offsets::EMBED_L2_NORM_OFFSET,
+                "EMBED_L2_NORM_OFFSET",
+            ),
         ];
 
         // Act & Assert: each offset + 4 bytes must fit within TELEMETRY_BUFFER_MIN_BYTES
@@ -3358,7 +4107,9 @@ mod tests {
             assert!(
                 off + 4 <= telemetry_offsets::TELEMETRY_BUFFER_MIN_BYTES,
                 "{} offset ({}) + sizeof(f32) exceeds TELEMETRY_BUFFER_MIN_BYTES ({})",
-                name, off, telemetry_offsets::TELEMETRY_BUFFER_MIN_BYTES,
+                name,
+                off,
+                telemetry_offsets::TELEMETRY_BUFFER_MIN_BYTES,
             );
         }
     }
@@ -3376,15 +4127,25 @@ mod tests {
         let mut prog_w256 = VmProgram::new();
         let acc_256 = prog_w256.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         emit_gemm_row_stats_telemetry(
-            &mut prog_w256, acc_256, SimdWidth::W256, &sym_map, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog_w256,
+            acc_256,
+            SimdWidth::W256,
+            &sym_map,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Act: emit with W512
         let mut prog_w512 = VmProgram::new();
         let acc_512 = prog_w512.alloc_vreg(VRegKind::Vec, SimdWidth::W512);
         emit_gemm_row_stats_telemetry(
-            &mut prog_w512, acc_512, SimdWidth::W512, &sym_map, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog_w512,
+            acc_512,
+            SimdWidth::W512,
+            &sym_map,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: both widths should produce instructions (exact count may vary by ISA path)
         assert!(prog_w256.len() > 0, "W256 should produce instructions");
@@ -3407,13 +4168,33 @@ mod tests {
 
         // Act
         emit_residual_with_telemetry(
-            &mut prog, &shape, 64, SimdWidth::W256,
-            input_ptr, weight_ptr, output_ptr, &sym_map, None, None, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            &shape,
+            64,
+            SimdWidth::W256,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            &sym_map,
+            None,
+            None,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: no Broadcast with Const(0.0) should appear (no accumulator init without telemetry)
-        let zero_broadcast_count = prog.instrs.iter()
-            .filter(|i| matches!(i, VmInstr::Broadcast { src: ScalarExpr::Const(0.0), .. }))
+        let zero_broadcast_count = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::Broadcast {
+                        src: ScalarExpr::Const(0.0),
+                        ..
+                    }
+                )
+            })
             .count();
         assert_eq!(
             zero_broadcast_count, 0,
@@ -3439,14 +4220,33 @@ mod tests {
 
         // Act
         emit_residual_with_telemetry(
-            &mut prog, &shape, 64, SimdWidth::W256,
-            input_ptr, weight_ptr, output_ptr, &sym_map,
-            Some(telemetry_ptr_vreg), None, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            &shape,
+            64,
+            SimdWidth::W256,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            &sym_map,
+            Some(telemetry_ptr_vreg),
+            None,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: should emit exactly 3 Broadcast(Const(0.0)) for the three accumulators
-        let zero_broadcast_count = prog.instrs.iter()
-            .filter(|i| matches!(i, VmInstr::Broadcast { src: ScalarExpr::Const(0.0), .. }))
+        let zero_broadcast_count = prog
+            .instrs
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    VmInstr::Broadcast {
+                        src: ScalarExpr::Const(0.0),
+                        ..
+                    }
+                )
+            })
             .count();
         assert!(
             zero_broadcast_count >= 3,
@@ -3468,11 +4268,19 @@ mod tests {
 
         // Act
         emit_silu_dead_neuron_telemetry(
-            &mut prog, input_ptr, &shape, SimdWidth::W256, &sym_map, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            input_ptr,
+            &shape,
+            SimdWidth::W256,
+            &sym_map,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: should emit at least one VecLoad to scan input values
-        let vecload_count = prog.instrs.iter()
+        let vecload_count = prog
+            .instrs
+            .iter()
             .filter(|i| matches!(i, VmInstr::VecLoad { .. }))
             .count();
         assert!(
@@ -3518,12 +4326,14 @@ mod tests {
         assert!(
             expert_off >= silu_mask_end,
             "EXPERT_HIT_COUNTS_OFFSET ({}) should be >= end of SILU region ({})",
-            expert_off, silu_mask_end,
+            expert_off,
+            silu_mask_end,
         );
         assert!(
             expert_off < residual_start,
             "EXPERT_HIT_COUNTS_OFFSET ({}) should be < RESIDUAL_DELTA_OFFSET ({})",
-            expert_off, residual_start,
+            expert_off,
+            residual_start,
         );
     }
 
@@ -3539,21 +4349,34 @@ mod tests {
         let mut prog_w256 = VmProgram::new();
         let ip_256 = prog_w256.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         emit_rmsnorm_channel_scale_telemetry(
-            &mut prog_w256, ip_256, 256, SimdWidth::W256, &sym_map, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog_w256,
+            ip_256,
+            256,
+            SimdWidth::W256,
+            &sym_map,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Act: W512
         let mut prog_w512 = VmProgram::new();
         let ip_512 = prog_w512.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         emit_rmsnorm_channel_scale_telemetry(
-            &mut prog_w512, ip_512, 256, SimdWidth::W512, &sym_map, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog_w512,
+            ip_512,
+            256,
+            SimdWidth::W512,
+            &sym_map,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: wider SIMD should produce fewer instructions (fewer loop iterations)
         assert!(
             prog_w512.len() <= prog_w256.len(),
             "W512 ({} instrs) should have <= W256 ({} instrs) for same feature_dim",
-            prog_w512.len(), prog_w256.len(),
+            prog_w512.len(),
+            prog_w256.len(),
         );
     }
 
@@ -3591,10 +4414,19 @@ mod tests {
 
         // Act
         emit_residual_with_telemetry(
-            &mut prog, &shape, 64, SimdWidth::W256,
-            input_ptr, weight_ptr, output_ptr, &sym_map,
-            Some(telemetry_ptr_vreg), None, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            &shape,
+            64,
+            SimdWidth::W256,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            &sym_map,
+            Some(telemetry_ptr_vreg),
+            None,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: should emit a Comment mentioning cosine similarity or telemetry finalization
         let has_cosine_comment = prog.instrs.iter().any(|i| {
@@ -3616,7 +4448,8 @@ mod tests {
 
         // Assert: pointer storage requires 8-byte alignment on 64-bit platforms
         assert_eq!(
-            off % 8, 0,
+            off % 8,
+            0,
             "CHANNEL_SCALE_PTR_OFFSET ({}) must be 8-byte aligned for pointer storage",
             off,
         );
@@ -3636,9 +4469,19 @@ mod tests {
             let wp = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
             let op = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
             emit_residual_with_telemetry(
-                &mut prog, &shape, 64, SimdWidth::W256, ip, wp, op,
-                &sym_map, None, None, QuantPrecision::F32,
-            ).unwrap();
+                &mut prog,
+                &shape,
+                64,
+                SimdWidth::W256,
+                ip,
+                wp,
+                op,
+                &sym_map,
+                None,
+                None,
+                QuantPrecision::F32,
+            )
+            .unwrap();
             prog.len()
         };
 
@@ -3662,8 +4505,13 @@ mod tests {
 
         // Act
         emit_gemm_row_stats_telemetry(
-            &mut prog, acc, SimdWidth::W256, &sym_map, QuantPrecision::F32,
-        ).unwrap();
+            &mut prog,
+            acc,
+            SimdWidth::W256,
+            &sym_map,
+            QuantPrecision::F32,
+        )
+        .unwrap();
 
         // Assert: collect all Const-offset VecStore instructions and verify no duplicates
         let tel_offsets = [
@@ -3671,16 +4519,98 @@ mod tests {
             telemetry_offsets::GEMM_ROW_MAX_OFFSET,
             telemetry_offsets::GEMM_ROW_MIN_OFFSET,
         ];
-        let store_offsets: Vec<usize> = prog.instrs.iter()
+        let store_offsets: Vec<usize> = prog
+            .instrs
+            .iter()
             .filter_map(|i| match i {
-                VmInstr::VecStore { offset: OffsetExpr::Const(off), .. } if tel_offsets.contains(off) => Some(*off),
+                VmInstr::VecStore {
+                    offset: OffsetExpr::Const(off),
+                    ..
+                } if tel_offsets.contains(off) => Some(*off),
                 _ => None,
             })
             .collect();
 
         // Must have 3 stores, and each must be unique
-        assert_eq!(store_offsets.len(), 3, "should have exactly 3 telemetry VecStore instructions");
+        assert_eq!(
+            store_offsets.len(),
+            3,
+            "should have exactly 3 telemetry VecStore instructions"
+        );
         let unique: std::collections::HashSet<usize> = store_offsets.iter().copied().collect();
-        assert_eq!(unique.len(), 3, "all 3 telemetry VecStore offsets must be distinct");
+        assert_eq!(
+            unique.len(),
+            3,
+            "all 3 telemetry VecStore offsets must be distinct"
+        );
+    }
+
+    #[test]
+    fn rmsnorm_channel_scale_w512_bf16_advances_by_loaded_bytes() {
+        let mut prog = VmProgram::new();
+        let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        emit_rmsnorm_channel_scale_telemetry(
+            &mut prog,
+            input,
+            32,
+            SimdWidth::W512,
+            &SymDimSlotMap::mega_kernel_abi(),
+            QuantPrecision::BF16,
+        )
+        .unwrap();
+
+        let stride = prog.instrs.iter().find_map(|instr| match instr {
+            VmInstr::LoopBegin {
+                offsets,
+                bound: BoundExpr::Const(2),
+                ..
+            } => offsets
+                .first()
+                .and_then(|offset| offset.stride.as_fixed_bytes()),
+            _ => None,
+        });
+        assert_eq!(
+            stride,
+            Some(32),
+            "W512 BF16 telemetry load advances by 32 bytes"
+        );
+    }
+
+    #[test]
+    fn residual_telemetry_w512_bf16_advances_by_loaded_bytes() {
+        let mut prog = VmProgram::new();
+        let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let weight = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        emit_residual_with_telemetry(
+            &mut prog,
+            &[SymDim::Concrete(1), SymDim::Concrete(32)],
+            32,
+            SimdWidth::W512,
+            input,
+            weight,
+            output,
+            &SymDimSlotMap::mega_kernel_abi(),
+            None,
+            None,
+            QuantPrecision::BF16,
+        )
+        .unwrap();
+
+        let stride = prog.instrs.iter().find_map(|instr| match instr {
+            VmInstr::LoopBegin {
+                offsets,
+                bound: BoundExpr::Const(2),
+                ..
+            } => offsets
+                .first()
+                .and_then(|offset| offset.stride.as_fixed_bytes()),
+            _ => None,
+        });
+        assert_eq!(
+            stride,
+            Some(32),
+            "W512 BF16 residual load advances by 32 bytes"
+        );
     }
 }

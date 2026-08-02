@@ -69,9 +69,9 @@ macro_rules! simd_primitive {
     (scalar, f32, round_nearest, $a:expr) => { $a.round() };
     (scalar, f32, cvt_to_i32, $a:expr) => { $a as i32 };
     (scalar, f32, cvt_from_i32, $a:expr) => { $a as f32 };
-    // Shuffle: scalar shuffle is identity or specific index? 
+    // Shuffle: scalar shuffle is identity or specific index?
     // Usually shuffle is typically used for rearranging bytes.
-    // For scalar, we might need a custom implementation if operating on bytes, but scalar mode 
+    // For scalar, we might need a custom implementation if operating on bytes, but scalar mode
     // usually means we process 1 element at a time, so shuffle is irrelevant.
     (scalar, i8, shuffle, $a:expr, $mask:expr) => { $a }; // Stub for scalar loop
 
@@ -105,9 +105,9 @@ macro_rules! simd_primitive {
     (avx2, f32, neg, $a:expr) => { std::arch::x86_64::_mm256_sub_ps(std::arch::x86_64::_mm256_setzero_ps(), $a) }; // 0 - a
     (avx2, f32, max, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_max_ps($a, $b) };
     (avx2, f32, min, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_min_ps($a, $b) };
-    
+
     // Reduce sum: horizontal add
-    (avx2, f32, reduce_sum, $v:expr) => { 
+    (avx2, f32, reduce_sum, $v:expr) => {
         {
             let h1 = std::arch::x86_64::_mm256_hadd_ps($v, $v);
             let h2 = std::arch::x86_64::_mm256_hadd_ps(h1, h1);
@@ -117,7 +117,7 @@ macro_rules! simd_primitive {
             std::arch::x86_64::_mm_cvtss_f32(res)
         }
     };
-    
+
     // Exp, Recip, Sqrt etc.
     (avx2, f32, sqrt, $a:expr) => { std::arch::x86_64::_mm256_sqrt_ps($a) };
     // rsqrt with one Newton-Raphson refinement: ~23-bit accuracy
@@ -197,7 +197,7 @@ macro_rules! simd_primitive {
     (avx2, i32, splat, $v:expr) => { std::arch::x86_64::_mm256_set1_epi32($v) };
     (avx2, i32, load, $p:expr) => { std::arch::x86_64::_mm256_loadu_si256($p as *const std::arch::x86_64::__m256i) };
     (avx2, i32, store, $p:expr, $v:expr) => { std::arch::x86_64::_mm256_storeu_si256($p as *mut std::arch::x86_64::__m256i, $v) };
-    
+
     (avx2, i32, add, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_add_epi32($a, $b) };
     (avx2, i32, and, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_and_si256($a, $b) };
     (avx2, i32, or, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_or_si256($a, $b) };
@@ -212,7 +212,7 @@ macro_rules! simd_primitive {
     (avx2, f32, round_nearest, $a:expr) => { std::arch::x86_64::_mm256_round_ps($a, std::arch::x86_64::_MM_FROUND_TO_NEAREST_INT | std::arch::x86_64::_MM_FROUND_NO_EXC) };
     (avx2, f32, cvt_to_i32, $a:expr) => { std::arch::x86_64::_mm256_cvtps_epi32($a) };
     (avx2, f32, cvt_from_i32, $a:expr) => { std::arch::x86_64::_mm256_cvtepi32_ps($a) };
-    
+
     // Shuffle bytes (pshufb) - operates on 128-bit memory lanes!
     // _mm256_shuffle_epi8
     (avx2, i8, shuffle, $a:expr, $mask:expr) => { std::arch::x86_64::_mm256_shuffle_epi8($a, $mask) };
@@ -572,12 +572,12 @@ macro_rules! simd_primitive {
     (neon, f32, neg, $a:expr) => { unsafe { std::arch::aarch64::vnegq_f32($a) } };
     (neon, f32, max, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vmaxq_f32($a, $b) } };
     (neon, f32, min, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vminq_f32($a, $b) } };
-    
+
     // Reduce sum
     (neon, f32, reduce_sum, $v:expr) => { unsafe { std::arch::aarch64::vaddvq_f32($v) } };
     (neon, f32, reduce_max, $v:expr) => { unsafe { std::arch::aarch64::vmaxvq_f32($v) } };
     (neon, f32, abs, $a:expr) => { unsafe { std::arch::aarch64::vabsq_f32($a) } };
-    
+
     // Ops
     (neon, f32, sqrt, $a:expr) => { unsafe { std::arch::aarch64::vsqrtq_f32($a) } };
     // rsqrt with one Newton-Raphson step via vrsqrtsq_f32
@@ -598,7 +598,7 @@ macro_rules! simd_primitive {
             std::arch::aarch64::vmulq_f32(r, step)
         }
     };
-    
+
     // EXP
     (neon, f32, exp, $a:expr) => { $crate::cpu_kernels::neon::math::exp_ps($a) };
     (neon, f32, exp_fast, $a:expr) => { $crate::cpu_kernels::neon::math::exp_ps($a) }; // NEON: same impl (already fast)
@@ -859,7 +859,7 @@ macro_rules! simd_primitive {
     (neon, f32, round_nearest, $a:expr) => { unsafe { std::arch::aarch64::vrndnq_f32($a) } };
     (neon, f32, cvt_to_i32, $a:expr) => { unsafe { std::arch::aarch64::vcvtq_s32_f32($a) } };
     (neon, f32, cvt_from_i32, $a:expr) => { unsafe { std::arch::aarch64::vcvtq_f32_s32($a) } };
-    
+
     // Shuffle: vqtbl1q_u8 (lookup table)
     (neon, i8, shuffle, $tbl:expr, $idx:expr) => { unsafe { std::arch::aarch64::vqtbl1q_u8($tbl, $idx) } };
 

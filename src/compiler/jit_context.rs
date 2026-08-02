@@ -72,28 +72,43 @@ impl ResourceKind {
         match self {
             Self::Gpr | Self::SimdVec => !platform.is_gpu(),
             Self::Stack => !platform.is_gpu(),
-            Self::Predicate => matches!(platform,
-                Platform::X86_64 { has_avx512: true, .. }
-                | Platform::AArch64 { has_sve: true, .. }),
-            Self::Tile => matches!(platform,
-                Platform::X86_64 { has_amx: true, .. }
-                | Platform::AArch64 { has_sme: true, .. }),
+            Self::Predicate => matches!(
+                platform,
+                Platform::X86_64 {
+                    has_avx512: true,
+                    ..
+                } | Platform::AArch64 { has_sve: true, .. }
+            ),
+            Self::Tile => matches!(
+                platform,
+                Platform::X86_64 { has_amx: true, .. } | Platform::AArch64 { has_sme: true, .. }
+            ),
             Self::TileAccumulator => match platform {
                 Platform::Cuda { sm_version, .. } => *sm_version >= 90,
                 Platform::Hip { .. } => true,
                 _ => false,
             },
-            Self::SharedMem => matches!(platform,
-                Platform::Cuda { .. } | Platform::Hip { .. } | Platform::Metal { .. }),
+            Self::SharedMem => matches!(
+                platform,
+                Platform::Cuda { .. } | Platform::Hip { .. } | Platform::Metal { .. }
+            ),
             Self::TensorMem => matches!(platform, Platform::Cuda { has_tmem: true, .. }),
-            Self::Barrier => matches!(platform,
-                Platform::Cuda { has_warp_spec: true, .. }),
+            Self::Barrier => matches!(
+                platform,
+                Platform::Cuda {
+                    has_warp_spec: true,
+                    ..
+                }
+            ),
         }
     }
 
     /// Whether this resource kind is tracked in bytes (memory-type).
     pub fn is_memory(&self) -> bool {
-        matches!(self, ResourceKind::Stack | ResourceKind::SharedMem | ResourceKind::TensorMem)
+        matches!(
+            self,
+            ResourceKind::Stack | ResourceKind::SharedMem | ResourceKind::TensorMem
+        )
     }
 }
 
@@ -159,7 +174,13 @@ impl JitResourceBudget {
     /// Derive full resource budget from IsaProfile.
     pub fn from_isa_profile(profile: &IsaProfile) -> Self {
         let (shared_mem, tmem, barriers, tile_acc) = match &profile.platform {
-            Platform::Cuda { shared_mem_kb, tmem_size_kb, has_warp_spec, sm_version, .. } => {
+            Platform::Cuda {
+                shared_mem_kb,
+                tmem_size_kb,
+                has_warp_spec,
+                sm_version,
+                ..
+            } => {
                 let smem = shared_mem_kb * 1024;
                 let tm = tmem_size_kb * 1024;
                 let barriers = if *has_warp_spec { 2 } else { 0 };
@@ -169,9 +190,9 @@ impl JitResourceBudget {
             Platform::Hip { lds_size_kb, .. } => {
                 (lds_size_kb * 1024, 0, 0, 4) // MFMA accumulator
             }
-            Platform::Metal { threadgroup_mem_kb, .. } => {
-                (threadgroup_mem_kb * 1024, 0, 0, 0)
-            }
+            Platform::Metal {
+                threadgroup_mem_kb, ..
+            } => (threadgroup_mem_kb * 1024, 0, 0, 0),
             _ => (0, 0, 0, 0),
         };
 
@@ -261,9 +282,17 @@ pub struct ResourceReport {
 #[derive(Debug, Clone)]
 pub enum ResourceWarning {
     /// Resource utilization exceeds 90%.
-    NearExhaustion { kind: ResourceKind, peak: usize, capacity: usize },
+    NearExhaustion {
+        kind: ResourceKind,
+        peak: usize,
+        capacity: usize,
+    },
     /// Resource allocated but never released.
-    Leak { kind: ResourceKind, instance: usize, purpose: &'static str },
+    Leak {
+        kind: ResourceKind,
+        instance: usize,
+        purpose: &'static str,
+    },
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -341,7 +370,10 @@ impl JitContext {
                     purpose,
                     alloc_instr: self.current_instr,
                 };
-                let live = pool.iter().filter(|s| matches!(s, ResourceState::Live { .. })).count();
+                let live = pool
+                    .iter()
+                    .filter(|s| matches!(s, ResourceState::Live { .. }))
+                    .count();
                 if live > self.peak_live[&kind] {
                     self.peak_live.insert(kind, live);
                 }
@@ -357,7 +389,10 @@ impl JitContext {
             }
         }
 
-        let live = pool.iter().filter(|s| matches!(s, ResourceState::Live { .. })).count();
+        let live = pool
+            .iter()
+            .filter(|s| matches!(s, ResourceState::Live { .. }))
+            .count();
         Err(ResourceExhausted {
             kind,
             requested: 1,
@@ -373,7 +408,10 @@ impl JitContext {
     /// Panics on double-free (release of already Free resource) per REQ-JCTX-021.
     pub fn release(&mut self, kind: ResourceKind, instance: usize) {
         let pool = self.resources.get_mut(&kind).unwrap_or_else(|| {
-            panic!("release({:?}, {}): resource kind not tracked", kind, instance)
+            panic!(
+                "release({:?}, {}): resource kind not tracked",
+                kind, instance
+            )
         });
         let state = &mut pool[instance];
         let purpose = match state {
@@ -393,7 +431,10 @@ impl JitContext {
             purpose,
         });
         *state = ResourceState::Free;
-        let live = pool.iter().filter(|s| matches!(s, ResourceState::Live { .. })).count();
+        let live = pool
+            .iter()
+            .filter(|s| matches!(s, ResourceState::Live { .. }))
+            .count();
         self.debug_log_release(kind, instance, live);
     }
 
@@ -432,7 +473,10 @@ impl JitContext {
         }
 
         let start = run_start.ok_or_else(|| {
-            let live = pool.iter().filter(|s| matches!(s, ResourceState::Live { .. })).count();
+            let live = pool
+                .iter()
+                .filter(|s| matches!(s, ResourceState::Live { .. }))
+                .count();
             ResourceExhausted {
                 kind,
                 requested: count,
@@ -457,7 +501,10 @@ impl JitContext {
             });
         }
 
-        let live = pool.iter().filter(|s| matches!(s, ResourceState::Live { .. })).count();
+        let live = pool
+            .iter()
+            .filter(|s| matches!(s, ResourceState::Live { .. }))
+            .count();
         if live > self.peak_live[&kind] {
             self.peak_live.insert(kind, live);
         }
@@ -471,7 +518,11 @@ impl JitContext {
     pub fn live_count(&self, kind: ResourceKind) -> usize {
         self.resources
             .get(&kind)
-            .map(|pool| pool.iter().filter(|s| matches!(s, ResourceState::Live { .. })).count())
+            .map(|pool| {
+                pool.iter()
+                    .filter(|s| matches!(s, ResourceState::Live { .. }))
+                    .count()
+            })
             .unwrap_or(0)
     }
 
@@ -566,7 +617,11 @@ impl JitContext {
         for &kind in &ResourceKind::ALL {
             let peak = self.peak(kind);
             let cap = self.capacity(kind);
-            let util = if cap > 0 { peak as f64 / cap as f64 } else { 0.0 };
+            let util = if cap > 0 {
+                peak as f64 / cap as f64
+            } else {
+                0.0
+            };
             utilization.insert(kind, util);
 
             if cap > 0 && util > 0.9 {
@@ -584,7 +639,10 @@ impl JitContext {
                         // Tile/Barrier/SMEM/TMEM are hardware-managed, skip
                         if !matches!(
                             kind,
-                            ResourceKind::Tile | ResourceKind::Barrier | ResourceKind::SharedMem | ResourceKind::TensorMem
+                            ResourceKind::Tile
+                                | ResourceKind::Barrier
+                                | ResourceKind::SharedMem
+                                | ResourceKind::TensorMem
                         ) {
                             warnings.push(ResourceWarning::Leak {
                                 kind,
@@ -617,7 +675,13 @@ impl JitContext {
 
     // ── Debug logging ────────────────────────────────────────────
 
-    fn debug_log_alloc(&self, kind: ResourceKind, instance: usize, purpose: &'static str, live: usize) {
+    fn debug_log_alloc(
+        &self,
+        kind: ResourceKind,
+        instance: usize,
+        purpose: &'static str,
+        live: usize,
+    ) {
         if std::env::var("GLLM_DEBUG_RESOURCE").as_deref() == Ok("1") {
             eprintln!(
                 "[JitContext] instr={} allocate {:?}:{} {:?} (live={}, peak={}, cap={})",
@@ -689,12 +753,18 @@ mod tests {
         let idx = ctx.allocate(ResourceKind::Gpr, "test_counter").unwrap();
         assert_eq!(ctx.live_count(ResourceKind::Gpr), 1);
         assert_eq!(ctx.peak(ResourceKind::Gpr), 1);
-        assert_eq!(ctx.available(ResourceKind::Gpr), ctx.capacity(ResourceKind::Gpr) - 1);
+        assert_eq!(
+            ctx.available(ResourceKind::Gpr),
+            ctx.capacity(ResourceKind::Gpr) - 1
+        );
 
         ctx.release(ResourceKind::Gpr, idx);
         assert_eq!(ctx.live_count(ResourceKind::Gpr), 0);
         assert_eq!(ctx.peak(ResourceKind::Gpr), 1); // peak stays
-        assert_eq!(ctx.available(ResourceKind::Gpr), ctx.capacity(ResourceKind::Gpr));
+        assert_eq!(
+            ctx.available(ResourceKind::Gpr),
+            ctx.capacity(ResourceKind::Gpr)
+        );
     }
 
     #[test]
@@ -774,7 +844,10 @@ mod tests {
         assert_eq!(snap.instr_idx, 42);
         assert_eq!(snap.live[&ResourceKind::Gpr], 1);
         assert_eq!(snap.peak[&ResourceKind::Gpr], 1);
-        assert_eq!(snap.available[&ResourceKind::Gpr], ctx.capacity(ResourceKind::Gpr) - 1);
+        assert_eq!(
+            snap.available[&ResourceKind::Gpr],
+            ctx.capacity(ResourceKind::Gpr) - 1
+        );
     }
 
     #[test]
@@ -802,7 +875,11 @@ mod tests {
         let report = ctx.usage_report();
         assert!(report.peak_usage[&ResourceKind::Gpr] >= 1);
         // No leaks because we released
-        let leaks: Vec<_> = report.warnings.iter().filter(|w| matches!(w, ResourceWarning::Leak { .. })).collect();
+        let leaks: Vec<_> = report
+            .warnings
+            .iter()
+            .filter(|w| matches!(w, ResourceWarning::Leak { .. }))
+            .collect();
         assert!(leaks.is_empty());
     }
 
@@ -813,7 +890,11 @@ mod tests {
         ctx.allocate(ResourceKind::Gpr, "leaked").unwrap();
 
         let report = ctx.usage_report();
-        let leaks: Vec<_> = report.warnings.iter().filter(|w| matches!(w, ResourceWarning::Leak { .. })).collect();
+        let leaks: Vec<_> = report
+            .warnings
+            .iter()
+            .filter(|w| matches!(w, ResourceWarning::Leak { .. }))
+            .collect();
         assert!(!leaks.is_empty());
     }
 
@@ -826,7 +907,9 @@ mod tests {
             return; // skip on very constrained configs
         }
 
-        let start = ctx.allocate_region(ResourceKind::Gpr, 3, "region_test").unwrap();
+        let start = ctx
+            .allocate_region(ResourceKind::Gpr, 3, "region_test")
+            .unwrap();
         assert!(start + 3 <= cap);
         assert_eq!(ctx.live_count(ResourceKind::Gpr), 3);
     }
@@ -884,7 +967,9 @@ mod tests {
         ctx.release(ResourceKind::Gpr, i1); // create a gap at i1
 
         // Assert: allocate_region should skip the gap and find a contiguous run
-        let start = ctx.allocate_region(ResourceKind::Gpr, 2, "frag_test").unwrap();
+        let start = ctx
+            .allocate_region(ResourceKind::Gpr, 2, "frag_test")
+            .unwrap();
         // The region of 2 contiguous slots must be after the gap or wrap around;
         // it must NOT include the freed slot as part of a 2-run starting there
         // unless i2+1 and i2+2 are free.
@@ -945,7 +1030,7 @@ mod tests {
 
         // Assert
         assert_eq!(ctx.mem_used(ResourceKind::SharedMem), 3072); // 1024 + 2048
-        assert_eq!(ctx.mem_used(ResourceKind::TensorMem), 768);  // 512 + 256
+        assert_eq!(ctx.mem_used(ResourceKind::TensorMem), 768); // 512 + 256
     }
 
     #[test]
@@ -968,8 +1053,18 @@ mod tests {
         let report = ctx.usage_report();
 
         // Assert
-        let near: Vec<_> = report.warnings.iter()
-            .filter(|w| matches!(w, ResourceWarning::NearExhaustion { kind: ResourceKind::Gpr, .. }))
+        let near: Vec<_> = report
+            .warnings
+            .iter()
+            .filter(|w| {
+                matches!(
+                    w,
+                    ResourceWarning::NearExhaustion {
+                        kind: ResourceKind::Gpr,
+                        ..
+                    }
+                )
+            })
             .collect();
         assert_eq!(near.len(), 1);
         if let ResourceWarning::NearExhaustion { peak, capacity, .. } = near[0] {
@@ -1004,7 +1099,10 @@ mod tests {
         assert_eq!(err.current_live, cap);
         assert_eq!(err.peak, cap);
         // Suggestion should be SIMD-specific
-        assert_eq!(err.suggestion, "reduce vector register pressure or use narrower types");
+        assert_eq!(
+            err.suggestion,
+            "reduce vector register pressure or use narrower types"
+        );
     }
 
     #[test]
@@ -1068,7 +1166,9 @@ mod tests {
         let events_before = ctx.event_count();
 
         // Act
-        let start = ctx.allocate_region(ResourceKind::Gpr, 3, "evt_region").unwrap();
+        let start = ctx
+            .allocate_region(ResourceKind::Gpr, 3, "evt_region")
+            .unwrap();
 
         // Assert: should generate 3 allocation events
         assert_eq!(ctx.event_count(), events_before + 3);
@@ -1172,7 +1272,9 @@ mod tests {
 
         if ctx.capacity(ResourceKind::SharedMem) == 0 {
             // Act
-            let err = ctx.allocate_region(ResourceKind::SharedMem, 2, "gpu_region").unwrap_err();
+            let err = ctx
+                .allocate_region(ResourceKind::SharedMem, 2, "gpu_region")
+                .unwrap_err();
 
             // Assert
             assert_eq!(err.kind, ResourceKind::SharedMem);
@@ -1203,7 +1305,12 @@ mod tests {
         // Assert
         let util = report.utilization[&ResourceKind::Gpr];
         let expected = half as f64 / cap as f64;
-        assert!((util - expected).abs() < 0.01, "expected {}, got {}", expected, util);
+        assert!(
+            (util - expected).abs() < 0.01,
+            "expected {}, got {}",
+            expected,
+            util
+        );
 
         // Cleanup
         for idx in allocated {
@@ -1285,9 +1392,15 @@ mod tests {
         let idx = ctx.allocate(ResourceKind::Gpr, "purpose_test").unwrap();
 
         // Assert: inspect internal state through the events log
-        let alloc_event = ctx.events.iter().find(|e| {
-            e.kind == ResourceKind::Gpr && e.instance == idx && e.event_type == ResourceEventType::Allocate
-        }).unwrap();
+        let alloc_event = ctx
+            .events
+            .iter()
+            .find(|e| {
+                e.kind == ResourceKind::Gpr
+                    && e.instance == idx
+                    && e.event_type == ResourceEventType::Allocate
+            })
+            .unwrap();
         assert_eq!(alloc_event.purpose, "purpose_test");
         assert_eq!(alloc_event.instr_idx, 77);
 
@@ -1341,7 +1454,11 @@ mod tests {
         let kinds = ResourceKind::ALL;
         for &kind in &kinds {
             let suggestion = JitContext::suggestion_for(kind);
-            assert!(!suggestion.is_empty(), "{:?} should have a non-empty suggestion", kind);
+            assert!(
+                !suggestion.is_empty(),
+                "{:?} should have a non-empty suggestion",
+                kind
+            );
         }
     }
 
@@ -1357,7 +1474,10 @@ mod tests {
                 let mut ctx = ctx;
                 ctx.release(ResourceKind::SharedMem, 0);
             }));
-            assert!(result.is_err(), "releasing untracked resource kind should panic");
+            assert!(
+                result.is_err(),
+                "releasing untracked resource kind should panic"
+            );
         }
     }
 
@@ -1420,24 +1540,45 @@ mod tests {
 
         // Live states with same fields are equal
         assert_eq!(
-            ResourceState::Live { purpose: "a", alloc_instr: 1 },
-            ResourceState::Live { purpose: "a", alloc_instr: 1 },
+            ResourceState::Live {
+                purpose: "a",
+                alloc_instr: 1
+            },
+            ResourceState::Live {
+                purpose: "a",
+                alloc_instr: 1
+            },
         );
 
         // Live != Free
         assert_ne!(
-            ResourceState::Live { purpose: "a", alloc_instr: 1 },
+            ResourceState::Live {
+                purpose: "a",
+                alloc_instr: 1
+            },
             ResourceState::Free,
         );
 
         // Different purpose or alloc_instr => not equal
         assert_ne!(
-            ResourceState::Live { purpose: "a", alloc_instr: 1 },
-            ResourceState::Live { purpose: "b", alloc_instr: 1 },
+            ResourceState::Live {
+                purpose: "a",
+                alloc_instr: 1
+            },
+            ResourceState::Live {
+                purpose: "b",
+                alloc_instr: 1
+            },
         );
         assert_ne!(
-            ResourceState::Live { purpose: "a", alloc_instr: 1 },
-            ResourceState::Live { purpose: "a", alloc_instr: 2 },
+            ResourceState::Live {
+                purpose: "a",
+                alloc_instr: 1
+            },
+            ResourceState::Live {
+                purpose: "a",
+                alloc_instr: 2
+            },
         );
     }
 
@@ -1618,13 +1759,23 @@ mod tests {
                     tile_regs: vec![],
                     mask_regs: vec![],
                     abi: super::super::codegen::vm::isa_profile::AbiConvention {
-                        arg_regs: vec![], stack_arg_offset: 0, callee_saved: vec![],
-                        caller_saved: vec![], callee_saved_vec: vec![],
-                        stack_alignment: 0, red_zone_bytes: 0,
+                        arg_regs: vec![],
+                        stack_arg_offset: 0,
+                        callee_saved: vec![],
+                        caller_saved: vec![],
+                        callee_saved_vec: vec![],
+                        stack_alignment: 0,
+                        red_zone_bytes: 0,
                     },
                     cache: super::super::codegen::vm::isa_profile::CacheHierarchy {
-                        l1d_bytes: 0, l1i_bytes: 0, l2_bytes: 0, l3_bytes: 0,
-                        cacheline_bytes: 128, tmem_bytes: 0, smem_bytes: 32 * 1024, lds_bytes: 0,
+                        l1d_bytes: 0,
+                        l1i_bytes: 0,
+                        l2_bytes: 0,
+                        l3_bytes: 0,
+                        cacheline_bytes: 128,
+                        tmem_bytes: 0,
+                        smem_bytes: 32 * 1024,
+                        lds_bytes: 0,
                     },
                     features: vec![],
                     k_unroll_factor: 4,
@@ -1654,7 +1805,8 @@ mod tests {
                 if !kind.is_available_on(platform) {
                     // Unavailable resources should have 0 capacity
                     assert_eq!(
-                        budget.capacity(kind), 0,
+                        budget.capacity(kind),
+                        0,
                         "{hw:?} × {kind:?}: unavailable resource should have 0 capacity"
                     );
                     continue;
@@ -1670,7 +1822,11 @@ mod tests {
             }
         }
         // Sanity: we should have tested a meaningful number of combinations
-        assert!(tested >= 25, "expected >= 25 valid combinations, got {}", tested);
+        assert!(
+            tested >= 25,
+            "expected >= 25 valid combinations, got {}",
+            tested
+        );
     }
 
     #[test]
@@ -1678,43 +1834,104 @@ mod tests {
         use super::super::codegen::vm::isa_profile::Platform;
 
         // Gpr/SimdVec/Stack available on CPU only
-        let x86 = Platform::X86_64 { has_avx512: false, has_bf16: false, has_vnni: false,
-            has_avx512fp16: false, has_f16c: false, has_amx: false, has_amx_fp16: false,
-            has_amx_complex: false, has_amx_transpose: false, has_amx_fp8: false,
-            has_avx10_2: false, has_apx: false, has_sparse_mask_intersect: false };
+        let x86 = Platform::X86_64 {
+            has_avx512: false,
+            has_bf16: false,
+            has_vnni: false,
+            has_avx512fp16: false,
+            has_f16c: false,
+            has_amx: false,
+            has_amx_fp16: false,
+            has_amx_complex: false,
+            has_amx_transpose: false,
+            has_amx_fp8: false,
+            has_avx10_2: false,
+            has_apx: false,
+            has_sparse_mask_intersect: false,
+        };
         assert!(ResourceKind::Gpr.is_available_on(&x86));
         assert!(ResourceKind::SimdVec.is_available_on(&x86));
         assert!(ResourceKind::Stack.is_available_on(&x86));
 
-        let cuda90 = Platform::Cuda { sm_version: 90, warp_size: 32, shared_mem_kb: 228,
-            reg_file_per_sm: 65536, max_regs_per_thread: 255,
-            has_wgmma: true, has_tma: true, has_warp_spec: true, has_fp8: true,
-            has_tmem: false, has_block_scaled: false, has_native_fp4: false,
-            has_native_fp6: false, has_cluster: false, has_2cta_mma: false, tmem_size_kb: 0 };
+        let cuda90 = Platform::Cuda {
+            sm_version: 90,
+            warp_size: 32,
+            shared_mem_kb: 228,
+            reg_file_per_sm: 65536,
+            max_regs_per_thread: 255,
+            has_wgmma: true,
+            has_tma: true,
+            has_warp_spec: true,
+            has_fp8: true,
+            has_tmem: false,
+            has_block_scaled: false,
+            has_native_fp4: false,
+            has_native_fp6: false,
+            has_cluster: false,
+            has_2cta_mma: false,
+            tmem_size_kb: 0,
+        };
         assert!(!ResourceKind::Gpr.is_available_on(&cuda90));
         assert!(!ResourceKind::SimdVec.is_available_on(&cuda90));
         assert!(!ResourceKind::Stack.is_available_on(&cuda90));
 
         // SharedMem: GPU-only
-        let x86 = Platform::X86_64 { has_avx512: false, has_bf16: false, has_vnni: false,
-            has_avx512fp16: false, has_f16c: false, has_amx: false, has_amx_fp16: false,
-            has_amx_complex: false, has_amx_transpose: false, has_amx_fp8: false,
-            has_avx10_2: false, has_apx: false, has_sparse_mask_intersect: false };
+        let x86 = Platform::X86_64 {
+            has_avx512: false,
+            has_bf16: false,
+            has_vnni: false,
+            has_avx512fp16: false,
+            has_f16c: false,
+            has_amx: false,
+            has_amx_fp16: false,
+            has_amx_complex: false,
+            has_amx_transpose: false,
+            has_amx_fp8: false,
+            has_avx10_2: false,
+            has_apx: false,
+            has_sparse_mask_intersect: false,
+        };
         assert!(!ResourceKind::SharedMem.is_available_on(&x86));
 
         // TensorMem: SM100+ only
-        let cuda90 = Platform::Cuda { sm_version: 90, warp_size: 32, shared_mem_kb: 228,
-            reg_file_per_sm: 65536, max_regs_per_thread: 255,
-            has_wgmma: true, has_tma: true, has_warp_spec: true, has_fp8: true,
-            has_tmem: false, has_block_scaled: false, has_native_fp4: false,
-            has_native_fp6: false, has_cluster: false, has_2cta_mma: false, tmem_size_kb: 0 };
+        let cuda90 = Platform::Cuda {
+            sm_version: 90,
+            warp_size: 32,
+            shared_mem_kb: 228,
+            reg_file_per_sm: 65536,
+            max_regs_per_thread: 255,
+            has_wgmma: true,
+            has_tma: true,
+            has_warp_spec: true,
+            has_fp8: true,
+            has_tmem: false,
+            has_block_scaled: false,
+            has_native_fp4: false,
+            has_native_fp6: false,
+            has_cluster: false,
+            has_2cta_mma: false,
+            tmem_size_kb: 0,
+        };
         assert!(!ResourceKind::TensorMem.is_available_on(&cuda90));
 
-        let cuda100 = Platform::Cuda { sm_version: 100, warp_size: 32, shared_mem_kb: 228,
-            reg_file_per_sm: 65536, max_regs_per_thread: 255,
-            has_wgmma: true, has_tma: true, has_warp_spec: true, has_fp8: true,
-            has_tmem: true, has_block_scaled: true, has_native_fp4: true,
-            has_native_fp6: true, has_cluster: true, has_2cta_mma: true, tmem_size_kb: 256 };
+        let cuda100 = Platform::Cuda {
+            sm_version: 100,
+            warp_size: 32,
+            shared_mem_kb: 228,
+            reg_file_per_sm: 65536,
+            max_regs_per_thread: 255,
+            has_wgmma: true,
+            has_tma: true,
+            has_warp_spec: true,
+            has_fp8: true,
+            has_tmem: true,
+            has_block_scaled: true,
+            has_native_fp4: true,
+            has_native_fp6: true,
+            has_cluster: true,
+            has_2cta_mma: true,
+            tmem_size_kb: 256,
+        };
         assert!(ResourceKind::TensorMem.is_available_on(&cuda100));
     }
 
@@ -1739,7 +1956,10 @@ mod tests {
         assert!(budget.shared_mem_bytes >= 228 * 1024, "SM90 SMEM >= 228KB");
         assert_eq!(budget.tensor_mem_bytes, 0, "SM90 no TMEM");
         assert!(budget.barrier_total >= 2, "SM90 has warp_spec barriers");
-        assert!(budget.tile_accumulator_total >= 4, "SM90 has WGMMA accumulators");
+        assert!(
+            budget.tile_accumulator_total >= 4,
+            "SM90 has WGMMA accumulators"
+        );
     }
 
     #[test]
@@ -1751,7 +1971,10 @@ mod tests {
         assert!(budget.shared_mem_bytes >= 228 * 1024, "SM100 SMEM >= 228KB");
         assert!(budget.tensor_mem_bytes >= 256 * 1024, "SM100 TMEM >= 256KB");
         assert!(budget.barrier_total >= 2, "SM100 has barriers");
-        assert!(budget.tile_accumulator_total >= 4, "SM100 has tcgen05 accumulators");
+        assert!(
+            budget.tile_accumulator_total >= 4,
+            "SM100 has tcgen05 accumulators"
+        );
     }
 
     #[test]
@@ -1762,7 +1985,10 @@ mod tests {
         // MI200: LDS = 64KB, no TMEM, 4 MFMA accumulators, no barriers
         assert_eq!(budget.shared_mem_bytes, 64 * 1024, "MI200 LDS = 64KB");
         assert_eq!(budget.tensor_mem_bytes, 0, "MI200 no TMEM");
-        assert!(budget.tile_accumulator_total >= 4, "MI200 has MFMA accumulators");
+        assert!(
+            budget.tile_accumulator_total >= 4,
+            "MI200 has MFMA accumulators"
+        );
     }
 
     #[test]
@@ -1773,7 +1999,10 @@ mod tests {
         // MI300: LDS = 64KB, no TMEM, 4 MFMA accumulators
         assert_eq!(budget.shared_mem_bytes, 64 * 1024, "MI300 LDS = 64KB");
         assert_eq!(budget.tensor_mem_bytes, 0, "MI300 no TMEM");
-        assert!(budget.tile_accumulator_total >= 4, "MI300 has MFMA accumulators");
+        assert!(
+            budget.tile_accumulator_total >= 4,
+            "MI300 has MFMA accumulators"
+        );
     }
 
     #[test]
@@ -1785,7 +2014,10 @@ mod tests {
         // 7 predicate masks, 4 tile regs
         assert!(budget.gpr_total > 0, "AArch64 has GPRs");
         assert!(budget.simd_vec_total > 0, "AArch64 has vec regs");
-        assert!(budget.predicate_total >= 7, "AArch64 SVE has >= 7 mask regs");
+        assert!(
+            budget.predicate_total >= 7,
+            "AArch64 SVE has >= 7 mask regs"
+        );
         assert!(budget.tile_total >= 4, "AArch64 SME has >= 4 tile regs");
         // No GPU resources
         assert_eq!(budget.shared_mem_bytes, 0, "AArch64 no SMEM");
@@ -1798,8 +2030,16 @@ mod tests {
         let budget = JitResourceBudget::from_isa_profile(&profile);
 
         // x86: GPR >= 11 (16 - 2 frame - 3 scratch), SimdVec >= 10 (16 - 6 scratch)
-        assert!(budget.gpr_total >= 11, "x86 GPR >= 11, got {}", budget.gpr_total);
-        assert!(budget.simd_vec_total >= 10, "x86 SimdVec >= 10, got {}", budget.simd_vec_total);
+        assert!(
+            budget.gpr_total >= 11,
+            "x86 GPR >= 11, got {}",
+            budget.gpr_total
+        );
+        assert!(
+            budget.simd_vec_total >= 10,
+            "x86 SimdVec >= 10, got {}",
+            budget.simd_vec_total
+        );
         assert!(budget.stack_bytes > 0, "x86 stack must be > 0");
         // No GPU resources
         assert_eq!(budget.shared_mem_bytes, 0, "x86 no SMEM");
@@ -1813,7 +2053,13 @@ mod tests {
         let profile = make_x86_avx2_profile();
         let budget = JitResourceBudget::from_isa_profile(&profile);
 
-        if matches!(&profile.platform, Platform::X86_64 { has_avx512: true, .. }) {
+        if matches!(
+            &profile.platform,
+            Platform::X86_64 {
+                has_avx512: true,
+                ..
+            }
+        ) {
             assert!(budget.predicate_total >= 8, "AVX-512 has 8 mask regs");
         } else {
             assert_eq!(budget.predicate_total, 0, "AVX2 has no mask regs");
@@ -1837,7 +2083,9 @@ mod tests {
         let profile = make_cuda_profile(90);
         let mut ctx = JitContext::new(&profile);
         let smem_cap = ctx.capacity(ResourceKind::SharedMem);
-        if smem_cap == 0 { return; }
+        if smem_cap == 0 {
+            return;
+        }
 
         // Declare SMEM usage and verify tracking
         ctx.declare_smem_usage(64 * 1024);
@@ -1850,14 +2098,23 @@ mod tests {
         let profile = make_cuda_profile(100);
         let mut ctx = JitContext::new(&profile);
         let tmem_cap = ctx.capacity(ResourceKind::TensorMem);
-        if tmem_cap == 0 { return; }
+        if tmem_cap == 0 {
+            return;
+        }
 
         // TMEM should be >= 256KB on SM100
-        assert!(tmem_cap >= 256 * 1024, "SM100 TMEM >= 256KB, got {}", tmem_cap);
+        assert!(
+            tmem_cap >= 256 * 1024,
+            "SM100 TMEM >= 256KB, got {}",
+            tmem_cap
+        );
 
         ctx.declare_tmem_usage(128 * 1024);
         assert_eq!(ctx.mem_used(ResourceKind::TensorMem), 128 * 1024);
-        assert_eq!(ctx.mem_available(ResourceKind::TensorMem), tmem_cap - 128 * 1024);
+        assert_eq!(
+            ctx.mem_available(ResourceKind::TensorMem),
+            tmem_cap - 128 * 1024
+        );
     }
 
     #[test]
@@ -1865,7 +2122,9 @@ mod tests {
         let profile = make_cuda_profile(90);
         let mut ctx = JitContext::new(&profile);
         let barrier_cap = ctx.capacity(ResourceKind::Barrier);
-        if barrier_cap == 0 { return; }
+        if barrier_cap == 0 {
+            return;
+        }
 
         // SM90 has warp_spec barriers — should be allocatable
         let idx = ctx.allocate(ResourceKind::Barrier, "sync_point").unwrap();
@@ -1885,7 +2144,8 @@ mod tests {
             for &kind in &ResourceKind::ALL {
                 if !kind.is_available_on(&profile.platform) {
                     assert_eq!(
-                        budget.capacity(kind), 0,
+                        budget.capacity(kind),
+                        0,
                         "{hw:?} × {kind:?}: unavailable kind should have 0 budget"
                     );
                 }
@@ -1900,9 +2160,13 @@ mod tests {
         let mut ctx = JitContext::new(&profile);
 
         for &kind in &ResourceKind::ALL {
-            if !kind.is_available_on(&profile.platform) { continue; }
+            if !kind.is_available_on(&profile.platform) {
+                continue;
+            }
             let cap = ctx.capacity(kind);
-            if cap == 0 || kind.is_memory() { continue; } // Skip memory-type resources
+            if cap == 0 || kind.is_memory() {
+                continue;
+            } // Skip memory-type resources
 
             // Exhaust all instances
             let mut allocated = Vec::new();
@@ -1912,7 +2176,10 @@ mod tests {
 
             // One more should fail
             let result = ctx.allocate(kind, "overflow");
-            assert!(result.is_err(), "{kind:?}: allocation beyond capacity should fail");
+            assert!(
+                result.is_err(),
+                "{kind:?}: allocation beyond capacity should fail"
+            );
 
             // Release all
             for idx in allocated {
@@ -1935,20 +2202,40 @@ mod tests {
             let platform = hw.platform();
             // GPU profiles should map to GPU platforms
             match hw {
-                HardwareProfile::CudaSM80 | HardwareProfile::CudaSM90 | HardwareProfile::CudaSM100 | HardwareProfile::CudaSM120 => {
-                    assert!(matches!(platform, Platform::Cuda { .. }), "{hw:?} should map to Cuda");
+                HardwareProfile::CudaSM80
+                | HardwareProfile::CudaSM90
+                | HardwareProfile::CudaSM100
+                | HardwareProfile::CudaSM120 => {
+                    assert!(
+                        matches!(platform, Platform::Cuda { .. }),
+                        "{hw:?} should map to Cuda"
+                    );
                 }
                 HardwareProfile::RocmMI200 | HardwareProfile::RocmMI300 => {
-                    assert!(matches!(platform, Platform::Hip { .. }), "{hw:?} should map to Hip");
+                    assert!(
+                        matches!(platform, Platform::Hip { .. }),
+                        "{hw:?} should map to Hip"
+                    );
                 }
-                HardwareProfile::CpuAvx2 | HardwareProfile::CpuAvx512 | HardwareProfile::CpuAvx10_2 => {
-                    assert!(matches!(platform, Platform::X86_64 { .. }), "{hw:?} should map to X86_64");
+                HardwareProfile::CpuAvx2
+                | HardwareProfile::CpuAvx512
+                | HardwareProfile::CpuAvx10_2 => {
+                    assert!(
+                        matches!(platform, Platform::X86_64 { .. }),
+                        "{hw:?} should map to X86_64"
+                    );
                 }
                 HardwareProfile::AppleM1 | HardwareProfile::AppleM2 | HardwareProfile::AppleM3 => {
-                    assert!(matches!(platform, Platform::Metal { .. }), "{hw:?} should map to Metal");
+                    assert!(
+                        matches!(platform, Platform::Metal { .. }),
+                        "{hw:?} should map to Metal"
+                    );
                 }
                 HardwareProfile::ArmNeoverse => {
-                    assert!(matches!(platform, Platform::AArch64 { .. }), "{hw:?} should map to AArch64");
+                    assert!(
+                        matches!(platform, Platform::AArch64 { .. }),
+                        "{hw:?} should map to AArch64"
+                    );
                 }
                 HardwareProfile::Generic => {} // fallback, no strong assertion
             }

@@ -62,7 +62,8 @@ mod tests {
             assert!(
                 (out[i] - x[i]).abs() < 1e-5,
                 "mean_pool_single[{i}]: got {}, expected {}",
-                out[i], x[i]
+                out[i],
+                x[i]
             );
         }
     }

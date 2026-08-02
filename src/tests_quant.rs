@@ -1,19 +1,14 @@
 #[cfg(test)]
 mod tests {
-    use crate::quant::{BlockQ4K, BlockQ8K, BlockQ2K, BlockQ3K, BlockQ5K, BlockQ6K};
-    use crate::Kernels;
     use crate::cpu_kernels::CpuKernels;
+    use crate::quant::{BlockQ2K, BlockQ3K, BlockQ4K, BlockQ5K, BlockQ6K, BlockQ8K};
+    use crate::Kernels;
     use half::f16;
-    use std::slice;
     use std::mem::size_of;
+    use std::slice;
 
     fn as_u8_slice<T>(v: &T) -> &[u8] {
-        unsafe {
-            slice::from_raw_parts(
-                v as *const T as *const u8,
-                size_of::<T>()
-            )
-        }
+        unsafe { slice::from_raw_parts(v as *const T as *const u8, size_of::<T>()) }
     }
 
     #[test]
@@ -57,10 +52,10 @@ mod tests {
         };
         block.qs[0] = 10;
         block.qs[1] = -5;
-        
+
         let mut out = vec![0.0f32; 256];
         kernels.dequant_q8_k(as_u8_slice(&block), &mut out);
-        
+
         assert_eq!(out[0], 20.0);
         assert_eq!(out[1], -10.0);
     }
@@ -90,10 +85,10 @@ mod tests {
         kernels.dequant_q2_k(as_u8_slice(&block), &mut out);
 
         // out[i] = d * sc * q = 2.0 * 1 * q
-        assert_eq!(out[0], 6.0);  // 2*1*3
-        assert_eq!(out[1], 4.0);  // 2*1*2
-        assert_eq!(out[2], 2.0);  // 2*1*1
-        assert_eq!(out[3], 0.0);  // 2*1*0
+        assert_eq!(out[0], 6.0); // 2*1*3
+        assert_eq!(out[1], 4.0); // 2*1*2
+        assert_eq!(out[2], 2.0); // 2*1*1
+        assert_eq!(out[3], 0.0); // 2*1*0
     }
 
     #[test]
@@ -224,10 +219,10 @@ mod tests {
         // dot row0 = 5*1 + 3*1 = 8, dot row1 = 10*1 + 6*1 = 16
         kernels.gemm_q4(&weight_data, &input, &mut output, &[], m, n, k);
 
-        assert_eq!(output[0], 8.0);   // batch0 x row0
-        assert_eq!(output[1], 16.0);  // batch0 x row1
-        assert_eq!(output[2], 8.0);   // batch1 x row0
-        assert_eq!(output[3], 16.0);  // batch1 x row1
+        assert_eq!(output[0], 8.0); // batch0 x row0
+        assert_eq!(output[1], 16.0); // batch0 x row1
+        assert_eq!(output[2], 8.0); // batch1 x row0
+        assert_eq!(output[3], 16.0); // batch1 x row1
     }
 
     // ========================================================================
@@ -270,8 +265,16 @@ mod tests {
         assert!((out[16] - (-3.5)).abs() < 1e-3, "q4_0: out[16]={}", out[16]);
         assert!((out[17] - 3.5).abs() < 1e-3, "q4_0: out[17]={}", out[17]);
         // Remaining zero-point elements
-        for i in [2,3,4,5,6,7,8,9,10,11,12,13,14,15,18,19,20,21,22,23,24,25,26,27,28,29,30,31] {
-            assert!((out[i]).abs() < 1e-3, "q4_0: out[{}]={} (should be 0)", i, out[i]);
+        for i in [
+            2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+            28, 29, 30, 31,
+        ] {
+            assert!(
+                (out[i]).abs() < 1e-3,
+                "q4_0: out[{}]={} (should be 0)",
+                i,
+                out[i]
+            );
         }
     }
 
@@ -296,10 +299,20 @@ mod tests {
         for j in 0..16 {
             let expected_lo = 2.0 * (j as f32 - 8.0);
             let expected_hi = 2.0 * ((15 - j) as f32 - 8.0);
-            assert!((out[j] - expected_lo).abs() < 1e-3,
-                "q4_0 full: out[{}]={}, expected {}", j, out[j], expected_lo);
-            assert!((out[j + 16] - expected_hi).abs() < 1e-3,
-                "q4_0 full: out[{}]={}, expected {}", j + 16, out[j + 16], expected_hi);
+            assert!(
+                (out[j] - expected_lo).abs() < 1e-3,
+                "q4_0 full: out[{}]={}, expected {}",
+                j,
+                out[j],
+                expected_lo
+            );
+            assert!(
+                (out[j + 16] - expected_hi).abs() < 1e-3,
+                "q4_0 full: out[{}]={}, expected {}",
+                j + 16,
+                out[j + 16],
+                expected_hi
+            );
         }
     }
 
@@ -338,7 +351,12 @@ mod tests {
         let mut out = vec![0.0f32; 32];
         kernels.dequant_q4_1(as_u8_slice(&block), &mut out);
         for i in 0..32 {
-            assert!((out[i] - 5.0).abs() < 1e-3, "q4_1 zero_scale: out[{}]={}", i, out[i]);
+            assert!(
+                (out[i] - 5.0).abs() < 1e-3,
+                "q4_1 zero_scale: out[{}]={}",
+                i,
+                out[i]
+            );
         }
     }
 
@@ -361,7 +379,11 @@ mod tests {
         let mut out = vec![0.0f32; 32];
         kernels.dequant_q5_0(as_u8_slice(&block), &mut out);
         assert!((out[0] - 15.0).abs() < 1e-3, "q5_0: out[0]={}", out[0]);
-        assert!((out[16] - (-16.0)).abs() < 1e-3, "q5_0: out[16]={}", out[16]);
+        assert!(
+            (out[16] - (-16.0)).abs() < 1e-3,
+            "q5_0: out[16]={}",
+            out[16]
+        );
     }
 
     #[test]
@@ -380,7 +402,11 @@ mod tests {
 
         let mut out = vec![0.0f32; 32];
         kernels.dequant_q5_0(as_u8_slice(&block), &mut out);
-        assert!((out[8] - 3.5).abs() < 1e-3, "q5_0 all_bits: out[8]={}", out[8]);
+        assert!(
+            (out[8] - 3.5).abs() < 1e-3,
+            "q5_0 all_bits: out[8]={}",
+            out[8]
+        );
     }
 
     #[test]
@@ -444,7 +470,12 @@ mod tests {
         kernels.dequant_q8_0(as_u8_slice(&block), &mut out);
         for i in 0..32 {
             let expected = if i % 2 == 0 { -128.0 } else { 127.0 };
-            assert!((out[i] - expected).abs() < 1e-3, "q8_0 extreme: out[{}]={}", i, out[i]);
+            assert!(
+                (out[i] - expected).abs() < 1e-3,
+                "q8_0 extreme: out[{}]={}",
+                i,
+                out[i]
+            );
         }
     }
 
@@ -491,8 +522,20 @@ mod tests {
         input[1] = 4.0;
         // Expected dot = 2*3 + 1*4 = 10.0
         let mut output = vec![0.0f32; 1];
-        kernels.classic_matmul(as_u8_slice(&block), &input, &mut output, QuantType::Q4_0, 1, 1, 32);
-        assert!((output[0] - 10.0).abs() < 1e-2, "dot_q4_0: got {}", output[0]);
+        kernels.classic_matmul(
+            as_u8_slice(&block),
+            &input,
+            &mut output,
+            QuantType::Q4_0,
+            1,
+            1,
+            32,
+        );
+        assert!(
+            (output[0] - 10.0).abs() < 1e-2,
+            "dot_q4_0: got {}",
+            output[0]
+        );
     }
 
     #[test]
@@ -514,8 +557,20 @@ mod tests {
         input[1] = 1.0;
         // Expected: 1.5*2 + 2.5*1 + 0.5*(sum of remaining 30 zeros in input) = 3.0 + 2.5 = 5.5
         let mut output = vec![0.0f32; 1];
-        kernels.classic_matmul(as_u8_slice(&block), &input, &mut output, QuantType::Q4_1, 1, 1, 32);
-        assert!((output[0] - 5.5).abs() < 1e-2, "dot_q4_1: got {}", output[0]);
+        kernels.classic_matmul(
+            as_u8_slice(&block),
+            &input,
+            &mut output,
+            QuantType::Q4_1,
+            1,
+            1,
+            32,
+        );
+        assert!(
+            (output[0] - 5.5).abs() < 1e-2,
+            "dot_q4_1: got {}",
+            output[0]
+        );
     }
 
     #[test]
@@ -536,8 +591,20 @@ mod tests {
         // Element 0: val=5, Element 1: qs[0] hi=0, qh bit1=0 -> q=0, val=0-16=-16
         // dot = 5*2 + (-16)*0 = 10.0
         let mut output = vec![0.0f32; 1];
-        kernels.classic_matmul(as_u8_slice(&block), &input, &mut output, QuantType::Q5_0, 1, 1, 32);
-        assert!((output[0] - 10.0).abs() < 1e-2, "dot_q5_0: got {}", output[0]);
+        kernels.classic_matmul(
+            as_u8_slice(&block),
+            &input,
+            &mut output,
+            QuantType::Q5_0,
+            1,
+            1,
+            32,
+        );
+        assert!(
+            (output[0] - 10.0).abs() < 1e-2,
+            "dot_q5_0: got {}",
+            output[0]
+        );
     }
 
     #[test]
@@ -559,8 +626,20 @@ mod tests {
         input[0] = 1.0;
         // dot = 19*1 = 19.0
         let mut output = vec![0.0f32; 1];
-        kernels.classic_matmul(as_u8_slice(&block), &input, &mut output, QuantType::Q5_1, 1, 1, 32);
-        assert!((output[0] - 19.0).abs() < 1e-2, "dot_q5_1: got {}", output[0]);
+        kernels.classic_matmul(
+            as_u8_slice(&block),
+            &input,
+            &mut output,
+            QuantType::Q5_1,
+            1,
+            1,
+            32,
+        );
+        assert!(
+            (output[0] - 19.0).abs() < 1e-2,
+            "dot_q5_1: got {}",
+            output[0]
+        );
     }
 
     #[test]
@@ -581,8 +660,20 @@ mod tests {
         // val[0]=0.5*10=5, val[1]=0.5*(-4)=-2
         // dot = 5*3 + (-2)*2 = 15 - 4 = 11.0
         let mut output = vec![0.0f32; 1];
-        kernels.classic_matmul(as_u8_slice(&block), &input, &mut output, QuantType::Q8_0, 1, 1, 32);
-        assert!((output[0] - 11.0).abs() < 1e-2, "dot_q8_0: got {}", output[0]);
+        kernels.classic_matmul(
+            as_u8_slice(&block),
+            &input,
+            &mut output,
+            QuantType::Q8_0,
+            1,
+            1,
+            32,
+        );
+        assert!(
+            (output[0] - 11.0).abs() < 1e-2,
+            "dot_q8_0: got {}",
+            output[0]
+        );
     }
 
     #[test]
@@ -604,8 +695,20 @@ mod tests {
         // val[0]=7, val[1]=-3
         // dot = 7*2 + (-3)*5 = 14 - 15 = -1.0
         let mut output = vec![0.0f32; 1];
-        kernels.classic_matmul(as_u8_slice(&block), &input, &mut output, QuantType::Q8_1, 1, 1, 32);
-        assert!((output[0] - (-1.0)).abs() < 1e-2, "dot_q8_1: got {}", output[0]);
+        kernels.classic_matmul(
+            as_u8_slice(&block),
+            &input,
+            &mut output,
+            QuantType::Q8_1,
+            1,
+            1,
+            32,
+        );
+        assert!(
+            (output[0] - (-1.0)).abs() < 1e-2,
+            "dot_q8_1: got {}",
+            output[0]
+        );
     }
 
     // ========================================================================
@@ -644,12 +747,20 @@ mod tests {
         let mut input = vec![0.0f32; k * n];
         input[0] = 1.0; // input[0*n+0] = 1.0
         input[1] = 1.0; // input[1*n+0] = 1.0
-        // Row 0 dot: 2*1 + 1*1 = 3.0
-        // Row 1 dot: 4*1 + 2*1 = 6.0
+                        // Row 0 dot: 2*1 + 1*1 = 3.0
+                        // Row 1 dot: 4*1 + 2*1 = 6.0
         let mut output = vec![0.0f32; m * n];
         kernels.classic_matmul(&weight_data, &input, &mut output, QuantType::Q4_0, m, n, k);
-        assert!((output[0] - 3.0).abs() < 1e-2, "classic_matmul q4_0 row0: got {}", output[0]);
-        assert!((output[1] - 6.0).abs() < 1e-2, "classic_matmul q4_0 row1: got {}", output[1]);
+        assert!(
+            (output[0] - 3.0).abs() < 1e-2,
+            "classic_matmul q4_0 row0: got {}",
+            output[0]
+        );
+        assert!(
+            (output[1] - 6.0).abs() < 1e-2,
+            "classic_matmul q4_0 row1: got {}",
+            output[1]
+        );
     }
 
     #[test]
@@ -729,7 +840,11 @@ mod tests {
         kernels.dequant_iq1_s(&block, &mut out);
         // At least some output should be non-zero
         let nonzero_count = out.iter().filter(|&&v| v != 0.0).count();
-        assert!(nonzero_count > 0, "IQ1_S dequant should produce non-zero output, got {} non-zero values", nonzero_count);
+        assert!(
+            nonzero_count > 0,
+            "IQ1_S dequant should produce non-zero output, got {} non-zero values",
+            nonzero_count
+        );
     }
 
     /// TEST-KERNELS-IQ-002: IQ1_M dequant outputs non-zero
@@ -748,7 +863,10 @@ mod tests {
         let mut out = vec![0.0f32; 256];
         kernels.dequant_iq1_m(&block, &mut out);
         let nonzero_count = out.iter().filter(|&&v| v != 0.0).count();
-        assert!(nonzero_count > 0, "IQ1_M dequant should produce non-zero output");
+        assert!(
+            nonzero_count > 0,
+            "IQ1_M dequant should produce non-zero output"
+        );
     }
 
     /// TEST-KERNELS-IQ-003: IQ2_XXS dequant outputs non-zero
@@ -765,7 +883,10 @@ mod tests {
         let mut out = vec![0.0f32; 256];
         kernels.dequant_iq2_xxs(&block, &mut out);
         let nonzero_count = out.iter().filter(|&&v| v != 0.0).count();
-        assert!(nonzero_count > 0, "IQ2_XXS dequant should produce non-zero output");
+        assert!(
+            nonzero_count > 0,
+            "IQ2_XXS dequant should produce non-zero output"
+        );
     }
 
     /// TEST-KERNELS-IQ-004: IQ2_XS dequant outputs non-zero
@@ -781,7 +902,10 @@ mod tests {
         let mut out = vec![0.0f32; 256];
         kernels.dequant_iq2_xs(&block, &mut out);
         let nonzero_count = out.iter().filter(|&&v| v != 0.0).count();
-        assert!(nonzero_count > 0, "IQ2_XS dequant should produce non-zero output");
+        assert!(
+            nonzero_count > 0,
+            "IQ2_XS dequant should produce non-zero output"
+        );
     }
 
     /// TEST-KERNELS-IQ-005: IQ2_S dequant outputs non-zero
@@ -797,7 +921,10 @@ mod tests {
         let mut out = vec![0.0f32; 256];
         kernels.dequant_iq2_s(&block, &mut out);
         let nonzero_count = out.iter().filter(|&&v| v != 0.0).count();
-        assert!(nonzero_count > 0, "IQ2_S dequant should produce non-zero output");
+        assert!(
+            nonzero_count > 0,
+            "IQ2_S dequant should produce non-zero output"
+        );
     }
 
     /// TEST-KERNELS-IQ-006: IQ3_XXS dequant outputs non-zero
@@ -813,7 +940,10 @@ mod tests {
         let mut out = vec![0.0f32; 256];
         kernels.dequant_iq3_xxs(&block, &mut out);
         let nonzero_count = out.iter().filter(|&&v| v != 0.0).count();
-        assert!(nonzero_count > 0, "IQ3_XXS dequant should produce non-zero output");
+        assert!(
+            nonzero_count > 0,
+            "IQ3_XXS dequant should produce non-zero output"
+        );
     }
 
     /// TEST-KERNELS-IQ-007: IQ3_S dequant outputs non-zero
@@ -829,7 +959,10 @@ mod tests {
         let mut out = vec![0.0f32; 256];
         kernels.dequant_iq3_s(&block, &mut out);
         let nonzero_count = out.iter().filter(|&&v| v != 0.0).count();
-        assert!(nonzero_count > 0, "IQ3_S dequant should produce non-zero output");
+        assert!(
+            nonzero_count > 0,
+            "IQ3_S dequant should produce non-zero output"
+        );
     }
 
     /// TEST-KERNELS-IQ-008: IQ4_NL dequant outputs non-zero (full 256-element block)
@@ -848,7 +981,11 @@ mod tests {
         let mut out = vec![0.0f32; 256];
         kernels.dequant_iq4_nl(&block, &mut out);
         let nonzero_count = out.iter().filter(|&&v| v != 0.0).count();
-        assert!(nonzero_count > 0, "IQ4_NL dequant should produce non-zero output, got {} non-zero values", nonzero_count);
+        assert!(
+            nonzero_count > 0,
+            "IQ4_NL dequant should produce non-zero output, got {} non-zero values",
+            nonzero_count
+        );
     }
 
     /// TEST-KERNELS-IQ-009: IQ4_XS dequant outputs non-zero
@@ -874,7 +1011,11 @@ mod tests {
         let mut out = vec![0.0f32; 256];
         kernels.dequant_iq4_xs(&block, &mut out);
         let nonzero_count = out.iter().filter(|&&v| v != 0.0).count();
-        assert!(nonzero_count > 0, "IQ4_XS dequant should produce non-zero output, got {} non-zero values", nonzero_count);
+        assert!(
+            nonzero_count > 0,
+            "IQ4_XS dequant should produce non-zero output, got {} non-zero values",
+            nonzero_count
+        );
     }
 
     /// TEST-KERNELS-IQ-010: All 9 IQ formats produce different outputs (not all zeros)
@@ -907,7 +1048,11 @@ mod tests {
             let mut out = vec![0.0f32; 256];
             dequant_fn(&kernels, &block, &mut out);
             let nonzero = out.iter().filter(|&&v| v != 0.0).count();
-            assert!(nonzero > 0, "block_bytes={} should produce non-zero output", block_bytes);
+            assert!(
+                nonzero > 0,
+                "block_bytes={} should produce non-zero output",
+                block_bytes
+            );
         }
     }
 }

@@ -7,7 +7,7 @@
 #[cfg(target_arch = "x86_64")]
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 
-use super::engine::{SymbolicExecutor, SymExecError};
+use super::engine::{SymExecError, SymbolicExecutor};
 use super::sym_value::SymValue;
 use crate::compiler::trace::{ScalarFnSignature, ScalarParam, TraceOp};
 use std::collections::HashMap;
@@ -179,7 +179,8 @@ pub unsafe fn analyze_scalar_fn(
 
         // Track GP register-to-register moves for pointer aliasing.
         // e.g. `mov r15, rdi` → r15 becomes an alias of the input pointer.
-        if mnemonic == Mnemonic::Mov && instr.op_count() == 2
+        if mnemonic == Mnemonic::Mov
+            && instr.op_count() == 2
             && instr.op_kind(0) == OpKind::Register
             && instr.op_kind(1) == OpKind::Register
         {
@@ -193,15 +194,17 @@ pub unsafe fn analyze_scalar_fn(
         // Check for float load from input pointer → inject Input(ordinal).
         if is_float_load(mnemonic) && instr.op_count() >= 2 {
             // Load: movss xmm, [input_ptr + ...]
-            if instr.op_kind(0) == OpKind::Register && is_xmm(instr.op_register(0))
-                && instr.op_kind(1) == OpKind::Memory {
-                    let base = instr.memory_base();
-                    if let Some(input_ord) = ptr_map.is_input(base) {
-                        let dst = format_register(instr.op_register(0));
-                        executor.set(&dst, SymValue::Param(input_ord));
-                        continue;
-                    }
+            if instr.op_kind(0) == OpKind::Register
+                && is_xmm(instr.op_register(0))
+                && instr.op_kind(1) == OpKind::Memory
+            {
+                let base = instr.memory_base();
+                if let Some(input_ord) = ptr_map.is_input(base) {
+                    let dst = format_register(instr.op_register(0));
+                    executor.set(&dst, SymValue::Param(input_ord));
+                    continue;
                 }
+            }
         }
 
         // Float store to output pointer → capture the value being stored.
@@ -221,9 +224,12 @@ pub unsafe fn analyze_scalar_fn(
 
         // xorps/xorpd with RIP-relative constant = sign-bit flip (negation).
         // The compiler emits `xorps xmm0, [sign_mask]` to negate a float.
-        if is_xor_ps_pd(mnemonic) && instr.op_count() == 2
-            && instr.op_kind(0) == OpKind::Register && is_xmm(instr.op_register(0))
-            && instr.op_kind(1) == OpKind::Memory && instr.memory_base() == Register::RIP
+        if is_xor_ps_pd(mnemonic)
+            && instr.op_count() == 2
+            && instr.op_kind(0) == OpKind::Register
+            && is_xmm(instr.op_register(0))
+            && instr.op_kind(1) == OpKind::Memory
+            && instr.memory_base() == Register::RIP
         {
             let dst = format_register(instr.op_register(0));
             executor.step("neg_float", &[&dst])?;
@@ -486,13 +492,14 @@ fn resolve_call_target(instr: &Instruction) -> String {
     // e.g. `call qword ptr [rip+0x...]`
     let resolved_addr = if target != 0 {
         target
-    } else if instr.op_count() > 0 && instr.op_kind(0) == OpKind::Memory
+    } else if instr.op_count() > 0
+        && instr.op_kind(0) == OpKind::Memory
         && instr.memory_base() == Register::RIP
     {
         // Indirect call through GOT: read the function pointer from the GOT entry.
         let got_addr = instr.memory_displacement64();
         // Safety: reading from GOT in our own process.
-        
+
         unsafe { *(got_addr as *const u64) }
     } else {
         return "unknown".to_string();
@@ -734,10 +741,14 @@ pub unsafe fn analyze_scalar_fn_structured(
     sig: &ScalarFnSignature,
 ) -> Result<Option<super::loop_analyzer::MultiPassAnalysis>, SymExecError> {
     use super::cfg::{build_cfg_from_fn, find_loops};
-    use super::loop_analyzer::{analyze_single_loop, analyze_nested_loops, combine_passes_with_sig, MultiPassAnalysis};
+    use super::loop_analyzer::{
+        analyze_nested_loops, analyze_single_loop, combine_passes_with_sig, MultiPassAnalysis,
+    };
 
     if fn_ptr.is_null() {
-        return Err(SymExecError::DisassemblyFailed("null function pointer".into()));
+        return Err(SymExecError::DisassemblyFailed(
+            "null function pointer".into(),
+        ));
     }
 
     // Build CFG (use a generous byte limit for multi-loop functions).
@@ -765,7 +776,9 @@ pub unsafe fn analyze_scalar_fn_structured(
     }
 
     // Flat multi-pass analysis: use top-level (outermost) loops.
-    let top_loops: Vec<&super::cfg::NaturalLoop> = forest.top_level.iter()
+    let top_loops: Vec<&super::cfg::NaturalLoop> = forest
+        .top_level
+        .iter()
         .filter_map(|&idx| forest.loops.get(idx))
         .collect();
 
@@ -878,20 +891,23 @@ mod tests {
         f: *const u8,
         params: Vec<ScalarParam>,
     ) -> Result<Vec<TraceOp>, SymExecError> {
-        let sig = ScalarFnSignature {
-            fn_ptr: f,
-            params,
-        };
+        let sig = ScalarFnSignature { fn_ptr: f, params };
         analyze_scalar_fn(f, &sig)
     }
 
     #[test]
     fn test_analyze_silu() {
         use gllm_scalar_ops::activations::scalar_silu;
-        let trace = unsafe { analyze(
-            scalar_silu as *const u8,
-            vec![ScalarParam::InputPtr, ScalarParam::OutputPtr, ScalarParam::Dim(0)],
-        )};
+        let trace = unsafe {
+            analyze(
+                scalar_silu as *const u8,
+                vec![
+                    ScalarParam::InputPtr,
+                    ScalarParam::OutputPtr,
+                    ScalarParam::Dim(0),
+                ],
+            )
+        };
         match trace {
             Ok(ops) => {
                 eprintln!("SiLU trace ({} ops): {ops:?}", ops.len());
@@ -917,10 +933,16 @@ mod tests {
     #[test]
     fn test_analyze_gelu() {
         use gllm_scalar_ops::activations::scalar_gelu;
-        let trace = unsafe { analyze(
-            scalar_gelu as *const u8,
-            vec![ScalarParam::InputPtr, ScalarParam::OutputPtr, ScalarParam::Dim(0)],
-        )};
+        let trace = unsafe {
+            analyze(
+                scalar_gelu as *const u8,
+                vec![
+                    ScalarParam::InputPtr,
+                    ScalarParam::OutputPtr,
+                    ScalarParam::Dim(0),
+                ],
+            )
+        };
         match trace {
             Ok(ops) => {
                 eprintln!("GELU trace ({} ops): {ops:?}", ops.len());
@@ -945,10 +967,16 @@ mod tests {
     #[test]
     fn test_analyze_relu() {
         use gllm_scalar_ops::activations::scalar_relu;
-        let trace = unsafe { analyze(
-            scalar_relu as *const u8,
-            vec![ScalarParam::InputPtr, ScalarParam::OutputPtr, ScalarParam::Dim(0)],
-        )};
+        let trace = unsafe {
+            analyze(
+                scalar_relu as *const u8,
+                vec![
+                    ScalarParam::InputPtr,
+                    ScalarParam::OutputPtr,
+                    ScalarParam::Dim(0),
+                ],
+            )
+        };
         match trace {
             Ok(ops) => {
                 eprintln!("ReLU trace ({} ops): {ops:?}", ops.len());
@@ -963,10 +991,7 @@ mod tests {
                 let has_max = ops.iter().any(|op| matches!(op, TraceOp::Max(_, _)));
                 // Some compilers emit maxss, others use compare+blend.
                 // Accept either Max or a non-trivial trace.
-                assert!(
-                    has_max || ops.len() > 1,
-                    "ReLU trace too simple: {ops:?}"
-                );
+                assert!(has_max || ops.len() > 1, "ReLU trace too simple: {ops:?}");
             }
             Err(e) => {
                 eprintln!("ReLU analysis failed: {e}");
@@ -977,15 +1002,17 @@ mod tests {
     #[test]
     fn test_analyze_vec_add() {
         use gllm_scalar_ops::blas::scalar_vec_add;
-        let trace = unsafe { analyze(
-            scalar_vec_add as *const u8,
-            vec![
-                ScalarParam::InputPtr,
-                ScalarParam::InputPtr,
-                ScalarParam::OutputPtr,
-                ScalarParam::Dim(0),
-            ],
-        )};
+        let trace = unsafe {
+            analyze(
+                scalar_vec_add as *const u8,
+                vec![
+                    ScalarParam::InputPtr,
+                    ScalarParam::InputPtr,
+                    ScalarParam::OutputPtr,
+                    ScalarParam::Dim(0),
+                ],
+            )
+        };
         match trace {
             Ok(ops) => {
                 eprintln!("VecAdd trace ({} ops): {ops:?}", ops.len());
@@ -1011,7 +1038,11 @@ mod tests {
     fn test_null_ptr_returns_error() {
         let sig = ScalarFnSignature {
             fn_ptr: std::ptr::null(),
-            params: vec![ScalarParam::InputPtr, ScalarParam::OutputPtr, ScalarParam::Dim(0)],
+            params: vec![
+                ScalarParam::InputPtr,
+                ScalarParam::OutputPtr,
+                ScalarParam::Dim(0),
+            ],
         };
         let result = unsafe { analyze_scalar_fn(std::ptr::null(), &sig) };
         assert!(result.is_err());
@@ -1024,34 +1055,41 @@ mod tests {
         f: *const u8,
         params: Vec<ScalarParam>,
     ) -> Result<Option<super::super::loop_analyzer::MultiPassAnalysis>, SymExecError> {
-        let sig = ScalarFnSignature {
-            fn_ptr: f,
-            params,
-        };
+        let sig = ScalarFnSignature { fn_ptr: f, params };
         analyze_scalar_fn_structured(f, &sig)
     }
 
     #[test]
     fn test_structured_rmsnorm() {
         use gllm_scalar_ops::norms::scalar_rms_norm;
-        let result = unsafe { analyze_structured(
-            scalar_rms_norm as *const u8,
-            vec![
-                ScalarParam::InputPtr,
-                ScalarParam::WeightPtr,
-                ScalarParam::OutputPtr,
-                ScalarParam::Dim(0),
-                ScalarParam::Scalar(1e-5),
-            ],
-        ) };
+        let result = unsafe {
+            analyze_structured(
+                scalar_rms_norm as *const u8,
+                vec![
+                    ScalarParam::InputPtr,
+                    ScalarParam::WeightPtr,
+                    ScalarParam::OutputPtr,
+                    ScalarParam::Dim(0),
+                    ScalarParam::Scalar(1e-5),
+                ],
+            )
+        };
         match result {
             Ok(Some(info)) => {
-                eprintln!("RmsNorm structured: {} loops, pattern={:?}", info.num_loops, info.pattern);
+                eprintln!(
+                    "RmsNorm structured: {} loops, pattern={:?}",
+                    info.num_loops, info.pattern
+                );
                 assert!(
                     matches!(info.pattern, ComputePattern::NormLike { .. }),
-                    "RmsNorm should be NormLike, got {:?}", info.pattern
+                    "RmsNorm should be NormLike, got {:?}",
+                    info.pattern
                 );
-                assert!(info.num_loops >= 2, "RmsNorm should have ≥2 loops, got {}", info.num_loops);
+                assert!(
+                    info.num_loops >= 2,
+                    "RmsNorm should have ≥2 loops, got {}",
+                    info.num_loops
+                );
             }
             Ok(None) => {
                 eprintln!("RmsNorm structured: no loops detected (may need CFG improvements)");
@@ -1065,25 +1103,35 @@ mod tests {
     #[test]
     fn test_structured_layernorm() {
         use gllm_scalar_ops::norms::scalar_layer_norm;
-        let result = unsafe { analyze_structured(
-            scalar_layer_norm as *const u8,
-            vec![
-                ScalarParam::InputPtr,
-                ScalarParam::WeightPtr,
-                ScalarParam::WeightPtr,
-                ScalarParam::OutputPtr,
-                ScalarParam::Dim(0),
-                ScalarParam::Scalar(1e-5),
-            ],
-        ) };
+        let result = unsafe {
+            analyze_structured(
+                scalar_layer_norm as *const u8,
+                vec![
+                    ScalarParam::InputPtr,
+                    ScalarParam::WeightPtr,
+                    ScalarParam::WeightPtr,
+                    ScalarParam::OutputPtr,
+                    ScalarParam::Dim(0),
+                    ScalarParam::Scalar(1e-5),
+                ],
+            )
+        };
         match result {
             Ok(Some(info)) => {
-                eprintln!("LayerNorm structured: {} loops, pattern={:?}", info.num_loops, info.pattern);
+                eprintln!(
+                    "LayerNorm structured: {} loops, pattern={:?}",
+                    info.num_loops, info.pattern
+                );
                 assert!(
                     matches!(info.pattern, ComputePattern::NormLike { .. }),
-                    "LayerNorm should be NormLike, got {:?}", info.pattern
+                    "LayerNorm should be NormLike, got {:?}",
+                    info.pattern
                 );
-                assert!(info.num_loops >= 2, "LayerNorm should have ≥2 loops, got {}", info.num_loops);
+                assert!(
+                    info.num_loops >= 2,
+                    "LayerNorm should have ≥2 loops, got {}",
+                    info.num_loops
+                );
             }
             Ok(None) => {
                 eprintln!("LayerNorm structured: no loops detected");
@@ -1097,19 +1145,36 @@ mod tests {
     #[test]
     fn test_structured_softmax() {
         use gllm_scalar_ops::blas::scalar_softmax;
-        let result = unsafe { analyze_structured(
-            scalar_softmax as *const u8,
-            vec![ScalarParam::InputPtr, ScalarParam::OutputPtr, ScalarParam::Dim(0)],
-        ) };
+        let result = unsafe {
+            analyze_structured(
+                scalar_softmax as *const u8,
+                vec![
+                    ScalarParam::InputPtr,
+                    ScalarParam::OutputPtr,
+                    ScalarParam::Dim(0),
+                ],
+            )
+        };
         match result {
             Ok(Some(info)) => {
-                eprintln!("Softmax structured: {} loops, pattern={:?}", info.num_loops, info.pattern);
+                eprintln!(
+                    "Softmax structured: {} loops, pattern={:?}",
+                    info.num_loops, info.pattern
+                );
                 // Softmax has 3 passes (max, sum-exp, normalize) → Reduction or NormLike
                 assert!(
-                    matches!(info.pattern, ComputePattern::Reduction { .. } | ComputePattern::NormLike { .. }),
-                    "Softmax should be Reduction or NormLike, got {:?}", info.pattern
+                    matches!(
+                        info.pattern,
+                        ComputePattern::Reduction { .. } | ComputePattern::NormLike { .. }
+                    ),
+                    "Softmax should be Reduction or NormLike, got {:?}",
+                    info.pattern
                 );
-                assert!(info.num_loops >= 2, "Softmax should have ≥2 loops, got {}", info.num_loops);
+                assert!(
+                    info.num_loops >= 2,
+                    "Softmax should have ≥2 loops, got {}",
+                    info.num_loops
+                );
             }
             Ok(None) => {
                 eprintln!("Softmax structured: no loops detected");
@@ -1123,18 +1188,32 @@ mod tests {
     #[test]
     fn test_structured_l2normalize() {
         use gllm_scalar_ops::norms::scalar_l2_normalize;
-        let result = unsafe { analyze_structured(
-            scalar_l2_normalize as *const u8,
-            vec![ScalarParam::InputPtr, ScalarParam::OutputPtr, ScalarParam::Dim(0)],
-        ) };
+        let result = unsafe {
+            analyze_structured(
+                scalar_l2_normalize as *const u8,
+                vec![
+                    ScalarParam::InputPtr,
+                    ScalarParam::OutputPtr,
+                    ScalarParam::Dim(0),
+                ],
+            )
+        };
         match result {
             Ok(Some(info)) => {
-                eprintln!("L2Normalize structured: {} loops, pattern={:?}", info.num_loops, info.pattern);
+                eprintln!(
+                    "L2Normalize structured: {} loops, pattern={:?}",
+                    info.num_loops, info.pattern
+                );
                 assert!(
                     matches!(info.pattern, ComputePattern::NormLike { .. }),
-                    "L2Normalize should be NormLike, got {:?}", info.pattern
+                    "L2Normalize should be NormLike, got {:?}",
+                    info.pattern
                 );
-                assert!(info.num_loops >= 2, "L2Normalize should have ≥2 loops, got {}", info.num_loops);
+                assert!(
+                    info.num_loops >= 2,
+                    "L2Normalize should have ≥2 loops, got {}",
+                    info.num_loops
+                );
             }
             Ok(None) => {
                 eprintln!("L2Normalize structured: no loops detected");
@@ -1148,21 +1227,30 @@ mod tests {
     #[test]
     fn test_structured_meanpool() {
         use gllm_scalar_ops::pooling::scalar_mean_pool;
-        let result = unsafe { analyze_structured(
-            scalar_mean_pool as *const u8,
-            vec![
-                ScalarParam::InputPtr,
-                ScalarParam::OutputPtr,
-                ScalarParam::Dim(0), // seq_len
-                ScalarParam::Dim(1), // hidden
-            ],
-        ) };
+        let result = unsafe {
+            analyze_structured(
+                scalar_mean_pool as *const u8,
+                vec![
+                    ScalarParam::InputPtr,
+                    ScalarParam::OutputPtr,
+                    ScalarParam::Dim(0), // seq_len
+                    ScalarParam::Dim(1), // hidden
+                ],
+            )
+        };
         match result {
             Ok(Some(info)) => {
-                eprintln!("MeanPool structured: {} loops, pattern={:?}", info.num_loops, info.pattern);
+                eprintln!(
+                    "MeanPool structured: {} loops, pattern={:?}",
+                    info.num_loops, info.pattern
+                );
                 assert!(
-                    matches!(info.pattern, ComputePattern::Reduction { .. } | ComputePattern::NormLike { .. }),
-                    "MeanPool should be Reduction or NormLike, got {:?}", info.pattern
+                    matches!(
+                        info.pattern,
+                        ComputePattern::Reduction { .. } | ComputePattern::NormLike { .. }
+                    ),
+                    "MeanPool should be Reduction or NormLike, got {:?}",
+                    info.pattern
                 );
             }
             Ok(None) => {
@@ -1178,7 +1266,11 @@ mod tests {
     fn test_structured_null_ptr_returns_error() {
         let sig = ScalarFnSignature {
             fn_ptr: std::ptr::null(),
-            params: vec![ScalarParam::InputPtr, ScalarParam::OutputPtr, ScalarParam::Dim(0)],
+            params: vec![
+                ScalarParam::InputPtr,
+                ScalarParam::OutputPtr,
+                ScalarParam::Dim(0),
+            ],
         };
         let result = unsafe { analyze_scalar_fn_structured(std::ptr::null(), &sig) };
         assert!(result.is_err(), "null pointer should return Err");
@@ -1333,10 +1425,22 @@ mod tests {
 
         // Assert
         assert!(s1.contains("test error"), "DisassemblyFailed display: {s1}");
-        assert!(s1.contains("disassembly failed"), "DisassemblyFailed prefix: {s1}");
-        assert!(s2.contains("bad opcode"), "UnsupportedInstruction display: {s2}");
-        assert!(s2.contains("unsupported instruction"), "UnsupportedInstruction prefix: {s2}");
-        assert!(s3.contains("no return value"), "NoReturnValue display: {s3}");
+        assert!(
+            s1.contains("disassembly failed"),
+            "DisassemblyFailed prefix: {s1}"
+        );
+        assert!(
+            s2.contains("bad opcode"),
+            "UnsupportedInstruction display: {s2}"
+        );
+        assert!(
+            s2.contains("unsupported instruction"),
+            "UnsupportedInstruction prefix: {s2}"
+        );
+        assert!(
+            s3.contains("no return value"),
+            "NoReturnValue display: {s3}"
+        );
 
         // Assert: Error trait is usable (boxed dyn dispatch)
         let _: Box<dyn std::error::Error> = Box::new(err1);
@@ -1353,7 +1457,10 @@ mod tests {
         let const_neg = SymValue::Const(-1e38);
         let add_val = SymValue::Add(Box::new(SymValue::Param(0)), Box::new(SymValue::Const(1.0)));
         let nested = SymValue::Mul(
-            Box::new(SymValue::Add(Box::new(SymValue::Param(0)), Box::new(SymValue::Param(1)))),
+            Box::new(SymValue::Add(
+                Box::new(SymValue::Param(0)),
+                Box::new(SymValue::Param(1)),
+            )),
             Box::new(SymValue::Const(2.0)),
         );
         let select_val = SymValue::Select {
@@ -1377,12 +1484,24 @@ mod tests {
 
         // Assert: Debug output contains expected substrings
         assert!(dbg_param.contains("Param"), "Debug for Param: {dbg_param}");
-        assert!(dbg_const.contains("-"), "Debug for negative Const: {dbg_const}");
+        assert!(
+            dbg_const.contains("-"),
+            "Debug for negative Const: {dbg_const}"
+        );
         assert!(dbg_add.contains("Add"), "Debug for Add: {dbg_add}");
-        assert!(dbg_nested.contains("Mul"), "Debug for nested Mul: {dbg_nested}");
-        assert!(dbg_select.contains("Select"), "Debug for Select: {dbg_select}");
+        assert!(
+            dbg_nested.contains("Mul"),
+            "Debug for nested Mul: {dbg_nested}"
+        );
+        assert!(
+            dbg_select.contains("Select"),
+            "Debug for Select: {dbg_select}"
+        );
         assert!(dbg_libm.contains("Call"), "Debug for Call: {dbg_libm}");
-        assert!(dbg_unknown.contains("test"), "Debug for Unknown: {dbg_unknown}");
+        assert!(
+            dbg_unknown.contains("test"),
+            "Debug for Unknown: {dbg_unknown}"
+        );
 
         // Assert: Clone works and produces equal value
         let cloned = nested.clone();
@@ -1399,9 +1518,15 @@ mod tests {
 
         let v = |n: u32| ValueId(n);
 
-        let ew = ComputePattern::Elementwise { body: vec![TraceOp::Input(0), TraceOp::Neg(v(0))] };
+        let ew = ComputePattern::Elementwise {
+            body: vec![TraceOp::Input(0), TraceOp::Neg(v(0))],
+        };
         let bew = ComputePattern::BinaryElementwise {
-            body: vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Add(v(0), v(1))],
+            body: vec![
+                TraceOp::Input(0),
+                TraceOp::Input(1),
+                TraceOp::Add(v(0), v(1)),
+            ],
         };
         let inj = ComputePattern::Injective {
             body: vec![TraceOp::Input(0)],
@@ -1459,13 +1584,19 @@ mod tests {
         let cond = TraceOp::ConditionalBranch(v(0), v(1), v(2));
 
         // Act: verify Debug doesn't panic
-        let ops = [input, input_max, const_val, const_neg, add, sub, mul, div, fma,
-                   neg, abs, exp, sqrt, rsqrt, tanh, recip, log, sigmoid, max, min, cond];
+        let ops = [
+            input, input_max, const_val, const_neg, add, sub, mul, div, fma, neg, abs, exp, sqrt,
+            rsqrt, tanh, recip, log, sigmoid, max, min, cond,
+        ];
 
         // Assert: all Debug formats produce non-empty strings
         for op in &ops {
             let dbg = format!("{:?}", op);
-            assert!(!dbg.is_empty(), "TraceOp Debug should not be empty for {:?}", op);
+            assert!(
+                !dbg.is_empty(),
+                "TraceOp Debug should not be empty for {:?}",
+                op
+            );
         }
 
         // Assert: boundary u32::MAX Input doesn't panic
@@ -1523,11 +1654,26 @@ mod tests {
         let dbg_nested = format!("{:?}", nested_symbolic);
 
         // Assert: Debug output contains variant names
-        assert!(dbg_const.contains("Const"), "AccumulatorInit::Const Debug: {dbg_const}");
-        assert!(dbg_neg_inf.contains("Const"), "AccumulatorInit::Const(neg_inf) Debug: {dbg_neg_inf}");
-        assert!(dbg_nan.contains("Const"), "AccumulatorInit::Const(NaN) Debug: {dbg_nan}");
-        assert!(dbg_sym.contains("Symbolic"), "AccumulatorInit::Symbolic Debug: {dbg_sym}");
-        assert!(dbg_nested.contains("Symbolic"), "AccumulatorInit::Symbolic nested Debug: {dbg_nested}");
+        assert!(
+            dbg_const.contains("Const"),
+            "AccumulatorInit::Const Debug: {dbg_const}"
+        );
+        assert!(
+            dbg_neg_inf.contains("Const"),
+            "AccumulatorInit::Const(neg_inf) Debug: {dbg_neg_inf}"
+        );
+        assert!(
+            dbg_nan.contains("Const"),
+            "AccumulatorInit::Const(NaN) Debug: {dbg_nan}"
+        );
+        assert!(
+            dbg_sym.contains("Symbolic"),
+            "AccumulatorInit::Symbolic Debug: {dbg_sym}"
+        );
+        assert!(
+            dbg_nested.contains("Symbolic"),
+            "AccumulatorInit::Symbolic nested Debug: {dbg_nested}"
+        );
 
         // Assert: Clone works
         let cloned = const_init.clone();
@@ -1562,11 +1708,20 @@ mod tests {
 
         // BranchKind variants
         let kinds = [
-            BranchKind::Above, BranchKind::AboveEqual, BranchKind::Below,
-            BranchKind::BelowEqual, BranchKind::Greater, BranchKind::GreaterEqual,
-            BranchKind::Less, BranchKind::LessEqual, BranchKind::Equal,
-            BranchKind::NotEqual, BranchKind::Sign, BranchKind::NotSign,
-            BranchKind::Parity, BranchKind::NotParity,
+            BranchKind::Above,
+            BranchKind::AboveEqual,
+            BranchKind::Below,
+            BranchKind::BelowEqual,
+            BranchKind::Greater,
+            BranchKind::GreaterEqual,
+            BranchKind::Less,
+            BranchKind::LessEqual,
+            BranchKind::Equal,
+            BranchKind::NotEqual,
+            BranchKind::Sign,
+            BranchKind::NotSign,
+            BranchKind::Parity,
+            BranchKind::NotParity,
         ];
         // Assert: all 14 variants are distinct
         for (i, k1) in kinds.iter().enumerate() {
@@ -1586,7 +1741,14 @@ mod tests {
         use super::super::sym_value::{LibmFn, SelectKind};
 
         // Act & Assert: SelectKind all variants + Copy + PartialEq
-        let select_kinds = [SelectKind::Gt, SelectKind::Ge, SelectKind::Lt, SelectKind::Le, SelectKind::Eq, SelectKind::Ne];
+        let select_kinds = [
+            SelectKind::Gt,
+            SelectKind::Ge,
+            SelectKind::Lt,
+            SelectKind::Le,
+            SelectKind::Eq,
+            SelectKind::Ne,
+        ];
         assert_eq!(select_kinds.len(), 6, "SelectKind should have 6 variants");
         for (i, k1) in select_kinds.iter().enumerate() {
             for (j, k2) in select_kinds.iter().enumerate() {
@@ -1598,7 +1760,13 @@ mod tests {
         assert_eq!(copied, SelectKind::Gt);
 
         // Act & Assert: LibmFn all variants + Copy + PartialEq
-        let libm_variants = [LibmFn::Expf, LibmFn::Sqrtf, LibmFn::Tanhf, LibmFn::Logf, LibmFn::Fabsf];
+        let libm_variants = [
+            LibmFn::Expf,
+            LibmFn::Sqrtf,
+            LibmFn::Tanhf,
+            LibmFn::Logf,
+            LibmFn::Fabsf,
+        ];
         assert_eq!(libm_variants.len(), 5, "LibmFn should have 5 variants");
         for (i, v1) in libm_variants.iter().enumerate() {
             for (j, v2) in libm_variants.iter().enumerate() {
@@ -1645,9 +1813,15 @@ mod tests {
         };
 
         // Act & Assert: no register is known as input or output
-        assert!(map.is_input(Register::RDI).is_none(), "empty map should have no input");
+        assert!(
+            map.is_input(Register::RDI).is_none(),
+            "empty map should have no input"
+        );
         assert!(map.is_input(Register::RSI).is_none());
-        assert!(!map.is_output(Register::RDI), "empty map should have no output");
+        assert!(
+            !map.is_output(Register::RDI),
+            "empty map should have no output"
+        );
         assert!(!map.is_output(Register::RSI));
     }
 
@@ -1665,7 +1839,10 @@ mod tests {
 
         // Act & Assert: is_input returns ordinal for mapped register
         assert_eq!(map.is_input(Register::RDI), Some(0));
-        assert!(map.is_input(Register::RSI).is_none(), "RSI is output, not input");
+        assert!(
+            map.is_input(Register::RSI).is_none(),
+            "RSI is output, not input"
+        );
 
         // Assert: is_output returns true for mapped register
         assert!(map.is_output(Register::RSI));
@@ -1689,7 +1866,11 @@ mod tests {
 
         // Assert: r15 now also recognized as Input(0)
         assert_eq!(map.is_input(Register::R15), Some(0));
-        assert_eq!(map.is_input(Register::RDI), Some(0), "original mapping preserved");
+        assert_eq!(
+            map.is_input(Register::RDI),
+            Some(0),
+            "original mapping preserved"
+        );
         assert!(!map.is_output(Register::R15));
     }
 
@@ -1728,10 +1909,24 @@ mod tests {
         let map = build_ptr_map(&sig_with_all);
 
         // Assert: RDI=Input(0), RDX=Input(1), RSI=Output
-        assert_eq!(map.input_regs.get(&Register::RDI), Some(&0), "RDI should be Input(0)");
-        assert_eq!(map.input_regs.get(&Register::RDX), Some(&1), "RDX should be Input(1)");
-        assert!(map.output_regs.contains(&Register::RSI), "RSI should be output");
-        assert!(map.input_regs.get(&Register::RCX).is_none(), "RCX holds Dim, not input");
+        assert_eq!(
+            map.input_regs.get(&Register::RDI),
+            Some(&0),
+            "RDI should be Input(0)"
+        );
+        assert_eq!(
+            map.input_regs.get(&Register::RDX),
+            Some(&1),
+            "RDX should be Input(1)"
+        );
+        assert!(
+            map.output_regs.contains(&Register::RSI),
+            "RSI should be output"
+        );
+        assert!(
+            map.input_regs.get(&Register::RCX).is_none(),
+            "RCX holds Dim, not input"
+        );
     }
 
     #[test]
@@ -1749,8 +1944,14 @@ mod tests {
         let reg_rdi = format_register(rdi);
 
         // Assert: all lowercase
-        assert_eq!(mnem_add, "addss", "format_mnemonic(Addss) should be 'addss'");
-        assert_eq!(mnem_mul, "vmulps", "format_mnemonic(Vmulps) should be 'vmulps'");
+        assert_eq!(
+            mnem_add, "addss",
+            "format_mnemonic(Addss) should be 'addss'"
+        );
+        assert_eq!(
+            mnem_mul, "vmulps",
+            "format_mnemonic(Vmulps) should be 'vmulps'"
+        );
         assert_eq!(reg_xmm, "xmm0", "format_register(XMM0) should be 'xmm0'");
         assert_eq!(reg_rdi, "rdi", "format_register(RDI) should be 'rdi'");
     }
@@ -1821,7 +2022,10 @@ mod tests {
 
         // Assert: Debug
         let dbg = format!("{:?}", block);
-        assert!(dbg.contains("BasicBlock"), "Debug should contain BasicBlock: {dbg}");
+        assert!(
+            dbg.contains("BasicBlock"),
+            "Debug should contain BasicBlock: {dbg}"
+        );
     }
 
     #[test]
@@ -1857,7 +2061,10 @@ mod tests {
         // Assert: Clone
         let cloned_loop = natural_loop.clone();
         assert_eq!(cloned_loop.header, natural_loop.header);
-        assert_eq!(cloned_loop.body_blocks.len(), natural_loop.body_blocks.len());
+        assert_eq!(
+            cloned_loop.body_blocks.len(),
+            natural_loop.body_blocks.len()
+        );
 
         // Arrange: LoopForest with a single top-level loop
         let forest = LoopForest {
@@ -1873,7 +2080,10 @@ mod tests {
 
         // Assert: Debug
         let dbg = format!("{:?}", forest);
-        assert!(dbg.contains("LoopForest"), "Debug should contain LoopForest: {dbg}");
+        assert!(
+            dbg.contains("LoopForest"),
+            "Debug should contain LoopForest: {dbg}"
+        );
     }
 
     // ── Additional pure data structure / logic tests ─────────────────────
@@ -1923,10 +2133,7 @@ mod tests {
             register: "xmm1".to_string(),
             kind: ReductionKind::Max,
             init: AccumulatorInit::Const(f64::NEG_INFINITY),
-            body_expr: SymValue::Mul(
-                Box::new(SymValue::Param(0)),
-                Box::new(SymValue::Param(0)),
-            ),
+            body_expr: SymValue::Mul(Box::new(SymValue::Param(0)), Box::new(SymValue::Param(0))),
         };
 
         // Act: Debug
@@ -1934,10 +2141,22 @@ mod tests {
         let dbg_max = format!("{:?}", rd_max);
 
         // Assert: Debug output contains key fields
-        assert!(dbg_sum.contains("xmm0"), "Debug should contain register: {dbg_sum}");
-        assert!(dbg_sum.contains("Sum"), "Debug should contain kind: {dbg_sum}");
-        assert!(dbg_max.contains("Max"), "Debug should contain kind: {dbg_max}");
-        assert!(dbg_max.contains("xmm1"), "Debug should contain register: {dbg_max}");
+        assert!(
+            dbg_sum.contains("xmm0"),
+            "Debug should contain register: {dbg_sum}"
+        );
+        assert!(
+            dbg_sum.contains("Sum"),
+            "Debug should contain kind: {dbg_sum}"
+        );
+        assert!(
+            dbg_max.contains("Max"),
+            "Debug should contain kind: {dbg_max}"
+        );
+        assert!(
+            dbg_max.contains("xmm1"),
+            "Debug should contain register: {dbg_max}"
+        );
 
         // Assert: Clone produces equal value
         let cloned = rd_sum.clone();
@@ -1949,7 +2168,9 @@ mod tests {
     fn test_loop_trace_construction_and_fields() {
         // Arrange
         use super::super::cfg::BlockId;
-        use super::super::loop_analyzer::{AccumulatorInit, LoopTrace, ReductionDetected, ReductionKind};
+        use super::super::loop_analyzer::{
+            AccumulatorInit, LoopTrace, ReductionDetected, ReductionKind,
+        };
 
         let reduction = ReductionDetected {
             register: "xmm0".to_string(),
@@ -1977,14 +2198,19 @@ mod tests {
 
         // Assert: Debug
         let dbg = format!("{:?}", trace);
-        assert!(dbg.contains("LoopTrace"), "Debug should contain LoopTrace: {dbg}");
+        assert!(
+            dbg.contains("LoopTrace"),
+            "Debug should contain LoopTrace: {dbg}"
+        );
     }
 
     #[test]
     fn test_multi_pass_analysis_construction_and_debug() {
         // Arrange
         use super::super::cfg::BlockId;
-        use super::super::loop_analyzer::{AccumulatorInit, LoopTrace, MultiPassAnalysis, ReductionDetected, ReductionKind};
+        use super::super::loop_analyzer::{
+            AccumulatorInit, LoopTrace, MultiPassAnalysis, ReductionDetected, ReductionKind,
+        };
 
         let loop_trace = LoopTrace {
             loop_header: BlockId(0),
@@ -1999,10 +2225,14 @@ mod tests {
         };
         let pattern = ComputePattern::Reduction {
             identity: f64::NEG_INFINITY,
-            combine: vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Max(
-                crate::compiler::trace::ValueId(0),
-                crate::compiler::trace::ValueId(1),
-            )],
+            combine: vec![
+                TraceOp::Input(0),
+                TraceOp::Input(1),
+                TraceOp::Max(
+                    crate::compiler::trace::ValueId(0),
+                    crate::compiler::trace::ValueId(1),
+                ),
+            ],
             second_pass: None,
             normalize: None,
         };
@@ -2021,8 +2251,14 @@ mod tests {
 
         // Assert: Debug
         let dbg = format!("{:?}", mpa);
-        assert!(dbg.contains("MultiPassAnalysis"), "Debug should contain MultiPassAnalysis: {dbg}");
-        assert!(dbg.contains("Reduction"), "Debug should contain Reduction pattern: {dbg}");
+        assert!(
+            dbg.contains("MultiPassAnalysis"),
+            "Debug should contain MultiPassAnalysis: {dbg}"
+        );
+        assert!(
+            dbg.contains("Reduction"),
+            "Debug should contain Reduction pattern: {dbg}"
+        );
     }
 
     #[test]
@@ -2059,7 +2295,10 @@ mod tests {
 
         // Assert: Clone
         let cloned = second_pass.clone();
-        assert_eq!(cloned.element_transform.len(), second_pass.element_transform.len());
+        assert_eq!(
+            cloned.element_transform.len(),
+            second_pass.element_transform.len()
+        );
     }
 
     #[test]
@@ -2071,25 +2310,42 @@ mod tests {
 
         let reduction = ComputePattern::Reduction {
             identity: 0.0,
-            combine: vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Add(v(0), v(1))],
+            combine: vec![
+                TraceOp::Input(0),
+                TraceOp::Input(1),
+                TraceOp::Add(v(0), v(1)),
+            ],
             second_pass: None,
             normalize: Some(vec![TraceOp::Input(0), TraceOp::Recip(v(0))]),
         };
         let normlike = ComputePattern::NormLike {
-            reduce: vec![TraceOp::Input(0), TraceOp::Mul(v(0), v(0)), TraceOp::Add(v(0), v(1))],
+            reduce: vec![
+                TraceOp::Input(0),
+                TraceOp::Mul(v(0), v(0)),
+                TraceOp::Add(v(0), v(1)),
+            ],
             finalize: vec![TraceOp::Rsqrt(v(0))],
             transform: vec![TraceOp::Input(0), TraceOp::Mul(v(0), v(1))],
         };
 
         // Act & Assert: body() returns None for these multi-phase patterns
-        assert!(reduction.body().is_none(), "Reduction body() should be None");
+        assert!(
+            reduction.body().is_none(),
+            "Reduction body() should be None"
+        );
         assert!(normlike.body().is_none(), "NormLike body() should be None");
 
         // Assert: Debug works
         let dbg_red = format!("{:?}", reduction);
         let dbg_norm = format!("{:?}", normlike);
-        assert!(dbg_red.contains("Reduction"), "Debug should contain Reduction: {dbg_red}");
-        assert!(dbg_norm.contains("NormLike"), "Debug should contain NormLike: {dbg_norm}");
+        assert!(
+            dbg_red.contains("Reduction"),
+            "Debug should contain Reduction: {dbg_red}"
+        );
+        assert!(
+            dbg_norm.contains("NormLike"),
+            "Debug should contain NormLike: {dbg_norm}"
+        );
     }
 
     #[test]
@@ -2123,7 +2379,10 @@ mod tests {
 
         // Assert: Debug
         let dbg = format!("{:?}", quant);
-        assert!(dbg.contains("QuantDecode"), "Debug should contain QuantDecode: {dbg}");
+        assert!(
+            dbg.contains("QuantDecode"),
+            "Debug should contain QuantDecode: {dbg}"
+        );
     }
 
     #[test]
@@ -2146,13 +2405,22 @@ mod tests {
         let dbg_nested = format!("{:?}", load_nested);
 
         // Assert: Debug contains "Load"
-        assert!(dbg_simple.contains("Load"), "Simple load Debug: {dbg_simple}");
-        assert!(dbg_nested.contains("Load"), "Nested load Debug: {dbg_nested}");
+        assert!(
+            dbg_simple.contains("Load"),
+            "Simple load Debug: {dbg_simple}"
+        );
+        assert!(
+            dbg_nested.contains("Load"),
+            "Nested load Debug: {dbg_nested}"
+        );
 
         // Assert: Clone
         let cloned = load_nested.clone();
         let dbg_cloned = format!("{:?}", cloned);
-        assert_eq!(dbg_nested, dbg_cloned, "Cloned Load should debug-format identically");
+        assert_eq!(
+            dbg_nested, dbg_cloned,
+            "Cloned Load should debug-format identically"
+        );
     }
 
     #[test]
@@ -2212,14 +2480,30 @@ mod tests {
     fn test_is_gp64_all_gp_and_non_gp_registers() {
         // Arrange: all 16 GP64 registers and some non-GP registers
         let gp64_regs = [
-            Register::RAX, Register::RBX, Register::RCX, Register::RDX,
-            Register::RSI, Register::RDI, Register::RBP, Register::RSP,
-            Register::R8, Register::R9, Register::R10, Register::R11,
-            Register::R12, Register::R13, Register::R14, Register::R15,
+            Register::RAX,
+            Register::RBX,
+            Register::RCX,
+            Register::RDX,
+            Register::RSI,
+            Register::RDI,
+            Register::RBP,
+            Register::RSP,
+            Register::R8,
+            Register::R9,
+            Register::R10,
+            Register::R11,
+            Register::R12,
+            Register::R13,
+            Register::R14,
+            Register::R15,
         ];
         let non_gp_regs = [
-            Register::XMM0, Register::XMM15, Register::EAX, Register::AL,
-            Register::RIP, Register::None,
+            Register::XMM0,
+            Register::XMM15,
+            Register::EAX,
+            Register::AL,
+            Register::RIP,
+            Register::None,
         ];
 
         // Act & Assert: all GP64 registers recognized
@@ -2236,10 +2520,22 @@ mod tests {
     fn test_is_xmm_all_16_and_non_xmm() {
         // Arrange: all 16 XMM registers
         let xmm_regs = [
-            Register::XMM0, Register::XMM1, Register::XMM2, Register::XMM3,
-            Register::XMM4, Register::XMM5, Register::XMM6, Register::XMM7,
-            Register::XMM8, Register::XMM9, Register::XMM10, Register::XMM11,
-            Register::XMM12, Register::XMM13, Register::XMM14, Register::XMM15,
+            Register::XMM0,
+            Register::XMM1,
+            Register::XMM2,
+            Register::XMM3,
+            Register::XMM4,
+            Register::XMM5,
+            Register::XMM6,
+            Register::XMM7,
+            Register::XMM8,
+            Register::XMM9,
+            Register::XMM10,
+            Register::XMM11,
+            Register::XMM12,
+            Register::XMM13,
+            Register::XMM14,
+            Register::XMM15,
         ];
         let non_xmm = [Register::RAX, Register::YMM0, Register::ZMM0, Register::EAX];
 
@@ -2257,14 +2553,30 @@ mod tests {
     fn test_is_branch_all_conditionals_and_unconditional() {
         // Arrange: all branch mnemonics that is_branch matches
         let branch_mnemonics = [
-            Mnemonic::Je, Mnemonic::Jne, Mnemonic::Jb, Mnemonic::Jbe,
-            Mnemonic::Ja, Mnemonic::Jae, Mnemonic::Jl, Mnemonic::Jle,
-            Mnemonic::Jg, Mnemonic::Jge, Mnemonic::Jmp, Mnemonic::Js,
-            Mnemonic::Jns, Mnemonic::Jp, Mnemonic::Jnp,
+            Mnemonic::Je,
+            Mnemonic::Jne,
+            Mnemonic::Jb,
+            Mnemonic::Jbe,
+            Mnemonic::Ja,
+            Mnemonic::Jae,
+            Mnemonic::Jl,
+            Mnemonic::Jle,
+            Mnemonic::Jg,
+            Mnemonic::Jge,
+            Mnemonic::Jmp,
+            Mnemonic::Js,
+            Mnemonic::Jns,
+            Mnemonic::Jp,
+            Mnemonic::Jnp,
         ];
         let non_branch = [
-            Mnemonic::Addss, Mnemonic::Movss, Mnemonic::Ret, Mnemonic::Call,
-            Mnemonic::Nop, Mnemonic::Push, Mnemonic::Xorps,
+            Mnemonic::Addss,
+            Mnemonic::Movss,
+            Mnemonic::Ret,
+            Mnemonic::Call,
+            Mnemonic::Nop,
+            Mnemonic::Push,
+            Mnemonic::Xorps,
         ];
 
         // Act & Assert: all branch mnemonics recognized
@@ -2281,16 +2593,38 @@ mod tests {
     fn test_is_integer_only_comprehensive() {
         // Arrange: mnemonics that are integer-only
         let integer_mnemonics = [
-            Mnemonic::Push, Mnemonic::Pop, Mnemonic::Mov, Mnemonic::Lea,
-            Mnemonic::Add, Mnemonic::Sub, Mnemonic::Xor, Mnemonic::And,
-            Mnemonic::Or, Mnemonic::Shl, Mnemonic::Shr, Mnemonic::Sar,
-            Mnemonic::Test, Mnemonic::Cmp, Mnemonic::Nop, Mnemonic::Neg,
-            Mnemonic::Imul, Mnemonic::Cdq, Mnemonic::Cdqe, Mnemonic::Cqo,
-            Mnemonic::Cmove, Mnemonic::Cmovne, Mnemonic::Sete, Mnemonic::Setne,
+            Mnemonic::Push,
+            Mnemonic::Pop,
+            Mnemonic::Mov,
+            Mnemonic::Lea,
+            Mnemonic::Add,
+            Mnemonic::Sub,
+            Mnemonic::Xor,
+            Mnemonic::And,
+            Mnemonic::Or,
+            Mnemonic::Shl,
+            Mnemonic::Shr,
+            Mnemonic::Sar,
+            Mnemonic::Test,
+            Mnemonic::Cmp,
+            Mnemonic::Nop,
+            Mnemonic::Neg,
+            Mnemonic::Imul,
+            Mnemonic::Cdq,
+            Mnemonic::Cdqe,
+            Mnemonic::Cqo,
+            Mnemonic::Cmove,
+            Mnemonic::Cmovne,
+            Mnemonic::Sete,
+            Mnemonic::Setne,
         ];
         let float_mnemonics = [
-            Mnemonic::Addss, Mnemonic::Mulss, Mnemonic::Divss,
-            Mnemonic::Movss, Mnemonic::Xorps, Mnemonic::Ucomiss,
+            Mnemonic::Addss,
+            Mnemonic::Mulss,
+            Mnemonic::Divss,
+            Mnemonic::Movss,
+            Mnemonic::Xorps,
+            Mnemonic::Ucomiss,
         ];
 
         // Act & Assert: integer mnemonics recognized
@@ -2307,12 +2641,19 @@ mod tests {
     fn test_is_float_load_and_float_mov_coverage() {
         // Arrange: float load mnemonics (subset of float mov)
         let float_loads = [
-            Mnemonic::Movss, Mnemonic::Vmovss, Mnemonic::Movsd, Mnemonic::Vmovsd,
+            Mnemonic::Movss,
+            Mnemonic::Vmovss,
+            Mnemonic::Movsd,
+            Mnemonic::Vmovsd,
         ];
         // float_mov includes additional mov variants not in is_float_load
         let float_mov_extra = [
-            Mnemonic::Movaps, Mnemonic::Vmovaps, Mnemonic::Movups,
-            Mnemonic::Vmovups, Mnemonic::Movd, Mnemonic::Vmovd,
+            Mnemonic::Movaps,
+            Mnemonic::Vmovaps,
+            Mnemonic::Movups,
+            Mnemonic::Vmovups,
+            Mnemonic::Movd,
+            Mnemonic::Vmovd,
         ];
         let non_float = [Mnemonic::Mov, Mnemonic::Addss, Mnemonic::Ret];
 
@@ -2337,7 +2678,10 @@ mod tests {
     fn test_is_xor_ps_pd_all_variants() {
         // Arrange
         let xor_variants = [
-            Mnemonic::Xorps, Mnemonic::Xorpd, Mnemonic::Vxorps, Mnemonic::Vxorpd,
+            Mnemonic::Xorps,
+            Mnemonic::Xorpd,
+            Mnemonic::Vxorps,
+            Mnemonic::Vxorpd,
         ];
         let non_xor = [Mnemonic::Xor, Mnemonic::Addss, Mnemonic::Pxor];
 
@@ -2357,13 +2701,13 @@ mod tests {
         let sig = ScalarFnSignature {
             fn_ptr: std::ptr::null(),
             params: vec![
-                ScalarParam::InputPtr,    // RDI → input ordinal 0
-                ScalarParam::InputPtr,    // RSI → input ordinal 1
-                ScalarParam::OutputPtr,   // RDX → output
-                ScalarParam::WeightPtr,   // RCX → input ordinal 2
-                ScalarParam::OutputPtr,   // R8  → output
-                ScalarParam::WeightPtr,   // R9  → input ordinal 3
-                ScalarParam::InputPtr,    // ← exceeds INT_ARG_REGS, dropped
+                ScalarParam::InputPtr,  // RDI → input ordinal 0
+                ScalarParam::InputPtr,  // RSI → input ordinal 1
+                ScalarParam::OutputPtr, // RDX → output
+                ScalarParam::WeightPtr, // RCX → input ordinal 2
+                ScalarParam::OutputPtr, // R8  → output
+                ScalarParam::WeightPtr, // R9  → input ordinal 3
+                ScalarParam::InputPtr,  // ← exceeds INT_ARG_REGS, dropped
             ],
         };
 
@@ -2388,10 +2732,10 @@ mod tests {
         let sig = ScalarFnSignature {
             fn_ptr: std::ptr::null(),
             params: vec![
-                ScalarParam::Scalar(1.0),  // xmm0 — does not consume int reg
-                ScalarParam::Scalar(2.0),  // xmm1 — does not consume int reg
-                ScalarParam::InputPtr,     // RDI → input ordinal 0
-                ScalarParam::OutputPtr,    // RSI → output
+                ScalarParam::Scalar(1.0), // xmm0 — does not consume int reg
+                ScalarParam::Scalar(2.0), // xmm1 — does not consume int reg
+                ScalarParam::InputPtr,    // RDI → input ordinal 0
+                ScalarParam::OutputPtr,   // RSI → output
             ],
         };
 
@@ -2443,7 +2787,10 @@ mod tests {
         // Act & Assert: all formatted as lowercase
         for (mnemonic, expected) in &test_cases {
             let formatted = format_mnemonic(*mnemonic);
-            assert_eq!(formatted, *expected, "format_mnemonic({mnemonic:?}) should be '{expected}'");
+            assert_eq!(
+                formatted, *expected,
+                "format_mnemonic({mnemonic:?}) should be '{expected}'"
+            );
             // Double-check: no uppercase characters
             assert_eq!(formatted, formatted.to_ascii_lowercase());
         }
@@ -2454,14 +2801,8 @@ mod tests {
     #[test]
     fn test_sym_value_sub_div_abs_nested() {
         // Arrange: build Sub, Div, Abs with nested expressions
-        let sub_val = SymValue::Sub(
-            Box::new(SymValue::Param(0)),
-            Box::new(SymValue::Const(1.0)),
-        );
-        let div_val = SymValue::Div(
-            Box::new(SymValue::Const(6.0)),
-            Box::new(SymValue::Param(1)),
-        );
+        let sub_val = SymValue::Sub(Box::new(SymValue::Param(0)), Box::new(SymValue::Const(1.0)));
+        let div_val = SymValue::Div(Box::new(SymValue::Const(6.0)), Box::new(SymValue::Param(1)));
         let abs_val = SymValue::Abs(Box::new(SymValue::Sub(
             Box::new(SymValue::Param(0)),
             Box::new(SymValue::Const(5.0)),
@@ -2557,14 +2898,8 @@ mod tests {
     #[test]
     fn test_sym_value_min_max_neg_display_round_trip() {
         // Arrange: build binary/unary SymValue variants not directly covered by other tests
-        let min_val = SymValue::Min(
-            Box::new(SymValue::Param(0)),
-            Box::new(SymValue::Const(0.0)),
-        );
-        let max_val = SymValue::Max(
-            Box::new(SymValue::Param(1)),
-            Box::new(SymValue::Param(2)),
-        );
+        let min_val = SymValue::Min(Box::new(SymValue::Param(0)), Box::new(SymValue::Const(0.0)));
+        let max_val = SymValue::Max(Box::new(SymValue::Param(1)), Box::new(SymValue::Param(2)));
         let neg_val = SymValue::Neg(Box::new(SymValue::Const(-3.5)));
         let unknown_val = SymValue::Unknown("spill".to_string());
 
@@ -2578,7 +2913,10 @@ mod tests {
         assert!(disp_min.contains("min"), "Min Display: {disp_min}");
         assert!(disp_max.contains("max"), "Max Display: {disp_max}");
         assert!(disp_neg.contains("(-"), "Neg Display: {disp_neg}");
-        assert!(disp_unknown.contains("spill"), "Unknown Display: {disp_unknown}");
+        assert!(
+            disp_unknown.contains("spill"),
+            "Unknown Display: {disp_unknown}"
+        );
 
         // Assert: Clone produces structurally equal value
         let cloned_min = min_val.clone();
@@ -2597,8 +2935,14 @@ mod tests {
         let map = build_ptr_map(&empty_sig);
 
         // Assert: no registers mapped
-        assert!(map.input_regs.is_empty(), "empty sig should have no input regs");
-        assert!(map.output_regs.is_empty(), "empty sig should have no output regs");
+        assert!(
+            map.input_regs.is_empty(),
+            "empty sig should have no input regs"
+        );
+        assert!(
+            map.output_regs.is_empty(),
+            "empty sig should have no output regs"
+        );
     }
 
     #[test]
@@ -2619,15 +2963,30 @@ mod tests {
         map.propagate_mov(Register::R13, Register::R15);
 
         // Assert: chain propagation worked for input
-        assert_eq!(map.is_input(Register::R13), Some(0), "r13 should inherit Input(0) via r15 chain");
-        assert_eq!(map.is_input(Register::R15), Some(0), "r15 should still be Input(0)");
-        assert_eq!(map.is_input(Register::RDI), Some(0), "rdi should still be Input(0)");
+        assert_eq!(
+            map.is_input(Register::R13),
+            Some(0),
+            "r13 should inherit Input(0) via r15 chain"
+        );
+        assert_eq!(
+            map.is_input(Register::R15),
+            Some(0),
+            "r15 should still be Input(0)"
+        );
+        assert_eq!(
+            map.is_input(Register::RDI),
+            Some(0),
+            "rdi should still be Input(0)"
+        );
 
         // Act: chain propagation — mov r12, rsi → r12 becomes output
         map.propagate_mov(Register::R12, Register::RSI);
 
         // Assert: chain propagation worked for output
-        assert!(map.is_output(Register::R12), "r12 should inherit output via rsi chain");
+        assert!(
+            map.is_output(Register::R12),
+            "r12 should inherit output via rsi chain"
+        );
         assert!(map.is_output(Register::RSI), "rsi should still be output");
     }
 
@@ -2646,7 +3005,10 @@ mod tests {
         let has_dst_mem = has_memory_operand_at_dst(&instr);
 
         // Assert: load has memory but dst is register (not memory)
-        assert!(has_mem, "movss xmm0, [rdi+rcx*4] should have memory operand");
+        assert!(
+            has_mem,
+            "movss xmm0, [rdi+rcx*4] should have memory operand"
+        );
         assert!(!has_dst_mem, "movss load dst is register, not memory");
 
         // Arrange: movss dword ptr [rsi+rcx*4], xmm0 — store, dst IS memory
@@ -2661,7 +3023,10 @@ mod tests {
         let has_dst_mem2 = has_memory_operand_at_dst(&instr2);
 
         // Assert: store has memory and dst IS memory
-        assert!(has_mem2, "movss [rsi+rcx*4], xmm0 should have memory operand");
+        assert!(
+            has_mem2,
+            "movss [rsi+rcx*4], xmm0 should have memory operand"
+        );
         assert!(has_dst_mem2, "movss store dst is memory");
     }
 
@@ -2678,9 +3043,18 @@ mod tests {
         let mem_str = format_memory(&instr);
 
         // Assert: stack-relative format
-        assert!(mem_str.starts_with('['), "memory operand should start with '[': {mem_str}");
-        assert!(mem_str.ends_with(']'), "memory operand should end with ']': {mem_str}");
-        assert!(mem_str.contains("rsp"), "stack-relative should contain 'rsp': {mem_str}");
+        assert!(
+            mem_str.starts_with('['),
+            "memory operand should start with '[': {mem_str}"
+        );
+        assert!(
+            mem_str.ends_with(']'),
+            "memory operand should end with ']': {mem_str}"
+        );
+        assert!(
+            mem_str.contains("rsp"),
+            "stack-relative should contain 'rsp': {mem_str}"
+        );
 
         // Arrange: [rdi+rcx*4] — general with scaled index
         let bytes_scaled: &[u8] = &[0xf3, 0x0f, 0x10, 0x04, 0x8f]; // movss xmm0, [rdi+rcx*4]
@@ -2693,8 +3067,14 @@ mod tests {
         let mem_str2 = format_memory(&instr2);
 
         // Assert: general format with scale
-        assert!(mem_str2.contains("rcx"), "should contain index register: {mem_str2}");
-        assert!(mem_str2.contains("4"), "should contain scale factor: {mem_str2}");
+        assert!(
+            mem_str2.contains("rcx"),
+            "should contain index register: {mem_str2}"
+        );
+        assert!(
+            mem_str2.contains("4"),
+            "should contain scale factor: {mem_str2}"
+        );
     }
 
     #[test]
@@ -2738,10 +3118,18 @@ mod tests {
 
         // Act: Debug format
         let dbg = format!("{:?}", injective);
-        assert!(dbg.contains("Injective"), "Debug should contain Injective: {dbg}");
+        assert!(
+            dbg.contains("Injective"),
+            "Debug should contain Injective: {dbg}"
+        );
 
         // Assert: field access via destructuring
-        if let ComputePattern::Injective { num_inputs, num_outputs, .. } = &injective {
+        if let ComputePattern::Injective {
+            num_inputs,
+            num_outputs,
+            ..
+        } = &injective
+        {
             assert_eq!(*num_inputs, 2);
             assert_eq!(*num_outputs, 2);
         } else {
@@ -2755,7 +3143,11 @@ mod tests {
     fn test_int_arg_regs_order_and_length() {
         // Arrange: System V AMD64 ABI specifies 6 integer argument registers
         // Act & Assert: exactly 6 registers in the canonical order
-        assert_eq!(INT_ARG_REGS.len(), 6, "System V ABI has 6 integer arg registers");
+        assert_eq!(
+            INT_ARG_REGS.len(),
+            6,
+            "System V ABI has 6 integer arg registers"
+        );
         assert_eq!(INT_ARG_REGS[0], Register::RDI);
         assert_eq!(INT_ARG_REGS[1], Register::RSI);
         assert_eq!(INT_ARG_REGS[2], Register::RDX);
@@ -2791,10 +3183,7 @@ mod tests {
     #[test]
     fn test_sym_value_deeply_nested_expression() {
         // Arrange: 4-level deep tree: Mul(Add(Sub(Param(0), Const(1)), Param(1)), Const(2))
-        let inner = SymValue::Sub(
-            Box::new(SymValue::Param(0)),
-            Box::new(SymValue::Const(1.0)),
-        );
+        let inner = SymValue::Sub(Box::new(SymValue::Param(0)), Box::new(SymValue::Const(1.0)));
         let mid = SymValue::Add(Box::new(inner), Box::new(SymValue::Param(1)));
         let outer = SymValue::Mul(Box::new(mid), Box::new(SymValue::Const(2.0)));
 
@@ -2899,8 +3288,14 @@ mod tests {
         let map = build_ptr_map(&sig);
 
         // Assert: Dim params consume integer registers but map to neither input nor output
-        assert!(map.input_regs.is_empty(), "Dim-only sig should have no input regs");
-        assert!(map.output_regs.is_empty(), "Dim-only sig should have no output regs");
+        assert!(
+            map.input_regs.is_empty(),
+            "Dim-only sig should have no input regs"
+        );
+        assert!(
+            map.output_regs.is_empty(),
+            "Dim-only sig should have no output regs"
+        );
     }
 
     #[test]
@@ -2930,8 +3325,14 @@ mod tests {
 
         // Assert: body contains expected operations
         let body = pattern.body().unwrap();
-        assert!(body.iter().any(|op| matches!(op, TraceOp::Exp(_))), "should contain Exp");
-        assert!(body.iter().any(|op| matches!(op, TraceOp::Recip(_))), "should contain Recip");
+        assert!(
+            body.iter().any(|op| matches!(op, TraceOp::Exp(_))),
+            "should contain Exp"
+        );
+        assert!(
+            body.iter().any(|op| matches!(op, TraceOp::Recip(_))),
+            "should contain Recip"
+        );
     }
 
     #[test]
@@ -3005,7 +3406,11 @@ mod tests {
         assert!(has_mem, "subss xmm0, [rdi] should have memory operand");
         assert_eq!(operands.len(), 2, "subss should have 2 operands");
         assert_eq!(operands[0], "xmm0", "destination should be xmm0");
-        assert!(operands[1].starts_with('['), "source should be memory operand: {}", operands[1]);
+        assert!(
+            operands[1].starts_with('['),
+            "source should be memory operand: {}",
+            operands[1]
+        );
     }
 
     #[test]
@@ -3023,7 +3428,11 @@ mod tests {
         // Assert: two operands — register and immediate (hex formatted)
         assert_eq!(operands.len(), 2, "add rcx, 4 should have 2 operands");
         assert_eq!(operands[0], "rcx", "first operand should be rcx");
-        assert!(operands[1].starts_with("0x"), "immediate should be hex-formatted: {}", operands[1]);
+        assert!(
+            operands[1].starts_with("0x"),
+            "immediate should be hex-formatted: {}",
+            operands[1]
+        );
     }
 
     #[test]
@@ -3040,25 +3449,44 @@ mod tests {
         let mnemonic = instr.mnemonic();
 
         // Assert: VEX-encoded instruction decoded as Vaddss
-        assert_eq!(mnemonic, Mnemonic::Vaddss, "VEX prefix should decode as Vaddss");
-        assert!(!is_integer_only(mnemonic), "Vaddss should not be integer-only");
+        assert_eq!(
+            mnemonic,
+            Mnemonic::Vaddss,
+            "VEX prefix should decode as Vaddss"
+        );
+        assert!(
+            !is_integer_only(mnemonic),
+            "Vaddss should not be integer-only"
+        );
     }
 
     #[test]
     fn test_format_register_r8_through_r15() {
         // Arrange: R8-R15 are the extended GP64 registers
         let extended_gp64 = [
-            Register::R8, Register::R9, Register::R10, Register::R11,
-            Register::R12, Register::R13, Register::R14, Register::R15,
+            Register::R8,
+            Register::R9,
+            Register::R10,
+            Register::R11,
+            Register::R12,
+            Register::R13,
+            Register::R14,
+            Register::R15,
         ];
 
         // Act & Assert: all extended registers are GP64 and format as lowercase
         for reg in &extended_gp64 {
             assert!(is_gp64(*reg), "{reg:?} should be GP64");
             let formatted = format_register(*reg);
-            assert_eq!(formatted, formatted.to_ascii_lowercase(),
-                "format_register({reg:?}) should be lowercase: {formatted}");
-            assert!(!formatted.is_empty(), "format_register({reg:?}) should not be empty");
+            assert_eq!(
+                formatted,
+                formatted.to_ascii_lowercase(),
+                "format_register({reg:?}) should be lowercase: {formatted}"
+            );
+            assert!(
+                !formatted.is_empty(),
+                "format_register({reg:?}) should not be empty"
+            );
         }
     }
 
@@ -3102,7 +3530,10 @@ mod tests {
         assert!(is_br, "Jmp should be a branch");
         assert!(has_br, "Jmp should have near branch operand");
         // Target = IP + 2 (instruction length) + 0xFD (signed -3) = 0x0FFF
-        assert!(target < 0x1000, "backward jmp target {target:#x} should be < IP 0x1000");
+        assert!(
+            target < 0x1000,
+            "backward jmp target {target:#x} should be < IP 0x1000"
+        );
     }
 
     #[test]
@@ -3119,7 +3550,10 @@ mod tests {
 
         // Assert: ret is neither a branch nor integer-only (it terminates analysis)
         assert_eq!(mnemonic, Mnemonic::Ret, "should decode as Ret");
-        assert!(!is_branch(mnemonic), "Ret should not be classified as branch");
+        assert!(
+            !is_branch(mnemonic),
+            "Ret should not be classified as branch"
+        );
         assert!(!is_integer_only(mnemonic), "Ret should not be integer-only");
     }
 
@@ -3143,7 +3577,10 @@ mod tests {
         assert!(is_xor, "Xorps should be recognized by is_xor_ps_pd");
         assert_eq!(operands.len(), 2, "xorps should have 2 operands");
         assert_eq!(operands[0], "xmm0", "first operand should be xmm0");
-        assert_eq!(operands[1], "xmm1", "second operand should be xmm1 (not memory)");
+        assert_eq!(
+            operands[1], "xmm1",
+            "second operand should be xmm1 (not memory)"
+        );
     }
 
     #[test]
@@ -3194,9 +3631,20 @@ mod tests {
         let operands = format_operands(&instr);
 
         // Assert: VEX mulss decoded correctly with 3-operand form
-        assert_eq!(mnemonic, Mnemonic::Vmulss, "VEX 0xC5 prefix should decode as Vmulss");
-        assert_eq!(operands.len(), 3, "vmulss should have 3 operands in VEX form");
-        assert!(!is_integer_only(mnemonic), "Vmulss should not be integer-only");
+        assert_eq!(
+            mnemonic,
+            Mnemonic::Vmulss,
+            "VEX 0xC5 prefix should decode as Vmulss"
+        );
+        assert_eq!(
+            operands.len(),
+            3,
+            "vmulss should have 3 operands in VEX form"
+        );
+        assert!(
+            !is_integer_only(mnemonic),
+            "Vmulss should not be integer-only"
+        );
         assert!(!is_float_mov(mnemonic), "Vmulss is not a float mov");
     }
 
@@ -3236,7 +3684,11 @@ mod tests {
 
         // Assert: iced-x86 decodes REP MOVSB as Mnemonic::Movsb with has_rep_prefix()=true
         // REP is tracked as a prefix, not merged into the mnemonic name.
-        assert_eq!(mnemonic, Mnemonic::Movsb, "should decode as Movsb (REP is a prefix)");
+        assert_eq!(
+            mnemonic,
+            Mnemonic::Movsb,
+            "should decode as Movsb (REP is a prefix)"
+        );
         assert!(has_rep, "rep movsb should have REP prefix flag set");
         // Movsb is not in is_integer_only() but is definitely not float-related:
         assert!(!is_float_load(mnemonic), "Movsb is not a float load");
@@ -3282,14 +3734,19 @@ mod tests {
         // Assert: high XMM registers accessible via VEX encoding
         assert_eq!(mnemonic, Mnemonic::Vaddss, "should decode as Vaddss");
         // Verify at least one operand uses a high XMM register (>= xmm8)
-        let has_high_xmm = operands.iter().any(|op| op.starts_with("xmm") && {
-            if let Ok(n) = op[3..].parse::<u32>() {
-                n >= 8
-            } else {
-                false
+        let has_high_xmm = operands.iter().any(|op| {
+            op.starts_with("xmm") && {
+                if let Ok(n) = op[3..].parse::<u32>() {
+                    n >= 8
+                } else {
+                    false
+                }
             }
         });
-        assert!(has_high_xmm, "VEX encoding should allow access to xmm8-15, got operands: {operands:?}");
+        assert!(
+            has_high_xmm,
+            "VEX encoding should allow access to xmm8-15, got operands: {operands:?}"
+        );
     }
 
     #[test]
@@ -3306,7 +3763,10 @@ mod tests {
 
         // Assert: ucomiss is not integer-only, not float-load, not float-mov, not xor
         assert_eq!(mnemonic, Mnemonic::Ucomiss, "should decode as Ucomiss");
-        assert!(!is_integer_only(mnemonic), "ucomiss is not integer-only (affects EFLAGS from float)");
+        assert!(
+            !is_integer_only(mnemonic),
+            "ucomiss is not integer-only (affects EFLAGS from float)"
+        );
         assert!(!is_float_load(mnemonic), "ucomiss is not a float load");
         assert!(!is_float_mov(mnemonic), "ucomiss is not a float mov");
         assert!(!is_xor_ps_pd(mnemonic), "ucomiss is not xor");
@@ -3332,7 +3792,10 @@ mod tests {
         assert!(has_mem, "cvtsi2ss xmm0, [rdi] should have memory operand");
         assert!(!is_integer_only(mnemonic), "cvtsi2ss produces float result");
         assert_eq!(operands[0], "xmm0", "destination should be xmm0");
-        assert!(operands[1].starts_with('['), "source should be memory operand");
+        assert!(
+            operands[1].starts_with('['),
+            "source should be memory operand"
+        );
     }
 
     #[test]
@@ -3354,7 +3817,10 @@ mod tests {
         assert_eq!(mnemonic, Mnemonic::Je, "should decode as Je");
         assert!(is_br, "Je should be a branch");
         assert!(has_br, "Je should have near branch operand");
-        assert!(target > 0x1000, "forward branch target {target:#x} should be > IP 0x1000");
+        assert!(
+            target > 0x1000,
+            "forward branch target {target:#x} should be > IP 0x1000"
+        );
     }
 
     #[test]
@@ -3374,8 +3840,14 @@ mod tests {
         // Assert: store to memory with displacement
         assert!(is_store, "movss [rsi+8], xmm0 should be a float store");
         assert!(has_dst_mem, "store destination should be memory");
-        assert!(mem_str.contains("rsi"), "memory operand should contain base register rsi: {mem_str}");
-        assert!(mem_str.starts_with('[') && mem_str.ends_with(']'), "memory format: [{mem_str}]");
+        assert!(
+            mem_str.contains("rsi"),
+            "memory operand should contain base register rsi: {mem_str}"
+        );
+        assert!(
+            mem_str.starts_with('[') && mem_str.ends_with(']'),
+            "memory format: [{mem_str}]"
+        );
     }
 
     #[test]
@@ -3394,7 +3866,10 @@ mod tests {
         assert_eq!(mnemonic, Mnemonic::Vmovsd, "should decode as Vmovsd");
         assert!(is_float_load(mnemonic), "Vmovsd should be a float load");
         assert!(is_float_mov(mnemonic), "Vmovsd should be a float mov");
-        assert!(!is_integer_only(mnemonic), "Vmovsd should not be integer-only");
+        assert!(
+            !is_integer_only(mnemonic),
+            "Vmovsd should not be integer-only"
+        );
         assert!(!is_xor_ps_pd(mnemonic), "Vmovsd should not be xor_ps/pd");
     }
 
@@ -3423,10 +3898,7 @@ mod tests {
         match result {
             Ok(Some(analysis)) => {
                 let pattern = &analysis.pattern;
-                eprintln!(
-                    "[QGEMM-PATTERN] structured analysis result: {:?}",
-                    pattern
-                );
+                eprintln!("[QGEMM-PATTERN] structured analysis result: {:?}", pattern);
                 if !matches!(pattern, ComputePattern::Gemm) {
                     eprintln!(
                         "[QGEMM-PATTERN] MISCLASSIFIED: expected Gemm, got {:?}",
@@ -3440,9 +3912,7 @@ mod tests {
                 );
             }
             Err(error) => {
-                eprintln!(
-                    "[QGEMM-PATTERN] structured analysis failed: {error}"
-                );
+                eprintln!("[QGEMM-PATTERN] structured analysis failed: {error}");
             }
         }
     }

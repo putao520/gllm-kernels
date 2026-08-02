@@ -12,8 +12,6 @@
 //! - `x86_lower/callframe.inc.rs`       — SymbolicSaveFrame + CallFrame
 //! - `x86_lower/tests.inc.rs`           — 测试模块
 
-use std::collections::{HashMap, HashSet};
-use iced_x86::code_asm::*;
 use super::instr::*;
 use super::isa_profile::*;
 use super::reg_alloc::RegAllocation;
@@ -22,6 +20,8 @@ use crate::compiler::trace::DTypeKind;
 use crate::compiler::trace::QuantPrecision;
 use crate::compiler::trace::X86ElemStrategy;
 use crate::types::CompilerError;
+use iced_x86::code_asm::*;
+use std::collections::{HashMap, HashSet};
 
 /// Scratch GPR slot 分配状态——追踪哪些 slot 正在使用。
 #[derive(Debug)]
@@ -31,11 +31,16 @@ pub(crate) struct ScratchSlotState {
 
 impl ScratchSlotState {
     pub fn new(num_slots: usize) -> Self {
-        Self { in_use: vec![false; num_slots] }
+        Self {
+            in_use: vec![false; num_slots],
+        }
     }
     pub fn alloc(&mut self) -> Option<usize> {
         for (i, used) in self.in_use.iter_mut().enumerate() {
-            if !*used { *used = true; return Some(i); }
+            if !*used {
+                *used = true;
+                return Some(i);
+            }
         }
         None
     }
@@ -147,7 +152,10 @@ enum SpillSafeRecipe {
     /// VReg = *(rbp + base_offset) + const_offset — load base from immutable slot, add offset.
     /// Used for LoadPtr { src: VRegPlusConst(base, off) } where base is StackArg-derived,
     /// and for AddPtr { base, offset } where base is StackArg-derived.
-    StackLoadPlusConst { rbp_offset: i32, const_offset: usize },
+    StackLoadPlusConst {
+        rbp_offset: i32,
+        const_offset: usize,
+    },
 }
 
 include!("x86_lower/helpers.inc.rs");

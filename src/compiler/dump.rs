@@ -38,11 +38,23 @@ pub fn graph_to_dot(
 
     // Topology annotation as graph-level comment
     if let Some(topo) = topology {
-        s.push_str(&format!("  // topology: loop_topology={:?}\n", topo.loop_topology));
-        s.push_str(&format!("  // topology: kv_cache_source={:?}\n", topo.kv_cache_source));
+        s.push_str(&format!(
+            "  // topology: loop_topology={:?}\n",
+            topo.loop_topology
+        ));
+        s.push_str(&format!(
+            "  // topology: kv_cache_source={:?}\n",
+            topo.kv_cache_source
+        ));
         s.push_str(&format!("  // topology: sg_ops={:?}\n", topo.sg_ops));
-        s.push_str(&format!("  // topology: weight_source={:?}\n", topo.weight_source));
-        s.push_str(&format!("  // topology: has_qk_norm={}\n", topo.has_qk_norm));
+        s.push_str(&format!(
+            "  // topology: weight_source={:?}\n",
+            topo.weight_source
+        ));
+        s.push_str(&format!(
+            "  // topology: has_qk_norm={}\n",
+            topo.has_qk_norm
+        ));
         if let Some(vs) = topo.vocab_size {
             s.push_str(&format!("  // topology: vocab_size={}\n", vs));
         }
@@ -69,7 +81,10 @@ pub fn graph_to_dot(
 
         // Color by category
         let color = op_category_color(&op.op);
-        s.push_str(&format!("  op{} [label=\"{}\", fillcolor=\"{}\"];\n", op.id.0, label, color));
+        s.push_str(&format!(
+            "  op{} [label=\"{}\", fillcolor=\"{}\"];\n",
+            op.id.0, label, color
+        ));
     }
 
     s.push('\n');
@@ -117,12 +132,30 @@ pub fn graph_to_json(
     // Topology
     if let Some(topo) = topology {
         s.push_str("  \"topology\": {\n");
-        s.push_str(&format!("    \"loop_topology\": \"{}\",\n", format!("{:?}", topo.loop_topology)));
-        s.push_str(&format!("    \"outer_loop_bound\": \"{}\",\n", format!("{:?}", topo.outer_loop_bound)));
-        s.push_str(&format!("    \"seq_len_source\": \"{}\",\n", format!("{:?}", topo.seq_len_source)));
-        s.push_str(&format!("    \"kv_cache_source\": \"{}\",\n", format!("{:?}", topo.kv_cache_source)));
-        s.push_str(&format!("    \"sg_ops\": \"{}\",\n", format!("{:?}", topo.sg_ops)));
-        s.push_str(&format!("    \"weight_source\": \"{}\",\n", format!("{:?}", topo.weight_source)));
+        s.push_str(&format!(
+            "    \"loop_topology\": \"{}\",\n",
+            format!("{:?}", topo.loop_topology)
+        ));
+        s.push_str(&format!(
+            "    \"outer_loop_bound\": \"{}\",\n",
+            format!("{:?}", topo.outer_loop_bound)
+        ));
+        s.push_str(&format!(
+            "    \"seq_len_source\": \"{}\",\n",
+            format!("{:?}", topo.seq_len_source)
+        ));
+        s.push_str(&format!(
+            "    \"kv_cache_source\": \"{}\",\n",
+            format!("{:?}", topo.kv_cache_source)
+        ));
+        s.push_str(&format!(
+            "    \"sg_ops\": \"{}\",\n",
+            format!("{:?}", topo.sg_ops)
+        ));
+        s.push_str(&format!(
+            "    \"weight_source\": \"{}\",\n",
+            format!("{:?}", topo.weight_source)
+        ));
         s.push_str(&format!("    \"has_qk_norm\": {},\n", topo.has_qk_norm));
         if let Some(vs) = topo.vocab_size {
             s.push_str(&format!("    \"vocab_size\": {},\n", vs));
@@ -140,14 +173,25 @@ pub fn graph_to_json(
         s.push_str("    {\n");
         s.push_str(&format!("      \"id\": {},\n", op.id.0));
         s.push_str(&format!("      \"label\": {},\n", json_str(&op.label)));
-        s.push_str(&format!("      \"op\": {},\n", json_str(&op_variant_name(&op.op))));
-        s.push_str(&format!("      \"category\": {},\n", json_str(op.op.category())));
-        s.push_str(&format!("      \"guard\": {},\n", json_str(&guard_label(&op.guard).unwrap_or_else(|| "Always".to_string()))));
+        s.push_str(&format!(
+            "      \"op\": {},\n",
+            json_str(&op_variant_name(&op.op))
+        ));
+        s.push_str(&format!(
+            "      \"category\": {},\n",
+            json_str(op.op.category())
+        ));
+        s.push_str(&format!(
+            "      \"guard\": {},\n",
+            json_str(&guard_label(&op.guard).unwrap_or_else(|| "Always".to_string()))
+        ));
 
         // Inputs
         s.push_str("      \"inputs\": [");
         for (j, &tid) in op.inputs.iter().enumerate() {
-            if j > 0 { s.push_str(", "); }
+            if j > 0 {
+                s.push_str(", ");
+            }
             s.push_str(&format!("{}", tid.0));
         }
         s.push_str("],\n");
@@ -155,7 +199,9 @@ pub fn graph_to_json(
         // Outputs
         s.push_str("      \"outputs\": [");
         for (j, &tid) in op.outputs.iter().enumerate() {
-            if j > 0 { s.push_str(", "); }
+            if j > 0 {
+                s.push_str(", ");
+            }
             s.push_str(&format!("{}", tid.0));
         }
         s.push_str("],\n");
@@ -163,7 +209,10 @@ pub fn graph_to_json(
         // ComputePattern annotation
         if i < op_traces.len() {
             if let Some(ref trace) = op_traces[i] {
-                s.push_str(&format!("      \"compute_pattern\": {},\n", json_str(&compute_pattern_brief(&trace.pattern))));
+                s.push_str(&format!(
+                    "      \"compute_pattern\": {},\n",
+                    json_str(&compute_pattern_brief(&trace.pattern))
+                ));
             } else {
                 s.push_str("      \"compute_pattern\": null,\n");
             }
@@ -172,9 +221,16 @@ pub fn graph_to_json(
         }
 
         // Op details from Debug format (abbreviated)
-        s.push_str(&format!("      \"op_detail\": {}\n", json_str(&format!("{:?}", op.op))));
+        s.push_str(&format!(
+            "      \"op_detail\": {}\n",
+            json_str(&format!("{:?}", op.op))
+        ));
 
-        s.push_str(if i + 1 < graph.ops.len() { "    },\n" } else { "    }\n" });
+        s.push_str(if i + 1 < graph.ops.len() {
+            "    },\n"
+        } else {
+            "    }\n"
+        });
     }
     s.push_str("  ],\n");
 
@@ -184,8 +240,14 @@ pub fn graph_to_json(
         s.push_str("    {\n");
         s.push_str(&format!("      \"id\": {},\n", tensor.id.0));
         s.push_str(&format!("      \"name\": {},\n", json_str(&tensor.name)));
-        s.push_str(&format!("      \"dtype\": {},\n", json_str(&format!("{:?}", tensor.dtype))));
-        s.push_str(&format!("      \"shape\": {},\n", json_str(&symdim_vec_to_string(&tensor.shape))));
+        s.push_str(&format!(
+            "      \"dtype\": {},\n",
+            json_str(&format!("{:?}", tensor.dtype))
+        ));
+        s.push_str(&format!(
+            "      \"shape\": {},\n",
+            json_str(&symdim_vec_to_string(&tensor.shape))
+        ));
 
         if let Some(pid) = tensor.producer {
             s.push_str(&format!("      \"producer\": {},\n", pid.0));
@@ -195,26 +257,36 @@ pub fn graph_to_json(
 
         s.push_str("      \"consumers\": [");
         for (j, &cid) in tensor.consumers.iter().enumerate() {
-            if j > 0 { s.push_str(", "); }
+            if j > 0 {
+                s.push_str(", ");
+            }
             s.push_str(&format!("{}", cid.0));
         }
         s.push_str("]\n");
 
-        s.push_str(if i + 1 < graph.tensors.len() { "    },\n" } else { "    }\n" });
+        s.push_str(if i + 1 < graph.tensors.len() {
+            "    },\n"
+        } else {
+            "    }\n"
+        });
     }
     s.push_str("  ],\n");
 
     // Graph inputs/outputs
     s.push_str("  \"graph_inputs\": [");
     for (j, &tid) in graph.inputs.iter().enumerate() {
-        if j > 0 { s.push_str(", "); }
+        if j > 0 {
+            s.push_str(", ");
+        }
         s.push_str(&format!("{}", tid.0));
     }
     s.push_str("],\n");
 
     s.push_str("  \"graph_outputs\": [");
     for (j, &tid) in graph.outputs.iter().enumerate() {
-        if j > 0 { s.push_str(", "); }
+        if j > 0 {
+            s.push_str(", ");
+        }
         s.push_str(&format!("{}", tid.0));
     }
     s.push_str("]\n");
@@ -253,17 +325,33 @@ pub fn trace_ssa_to_json(ctx: &TraceDumpContext) -> String {
         s.push_str("    {\n");
         s.push_str(&format!("      \"op_id\": {},\n", op.id.0));
         s.push_str(&format!("      \"label\": {},\n", json_str(&op.label)));
-        s.push_str(&format!("      \"source_op\": {},\n", json_str(&op_variant_name(&op.op))));
+        s.push_str(&format!(
+            "      \"source_op\": {},\n",
+            json_str(&op_variant_name(&op.op))
+        ));
 
         // Input tensor dtype/shape
         s.push_str("      \"input_tensors\": [\n");
         for (j, &tid) in op.inputs.iter().enumerate() {
             if let Some(tensor) = ctx.graph.tensor(tid) {
                 s.push_str("        {\n");
-                s.push_str(&format!("          \"name\": {},\n", json_str(&tensor.name)));
-                s.push_str(&format!("          \"dtype\": {},\n", json_str(&format!("{:?}", tensor.dtype))));
-                s.push_str(&format!("          \"shape\": {}\n", json_str(&symdim_vec_to_string(&tensor.shape))));
-                s.push_str(if j + 1 < op.inputs.len() { "        },\n" } else { "        }\n" });
+                s.push_str(&format!(
+                    "          \"name\": {},\n",
+                    json_str(&tensor.name)
+                ));
+                s.push_str(&format!(
+                    "          \"dtype\": {},\n",
+                    json_str(&format!("{:?}", tensor.dtype))
+                ));
+                s.push_str(&format!(
+                    "          \"shape\": {}\n",
+                    json_str(&symdim_vec_to_string(&tensor.shape))
+                ));
+                s.push_str(if j + 1 < op.inputs.len() {
+                    "        },\n"
+                } else {
+                    "        }\n"
+                });
             }
         }
         s.push_str("      ],\n");
@@ -273,10 +361,23 @@ pub fn trace_ssa_to_json(ctx: &TraceDumpContext) -> String {
         for (j, &tid) in op.outputs.iter().enumerate() {
             if let Some(tensor) = ctx.graph.tensor(tid) {
                 s.push_str("        {\n");
-                s.push_str(&format!("          \"name\": {},\n", json_str(&tensor.name)));
-                s.push_str(&format!("          \"dtype\": {},\n", json_str(&format!("{:?}", tensor.dtype))));
-                s.push_str(&format!("          \"shape\": {}\n", json_str(&symdim_vec_to_string(&tensor.shape))));
-                s.push_str(if j + 1 < op.outputs.len() { "        },\n" } else { "        }\n" });
+                s.push_str(&format!(
+                    "          \"name\": {},\n",
+                    json_str(&tensor.name)
+                ));
+                s.push_str(&format!(
+                    "          \"dtype\": {},\n",
+                    json_str(&format!("{:?}", tensor.dtype))
+                ));
+                s.push_str(&format!(
+                    "          \"shape\": {}\n",
+                    json_str(&symdim_vec_to_string(&tensor.shape))
+                ));
+                s.push_str(if j + 1 < op.outputs.len() {
+                    "        },\n"
+                } else {
+                    "        }\n"
+                });
             }
         }
         s.push_str("      ],\n");
@@ -284,7 +385,10 @@ pub fn trace_ssa_to_json(ctx: &TraceDumpContext) -> String {
         // TraceOp SSA
         if i < ctx.op_traces.len() {
             if let Some(ref trace) = ctx.op_traces[i] {
-                s.push_str(&format!("      \"compute_pattern\": {},\n", json_str(&compute_pattern_brief(&trace.pattern))));
+                s.push_str(&format!(
+                    "      \"compute_pattern\": {},\n",
+                    json_str(&compute_pattern_brief(&trace.pattern))
+                ));
                 s.push_str("      \"trace_ops\": [\n");
                 let body_ops = trace_ops_for_pattern(&trace.pattern);
                 for (j, top) in body_ops.iter().enumerate() {
@@ -318,7 +422,11 @@ pub fn trace_ssa_to_json(ctx: &TraceDumpContext) -> String {
             s.push_str("      \"ssa_registers\": []\n");
         }
 
-        s.push_str(if i + 1 < ctx.graph.ops.len() { "    },\n" } else { "    }\n" });
+        s.push_str(if i + 1 < ctx.graph.ops.len() {
+            "    },\n"
+        } else {
+            "    }\n"
+        });
     }
     s.push_str("  ]\n");
     s.push_str("}\n");
@@ -333,28 +441,46 @@ pub fn trace_ssa_to_text(ctx: &TraceDumpContext) -> String {
     s.push('\n');
 
     for (i, op) in ctx.graph.ops.iter().enumerate() {
-        s.push_str(&format!("\n[{}] {} ({})\n", op.id.0, op.label, op_variant_name(&op.op)));
+        s.push_str(&format!(
+            "\n[{}] {} ({})\n",
+            op.id.0,
+            op.label,
+            op_variant_name(&op.op)
+        ));
 
         // Input tensors
         for (j, &tid) in op.inputs.iter().enumerate() {
             if let Some(tensor) = ctx.graph.tensor(tid) {
-                s.push_str(&format!("  in[{}]: {} [{:?}] shape={}\n",
-                    j, tensor.name, tensor.dtype, symdim_vec_to_string(&tensor.shape)));
+                s.push_str(&format!(
+                    "  in[{}]: {} [{:?}] shape={}\n",
+                    j,
+                    tensor.name,
+                    tensor.dtype,
+                    symdim_vec_to_string(&tensor.shape)
+                ));
             }
         }
 
         // Output tensors
         for (j, &tid) in op.outputs.iter().enumerate() {
             if let Some(tensor) = ctx.graph.tensor(tid) {
-                s.push_str(&format!("  out[{}]: {} [{:?}] shape={}\n",
-                    j, tensor.name, tensor.dtype, symdim_vec_to_string(&tensor.shape)));
+                s.push_str(&format!(
+                    "  out[{}]: {} [{:?}] shape={}\n",
+                    j,
+                    tensor.name,
+                    tensor.dtype,
+                    symdim_vec_to_string(&tensor.shape)
+                ));
             }
         }
 
         // Trace
         if i < ctx.op_traces.len() {
             if let Some(ref trace) = ctx.op_traces[i] {
-                s.push_str(&format!("  ComputePattern: {}\n", compute_pattern_brief(&trace.pattern)));
+                s.push_str(&format!(
+                    "  ComputePattern: {}\n",
+                    compute_pattern_brief(&trace.pattern)
+                ));
                 let body_ops = trace_ops_for_pattern(&trace.pattern);
                 if !body_ops.is_empty() {
                     s.push_str("  TraceOps:\n");
@@ -405,8 +531,16 @@ pub fn vminstr_to_json(ctx: &VmInstrDumpContext) -> String {
     // ABI bindings
     s.push_str("  \"abi_bindings\": [\n");
     for (i, (vreg, name)) in ctx.abi_bindings.iter().enumerate() {
-        s.push_str(&format!("    {{\"vreg\": {}, \"name\": {}}}", vreg.0, json_str(name)));
-        if i + 1 < ctx.abi_bindings.len() { s.push_str(",\n"); } else { s.push('\n'); }
+        s.push_str(&format!(
+            "    {{\"vreg\": {}, \"name\": {}}}",
+            vreg.0,
+            json_str(name)
+        ));
+        if i + 1 < ctx.abi_bindings.len() {
+            s.push_str(",\n");
+        } else {
+            s.push('\n');
+        }
     }
     s.push_str("  ],\n");
 
@@ -418,15 +552,29 @@ pub fn vminstr_to_json(ctx: &VmInstrDumpContext) -> String {
         s.push_str("    \"mapping\": [\n");
         let mapping: Vec<_> = alloc.mapping.iter().collect();
         for (i, (vreg, phys)) in mapping.iter().enumerate() {
-            s.push_str(&format!("      {{\"vreg\": {}, \"phys\": {}}}", vreg.0, json_str(&format!("{:?}", phys))));
-            if i + 1 < mapping.len() { s.push_str(",\n"); } else { s.push('\n'); }
+            s.push_str(&format!(
+                "      {{\"vreg\": {}, \"phys\": {}}}",
+                vreg.0,
+                json_str(&format!("{:?}", phys))
+            ));
+            if i + 1 < mapping.len() {
+                s.push_str(",\n");
+            } else {
+                s.push('\n');
+            }
         }
         s.push_str("    ],\n");
         s.push_str("    \"spills\": [\n");
         for (i, slot) in alloc.spills.iter().enumerate() {
-            s.push_str(&format!("      {{\"vreg\": {}, \"offset\": {}, \"size\": {}}}",
-                slot.vreg.0, slot.offset, slot.size));
-            if i + 1 < alloc.spills.len() { s.push_str(",\n"); } else { s.push('\n'); }
+            s.push_str(&format!(
+                "      {{\"vreg\": {}, \"offset\": {}, \"size\": {}}}",
+                slot.vreg.0, slot.offset, slot.size
+            ));
+            if i + 1 < alloc.spills.len() {
+                s.push_str(",\n");
+            } else {
+                s.push('\n');
+            }
         }
         s.push_str("    ]\n");
         s.push_str("  },\n");
@@ -436,8 +584,16 @@ pub fn vminstr_to_json(ctx: &VmInstrDumpContext) -> String {
     if !ctx.trace_mapping.is_empty() {
         s.push_str("  \"trace_mapping\": [\n");
         for (i, (instr_idx, desc)) in ctx.trace_mapping.iter().enumerate() {
-            s.push_str(&format!("    {{\"instr_idx\": {}, \"source\": {}}}", instr_idx, json_str(desc)));
-            if i + 1 < ctx.trace_mapping.len() { s.push_str(",\n"); } else { s.push('\n'); }
+            s.push_str(&format!(
+                "    {{\"instr_idx\": {}, \"source\": {}}}",
+                instr_idx,
+                json_str(desc)
+            ));
+            if i + 1 < ctx.trace_mapping.len() {
+                s.push_str(",\n");
+            } else {
+                s.push('\n');
+            }
         }
         s.push_str("  ],\n");
     }
@@ -453,11 +609,21 @@ pub fn vminstr_to_json(ctx: &VmInstrDumpContext) -> String {
 
         s.push_str("    {\n");
         s.push_str(&format!("      \"idx\": {},\n", i));
-        s.push_str(&format!("      \"name\": {},\n", json_str(&vminstr_name(instr))));
+        s.push_str(&format!(
+            "      \"name\": {},\n",
+            json_str(&vminstr_name(instr))
+        ));
         s.push_str(&format!("      \"loop_depth\": {},\n", loop_depth));
-        s.push_str(&format!("      \"detail\": {}\n", json_str(&format!("{:?}", instr))));
+        s.push_str(&format!(
+            "      \"detail\": {}\n",
+            json_str(&format!("{:?}", instr))
+        ));
 
-        s.push_str(if i + 1 < ctx.instrs.len() { "    },\n" } else { "    }\n" });
+        s.push_str(if i + 1 < ctx.instrs.len() {
+            "    },\n"
+        } else {
+            "    }\n"
+        });
 
         if matches!(instr, VmInstr::LoopEnd) {
             loop_depth = loop_depth.saturating_sub(1);
@@ -471,7 +637,10 @@ pub fn vminstr_to_json(ctx: &VmInstrDumpContext) -> String {
 /// Dump the VmInstr sequence in human-readable text format.
 pub fn vminstr_to_text(ctx: &VmInstrDumpContext) -> String {
     let mut s = String::with_capacity(16384);
-    s.push_str(&format!("VmInstr Sequence Dump: {} instructions\n", ctx.instrs.len()));
+    s.push_str(&format!(
+        "VmInstr Sequence Dump: {} instructions\n",
+        ctx.instrs.len()
+    ));
     s.push_str(&"=".repeat(60));
     s.push('\n');
 
@@ -485,13 +654,18 @@ pub fn vminstr_to_text(ctx: &VmInstrDumpContext) -> String {
 
     // Register allocation summary
     if let Some(alloc) = ctx.reg_alloc {
-        s.push_str(&format!("\nRegister Allocation: {} vregs, {} spills\n",
-            alloc.num_vregs(), alloc.spills.len()));
+        s.push_str(&format!(
+            "\nRegister Allocation: {} vregs, {} spills\n",
+            alloc.num_vregs(),
+            alloc.spills.len()
+        ));
         if !alloc.spills.is_empty() {
             s.push_str("Spills:\n");
             for slot in &alloc.spills {
-                s.push_str(&format!("  v{} -> offset={} size={}\n",
-                    slot.vreg.0, slot.offset, slot.size));
+                s.push_str(&format!(
+                    "  v{} -> offset={} size={}\n",
+                    slot.vreg.0, slot.offset, slot.size
+                ));
             }
         }
     }
@@ -508,7 +682,10 @@ pub fn vminstr_to_text(ctx: &VmInstrDumpContext) -> String {
         let indent = "  ".repeat(loop_depth as usize);
         let name = vminstr_name(instr);
         let reg_info = vminstr_reg_summary(instr);
-        s.push_str(&format!("[{:>4}] {:>2} | {}{} {}\n", i, loop_depth, indent, name, reg_info));
+        s.push_str(&format!(
+            "[{:>4}] {:>2} | {}{} {}\n",
+            i, loop_depth, indent, name, reg_info
+        ));
 
         // Trace mapping
         if let Some((_, desc)) = ctx.trace_mapping.iter().find(|(idx, _)| *idx == i) {
@@ -529,9 +706,12 @@ pub fn vminstr_to_text(ctx: &VmInstrDumpContext) -> String {
 /// Extract the Op variant name from Debug format.
 fn op_variant_name(op: &Op) -> String {
     let debug = format!("{:?}", op);
-    debug.split('(').next()
+    debug
+        .split('(')
+        .next()
         .unwrap_or(&debug)
-        .split('{').next()
+        .split('{')
+        .next()
         .unwrap_or(&debug)
         .to_string()
 }
@@ -541,13 +721,17 @@ fn compute_pattern_brief(pattern: &ComputePattern) -> String {
     match pattern {
         ComputePattern::Elementwise { .. } => "Elementwise".to_string(),
         ComputePattern::BinaryElementwise { .. } => "BinaryElementwise".to_string(),
-        ComputePattern::Injective { num_inputs, num_outputs, .. } =>
-            format!("Injective(inputs={}, outputs={})", num_inputs, num_outputs),
+        ComputePattern::Injective {
+            num_inputs,
+            num_outputs,
+            ..
+        } => format!("Injective(inputs={}, outputs={})", num_inputs, num_outputs),
         ComputePattern::Reduction { .. } => "Reduction".to_string(),
         ComputePattern::NormLike { .. } => "NormLike".to_string(),
         ComputePattern::Gemm => "Gemm".to_string(),
-        ComputePattern::QuantDecode { block_size, .. } =>
-            format!("QuantDecode(block_size={})", block_size),
+        ComputePattern::QuantDecode { block_size, .. } => {
+            format!("QuantDecode(block_size={})", block_size)
+        }
     }
 }
 
@@ -609,7 +793,9 @@ fn guard_label(guard: &crate::compiler::graph::LayerCondition) -> Option<String>
         LayerCondition::LayerIdxLt(threshold) => Some(format!("layer_idx<{}", threshold)),
         LayerCondition::LayerIdxGe(threshold) => Some(format!("layer_idx>={}", threshold)),
         LayerCondition::LayerInGroup(bitset) => Some(format!("layer_in_group=0x{:016x}", bitset)),
-        LayerCondition::LayerNotInGroup(bitset) => Some(format!("layer_not_in_group=0x{:016x}", bitset)),
+        LayerCondition::LayerNotInGroup(bitset) => {
+            Some(format!("layer_not_in_group=0x{:016x}", bitset))
+        }
     }
 }
 
@@ -632,24 +818,28 @@ fn op_category_color(op: &Op) -> &'static str {
 /// Format SymDim vector to human-readable string.
 fn symdim_vec_to_string(shape: &[crate::compiler::graph::SymDim]) -> String {
     use crate::compiler::graph::SymDim;
-    let parts: Vec<String> = shape.iter().map(|d| match d {
-        SymDim::Concrete(v) => format!("{}", v),
-        SymDim::Symbolic { name, max_value } => {
-            match max_value {
+    let parts: Vec<String> = shape
+        .iter()
+        .map(|d| match d {
+            SymDim::Concrete(v) => format!("{}", v),
+            SymDim::Symbolic { name, max_value } => match max_value {
                 Some(mv) => format!("{}(max={})", name, mv),
                 None => name.clone(),
-            }
-        }
-    }).collect();
+            },
+        })
+        .collect();
     format!("[{}]", parts.join(", "))
 }
 
 /// Get the VmInstr variant name from Debug format.
 fn vminstr_name(instr: &VmInstr) -> String {
     let debug = format!("{:?}", instr);
-    debug.split('{').next()
+    debug
+        .split('{')
+        .next()
         .unwrap_or(&debug)
-        .split('(').next()
+        .split('(')
+        .next()
         .unwrap_or(&debug)
         .to_string()
 }
@@ -711,7 +901,10 @@ mod tests {
         let op_traces: Vec<Option<OpTrace>> = vec![];
         let dot = graph_to_dot(&graph, &op_traces, None);
 
-        assert!(dot.starts_with("digraph CompilerGraph"), "DOT must start with digraph");
+        assert!(
+            dot.starts_with("digraph CompilerGraph"),
+            "DOT must start with digraph"
+        );
         assert!(dot.contains("}"), "DOT must end with closing brace");
         assert!(dot.contains("op0"), "DOT must contain op nodes");
         assert!(dot.contains("->"), "DOT must contain edges");
@@ -727,8 +920,14 @@ mod tests {
         let op_traces: Vec<Option<OpTrace>> = vec![];
         let dot = graph_to_dot(&graph, &op_traces, Some(&topo));
 
-        assert!(dot.contains("loop_topology"), "DOT must contain loop_topology");
-        assert!(dot.contains("kv_cache_source"), "DOT must contain kv_cache_source");
+        assert!(
+            dot.contains("loop_topology"),
+            "DOT must contain loop_topology"
+        );
+        assert!(
+            dot.contains("kv_cache_source"),
+            "DOT must contain kv_cache_source"
+        );
     }
 
     // @trace TEST-DUMP-001 [entity:CompilerGraph] test_graph_json_basic
@@ -744,7 +943,10 @@ mod tests {
         assert!(json.ends_with("}\n"), "JSON must end with }}\\n");
         assert!(json.contains("\"ops\":"), "JSON must contain ops");
         assert!(json.contains("\"tensors\":"), "JSON must contain tensors");
-        assert!(json.contains("\"op\":"), "JSON must contain op variant name");
+        assert!(
+            json.contains("\"op\":"),
+            "JSON must contain op variant name"
+        );
         assert!(json.contains("\"category\":"), "JSON must contain category");
     }
 
@@ -759,7 +961,10 @@ mod tests {
         let json = graph_to_json(&graph, &op_traces, Some(&topo));
 
         assert!(json.contains("\"topology\":"), "JSON must contain topology");
-        assert!(json.contains("\"compute_pattern\":"), "JSON must contain compute_pattern");
+        assert!(
+            json.contains("\"compute_pattern\":"),
+            "JSON must contain compute_pattern"
+        );
     }
 
     // @trace TEST-DUMP-002 [entity:TraceOp] test_trace_ssa_json
@@ -769,15 +974,33 @@ mod tests {
     fn test_trace_ssa_json() {
         let graph = build_test_graph();
         let op_traces: Vec<Option<OpTrace>> = vec![None];
-        let ctx = TraceDumpContext { graph: &graph, op_traces: &op_traces };
+        let ctx = TraceDumpContext {
+            graph: &graph,
+            op_traces: &op_traces,
+        };
         let json = trace_ssa_to_json(&ctx);
 
         assert!(json.starts_with("{"), "JSON must start with {{");
-        assert!(json.contains("\"source_op\":"), "JSON must contain source_op mapping");
-        assert!(json.contains("\"compute_pattern\":"), "JSON must contain compute_pattern");
-        assert!(json.contains("\"input_tensors\":"), "JSON must contain input_tensors");
-        assert!(json.contains("\"output_tensors\":"), "JSON must contain output_tensors");
-        assert!(json.contains("\"ssa_registers\":"), "JSON must contain ssa_registers");
+        assert!(
+            json.contains("\"source_op\":"),
+            "JSON must contain source_op mapping"
+        );
+        assert!(
+            json.contains("\"compute_pattern\":"),
+            "JSON must contain compute_pattern"
+        );
+        assert!(
+            json.contains("\"input_tensors\":"),
+            "JSON must contain input_tensors"
+        );
+        assert!(
+            json.contains("\"output_tensors\":"),
+            "JSON must contain output_tensors"
+        );
+        assert!(
+            json.contains("\"ssa_registers\":"),
+            "JSON must contain ssa_registers"
+        );
     }
 
     // @trace TEST-DUMP-002 [entity:TraceOp] test_trace_ssa_text
@@ -787,10 +1010,16 @@ mod tests {
     fn test_trace_ssa_text() {
         let graph = build_test_graph();
         let op_traces: Vec<Option<OpTrace>> = vec![None];
-        let ctx = TraceDumpContext { graph: &graph, op_traces: &op_traces };
+        let ctx = TraceDumpContext {
+            graph: &graph,
+            op_traces: &op_traces,
+        };
         let text = trace_ssa_to_text(&ctx);
 
-        assert!(text.contains("TraceOp SSA Dump"), "Text must contain header");
+        assert!(
+            text.contains("TraceOp SSA Dump"),
+            "Text must contain header"
+        );
     }
 
     // @trace TEST-DUMP-003 [entity:VmInstr] test_vminstr_json
@@ -811,10 +1040,22 @@ mod tests {
         let json = vminstr_to_json(&ctx);
 
         assert!(json.starts_with("{"), "JSON must start with {{");
-        assert!(json.contains("\"num_instrs\":"), "JSON must contain num_instrs");
-        assert!(json.contains("\"instrs\":"), "JSON must contain instrs array");
-        assert!(json.contains("\"loop_depth\":"), "JSON must contain loop_depth");
-        assert!(json.contains("\"reg_alloc\":"), "JSON must contain reg_alloc");
+        assert!(
+            json.contains("\"num_instrs\":"),
+            "JSON must contain num_instrs"
+        );
+        assert!(
+            json.contains("\"instrs\":"),
+            "JSON must contain instrs array"
+        );
+        assert!(
+            json.contains("\"loop_depth\":"),
+            "JSON must contain loop_depth"
+        );
+        assert!(
+            json.contains("\"reg_alloc\":"),
+            "JSON must contain reg_alloc"
+        );
     }
 
     // @trace TEST-DUMP-003 [entity:VmInstr] test_vminstr_text
@@ -823,10 +1064,8 @@ mod tests {
     #[test]
     fn test_vminstr_text() {
         let prog = build_test_vm_program();
-        let abi_bindings: [(VRegId, &str); 2] = [
-            (VRegId(0), "input_ptr"),
-            (VRegId(1), "weight_ptr"),
-        ];
+        let abi_bindings: [(VRegId, &str); 2] =
+            [(VRegId(0), "input_ptr"), (VRegId(1), "weight_ptr")];
         let trace_mapping: [(usize, String); 0] = [];
         let ctx = VmInstrDumpContext {
             instrs: &prog,
@@ -836,11 +1075,20 @@ mod tests {
         };
         let text = vminstr_to_text(&ctx);
 
-        assert!(text.contains("VmInstr Sequence Dump"), "Text must contain header");
+        assert!(
+            text.contains("VmInstr Sequence Dump"),
+            "Text must contain header"
+        );
         assert!(text.contains("ABI Bindings"), "Text must show ABI bindings");
-        assert!(text.contains("LOOP BEGIN"), "Text must show loop boundaries");
+        assert!(
+            text.contains("LOOP BEGIN"),
+            "Text must show loop boundaries"
+        );
         assert!(text.contains("LOOP END"), "Text must show loop boundaries");
-        assert!(text.contains("input_ptr"), "Text must show ABI parameter names");
+        assert!(
+            text.contains("input_ptr"),
+            "Text must show ABI parameter names"
+        );
     }
 
     // @trace TEST-DUMP-003 [entity:VmInstr] test_vminstr_json_with_trace_mapping
@@ -862,8 +1110,14 @@ mod tests {
         };
         let json = vminstr_to_json(&ctx);
 
-        assert!(json.contains("\"trace_mapping\":"), "JSON must contain trace_mapping");
-        assert!(json.contains("TraceOp::Input(0)"), "JSON must contain trace mapping detail");
+        assert!(
+            json.contains("\"trace_mapping\":"),
+            "JSON must contain trace_mapping"
+        );
+        assert!(
+            json.contains("TraceOp::Input(0)"),
+            "JSON must contain trace mapping detail"
+        );
     }
 
     // @trace TEST-DUMP-001 [entity:CompilerGraph] test_json_str_escaping
@@ -881,14 +1135,20 @@ mod tests {
     // ── Test fixtures ──
 
     fn build_test_graph() -> CompilerGraph {
-        use crate::compiler::graph::{SymDim, NormSpec};
+        use crate::compiler::graph::{NormSpec, SymDim};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
 
         let input_tid = graph.add_tensor(
             "input",
-            vec![SymDim::Symbolic { name: "seq_len".to_string(), max_value: Some(2048) }, SymDim::Concrete(4096)],
+            vec![
+                SymDim::Symbolic {
+                    name: "seq_len".to_string(),
+                    max_value: Some(2048),
+                },
+                SymDim::Concrete(4096),
+            ],
             DType::F32,
         );
 
@@ -900,12 +1160,23 @@ mod tests {
 
         let norm_out_tid = graph.add_tensor(
             "norm_out",
-            vec![SymDim::Symbolic { name: "seq_len".to_string(), max_value: Some(2048) }, SymDim::Concrete(4096)],
+            vec![
+                SymDim::Symbolic {
+                    name: "seq_len".to_string(),
+                    max_value: Some(2048),
+                },
+                SymDim::Concrete(4096),
+            ],
             DType::F32,
         );
 
         graph.add_op(
-            Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }),
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
             vec![input_tid],
             vec![norm_out_tid],
             "layer.input_layernorm",
@@ -918,8 +1189,10 @@ mod tests {
     }
 
     fn build_test_vm_program() -> Vec<VmInstr> {
-        use crate::compiler::codegen::vm::instr::{LoopOffset, LoopStride, OffsetExpr, SimdWidth, SymBound};
         use crate::compiler::codegen::vm::instr::BoundExpr;
+        use crate::compiler::codegen::vm::instr::{
+            LoopOffset, LoopStride, OffsetExpr, SimdWidth, SymBound,
+        };
         use crate::compiler::trace::QuantPrecision;
 
         vec![
@@ -952,7 +1225,10 @@ mod tests {
                     vreg: VRegId(4),
                     stride: LoopStride::FixedBytes(4),
                 }],
-                bound: BoundExpr::Symbolic(SymBound { name: "seq_len".to_string(), max_alloc: 2048 }),
+                bound: BoundExpr::Symbolic(SymBound {
+                    name: "seq_len".to_string(),
+                    max_alloc: 2048,
+                }),
             },
             VmInstr::Fma {
                 dst: VRegId(5),
@@ -974,9 +1250,9 @@ mod tests {
     }
 
     fn build_test_reg_alloc() -> RegAllocation {
-        use std::collections::HashMap;
         use crate::compiler::codegen::vm::isa_profile::{PhysGpr, PhysVec};
         use crate::compiler::codegen::vm::reg_alloc::SpillSlot;
+        use std::collections::HashMap;
 
         let mut mapping = HashMap::new();
         mapping.insert(VRegId(0), PhysReg::Gpr(PhysGpr(0)));
@@ -990,7 +1266,11 @@ mod tests {
 
         RegAllocation {
             mapping,
-            spills: vec![SpillSlot { vreg: VRegId(8), offset: 0, size: 32 }],
+            spills: vec![SpillSlot {
+                vreg: VRegId(8),
+                offset: 0,
+                size: 32,
+            }],
             callee_saved_used: vec![],
         }
     }

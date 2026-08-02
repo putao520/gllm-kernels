@@ -5,7 +5,7 @@
 //!
 //! Run with: RUSTFLAGS="-C target-cpu=native" cargo bench --bench baseline_audit
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use gllm_kernels::cpu_kernels::CpuKernels;
 use gllm_kernels::traits::Kernels;
 use rand::Rng;
@@ -129,8 +129,10 @@ fn bench_rms_norm(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, _| {
             bench.iter(|| {
                 kernels.rms_norm(
-                    black_box(&input), black_box(&weight),
-                    black_box(&mut out), 1e-5,
+                    black_box(&input),
+                    black_box(&weight),
+                    black_box(&mut out),
+                    1e-5,
                 )
             })
         });
@@ -161,8 +163,10 @@ fn bench_rope(c: &mut Criterion) {
             bench.iter(|| {
                 kernels.rope(
                     black_box(&mut qk),
-                    black_box(&cos), black_box(&sin),
-                    head_dim, false,
+                    black_box(&cos),
+                    black_box(&sin),
+                    head_dim,
+                    false,
                 )
             })
         });
@@ -186,8 +190,10 @@ fn bench_rope(c: &mut Criterion) {
             bench.iter(|| {
                 kernels.rope(
                     black_box(&mut qk),
-                    black_box(&cos), black_box(&sin),
-                    head_dim, false,
+                    black_box(&cos),
+                    black_box(&sin),
+                    head_dim,
+                    false,
                 )
             })
         });
@@ -208,15 +214,19 @@ fn bench_dequant_q4k(c: &mut Criterion) {
         // Bytes: read weight + write f32 output
         let bytes = (num_blocks * block_bytes + num_elements * 4) as u64;
         group.throughput(Throughput::Bytes(bytes));
-        group.bench_with_input(BenchmarkId::from_parameter(num_elements), &num_elements, |bench, _| {
-            bench.iter(|| {
-                for b in 0..num_blocks {
-                    let blk = &weight[b * block_bytes..(b + 1) * block_bytes];
-                    let dst = &mut out[b * 256..(b + 1) * 256];
-                    kernels.dequant_q4_k(black_box(blk), black_box(dst));
-                }
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(num_elements),
+            &num_elements,
+            |bench, _| {
+                bench.iter(|| {
+                    for b in 0..num_blocks {
+                        let blk = &weight[b * block_bytes..(b + 1) * block_bytes];
+                        let dst = &mut out[b * 256..(b + 1) * 256];
+                        kernels.dequant_q4_k(black_box(blk), black_box(dst));
+                    }
+                })
+            },
+        );
     }
     group.finish();
 }
@@ -233,15 +243,19 @@ fn bench_dequant_q8k(c: &mut Criterion) {
         let mut out = vec![0.0f32; num_elements];
         let bytes = (num_blocks * block_bytes + num_elements * 4) as u64;
         group.throughput(Throughput::Bytes(bytes));
-        group.bench_with_input(BenchmarkId::from_parameter(num_elements), &num_elements, |bench, _| {
-            bench.iter(|| {
-                for b in 0..num_blocks {
-                    let blk = &weight[b * block_bytes..(b + 1) * block_bytes];
-                    let dst = &mut out[b * 256..(b + 1) * 256];
-                    kernels.dequant_q8_k(black_box(blk), black_box(dst));
-                }
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(num_elements),
+            &num_elements,
+            |bench, _| {
+                bench.iter(|| {
+                    for b in 0..num_blocks {
+                        let blk = &weight[b * block_bytes..(b + 1) * block_bytes];
+                        let dst = &mut out[b * 256..(b + 1) * 256];
+                        kernels.dequant_q8_k(black_box(blk), black_box(dst));
+                    }
+                })
+            },
+        );
     }
     group.finish();
 }
@@ -262,11 +276,15 @@ fn bench_gemm(c: &mut Criterion) {
         let mut out = vec![0.0f32; m * n];
         let flops = (2 * m * n * k) as u64;
         group.throughput(Throughput::Elements(flops));
-        group.bench_with_input(BenchmarkId::new("gemm", format!("{size}x{size}x{size}")), &size, |bench, _| {
-            bench.iter(|| {
-                kernels.gemm(black_box(&a), black_box(&b), black_box(&mut out), m, n, k)
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("gemm", format!("{size}x{size}x{size}")),
+            &size,
+            |bench, _| {
+                bench.iter(|| {
+                    kernels.gemm(black_box(&a), black_box(&b), black_box(&mut out), m, n, k)
+                })
+            },
+        );
     }
     group.finish();
 }
@@ -284,11 +302,22 @@ fn bench_gemm_prepacked(c: &mut Criterion) {
         let mut out = vec![0.0f32; m * n];
         let flops = (2 * m * n * k) as u64;
         group.throughput(Throughput::Elements(flops));
-        group.bench_with_input(BenchmarkId::new("prepacked", format!("{size}x{size}x{size}")), &size, |bench, _| {
-            bench.iter(|| {
-                kernels.gemm_prepacked(black_box(&a), black_box(&packed_b), black_box(&mut out), m, n, k)
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("prepacked", format!("{size}x{size}x{size}")),
+            &size,
+            |bench, _| {
+                bench.iter(|| {
+                    kernels.gemm_prepacked(
+                        black_box(&a),
+                        black_box(&packed_b),
+                        black_box(&mut out),
+                        m,
+                        n,
+                        k,
+                    )
+                })
+            },
+        );
     }
     group.finish();
 }
@@ -304,11 +333,13 @@ fn bench_gemv(c: &mut Criterion) {
         let mut y = vec![0.0f32; m];
         let flops = (2 * m * n) as u64;
         group.throughput(Throughput::Elements(flops));
-        group.bench_with_input(BenchmarkId::new("gemv", format!("{m}x{n}")), &(m, n), |bench, _| {
-            bench.iter(|| {
-                kernels.gemv(black_box(&mat), black_box(&x), black_box(&mut y), m, n)
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("gemv", format!("{m}x{n}")),
+            &(m, n),
+            |bench, _| {
+                bench.iter(|| kernels.gemv(black_box(&mat), black_box(&x), black_box(&mut y), m, n))
+            },
+        );
     }
     group.finish();
 }
@@ -327,9 +358,7 @@ fn bench_gemv_q4(c: &mut Criterion) {
     let flops = (2 * n) as u64;
     group.throughput(Throughput::Elements(flops));
     group.bench_function(BenchmarkId::new("q4k_dot", n), |bench| {
-        bench.iter(|| {
-            black_box(kernels.gemv_q4(black_box(&weight), black_box(&x), 1.0, n))
-        })
+        bench.iter(|| black_box(kernels.gemv_q4(black_box(&weight), black_box(&x), 1.0, n)))
     });
     group.finish();
 }
@@ -359,14 +388,13 @@ fn bench_gemv_q8(c: &mut Criterion) {
         }
     }
 
-    let weight = unsafe { std::slice::from_raw_parts(weight_raw.as_ptr() as *const i8, weight_raw.len()) };
+    let weight =
+        unsafe { std::slice::from_raw_parts(weight_raw.as_ptr() as *const i8, weight_raw.len()) };
     let x = rand_vec(n);
     let flops = (2 * n) as u64;
     group.throughput(Throughput::Elements(flops));
     group.bench_function(BenchmarkId::new("q8k_dot", n), |bench| {
-        bench.iter(|| {
-            black_box(kernels.gemv_q8(black_box(weight), black_box(&x), 1.0, n))
-        })
+        bench.iter(|| black_box(kernels.gemv_q8(black_box(weight), black_box(&x), 1.0, n)))
     });
     group.finish();
 }
@@ -421,8 +449,11 @@ fn bench_layer_norm(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bench, _| {
             bench.iter(|| {
                 kernels.layer_norm(
-                    black_box(&input), black_box(&gamma), black_box(&beta),
-                    black_box(&mut out), 1e-5,
+                    black_box(&input),
+                    black_box(&gamma),
+                    black_box(&beta),
+                    black_box(&mut out),
+                    1e-5,
                 )
             })
         });

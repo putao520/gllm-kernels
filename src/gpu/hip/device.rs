@@ -6,8 +6,8 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use crate::gpu::{GpuDevice, GpuBuffer, GpuStream, GpuError};
 use super::driver::*;
+use crate::gpu::{GpuBuffer, GpuDevice, GpuError, GpuStream};
 
 // ── HipBuffer ──────────────────────────────────────────────────────
 
@@ -31,7 +31,9 @@ impl GpuBuffer for HipBuffer {
 impl Drop for HipBuffer {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            unsafe { (self.driver.hipFree)(self.ptr); }
+            unsafe {
+                (self.driver.hipFree)(self.ptr);
+            }
         }
     }
 }
@@ -66,7 +68,9 @@ impl HipStream {
 impl Drop for HipStream {
     fn drop(&mut self) {
         if !self.handle.is_null() {
-            unsafe { (self.driver.hipStreamDestroy)(self.handle); }
+            unsafe {
+                (self.driver.hipStreamDestroy)(self.handle);
+            }
         }
     }
 }
@@ -105,7 +109,8 @@ impl HipDevice {
 
         // Build device name
         let raw_name = driver.device_name(ordinal).unwrap_or_default();
-        let cu_count = driver.device_attribute(HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, ordinal)
+        let cu_count = driver
+            .device_attribute(HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, ordinal)
             .unwrap_or(0);
         let name = if raw_name.is_empty() {
             format!("HIP device {ordinal} (gfx{gfx_arch}, {cu_count} CUs)")
@@ -124,7 +129,11 @@ impl HipDevice {
             let mut free: usize = 0;
             let mut total: usize = 0;
             let res = unsafe { (driver.hipMemGetInfo)(&mut free, &mut total) };
-            if res == HIP_SUCCESS { total } else { 0 }
+            if res == HIP_SUCCESS {
+                total
+            } else {
+                0
+            }
         };
 
         Ok(Self {
@@ -154,11 +163,14 @@ impl HipDevice {
         let d = &self.driver;
         let id = self.device_id;
 
-        let compute_units = d.device_attribute(HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, id)? as u32;
-        let shared_mem = d.device_attribute(HIP_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK, id)? as u32;
+        let compute_units =
+            d.device_attribute(HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, id)? as u32;
+        let shared_mem =
+            d.device_attribute(HIP_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK, id)? as u32;
         let max_regs = d.device_attribute(HIP_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_BLOCK, id)? as u32;
         let warp_size = d.device_attribute(HIP_DEVICE_ATTRIBUTE_WARP_SIZE, id)? as u32;
-        let max_threads = d.device_attribute(HIP_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, id)? as u32;
+        let max_threads =
+            d.device_attribute(HIP_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, id)? as u32;
 
         let max_block_dim = [
             d.device_attribute(HIP_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X, id)? as u32,
@@ -175,15 +187,20 @@ impl HipDevice {
         let clock_mhz = clock_khz / 1000;
 
         // Memory bandwidth estimate
-        let mem_clock_khz = d.device_attribute(HIP_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE, id).unwrap_or(0) as f64;
-        let bus_width = d.device_attribute(HIP_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH, id).unwrap_or(0) as f64;
+        let mem_clock_khz = d
+            .device_attribute(HIP_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE, id)
+            .unwrap_or(0) as f64;
+        let bus_width = d
+            .device_attribute(HIP_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH, id)
+            .unwrap_or(0) as f64;
         let memory_bandwidth_gbs = (mem_clock_khz * 1e-6) * (bus_width / 8.0) * 2.0;
 
         // Peak GFLOPS estimate for AMD GPUs
         // CDNA (gfx908/gfx90a/gfx940+): 64 stream processors per CU, 2 FMA ops
         // RDNA (gfx1010+): 64 stream processors per CU (dual-issue), 2 FMA ops
         let cores_per_cu: f64 = 64.0;
-        let peak_gflops_f32 = (compute_units as f64) * cores_per_cu * 2.0 * (clock_mhz as f64 / 1000.0);
+        let peak_gflops_f32 =
+            (compute_units as f64) * cores_per_cu * 2.0 * (clock_mhz as f64 / 1000.0);
 
         // F16 throughput: CDNA with MFMA (gfx908+) gets ~2x, RDNA gets ~2x via packed math
         // gfx_arch is parsed as hex: gfx908=0x908=2312, gfx90a=0x90a=2314, gfx940=0x940=2368
@@ -196,14 +213,24 @@ impl HipDevice {
         // Hardware capability detection for JIT codegen decisions
         // gfx940+=CDNA3 (MI300), gfx908+=CDNA1/2 (MI100/MI200/MI210)
         let isv = crate::gpu::GpuIsvCapabilities {
-            tensor_core_gen: if self.gfx_arch >= 0x940 { 3 }   // MI300 (MFMA v3)
-                else if self.gfx_arch >= 0x908 { 2 }            // MI100/MI200 (MFMA v2)
-                else { 0 },
+            tensor_core_gen: if self.gfx_arch >= 0x940 {
+                3
+            }
+            // MI300 (MFMA v3)
+            else if self.gfx_arch >= 0x908 {
+                2
+            }
+            // MI100/MI200 (MFMA v2)
+            else {
+                0
+            },
             ..Default::default()
         };
 
         Ok(crate::gpu::GpuDeviceProfile {
-            platform: Platform::Hip { gfx_arch: self.gfx_arch },
+            platform: Platform::Hip {
+                gfx_arch: self.gfx_arch,
+            },
             compute_units,
             shared_mem_per_block: shared_mem,
             max_registers_per_thread: max_regs / max_threads.max(1),
@@ -224,9 +251,8 @@ impl HipDevice {
     /// Load HSACO/AMDGPU binary into a module.
     pub fn load_hsaco(&self, code: &[u8]) -> Result<HipModule, GpuError> {
         let mut module: super::driver::HipModule = std::ptr::null_mut();
-        let res = unsafe {
-            (self.driver.hipModuleLoadData)(&mut module, code.as_ptr() as *const _)
-        };
+        let res =
+            unsafe { (self.driver.hipModuleLoadData)(&mut module, code.as_ptr() as *const _) };
         if res != 0 {
             return Err(GpuError::Driver(format!(
                 "hipModuleLoadData failed with error {res}"
@@ -250,8 +276,12 @@ impl HipDevice {
         let res = unsafe {
             (self.driver.hipModuleLaunchKernel)(
                 func,
-                grid.0, grid.1, grid.2,
-                block.0, block.1, block.2,
+                grid.0,
+                grid.1,
+                grid.2,
+                block.0,
+                block.1,
+                block.2,
                 0,
                 stream.handle(),
                 args.as_ptr() as *mut *mut _,
@@ -275,13 +305,11 @@ pub struct HipModule {
 
 impl HipModule {
     pub fn get_function(&self, name: &str) -> Result<super::driver::HipFunction, GpuError> {
-        let cname = std::ffi::CString::new(name).map_err(|_| {
-            GpuError::Driver(format!("kernel name contains NUL: {name}"))
-        })?;
+        let cname = std::ffi::CString::new(name)
+            .map_err(|_| GpuError::Driver(format!("kernel name contains NUL: {name}")))?;
         let mut func: super::driver::HipFunction = std::ptr::null_mut();
-        let res = unsafe {
-            (self.driver.hipModuleGetFunction)(&mut func, self.module, cname.as_ptr())
-        };
+        let res =
+            unsafe { (self.driver.hipModuleGetFunction)(&mut func, self.module, cname.as_ptr()) };
         if res != 0 {
             return Err(GpuError::Driver(format!(
                 "hipModuleGetFunction({name}) failed with error {res}"
@@ -393,9 +421,7 @@ impl GpuDevice for HipDevice {
         _stream: &Self::Stream,
     ) -> Result<(), GpuError> {
         let bytes = src.size.min(dst.size);
-        let res = unsafe {
-            (self.driver.hipMemcpyDtoD)(dst.ptr as u64, src.ptr as u64, bytes)
-        };
+        let res = unsafe { (self.driver.hipMemcpyDtoD)(dst.ptr as u64, src.ptr as u64, bytes) };
         if res != HIP_SUCCESS {
             return Err(GpuError::Transfer(format!(
                 "hipMemcpyDtoD failed with error {res}"

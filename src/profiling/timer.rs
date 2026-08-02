@@ -297,7 +297,10 @@ mod tests {
         let secs = cycles_to_secs(one_sec_in_cycles);
         // Assert: should be approximately 1.0 second (within 1% tolerance for float)
         let diff = (secs - 1.0).abs();
-        assert!(diff < 0.01, "freq cycles should be ~1.0s, got {secs}, diff={diff}");
+        assert!(
+            diff < 0.01,
+            "freq cycles should be ~1.0s, got {secs}, diff={diff}"
+        );
     }
 
     #[test]
@@ -416,7 +419,11 @@ mod tests {
         let ns = timer.elapsed_ns();
         // Assert: ns should be roughly secs * 1e9; check same order of magnitude
         let ns_from_secs = secs * 1e9;
-        let ratio = if ns_from_secs > 0.0 { ns / ns_from_secs } else { 0.0 };
+        let ratio = if ns_from_secs > 0.0 {
+            ns / ns_from_secs
+        } else {
+            0.0
+        };
         assert!(
             (ratio - 1.0).abs() < 0.01,
             "ns ({ns}) / (secs*1e9 = {ns_from_secs}) = {ratio}, expected ~1.0"

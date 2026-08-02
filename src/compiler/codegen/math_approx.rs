@@ -130,7 +130,10 @@ mod tests {
         let t = 0.5f32;
         let poly = LOG_C1 * t + LOG_C2 * t * t + LOG_C3 * t * t * t + LOG_C4 * t * t * t * t;
         let expected = (1.0f32 + t).ln();
-        assert!((poly - expected).abs() < 0.01, "poly={poly}, expected={expected}");
+        assert!(
+            (poly - expected).abs() < 0.01,
+            "poly={poly}, expected={expected}"
+        );
     }
 
     // ── Cross-validation ──────────────────────────────────────────────
@@ -155,8 +158,10 @@ mod tests {
         let neg_ln2 = -(2.0f32).ln();
         let c1_only_error = (EXP_C1 - neg_ln2).abs();
         let combined_error = (EXP_C1 + EXP_C2 - neg_ln2).abs();
-        assert!(combined_error < c1_only_error,
-            "Cody-Waite should reduce error: combined={combined_error}, c1_only={c1_only_error}");
+        assert!(
+            combined_error < c1_only_error,
+            "Cody-Waite should reduce error: combined={combined_error}, c1_only={c1_only_error}"
+        );
     }
 
     #[test]
@@ -203,7 +208,10 @@ mod tests {
         for i in 1..=10 {
             let t = i as f32 / 10.0;
             let poly = LOG_C1 * t + LOG_C2 * t * t + LOG_C3 * t * t * t + LOG_C4 * t * t * t * t;
-            assert!(poly > prev, "poly not monotonic at t={t}: prev={prev}, poly={poly}");
+            assert!(
+                poly > prev,
+                "poly not monotonic at t={t}: prev={prev}, poly={poly}"
+            );
             prev = poly;
         }
     }

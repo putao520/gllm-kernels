@@ -4,34 +4,34 @@
 //! Each profile has distinct fusion preferences based on memory hierarchy,
 //! compute throughput, and instruction set capabilities.
 
-use crate::dispatch::DeviceProfile;
 use crate::compiler::codegen::vm::isa_profile::Platform;
+use crate::dispatch::DeviceProfile;
 
 /// 13 hardware profiles for topology-driven fusion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HardwareProfile {
     // NVIDIA CUDA
-    CudaSM80,      // Ampere (A100) — aggressive fusion, tensor cores
-    CudaSM90,      // Hopper (H100) — max fusion, TMA, FP8
-    CudaSM100,     // Blackwell Datacenter (B100/B200) — ultra-aggressive, FP4/FP6, TMEM, tcgen05.mma
-    CudaSM120,     // Blackwell Consumer (RTX 5070 Ti / 5090) — SM 12.0, tcgen05.mma, NVFP4, no NVLink
+    CudaSM80,  // Ampere (A100) — aggressive fusion, tensor cores
+    CudaSM90,  // Hopper (H100) — max fusion, TMA, FP8
+    CudaSM100, // Blackwell Datacenter (B100/B200) — ultra-aggressive, FP4/FP6, TMEM, tcgen05.mma
+    CudaSM120, // Blackwell Consumer (RTX 5070 Ti / 5090) — SM 12.0, tcgen05.mma, NVFP4, no NVLink
 
     // AMD ROCm
-    RocmMI200,     // CDNA2 (MI200) — matrix cores, 64-wide wavefront
-    RocmMI300,     // CDNA3 (MI300) — enhanced matrix, FP8
+    RocmMI200, // CDNA2 (MI200) — matrix cores, 64-wide wavefront
+    RocmMI300, // CDNA3 (MI300) — enhanced matrix, FP8
 
     // CPU x86_64
-    CpuAvx2,       // Intel/AMD AVX2 — conservative fusion, register pressure
-    CpuAvx512,     // Intel AVX-512 — moderate fusion, 32 ZMM regs
-    CpuAvx10_2,    // Intel AVX10.2 — AVX-512 subset, no downclocking
+    CpuAvx2,    // Intel/AMD AVX2 — conservative fusion, register pressure
+    CpuAvx512,  // Intel AVX-512 — moderate fusion, 32 ZMM regs
+    CpuAvx10_2, // Intel AVX10.2 — AVX-512 subset, no downclocking
 
     // Apple Silicon
-    AppleM1,       // M1 — AMX tiles, unified memory
-    AppleM2,       // M2 — enhanced AMX, wider memory
-    AppleM3,       // M3 — dynamic caching, ray tracing
+    AppleM1, // M1 — AMX tiles, unified memory
+    AppleM2, // M2 — enhanced AMX, wider memory
+    AppleM3, // M3 — dynamic caching, ray tracing
 
     // ARM Server
-    ArmNeoverse,   // Neoverse V1/V2 — SVE2, 128-bit vectors
+    ArmNeoverse, // Neoverse V1/V2 — SVE2, 128-bit vectors
 
     // Fallback
     Generic,
@@ -69,11 +69,27 @@ impl HardwareProfile {
                 let is_avx512_class = matches!(self, Self::CpuAvx512 | Self::CpuAvx10_2);
                 Platform::X86_64 {
                     has_avx512: is_avx512_class,
-                    has_bf16: if is_avx512_class { arch.has_bf16() } else { false },
-                    has_vnni: if is_avx512_class { arch.has_vnni() } else { false },
-                    has_avx512fp16: if is_avx512_class { arch.has_avx512fp16() } else { false },
+                    has_bf16: if is_avx512_class {
+                        arch.has_bf16()
+                    } else {
+                        false
+                    },
+                    has_vnni: if is_avx512_class {
+                        arch.has_vnni()
+                    } else {
+                        false
+                    },
+                    has_avx512fp16: if is_avx512_class {
+                        arch.has_avx512fp16()
+                    } else {
+                        false
+                    },
                     has_f16c: arch.has_f16c(),
-                    has_amx: if is_avx512_class { arch.has_amx() } else { false },
+                    has_amx: if is_avx512_class {
+                        arch.has_amx()
+                    } else {
+                        false
+                    },
                     has_amx_fp16: arch.has_amx_fp16(),
                     has_amx_complex: arch.has_amx_complex(),
                     has_amx_transpose: arch.has_amx_transpose(),
@@ -336,10 +352,17 @@ impl HardwareProfile {
 
     /// Whether to prefer large GEMM fusion (vs small elementwise fusion).
     pub fn prefer_gemm_fusion(self) -> bool {
-        matches!(self,
-            Self::CudaSM100 | Self::CudaSM120 | Self::CudaSM90 | Self::CudaSM80 |
-            Self::RocmMI300 | Self::RocmMI200 |
-            Self::AppleM3 | Self::AppleM2 | Self::AppleM1
+        matches!(
+            self,
+            Self::CudaSM100
+                | Self::CudaSM120
+                | Self::CudaSM90
+                | Self::CudaSM80
+                | Self::RocmMI300
+                | Self::RocmMI200
+                | Self::AppleM3
+                | Self::AppleM2
+                | Self::AppleM1
         )
     }
 
@@ -456,7 +479,9 @@ impl HardwareProfile {
         let available_for_epilogue = simd_regs / 2;
         // Each epilogue op needs ~1-2 SIMD registers for temporaries.
         // Use 2 as conservative estimate to avoid register spills.
-        (available_for_epilogue / 2).max(1).min(self.max_fusion_depth())
+        (available_for_epilogue / 2)
+            .max(1)
+            .min(self.max_fusion_depth())
     }
 
     /// Whether this profile supports deep-chain quantized GEMM epilogue.
@@ -496,7 +521,9 @@ impl HardwareProfile {
         let effective_cache = l1.max(shared) as f64;
         // Normalize to 0.5-1.5 range based on cache size
         // 256KB+ -> 1.5 (high benefit), <32KB -> 0.5 (low benefit)
-        ((effective_cache / (32.0 * 1024.0)).ln().max(0.0) + 1.0).min(1.5).max(0.5)
+        ((effective_cache / (32.0 * 1024.0)).ln().max(0.0) + 1.0)
+            .min(1.5)
+            .max(0.5)
     }
 
     /// GPU GEMM 三级分块参数: (cta_m, cta_n, cta_k, warp_m, warp_n, mma_k).
@@ -569,11 +596,17 @@ fn detect_apple_silicon_gen() -> Option<u32> {
         .output()
         .ok()?;
     let brand = String::from_utf8_lossy(&output.stdout);
-    if brand.contains("M1") { Some(1) }
-    else if brand.contains("M2") { Some(2) }
-    else if brand.contains("M3") { Some(3) }
-    else if brand.contains("M4") { Some(4) }
-    else { None }
+    if brand.contains("M1") {
+        Some(1)
+    } else if brand.contains("M2") {
+        Some(2)
+    } else if brand.contains("M3") {
+        Some(3)
+    } else if brand.contains("M4") {
+        Some(4)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -584,8 +617,14 @@ mod tests {
 
     #[test]
     fn fusion_aggressiveness_gpu_highest() {
-        assert!(HardwareProfile::CudaSM100.fusion_aggressiveness() >= HardwareProfile::CudaSM90.fusion_aggressiveness());
-        assert!(HardwareProfile::CudaSM90.fusion_aggressiveness() >= HardwareProfile::CudaSM80.fusion_aggressiveness());
+        assert!(
+            HardwareProfile::CudaSM100.fusion_aggressiveness()
+                >= HardwareProfile::CudaSM90.fusion_aggressiveness()
+        );
+        assert!(
+            HardwareProfile::CudaSM90.fusion_aggressiveness()
+                >= HardwareProfile::CudaSM80.fusion_aggressiveness()
+        );
     }
 
     #[test]
@@ -607,14 +646,20 @@ mod tests {
 
     #[test]
     fn min_fusion_benefit_gpu_lower_than_cpu() {
-        assert!(HardwareProfile::CudaSM100.min_fusion_benefit() < HardwareProfile::CpuAvx2.min_fusion_benefit());
+        assert!(
+            HardwareProfile::CudaSM100.min_fusion_benefit()
+                < HardwareProfile::CpuAvx2.min_fusion_benefit()
+        );
     }
 
     // ── max_fusion_depth ──
 
     #[test]
     fn max_fusion_depth_gpu_deepest() {
-        assert!(HardwareProfile::CudaSM100.max_fusion_depth() >= HardwareProfile::CpuAvx2.max_fusion_depth());
+        assert!(
+            HardwareProfile::CudaSM100.max_fusion_depth()
+                >= HardwareProfile::CpuAvx2.max_fusion_depth()
+        );
     }
 
     #[test]
@@ -701,8 +746,14 @@ mod tests {
 
     #[test]
     fn shared_memory_sm100_largest() {
-        assert!(HardwareProfile::CudaSM100.shared_memory_bytes() >= HardwareProfile::CudaSM90.shared_memory_bytes());
-        assert!(HardwareProfile::CudaSM90.shared_memory_bytes() >= HardwareProfile::CudaSM80.shared_memory_bytes());
+        assert!(
+            HardwareProfile::CudaSM100.shared_memory_bytes()
+                >= HardwareProfile::CudaSM90.shared_memory_bytes()
+        );
+        assert!(
+            HardwareProfile::CudaSM90.shared_memory_bytes()
+                >= HardwareProfile::CudaSM80.shared_memory_bytes()
+        );
     }
 
     #[test]
@@ -746,14 +797,18 @@ mod tests {
 
     #[test]
     fn gpu_gemm_tiles_sm100() {
-        let (cta_m, cta_n, cta_k, warp_m, warp_n, mma_k) = HardwareProfile::CudaSM100.gpu_gemm_tiles();
+        let (cta_m, cta_n, cta_k, warp_m, warp_n, mma_k) =
+            HardwareProfile::CudaSM100.gpu_gemm_tiles();
         assert!(cta_m > 0 && cta_n > 0 && cta_k > 0);
         assert!(warp_m > 0 && warp_n > 0 && mma_k > 0);
     }
 
     #[test]
     fn gpu_gemm_tiles_cpu_zero() {
-        assert_eq!(HardwareProfile::CpuAvx2.gpu_gemm_tiles(), (0, 0, 0, 0, 0, 0));
+        assert_eq!(
+            HardwareProfile::CpuAvx2.gpu_gemm_tiles(),
+            (0, 0, 0, 0, 0, 0)
+        );
     }
 
     // ── pipeline depth ──
@@ -772,14 +827,20 @@ mod tests {
 
     #[test]
     fn compute_roi_weight_cpu_higher_than_gpu() {
-        assert!(HardwareProfile::CpuAvx2.compute_roi_weight() > HardwareProfile::CudaSM100.compute_roi_weight());
+        assert!(
+            HardwareProfile::CpuAvx2.compute_roi_weight()
+                > HardwareProfile::CudaSM100.compute_roi_weight()
+        );
     }
 
     #[test]
     fn cache_roi_weight_range() {
         for variant in all_variants() {
             let w = variant.cache_roi_weight();
-            assert!((0.5..=1.5).contains(&w), "{variant:?}: {w} out of [0.5,1.5]");
+            assert!(
+                (0.5..=1.5).contains(&w),
+                "{variant:?}: {w} out of [0.5,1.5]"
+            );
         }
     }
 

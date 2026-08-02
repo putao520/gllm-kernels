@@ -64,8 +64,7 @@ impl TracePassPipeline {
     /// 按优先级排序后顺序执行
     pub fn optimize(&self, body: &mut Vec<TraceOp>) -> TraceOptStats {
         let mut total = TraceOptStats::default();
-        let mut sorted: Vec<&dyn TraceOptPass> =
-            self.passes.iter().map(|p| p.as_ref()).collect();
+        let mut sorted: Vec<&dyn TraceOptPass> = self.passes.iter().map(|p| p.as_ref()).collect();
         sorted.sort_by_key(|p| p.priority());
         for pass in sorted {
             total += pass.run(body);
@@ -93,8 +92,12 @@ fn compute_op_hash(op: &TraceOp) -> u64 {
 pub struct DeadCodeElimination;
 
 impl TraceOptPass for DeadCodeElimination {
-    fn name(&self) -> &'static str { "dce" }
-    fn priority(&self) -> u32 { 10 }
+    fn name(&self) -> &'static str {
+        "dce"
+    }
+    fn priority(&self) -> u32 {
+        10
+    }
 
     fn run(&self, body: &mut Vec<TraceOp>) -> TraceOptStats {
         if body.is_empty() {
@@ -114,9 +117,7 @@ impl TraceOptPass for DeadCodeElimination {
         let alive: Vec<bool> = body
             .iter()
             .enumerate()
-            .map(|(i, op)| {
-                i == last || used.contains(&ValueId(i as u32)) || op.has_side_effects()
-            })
+            .map(|(i, op)| i == last || used.contains(&ValueId(i as u32)) || op.has_side_effects())
             .collect();
 
         let removed = alive.iter().filter(|&&a| !a).count();
@@ -168,8 +169,12 @@ impl TraceOptPass for DeadCodeElimination {
 pub struct CommonSubexprElimination;
 
 impl TraceOptPass for CommonSubexprElimination {
-    fn name(&self) -> &'static str { "cse" }
-    fn priority(&self) -> u32 { 20 }
+    fn name(&self) -> &'static str {
+        "cse"
+    }
+    fn priority(&self) -> u32 {
+        20
+    }
 
     fn run(&self, body: &mut Vec<TraceOp>) -> TraceOptStats {
         if body.len() < 2 {
@@ -265,8 +270,12 @@ fn ops_structurally_equal(a: &TraceOp, b: &TraceOp, _remap: &[ValueId]) -> bool 
 pub struct ConstantFolding;
 
 impl TraceOptPass for ConstantFolding {
-    fn name(&self) -> &'static str { "const_fold" }
-    fn priority(&self) -> u32 { 30 }
+    fn name(&self) -> &'static str {
+        "const_fold"
+    }
+    fn priority(&self) -> u32 {
+        30
+    }
 
     fn run(&self, body: &mut Vec<TraceOp>) -> TraceOptStats {
         if body.is_empty() {
@@ -507,10 +516,10 @@ mod tests {
     #[test]
     fn test_dce_removes_unused_ops() {
         let mut body = vec![
-            TraceOp::Input(0),   // [0] x — used by Mul
-            TraceOp::Input(1),   // [1] y — used by Add
-            TraceOp::Mul(ValueId(0), ValueId(0)),  // [2] x*x — DEAD
-            TraceOp::Add(ValueId(0), ValueId(1)),  // [3] x+y — output
+            TraceOp::Input(0),                    // [0] x — used by Mul
+            TraceOp::Input(1),                    // [1] y — used by Add
+            TraceOp::Mul(ValueId(0), ValueId(0)), // [2] x*x — DEAD
+            TraceOp::Add(ValueId(0), ValueId(1)), // [3] x+y — output
         ];
         let stats = DeadCodeElimination.run(&mut body);
         assert_eq!(stats.ops_removed, 1);
@@ -521,11 +530,11 @@ mod tests {
     #[test]
     fn test_cse_merges_identical_ops() {
         let mut body = vec![
-            TraceOp::Input(0),   // [0] x
-            TraceOp::Input(1),   // [1] y
-            TraceOp::Mul(ValueId(0), ValueId(1)),  // [2] x*y (original)
-            TraceOp::Add(ValueId(0), ValueId(1)),  // [3] x+y (different)
-            TraceOp::Mul(ValueId(0), ValueId(1)),  // [4] x*y (duplicate of [2])
+            TraceOp::Input(0),                    // [0] x
+            TraceOp::Input(1),                    // [1] y
+            TraceOp::Mul(ValueId(0), ValueId(1)), // [2] x*y (original)
+            TraceOp::Add(ValueId(0), ValueId(1)), // [3] x+y (different)
+            TraceOp::Mul(ValueId(0), ValueId(1)), // [4] x*y (duplicate of [2])
         ];
         let stats = CommonSubexprElimination.run(&mut body);
         assert_eq!(stats.ops_merged, 1);
@@ -534,11 +543,11 @@ mod tests {
     #[test]
     fn test_const_fold_binary() {
         let mut body = vec![
-            TraceOp::Const(2.0),  // [0]
-            TraceOp::Const(3.0),  // [1]
-            TraceOp::Add(ValueId(0), ValueId(1)),   // [2] → Const(5.0)
-            TraceOp::Const(0.0),  // [3]
-            TraceOp::Add(ValueId(2), ValueId(3)),   // [4] → identity (x+0=x)
+            TraceOp::Const(2.0),                  // [0]
+            TraceOp::Const(3.0),                  // [1]
+            TraceOp::Add(ValueId(0), ValueId(1)), // [2] → Const(5.0)
+            TraceOp::Const(0.0),                  // [3]
+            TraceOp::Add(ValueId(2), ValueId(3)), // [4] → identity (x+0=x)
         ];
         let stats = ConstantFolding.run(&mut body);
         assert_eq!(stats.ops_folded, 2);
@@ -548,9 +557,9 @@ mod tests {
     #[test]
     fn test_const_fold_mul_identity() {
         let mut body = vec![
-            TraceOp::Input(0),     // [0] x
-            TraceOp::Const(1.0),   // [1] 1.0
-            TraceOp::Mul(ValueId(0), ValueId(1)),    // [2] → identity (x*1=x)
+            TraceOp::Input(0),                    // [0] x
+            TraceOp::Const(1.0),                  // [1] 1.0
+            TraceOp::Mul(ValueId(0), ValueId(1)), // [2] → identity (x*1=x)
         ];
         let stats = ConstantFolding.run(&mut body);
         assert_eq!(stats.ops_folded, 1);
@@ -559,9 +568,9 @@ mod tests {
     #[test]
     fn test_const_fold_mul_zero() {
         let mut body = vec![
-            TraceOp::Input(0),     // [0] x
-            TraceOp::Const(0.0),   // [1] 0.0
-            TraceOp::Mul(ValueId(0), ValueId(1)),    // [2] → Const(0.0)
+            TraceOp::Input(0),                    // [0] x
+            TraceOp::Const(0.0),                  // [1] 0.0
+            TraceOp::Mul(ValueId(0), ValueId(1)), // [2] → Const(0.0)
         ];
         let stats = ConstantFolding.run(&mut body);
         assert_eq!(stats.ops_folded, 1);
@@ -571,18 +580,22 @@ mod tests {
     #[test]
     fn test_full_pipeline_silu() {
         let mut body = vec![
-            TraceOp::Input(0),   // [0] x
-            TraceOp::Input(0),   // [1] x (duplicate)
-            TraceOp::Mul(ValueId(0), ValueId(0)),  // [2] x*x (unused)
-            TraceOp::Neg(ValueId(0)),     // [3] -x
-            TraceOp::Exp(ValueId(3)),     // [4] exp(-x)
-            TraceOp::Const(1.0), // [5] 1.0
-            TraceOp::Add(ValueId(4), ValueId(5)),  // [6] 1 + exp(-x)
-            TraceOp::Div(ValueId(0), ValueId(6)),  // [7] x / (1 + exp(-x))
+            TraceOp::Input(0),                    // [0] x
+            TraceOp::Input(0),                    // [1] x (duplicate)
+            TraceOp::Mul(ValueId(0), ValueId(0)), // [2] x*x (unused)
+            TraceOp::Neg(ValueId(0)),             // [3] -x
+            TraceOp::Exp(ValueId(3)),             // [4] exp(-x)
+            TraceOp::Const(1.0),                  // [5] 1.0
+            TraceOp::Add(ValueId(4), ValueId(5)), // [6] 1 + exp(-x)
+            TraceOp::Div(ValueId(0), ValueId(6)), // [7] x / (1 + exp(-x))
         ];
         let pipeline = TracePassPipeline::with_defaults();
         let stats = pipeline.optimize(&mut body);
-        assert!(stats.ops_removed >= 1, "DCE should remove unused ops, got {:?}", stats);
+        assert!(
+            stats.ops_removed >= 1,
+            "DCE should remove unused ops, got {:?}",
+            stats
+        );
         assert!(body.len() <= 7, "body should shrink: {} ops", body.len());
     }
 
@@ -602,11 +615,15 @@ mod tests {
     #[test]
     fn test_dce_preserves_side_effects() {
         let mut body = vec![
-            TraceOp::Input(0),                          // [0] base
-            TraceOp::Input(1),                          // [1] offset
-            TraceOp::Input(2),                          // [2] value
-            TraceOp::Mul(ValueId(0), ValueId(1)),       // [3] dead (nobody refs ValueId(3))
-            TraceOp::VecStoreIndexed { base: ValueId(0), offset: ValueId(1), value: ValueId(2) },
+            TraceOp::Input(0),                    // [0] base
+            TraceOp::Input(1),                    // [1] offset
+            TraceOp::Input(2),                    // [2] value
+            TraceOp::Mul(ValueId(0), ValueId(1)), // [3] dead (nobody refs ValueId(3))
+            TraceOp::VecStoreIndexed {
+                base: ValueId(0),
+                offset: ValueId(1),
+                value: ValueId(2),
+            },
             // [4] side effect + last op → always preserved
         ];
         let stats = DeadCodeElimination.run(&mut body);
@@ -634,11 +651,19 @@ mod tests {
     fn test_cse_skips_impure_ops() {
         // Arrange: VecStoreIndexed has side effects so CSE must not merge it
         let mut body = vec![
-            TraceOp::Input(0),   // [0] base
-            TraceOp::Input(1),   // [1] offset
-            TraceOp::Input(2),   // [2] value
-            TraceOp::VecStoreIndexed { base: ValueId(0), offset: ValueId(1), value: ValueId(2) },
-            TraceOp::VecStoreIndexed { base: ValueId(0), offset: ValueId(1), value: ValueId(2) },
+            TraceOp::Input(0), // [0] base
+            TraceOp::Input(1), // [1] offset
+            TraceOp::Input(2), // [2] value
+            TraceOp::VecStoreIndexed {
+                base: ValueId(0),
+                offset: ValueId(1),
+                value: ValueId(2),
+            },
+            TraceOp::VecStoreIndexed {
+                base: ValueId(0),
+                offset: ValueId(1),
+                value: ValueId(2),
+            },
         ];
 
         // Act
@@ -654,10 +679,10 @@ mod tests {
     fn test_const_fold_unary_chain() {
         // Arrange: Neg(2.0) → Const(-2.0), Abs(-3.0) → Const(3.0)
         let mut body = vec![
-            TraceOp::Const(2.0),   // [0]
-            TraceOp::Const(-3.0),  // [1]
-            TraceOp::Neg(ValueId(0)),      // [2] → Const(-2.0)
-            TraceOp::Abs(ValueId(1)),      // [3] → Const(3.0)
+            TraceOp::Const(2.0),      // [0]
+            TraceOp::Const(-3.0),     // [1]
+            TraceOp::Neg(ValueId(0)), // [2] → Const(-2.0)
+            TraceOp::Abs(ValueId(1)), // [3] → Const(3.0)
         ];
 
         // Act
@@ -674,12 +699,12 @@ mod tests {
     fn test_const_fold_sqrt_exp_log() {
         // Arrange: Sqrt(4.0) → 2.0, Exp(0.0) → 1.0, Log(1.0) → 0.0
         let mut body = vec![
-            TraceOp::Const(4.0),   // [0]
-            TraceOp::Const(0.0),   // [1]
-            TraceOp::Const(1.0),   // [2]
-            TraceOp::Sqrt(ValueId(0)),      // [3] → Const(2.0)
-            TraceOp::Exp(ValueId(1)),       // [4] → Const(1.0)
-            TraceOp::Log(ValueId(2)),       // [5] → Const(0.0)
+            TraceOp::Const(4.0),       // [0]
+            TraceOp::Const(0.0),       // [1]
+            TraceOp::Const(1.0),       // [2]
+            TraceOp::Sqrt(ValueId(0)), // [3] → Const(2.0)
+            TraceOp::Exp(ValueId(1)),  // [4] → Const(1.0)
+            TraceOp::Log(ValueId(2)),  // [5] → Const(0.0)
         ];
 
         // Act
@@ -697,10 +722,10 @@ mod tests {
     fn test_const_fold_rsqrt_recip() {
         // Arrange: Rsqrt(4.0) → 0.5, Recip(2.0) → 0.5
         let mut body = vec![
-            TraceOp::Const(4.0),   // [0]
-            TraceOp::Const(2.0),   // [1]
-            TraceOp::Rsqrt(ValueId(0)),     // [2] → Const(0.5)
-            TraceOp::Recip(ValueId(1)),     // [3] → Const(0.5)
+            TraceOp::Const(4.0),        // [0]
+            TraceOp::Const(2.0),        // [1]
+            TraceOp::Rsqrt(ValueId(0)), // [2] → Const(0.5)
+            TraceOp::Recip(ValueId(1)), // [3] → Const(0.5)
         ];
 
         // Act
@@ -717,7 +742,7 @@ mod tests {
     fn test_const_fold_recip_zero_guard() {
         // Arrange: Recip(0.0) must NOT be folded (division by zero guard)
         let mut body = vec![
-            TraceOp::Const(0.0),       // [0]
+            TraceOp::Const(0.0),        // [0]
             TraceOp::Recip(ValueId(0)), // [1] → should remain Recip
         ];
 
@@ -734,12 +759,12 @@ mod tests {
     fn test_const_fold_sub_zero_identity() {
         // Arrange: x - 0 → x (identity), 5.0 - 3.0 → 2.0 (full fold)
         let mut body = vec![
-            TraceOp::Input(0),       // [0] x
-            TraceOp::Const(0.0),     // [1] zero
-            TraceOp::Const(5.0),     // [2]
-            TraceOp::Const(3.0),     // [3]
-            TraceOp::Sub(ValueId(0), ValueId(1)),   // [4] → identity: remap to ValueId(0)
-            TraceOp::Sub(ValueId(2), ValueId(3)),   // [5] → Const(2.0)
+            TraceOp::Input(0),                    // [0] x
+            TraceOp::Const(0.0),                  // [1] zero
+            TraceOp::Const(5.0),                  // [2]
+            TraceOp::Const(3.0),                  // [3]
+            TraceOp::Sub(ValueId(0), ValueId(1)), // [4] → identity: remap to ValueId(0)
+            TraceOp::Sub(ValueId(2), ValueId(3)), // [5] → Const(2.0)
         ];
 
         // Act
@@ -755,12 +780,12 @@ mod tests {
     fn test_const_fold_div_identity_and_full() {
         // Arrange: x / 1 → x, 6.0 / 3.0 → 2.0
         let mut body = vec![
-            TraceOp::Input(0),       // [0] x
-            TraceOp::Const(1.0),     // [1]
-            TraceOp::Const(6.0),     // [2]
-            TraceOp::Const(3.0),     // [3]
-            TraceOp::Div(ValueId(0), ValueId(1)),   // [4] → identity: remap to ValueId(0)
-            TraceOp::Div(ValueId(2), ValueId(3)),   // [5] → Const(2.0)
+            TraceOp::Input(0),                    // [0] x
+            TraceOp::Const(1.0),                  // [1]
+            TraceOp::Const(6.0),                  // [2]
+            TraceOp::Const(3.0),                  // [3]
+            TraceOp::Div(ValueId(0), ValueId(1)), // [4] → identity: remap to ValueId(0)
+            TraceOp::Div(ValueId(2), ValueId(3)), // [5] → Const(2.0)
         ];
 
         // Act
@@ -776,9 +801,9 @@ mod tests {
     fn test_const_fold_div_by_zero_guard() {
         // Arrange: 5.0 / 0.0 must NOT be folded
         let mut body = vec![
-            TraceOp::Const(5.0),     // [0]
-            TraceOp::Const(0.0),     // [1]
-            TraceOp::Div(ValueId(0), ValueId(1)),   // [2] → should remain Div
+            TraceOp::Const(5.0),                  // [0]
+            TraceOp::Const(0.0),                  // [1]
+            TraceOp::Div(ValueId(0), ValueId(1)), // [2] → should remain Div
         ];
 
         // Act
@@ -794,9 +819,9 @@ mod tests {
     fn test_const_fold_max_min_same_operand() {
         // Arrange: Max(x, x) → x, Min(x, x) → x (same operand identity)
         let mut body = vec![
-            TraceOp::Input(0),       // [0] x
-            TraceOp::Max(ValueId(0), ValueId(0)),   // [1] → remap to ValueId(0)
-            TraceOp::Min(ValueId(0), ValueId(0)),   // [2] → remap to ValueId(0)
+            TraceOp::Input(0),                    // [0] x
+            TraceOp::Max(ValueId(0), ValueId(0)), // [1] → remap to ValueId(0)
+            TraceOp::Min(ValueId(0), ValueId(0)), // [2] → remap to ValueId(0)
         ];
 
         // Act
@@ -811,10 +836,10 @@ mod tests {
     fn test_const_fold_max_min_both_constants() {
         // Arrange: Max(3.0, 7.0) → 7.0, Min(3.0, 7.0) → 3.0
         let mut body = vec![
-            TraceOp::Const(3.0),     // [0]
-            TraceOp::Const(7.0),     // [1]
-            TraceOp::Max(ValueId(0), ValueId(1)),   // [2] → Const(7.0)
-            TraceOp::Min(ValueId(0), ValueId(1)),   // [3] → Const(3.0)
+            TraceOp::Const(3.0),                  // [0]
+            TraceOp::Const(7.0),                  // [1]
+            TraceOp::Max(ValueId(0), ValueId(1)), // [2] → Const(7.0)
+            TraceOp::Min(ValueId(0), ValueId(1)), // [3] → Const(3.0)
         ];
 
         // Act
@@ -831,9 +856,9 @@ mod tests {
     fn test_const_fold_mul_zero_right_operand() {
         // Arrange: x * 0.0 (right operand is zero) → Const(0.0)
         let mut body = vec![
-            TraceOp::Input(0),       // [0] x
-            TraceOp::Const(0.0),     // [1] 0.0
-            TraceOp::Mul(ValueId(0), ValueId(1)),   // [2] → Const(0.0)
+            TraceOp::Input(0),                    // [0] x
+            TraceOp::Const(0.0),                  // [1] 0.0
+            TraceOp::Mul(ValueId(0), ValueId(1)), // [2] → Const(0.0)
         ];
 
         // Act
@@ -852,11 +877,11 @@ mod tests {
         // ConstFold phase 1: Mul(5,1) → identity remap
         // Then final DCE cleans up
         let mut body = vec![
-            TraceOp::Const(2.0),     // [0]
-            TraceOp::Const(3.0),     // [1]
-            TraceOp::Add(ValueId(0), ValueId(1)),   // [2] → Const(5.0)
-            TraceOp::Const(1.0),     // [3]
-            TraceOp::Mul(ValueId(2), ValueId(3)),   // [4] → identity remap to ValueId(2)
+            TraceOp::Const(2.0),                  // [0]
+            TraceOp::Const(3.0),                  // [1]
+            TraceOp::Add(ValueId(0), ValueId(1)), // [2] → Const(5.0)
+            TraceOp::Const(1.0),                  // [3]
+            TraceOp::Mul(ValueId(2), ValueId(3)), // [4] → identity remap to ValueId(2)
         ];
 
         // Act
@@ -871,9 +896,7 @@ mod tests {
     #[test]
     fn test_dce_single_op_body() {
         // Arrange: body with a single op — always alive because it is the last op
-        let mut body = vec![
-            TraceOp::Const(42.0),
-        ];
+        let mut body = vec![TraceOp::Const(42.0)];
 
         // Act
         let stats = DeadCodeElimination.run(&mut body);
@@ -891,9 +914,9 @@ mod tests {
         // Const(99) is dead — nothing references ValueId(1).
         // After DCE: [0]=Input, [1]=Add(0,0). The Add's args should stay ValueId(0).
         let mut body = vec![
-            TraceOp::Input(0),                              // [0] — used by Add
-            TraceOp::Const(99.0),                           // [1] — dead (nobody refs ValueId(1))
-            TraceOp::Add(ValueId(0), ValueId(0)),           // [2] — last, alive
+            TraceOp::Input(0),                    // [0] — used by Add
+            TraceOp::Const(99.0),                 // [1] — dead (nobody refs ValueId(1))
+            TraceOp::Add(ValueId(0), ValueId(0)), // [2] — last, alive
         ];
 
         // Act
@@ -912,9 +935,7 @@ mod tests {
     #[test]
     fn test_cse_single_element_body() {
         // Arrange: body with 1 element — CSE early-returns (len < 2)
-        let mut body = vec![
-            TraceOp::Neg(ValueId(0)),
-        ];
+        let mut body = vec![TraceOp::Neg(ValueId(0))];
 
         // Act
         let stats = CommonSubexprElimination.run(&mut body);
@@ -930,12 +951,12 @@ mod tests {
         // Arrange: two identical Add ops; the second is consumed by downstream Mul.
         // CSE should remap [4] to point to the original [2].
         let mut body = vec![
-            TraceOp::Input(0),                              // [0] x
-            TraceOp::Input(1),                              // [1] y
-            TraceOp::Add(ValueId(0), ValueId(1)),           // [2] x+y (original)
-            TraceOp::Mul(ValueId(0), ValueId(1)),           // [3] x*y (different)
-            TraceOp::Add(ValueId(0), ValueId(1)),           // [4] x+y (duplicate → remap to ValueId(2))
-            TraceOp::Mul(ValueId(4), ValueId(3)),           // [5] (x+y)*(x*y) — should become Mul(ValueId(2), ValueId(3))
+            TraceOp::Input(0),                    // [0] x
+            TraceOp::Input(1),                    // [1] y
+            TraceOp::Add(ValueId(0), ValueId(1)), // [2] x+y (original)
+            TraceOp::Mul(ValueId(0), ValueId(1)), // [3] x*y (different)
+            TraceOp::Add(ValueId(0), ValueId(1)), // [4] x+y (duplicate → remap to ValueId(2))
+            TraceOp::Mul(ValueId(4), ValueId(3)), // [5] (x+y)*(x*y) — should become Mul(ValueId(2), ValueId(3))
         ];
 
         // Act
@@ -952,9 +973,9 @@ mod tests {
     fn test_const_fold_mul_one_right_operand() {
         // Arrange: x * 1.0 (right operand is 1.0) → identity remap to x
         let mut body = vec![
-            TraceOp::Input(0),       // [0] x
-            TraceOp::Const(1.0),     // [1] 1.0
-            TraceOp::Mul(ValueId(0), ValueId(1)),   // [2] → identity: remap to ValueId(0)
+            TraceOp::Input(0),                    // [0] x
+            TraceOp::Const(1.0),                  // [1] 1.0
+            TraceOp::Mul(ValueId(0), ValueId(1)), // [2] → identity: remap to ValueId(0)
         ];
 
         // Act
@@ -970,10 +991,10 @@ mod tests {
         // Arrange: Fma with all-constant inputs — ConstantFolding does not handle Fma,
         // so it should remain unchanged.
         let mut body = vec![
-            TraceOp::Const(2.0),   // [0]
-            TraceOp::Const(3.0),   // [1]
-            TraceOp::Const(1.0),   // [2]
-            TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2)),  // [3] 2*3+1
+            TraceOp::Const(2.0),                              // [0]
+            TraceOp::Const(3.0),                              // [1]
+            TraceOp::Const(1.0),                              // [2]
+            TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2)), // [3] 2*3+1
         ];
 
         // Act
@@ -981,7 +1002,10 @@ mod tests {
 
         // Assert: nothing folded, Fma preserved as-is
         assert_eq!(stats.ops_folded, 0);
-        assert!(matches!(body[3], TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2))));
+        assert!(matches!(
+            body[3],
+            TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2))
+        ));
     }
 
     // @trace TEST-TOPT-28 [req:REQ-VR] [level:unit]
@@ -1003,9 +1027,9 @@ mod tests {
     fn test_pipeline_stats_accumulation() {
         // Arrange: ConstFold alone folds Add(5,3)→8. Verify fold stat is reported.
         let mut body = vec![
-            TraceOp::Const(5.0),                            // [0]
-            TraceOp::Const(3.0),                            // [1]
-            TraceOp::Add(ValueId(0), ValueId(1)),           // [2] → Const(8.0)
+            TraceOp::Const(5.0),                  // [0]
+            TraceOp::Const(3.0),                  // [1]
+            TraceOp::Add(ValueId(0), ValueId(1)), // [2] → Const(8.0)
         ];
 
         // Act
@@ -1022,10 +1046,10 @@ mod tests {
         // Arrange: two Const ops with different values — CSE must not merge them
         // even though they share the same discriminant.
         let mut body = vec![
-            TraceOp::Const(1.0),   // [0]
-            TraceOp::Const(2.0),   // [1]
-            TraceOp::Neg(ValueId(0)),  // [2] -1.0
-            TraceOp::Neg(ValueId(1)),  // [3] -2.0
+            TraceOp::Const(1.0),      // [0]
+            TraceOp::Const(2.0),      // [1]
+            TraceOp::Neg(ValueId(0)), // [2] -1.0
+            TraceOp::Neg(ValueId(1)), // [3] -2.0
         ];
 
         // Act
@@ -1044,10 +1068,10 @@ mod tests {
         // Run CSE first (not through default pipeline, which runs DCE first at priority 10).
         // Then DCE removes any ops that become dead after remapping.
         let mut body = vec![
-            TraceOp::Input(0),                              // [0] x
-            TraceOp::Neg(ValueId(0)),                       // [1] -x (original)
-            TraceOp::Neg(ValueId(0)),                       // [2] -x (CSE duplicate → remap to ValueId(1))
-            TraceOp::Add(ValueId(1), ValueId(2)),           // [3] (-x)+(-x) — last, alive; refs both
+            TraceOp::Input(0),                    // [0] x
+            TraceOp::Neg(ValueId(0)),             // [1] -x (original)
+            TraceOp::Neg(ValueId(0)),             // [2] -x (CSE duplicate → remap to ValueId(1))
+            TraceOp::Add(ValueId(1), ValueId(2)), // [3] (-x)+(-x) — last, alive; refs both
         ];
 
         // Act: run CSE first, then DCE
@@ -1058,7 +1082,11 @@ mod tests {
         assert_eq!(cse_stats.ops_merged, 1);
         // After remap, body[3] becomes Add(ValueId(1), ValueId(1)).
         // ValueId(2) is now dead because its result was remapped away and nobody refs it.
-        assert!(dce_stats.ops_removed >= 1, "DCE should remove dead duplicate, got {:?}", dce_stats);
+        assert!(
+            dce_stats.ops_removed >= 1,
+            "DCE should remove dead duplicate, got {:?}",
+            dce_stats
+        );
         assert!(body.len() < 4, "body should shrink: {} ops", body.len());
     }
 
@@ -1068,8 +1096,8 @@ mod tests {
         // Arrange: a body with an unused op; empty pipeline should not touch it
         let mut body = vec![
             TraceOp::Input(0),
-            TraceOp::Const(99.0),                          // dead
-            TraceOp::Add(ValueId(0), ValueId(0)),          // last = output
+            TraceOp::Const(99.0),                 // dead
+            TraceOp::Add(ValueId(0), ValueId(0)), // last = output
         ];
         let original_len = body.len();
 
@@ -1095,8 +1123,12 @@ mod tests {
         struct PassB;
 
         impl TraceOptPass for PassA {
-            fn name(&self) -> &'static str { "a" }
-            fn priority(&self) -> u32 { 100 } // runs second
+            fn name(&self) -> &'static str {
+                "a"
+            }
+            fn priority(&self) -> u32 {
+                100
+            } // runs second
             fn run(&self, body: &mut Vec<TraceOp>) -> TraceOptStats {
                 let order = ORDER.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(order, 1, "PassA should run second (priority 100)");
@@ -1106,8 +1138,12 @@ mod tests {
         }
 
         impl TraceOptPass for PassB {
-            fn name(&self) -> &'static str { "b" }
-            fn priority(&self) -> u32 { 50 } // runs first
+            fn name(&self) -> &'static str {
+                "b"
+            }
+            fn priority(&self) -> u32 {
+                50
+            } // runs first
             fn run(&self, body: &mut Vec<TraceOp>) -> TraceOptStats {
                 let order = ORDER.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(order, 0, "PassB should run first (priority 50)");
@@ -1159,9 +1195,9 @@ mod tests {
     fn test_const_fold_add_zero_left_operand() {
         // Arrange: 0 + x -> x (left operand is zero, identity remap)
         let mut body = vec![
-            TraceOp::Input(0),       // [0] x
-            TraceOp::Const(0.0),     // [1] 0.0
-            TraceOp::Add(ValueId(1), ValueId(0)),   // [2] 0+x -> identity remap to ValueId(0)
+            TraceOp::Input(0),                    // [0] x
+            TraceOp::Const(0.0),                  // [1] 0.0
+            TraceOp::Add(ValueId(1), ValueId(0)), // [2] 0+x -> identity remap to ValueId(0)
         ];
 
         // Act
@@ -1176,7 +1212,7 @@ mod tests {
     fn test_const_fold_tanh_not_folded() {
         // Arrange: Tanh with constant input -- ConstantFolding does not handle Tanh
         let mut body = vec![
-            TraceOp::Const(1.0),      // [0]
+            TraceOp::Const(1.0),       // [0]
             TraceOp::Tanh(ValueId(0)), // [1] -- not foldable by current pass
         ];
 
@@ -1193,7 +1229,7 @@ mod tests {
     fn test_const_fold_sigmoid_not_folded() {
         // Arrange: Sigmoid with constant input -- ConstantFolding does not handle Sigmoid
         let mut body = vec![
-            TraceOp::Const(0.5),         // [0]
+            TraceOp::Const(0.5),          // [0]
             TraceOp::Sigmoid(ValueId(0)), // [1] -- not foldable by current pass
         ];
 
@@ -1213,11 +1249,11 @@ mod tests {
         // in the single-pass "is my result referenced?" analysis.
         // Only Neg is removed. Input(0)/Input(1) are kept alive because Mul references them.
         let mut body = vec![
-            TraceOp::Input(0),                              // [0] -- referenced by Mul, kept alive
-            TraceOp::Input(1),                              // [1] -- referenced by Mul, kept alive
-            TraceOp::Mul(ValueId(0), ValueId(1)),           // [2] -- alive (Neg refs ValueId(2))
-            TraceOp::Neg(ValueId(2)),                       // [3] -- dead (nobody refs ValueId(3))
-            TraceOp::Const(7.0),                            // [4] -- last = output, always alive
+            TraceOp::Input(0),                    // [0] -- referenced by Mul, kept alive
+            TraceOp::Input(1),                    // [1] -- referenced by Mul, kept alive
+            TraceOp::Mul(ValueId(0), ValueId(1)), // [2] -- alive (Neg refs ValueId(2))
+            TraceOp::Neg(ValueId(2)),             // [3] -- dead (nobody refs ValueId(3))
+            TraceOp::Const(7.0),                  // [4] -- last = output, always alive
         ];
 
         // Act
@@ -1239,13 +1275,13 @@ mod tests {
     fn test_cse_merges_multiple_duplicates() {
         // Arrange: three identical Add ops -- CSE should merge the 2nd and 3rd into the 1st.
         let mut body = vec![
-            TraceOp::Input(0),                              // [0] x
-            TraceOp::Input(1),                              // [1] y
-            TraceOp::Add(ValueId(0), ValueId(1)),           // [2] x+y (original)
-            TraceOp::Add(ValueId(0), ValueId(1)),           // [3] x+y (duplicate 1)
-            TraceOp::Add(ValueId(0), ValueId(1)),           // [4] x+y (duplicate 2)
-            TraceOp::Mul(ValueId(2), ValueId(3)),           // [5] -- consumer of original + dup1
-            TraceOp::Mul(ValueId(4), ValueId(0)),           // [6] -- consumer of dup2
+            TraceOp::Input(0),                    // [0] x
+            TraceOp::Input(1),                    // [1] y
+            TraceOp::Add(ValueId(0), ValueId(1)), // [2] x+y (original)
+            TraceOp::Add(ValueId(0), ValueId(1)), // [3] x+y (duplicate 1)
+            TraceOp::Add(ValueId(0), ValueId(1)), // [4] x+y (duplicate 2)
+            TraceOp::Mul(ValueId(2), ValueId(3)), // [5] -- consumer of original + dup1
+            TraceOp::Mul(ValueId(4), ValueId(0)), // [6] -- consumer of dup2
         ];
 
         // Act
@@ -1264,9 +1300,9 @@ mod tests {
         // Arrange: ConditionalBranch with all-constant inputs --
         // ConstantFolding does not handle ConditionalBranch.
         let mut body = vec![
-            TraceOp::Const(1.0),      // [0] mask (non-zero)
-            TraceOp::Const(5.0),      // [1] true_val
-            TraceOp::Const(9.0),      // [2] false_val
+            TraceOp::Const(1.0), // [0] mask (non-zero)
+            TraceOp::Const(5.0), // [1] true_val
+            TraceOp::Const(9.0), // [2] false_val
             TraceOp::ConditionalBranch(ValueId(0), ValueId(1), ValueId(2)), // [3]
         ];
 
@@ -1287,13 +1323,13 @@ mod tests {
         // Arrange: (2.0 * 3.0) + (4.0 - 0.0) -> Const(6.0) + Const(4.0) -> Const(10.0)
         // Tests that the full pipeline folds multi-level expressions in one pass.
         let mut body = vec![
-            TraceOp::Const(2.0),     // [0]
-            TraceOp::Const(3.0),     // [1]
-            TraceOp::Mul(ValueId(0), ValueId(1)),    // [2] -> Const(6.0)
-            TraceOp::Const(4.0),     // [3]
-            TraceOp::Const(0.0),     // [4]
-            TraceOp::Sub(ValueId(3), ValueId(4)),    // [5] -> Const(4.0)
-            TraceOp::Add(ValueId(2), ValueId(5)),    // [6] -> Const(10.0)
+            TraceOp::Const(2.0),                  // [0]
+            TraceOp::Const(3.0),                  // [1]
+            TraceOp::Mul(ValueId(0), ValueId(1)), // [2] -> Const(6.0)
+            TraceOp::Const(4.0),                  // [3]
+            TraceOp::Const(0.0),                  // [4]
+            TraceOp::Sub(ValueId(3), ValueId(4)), // [5] -> Const(4.0)
+            TraceOp::Add(ValueId(2), ValueId(5)), // [6] -> Const(10.0)
         ];
 
         // Act
@@ -1312,10 +1348,10 @@ mod tests {
     fn test_dce_all_alive_no_removal() {
         // Arrange: every op is either referenced or is the last op
         let mut body = vec![
-            TraceOp::Input(0),                              // [0] — referenced by Add
-            TraceOp::Input(1),                              // [1] — referenced by Add
-            TraceOp::Add(ValueId(0), ValueId(1)),           // [2] — referenced by Neg
-            TraceOp::Neg(ValueId(2)),                       // [3] — last = output
+            TraceOp::Input(0),                    // [0] — referenced by Add
+            TraceOp::Input(1),                    // [1] — referenced by Add
+            TraceOp::Add(ValueId(0), ValueId(1)), // [2] — referenced by Neg
+            TraceOp::Neg(ValueId(2)),             // [3] — last = output
         ];
 
         // Act
@@ -1332,11 +1368,11 @@ mod tests {
         // Arrange: three dead ops in a row (Const 10, Const 20, Const 30)
         // with only the last Const(99.0) alive as the output.
         let mut body = vec![
-            TraceOp::Input(0),                              // [0] — dead (nobody refs ValueId(0))
-            TraceOp::Const(10.0),                           // [1] — dead
-            TraceOp::Const(20.0),                           // [2] — dead
-            TraceOp::Const(30.0),                           // [3] — dead
-            TraceOp::Const(99.0),                           // [4] — last = output, alive
+            TraceOp::Input(0),    // [0] — dead (nobody refs ValueId(0))
+            TraceOp::Const(10.0), // [1] — dead
+            TraceOp::Const(20.0), // [2] — dead
+            TraceOp::Const(30.0), // [3] — dead
+            TraceOp::Const(99.0), // [4] — last = output, alive
         ];
 
         // Act
@@ -1354,17 +1390,19 @@ mod tests {
         // Arrange: two identical pure Neg ops and two identical impure VecStoreIndexed ops.
         // CSE should merge the Neg pair but leave both VecStoreIndexed untouched.
         let mut body = vec![
-            TraceOp::Input(0),                              // [0] x
-            TraceOp::Input(1),                              // [1] offset
-            TraceOp::Input(2),                              // [2] value
-            TraceOp::Neg(ValueId(0)),                       // [3] -x (original pure)
-            TraceOp::Neg(ValueId(0)),                       // [4] -x (duplicate pure)
-            TraceOp::VecStoreIndexed {                      // [5] impure
+            TraceOp::Input(0),        // [0] x
+            TraceOp::Input(1),        // [1] offset
+            TraceOp::Input(2),        // [2] value
+            TraceOp::Neg(ValueId(0)), // [3] -x (original pure)
+            TraceOp::Neg(ValueId(0)), // [4] -x (duplicate pure)
+            TraceOp::VecStoreIndexed {
+                // [5] impure
                 base: ValueId(0),
                 offset: ValueId(1),
                 value: ValueId(2),
             },
-            TraceOp::VecStoreIndexed {                      // [6] impure (identical but NOT merged)
+            TraceOp::VecStoreIndexed {
+                // [6] impure (identical but NOT merged)
                 base: ValueId(0),
                 offset: ValueId(1),
                 value: ValueId(2),
@@ -1378,7 +1416,10 @@ mod tests {
         assert_eq!(stats.ops_merged, 1);
         assert_eq!(body.len(), 7);
         // Verify the impure ops are still structurally present
-        let store_count = body.iter().filter(|op| matches!(op, TraceOp::VecStoreIndexed { .. })).count();
+        let store_count = body
+            .iter()
+            .filter(|op| matches!(op, TraceOp::VecStoreIndexed { .. }))
+            .count();
         assert_eq!(store_count, 2);
     }
 
@@ -1388,9 +1429,9 @@ mod tests {
         // Arrange: Neg(Abs(-5.0)) — two unary ops on constants should chain-fold.
         // Abs(-5.0) → Const(5.0), then Neg(5.0) → Const(-5.0).
         let mut body = vec![
-            TraceOp::Const(-5.0),                           // [0]
-            TraceOp::Abs(ValueId(0)),                       // [1] → Const(5.0)
-            TraceOp::Neg(ValueId(1)),                       // [2] → Const(-5.0)
+            TraceOp::Const(-5.0),     // [0]
+            TraceOp::Abs(ValueId(0)), // [1] → Const(5.0)
+            TraceOp::Neg(ValueId(1)), // [2] → Const(-5.0)
         ];
 
         // Act
@@ -1407,9 +1448,9 @@ mod tests {
     fn test_const_fold_mul_both_constants() {
         // Arrange: 4.0 * 0.25 → 1.0 (full binary fold, neither identity nor zero)
         let mut body = vec![
-            TraceOp::Const(4.0),                            // [0]
-            TraceOp::Const(0.25),                           // [1]
-            TraceOp::Mul(ValueId(0), ValueId(1)),           // [2] → Const(1.0)
+            TraceOp::Const(4.0),                  // [0]
+            TraceOp::Const(0.25),                 // [1]
+            TraceOp::Mul(ValueId(0), ValueId(1)), // [2] → Const(1.0)
         ];
 
         // Act
@@ -1426,11 +1467,11 @@ mod tests {
         // Arrange: (x + 0) * 1 should apply add-zero identity then mul-one identity.
         // Add(x, 0.0) → remap to x, then Mul(x, 1.0) → remap to x.
         let mut body = vec![
-            TraceOp::Input(0),                              // [0] x
-            TraceOp::Const(0.0),                            // [1] 0.0
-            TraceOp::Add(ValueId(0), ValueId(1)),           // [2] → identity remap to ValueId(0)
-            TraceOp::Const(1.0),                            // [3] 1.0
-            TraceOp::Mul(ValueId(2), ValueId(3)),           // [4] → identity remap to ValueId(2) → ValueId(0)
+            TraceOp::Input(0),                    // [0] x
+            TraceOp::Const(0.0),                  // [1] 0.0
+            TraceOp::Add(ValueId(0), ValueId(1)), // [2] → identity remap to ValueId(0)
+            TraceOp::Const(1.0),                  // [3] 1.0
+            TraceOp::Mul(ValueId(2), ValueId(3)), // [4] → identity remap to ValueId(2) → ValueId(0)
         ];
 
         // Act
@@ -1447,24 +1488,36 @@ mod tests {
         // and the original Const(3.0)/Const(7.0) become dead (no one references them).
         // Second pipeline run removes the dead constants. Third run is a complete no-op.
         let mut body = vec![
-            TraceOp::Const(3.0),                            // [0]
-            TraceOp::Const(7.0),                            // [1]
-            TraceOp::Add(ValueId(0), ValueId(1)),           // [2] → foldable
+            TraceOp::Const(3.0),                  // [0]
+            TraceOp::Const(7.0),                  // [1]
+            TraceOp::Add(ValueId(0), ValueId(1)), // [2] → foldable
         ];
 
         // Act: first run folds Add → Const(10.0)
         let pipeline = TracePassPipeline::with_defaults();
         let stats1 = pipeline.optimize(&mut body);
-        assert!(stats1.ops_folded >= 1, "first run should fold Add, got {:?}", stats1);
+        assert!(
+            stats1.ops_folded >= 1,
+            "first run should fold Add, got {:?}",
+            stats1
+        );
 
         // Act: second run removes dead Const(3.0)/Const(7.0) left over from folding
         let stats2 = pipeline.optimize(&mut body);
-        assert!(stats2.ops_removed >= 2, "second run should remove dead constants, got {:?}", stats2);
+        assert!(
+            stats2.ops_removed >= 2,
+            "second run should remove dead constants, got {:?}",
+            stats2
+        );
 
         // Act: third run — truly stable, no further changes
         let stats3 = pipeline.optimize(&mut body);
-        assert_eq!(stats3.ops_removed + stats3.ops_folded + stats3.ops_merged, 0,
-            "third run should be a no-op, got {:?}", stats3);
+        assert_eq!(
+            stats3.ops_removed + stats3.ops_folded + stats3.ops_merged,
+            0,
+            "third run should be a no-op, got {:?}",
+            stats3
+        );
         // Body is just [Const(10.0)]
         assert_eq!(body.len(), 1);
         assert!(matches!(body[0], TraceOp::Const(v) if (v - 10.0).abs() < 1e-10));
@@ -1482,7 +1535,10 @@ mod tests {
         let hash_b = compute_op_hash(&op_b);
 
         // Assert: hashes must differ because discriminants differ
-        assert_ne!(hash_a, hash_b, "different op variants must produce different hashes");
+        assert_ne!(
+            hash_a, hash_b,
+            "different op variants must produce different hashes"
+        );
     }
 
     // @trace TEST-TOPT-50 [req:REQ-VR] [level:unit]
@@ -1506,10 +1562,10 @@ mod tests {
         // Arrange: body with only Input ops and a final pure op on inputs —
         // nothing is foldable because no constants feed into the arithmetic.
         let mut body = vec![
-            TraceOp::Input(0),                              // [0] x
-            TraceOp::Input(1),                              // [1] y
-            TraceOp::Add(ValueId(0), ValueId(1)),           // [2] x+y — not foldable
-            TraceOp::Neg(ValueId(2)),                       // [3] -(x+y) — not foldable
+            TraceOp::Input(0),                    // [0] x
+            TraceOp::Input(1),                    // [1] y
+            TraceOp::Add(ValueId(0), ValueId(1)), // [2] x+y — not foldable
+            TraceOp::Neg(ValueId(2)),             // [3] -(x+y) — not foldable
         ];
 
         // Act

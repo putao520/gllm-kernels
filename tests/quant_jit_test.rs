@@ -9,16 +9,14 @@
 //!               QCG7 (QuantAlgoKind), QCG8 (quant_aware_fusion),
 //!               QCG11 (QuantCapability)
 
-use gllm_kernels::compiler::codegen::vm::quant_decode::DecodeTraceBuilder;
 use gllm_kernels::compiler::codegen::vm::numerical_sim::simulate_compile;
-use gllm_kernels::compiler::quant_format::{
-    QuantAlgoKind, QuantDataKind, QuantFormatDescriptor, registry,
-    IsaKind, OpCategory, CoveragePath, CoverageMatrix,
-    coverage_check, coverage_matrix,
-};
+use gllm_kernels::compiler::codegen::vm::quant_decode::DecodeTraceBuilder;
 use gllm_kernels::compiler::fusion::quant_aware::{
-    can_fuse_quant_aware, QuantFusionDecision, fusion_cost,
-    select_fusion_groups,
+    can_fuse_quant_aware, fusion_cost, select_fusion_groups, QuantFusionDecision,
+};
+use gllm_kernels::compiler::quant_format::{
+    coverage_check, coverage_matrix, registry, CoverageMatrix, CoveragePath, IsaKind, OpCategory,
+    QuantAlgoKind, QuantDataKind, QuantFormatDescriptor,
 };
 use gllm_kernels::dispatch::DeviceProfile;
 use gllm_kernels::quant::QuantType;
@@ -95,15 +93,25 @@ fn representative_formats() -> Vec<QuantJitTestCase> {
 }
 
 /// Validates a dequantization trace: non-empty, correct input slots, final slot in range.
-fn assert_trace_valid(trace_name: &str, trace: &[gllm_kernels::compiler::trace::TraceOp], _output_lanes: usize) {
-    assert!(!trace.is_empty(), "[{}] DecodeTraceBuilder produced empty trace", trace_name);
+fn assert_trace_valid(
+    trace_name: &str,
+    trace: &[gllm_kernels::compiler::trace::TraceOp],
+    _output_lanes: usize,
+) {
+    assert!(
+        !trace.is_empty(),
+        "[{}] DecodeTraceBuilder produced empty trace",
+        trace_name
+    );
     assert!(
         matches!(trace[0], gllm_kernels::compiler::trace::TraceOp::Input(0)),
-        "[{}] First TraceOp must be Input(0) for block_base", trace_name
+        "[{}] First TraceOp must be Input(0) for block_base",
+        trace_name
     );
     assert!(
         matches!(trace[1], gllm_kernels::compiler::trace::TraceOp::Input(1)),
-        "[{}] Second TraceOp must be Input(1) for data_ptr", trace_name
+        "[{}] Second TraceOp must be Input(1) for data_ptr",
+        trace_name
     );
 }
 
@@ -120,21 +128,26 @@ fn assert_numerical_simulation_ok(name: &str, desc: &QuantFormatDescriptor, outp
     let result = simulate_compile(&trace, desc, &block_data, inputs);
     assert!(
         result.is_ok(),
-        "[{}] numerical simulation failed: {:?}", name, result.err()
+        "[{}] numerical simulation failed: {:?}",
+        name,
+        result.err()
     );
 
     let sim_result = result.unwrap();
     assert!(
         !sim_result.has_nan,
-        "[{}] numerical simulation produced NaN", name
+        "[{}] numerical simulation produced NaN",
+        name
     );
     assert!(
         !sim_result.has_inf,
-        "[{}] numerical simulation produced Inf", name
+        "[{}] numerical simulation produced Inf",
+        name
     );
     assert!(
         !sim_result.outputs.is_empty(),
-        "[{}] numerical simulation produced empty outputs", name
+        "[{}] numerical simulation produced empty outputs",
+        name
     );
 }
 
@@ -149,7 +162,9 @@ fn test_quant_codegen_trace_all_representative_formats() {
         let desc = reg.get(&tc.quant_type);
         assert!(
             desc.is_some(),
-            "[{}] QuantFormatDescriptor not registered for {:?}", tc.name, tc.quant_type
+            "[{}] QuantFormatDescriptor not registered for {:?}",
+            tc.name,
+            tc.quant_type
         );
         let desc = desc.unwrap();
 
@@ -159,7 +174,10 @@ fn test_quant_codegen_trace_all_representative_formats() {
         assert_trace_valid(tc.name, &trace, tc.output_lanes);
         assert!(
             final_slot.0 < trace.len() as u32,
-            "[{}] final_slot {} out of range [0, {})", tc.name, final_slot, trace.len()
+            "[{}] final_slot {} out of range [0, {})",
+            tc.name,
+            final_slot,
+            trace.len()
         );
     }
 }
@@ -175,7 +193,10 @@ fn test_quant_codegen_trace_slot_references_valid() {
         let len = trace.len();
         assert!(
             final_slot.0 < len as u32,
-            "[{}] final_slot {} >= trace.len() {}", tc.name, final_slot, len
+            "[{}] final_slot {} >= trace.len() {}",
+            tc.name,
+            final_slot,
+            len
         );
 
         // Validate all slot references within each op are to earlier slots
@@ -183,8 +204,9 @@ fn test_quant_codegen_trace_slot_references_valid() {
         use gllm_kernels::compiler::trace::ValueId;
         for (pos, op) in trace.iter().enumerate() {
             let refs: Vec<ValueId> = match op {
-                TraceOp::QuantBitAnd { lhs, rhs }
-                | TraceOp::QuantBitOr { lhs, rhs } => vec![*lhs, *rhs],
+                TraceOp::QuantBitAnd { lhs, rhs } | TraceOp::QuantBitOr { lhs, rhs } => {
+                    vec![*lhs, *rhs]
+                }
                 TraceOp::QuantBroadcast { src, .. }
                 | TraceOp::QuantCastF16toF32 { src }
                 | TraceOp::QuantCastI8toF32 { src }
@@ -205,7 +227,10 @@ fn test_quant_codegen_trace_slot_references_valid() {
                 assert!(
                     (r.0 as usize) < pos,
                     "[{}] Op at slot {} refs future slot {} ({:?})",
-                    tc.name, pos, r, op
+                    tc.name,
+                    pos,
+                    r,
+                    op
                 );
             }
         }
@@ -245,17 +270,22 @@ fn test_quant_codegen_path_priority_native_over_assisted() {
     // Both should be valid (not panic), and INT8 on x86 should be at least Assisted
     assert!(
         native_path.rank() <= CoveragePath::Assisted.rank(),
-        "Q8_0 on x86_64 GEMM should be Native or Assisted, got {:?}", native_path
+        "Q8_0 on x86_64 GEMM should be Native or Assisted, got {:?}",
+        native_path
     );
     assert!(
         arm_path.rank() <= CoveragePath::Assisted.rank(),
-        "Q8_0 on ARM GEMM should be Native or Assisted, got {:?}", arm_path
+        "Q8_0 on ARM GEMM should be Native or Assisted, got {:?}",
+        arm_path
     );
 
     // Q4_0 on x86_64: PackedInt4 requires assisted nibble unpack on VNNI
     let q4_path = coverage_check(QuantType::Q4_0, IsaKind::X86, OpCategory::Gemm);
     assert!(
-        matches!(q4_path, CoveragePath::Native | CoveragePath::Assisted | CoveragePath::DequantFMA),
+        matches!(
+            q4_path,
+            CoveragePath::Native | CoveragePath::Assisted | CoveragePath::DequantFMA
+        ),
         "Q4_0 on x86_64 must have a valid coverage path"
     );
 
@@ -271,8 +301,13 @@ fn test_quant_codegen_dequant_fma_path_for_float_formats() {
     for qt in &[QuantType::Bf16, QuantType::F16, QuantType::F32] {
         let path = coverage_check(*qt, IsaKind::X86, OpCategory::Quant);
         assert!(
-            matches!(path, CoveragePath::Native | CoveragePath::Assisted | CoveragePath::DequantFMA),
-            "Float format {:?} on x86_64 Quant must have valid path, got {:?}", qt, path
+            matches!(
+                path,
+                CoveragePath::Native | CoveragePath::Assisted | CoveragePath::DequantFMA
+            ),
+            "Float format {:?} on x86_64 Quant must have valid path, got {:?}",
+            qt,
+            path
         );
     }
 }
@@ -337,10 +372,27 @@ fn test_quant_codegen_algo_kind_descriptor_roundtrip() {
     // Every QuantAlgoKind must produce a valid descriptor from the registry
     for kind in QuantAlgoKind::all() {
         let desc = kind.descriptor();
-        assert_eq!(desc.quant_type, kind.quant_type(), "QuantAlgoKind::{:?} descriptor mismatch", kind);
-        assert!(!desc.name.is_empty(), "QuantAlgoKind::{:?} has empty name", kind);
-        assert!(desc.block_size > 0, "QuantAlgoKind::{:?} has zero block_size", kind);
-        assert!(desc.block_bytes > 0, "QuantAlgoKind::{:?} has zero block_bytes", kind);
+        assert_eq!(
+            desc.quant_type,
+            kind.quant_type(),
+            "QuantAlgoKind::{:?} descriptor mismatch",
+            kind
+        );
+        assert!(
+            !desc.name.is_empty(),
+            "QuantAlgoKind::{:?} has empty name",
+            kind
+        );
+        assert!(
+            desc.block_size > 0,
+            "QuantAlgoKind::{:?} has zero block_size",
+            kind
+        );
+        assert!(
+            desc.block_bytes > 0,
+            "QuantAlgoKind::{:?} has zero block_bytes",
+            kind
+        );
     }
 }
 
@@ -352,7 +404,8 @@ fn test_quant_codegen_algo_kind_all_registered() {
         assert!(
             reg.get(&qt).is_some(),
             "QuantAlgoKind::{:?} → {:?} not registered in QuantFormatRegistry",
-            kind, qt
+            kind,
+            qt
         );
     }
 }
@@ -367,19 +420,25 @@ fn test_quant_codegen_format_descriptor_properties() {
         // bits_per_element must be positive for quantized formats
         assert!(
             desc.bits_per_element > 0,
-            "[{}] bits_per_element must be > 0, got {}", name, desc.bits_per_element
+            "[{}] bits_per_element must be > 0, got {}",
+            name,
+            desc.bits_per_element
         );
 
         // block_size must be positive
         assert!(
             desc.block_size > 0,
-            "[{}] block_size must be > 0, got {}", name, desc.block_size
+            "[{}] block_size must be > 0, got {}",
+            name,
+            desc.block_size
         );
 
         // block_bytes must be positive
         assert!(
             desc.block_bytes > 0,
-            "[{}] block_bytes must be > 0, got {}", name, desc.block_bytes
+            "[{}] block_bytes must be > 0, got {}",
+            name,
+            desc.block_bytes
         );
     }
 }
@@ -407,7 +466,9 @@ fn test_quant_codegen_fusion_same_format_fuses() {
             decision,
             QuantFusionDecision::Fuse,
             "can_fuse_quant_aware({:?}, {:?}) should be Fuse, got {:?}",
-            qt, qt, decision
+            qt,
+            qt,
+            decision
         );
     }
 }
@@ -425,7 +486,8 @@ fn test_quant_codegen_fusion_different_format_splits() {
                 decision,
                 QuantFusionDecision::Split,
                 "can_fuse_quant_aware({:?}, {:?}) should be Split for different formats",
-                qt_a, qt_b
+                qt_a,
+                qt_b
             );
         }
     }
@@ -438,7 +500,10 @@ fn test_quant_codegen_fusion_cost_same_is_zero() {
         let cost = fusion_cost(Some(qt), Some(qt));
         assert!(
             (cost - 0.0).abs() < TOLERANCE as f32,
-            "fusion_cost({:?}, {:?}) should be 0.0, got {}", qt, qt, cost
+            "fusion_cost({:?}, {:?}) should be 0.0, got {}",
+            qt,
+            qt,
+            cost
         );
     }
 }
@@ -473,7 +538,9 @@ fn test_quant_codegen_same_precision_exhaustive() {
         let qt = kind.quant_type();
         assert!(
             same_precision(Some(qt), Some(qt)),
-            "same_precision({:?}, {:?}) should be true", qt, qt
+            "same_precision({:?}, {:?}) should be true",
+            qt,
+            qt
         );
     }
     // None/None is same precision
@@ -489,7 +556,8 @@ fn test_quant_codegen_same_precision_exhaustive() {
                 assert!(
                     !same_precision(Some(qa), Some(qb)),
                     "same_precision({:?}, {:?}) should be false for different formats",
-                    qa, qb
+                    qa,
+                    qb
                 );
             }
         }
@@ -516,11 +584,18 @@ fn test_quant_codegen_coverage_matrix_completeness() {
                     CoveragePath::Native | CoveragePath::Assisted | CoveragePath::DequantFMA
                 ),
                 "Uncovered cell: qt={:?} isa={:?} op={:?} path={:?}",
-                qt, entry.isa, entry.op, entry.path
+                qt,
+                entry.isa,
+                entry.op,
+                entry.path
             );
             cell_count += 1;
         }
-        assert_eq!(cell_count, 25, "CoverageMatrix for {:?} should have 25 cells", qt);
+        assert_eq!(
+            cell_count, 25,
+            "CoverageMatrix for {:?} should have 25 cells",
+            qt
+        );
     }
 }
 
@@ -537,7 +612,10 @@ fn test_quant_codegen_coverage_check_returns_valid_path() {
                         CoveragePath::Native | CoveragePath::Assisted | CoveragePath::DequantFMA
                     ),
                     "coverage_check({:?}, {:?}, {:?}) returned invalid path: {:?}",
-                    qt, isa, op, path
+                    qt,
+                    isa,
+                    op,
+                    path
                 );
             }
         }
@@ -549,7 +627,10 @@ fn test_quant_codegen_coverage_report_generates() {
     let matrix = CoverageMatrix::new(QuantType::Q4_0);
     let report = matrix.coverage_report(QuantType::Q4_0);
     assert!(!report.is_empty(), "Coverage report must not be empty");
-    assert!(report.contains("Q4_0"), "Report must mention the quant type");
+    assert!(
+        report.contains("Q4_0"),
+        "Report must mention the quant type"
+    );
     assert!(report.contains("x86_64"), "Report must mention ISA x86_64");
     assert!(report.contains("ARM"), "Report must mention ISA ARM");
 }
@@ -599,8 +680,8 @@ fn test_quant_codegen_scalar_reference_q4_0_values() {
     // Simulate a Q4_0 block: d = f16(0.5), qs = [0x87, 0x43, ...]
     let d = half::f16::from_f32(0.5);
     let block_data: [u8; 16] = [
-        0x87, 0x43, 0x21, 0x65, 0xAB, 0xCD, 0xEF, 0x01,
-        0x23, 0x45, 0x67, 0x89, 0xBC, 0xDE, 0xF0, 0x12,
+        0x87, 0x43, 0x21, 0x65, 0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xBC, 0xDE, 0xF0,
+        0x12,
     ];
     let values = scalar_dequant_q4_0(&block_data, d);
 
@@ -610,21 +691,25 @@ fn test_quant_codegen_scalar_reference_q4_0_values() {
     // byte 0x87: lo=7 → (7-8)*0.5 = -0.5, hi=8 → (8-8)*0.5 = 0.0
     assert!(
         (values[0] - (-0.5)).abs() < TOLERANCE as f32,
-        "Q4_0 values[0] should be -0.5, got {}", values[0]
+        "Q4_0 values[0] should be -0.5, got {}",
+        values[0]
     );
     assert!(
         (values[1] - 0.0).abs() < TOLERANCE as f32,
-        "Q4_0 values[1] should be 0.0, got {}", values[1]
+        "Q4_0 values[1] should be 0.0, got {}",
+        values[1]
     );
 
     // byte 0x43: lo=3 → (3-8)*0.5 = -2.5, hi=4 → (4-8)*0.5 = -2.0
     assert!(
         (values[2] - (-2.5)).abs() < TOLERANCE as f32,
-        "Q4_0 values[2] should be -2.5, got {}", values[2]
+        "Q4_0 values[2] should be -2.5, got {}",
+        values[2]
     );
     assert!(
         (values[3] - (-2.0)).abs() < TOLERANCE as f32,
-        "Q4_0 values[3] should be -2.0, got {}", values[3]
+        "Q4_0 values[3] should be -2.0, got {}",
+        values[3]
     );
 
     // Verify all values are finite
@@ -638,8 +723,8 @@ fn test_quant_codegen_scalar_reference_q4_1_values() {
     let d = half::f16::from_f32(1.5);
     let m = half::f16::from_f32(0.25);
     let block_data: [u8; 16] = [
-        0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE,
-        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+        0x77,
     ];
     let values = scalar_dequant_q4_1(&block_data, d, m);
 
@@ -648,11 +733,13 @@ fn test_quant_codegen_scalar_reference_q4_1_values() {
     // byte 0x10: lo=0 → 0*1.5+0.25 = 0.25, hi=1 → 1*1.5+0.25 = 1.75
     assert!(
         (values[0] - 0.25).abs() < TOLERANCE as f32,
-        "Q4_1 values[0] should be 0.25, got {}", values[0]
+        "Q4_1 values[0] should be 0.25, got {}",
+        values[0]
     );
     assert!(
         (values[1] - 1.75).abs() < TOLERANCE as f32,
-        "Q4_1 values[1] should be 1.75, got {}", values[1]
+        "Q4_1 values[1] should be 1.75, got {}",
+        values[1]
     );
 }
 
@@ -661,10 +748,8 @@ fn test_quant_codegen_scalar_reference_q8_0_values() {
     // Use 0.125 (1/8) which f16 can represent exactly, avoiding f16 rounding.
     let d = half::f16::from_f32(0.125);
     let qs: [i8; 32] = [
-        -10, -5, -1, 0, 1, 5, 10, 20,
-        -128, -64, -32, -16, -8, -4, -2, -1,
-        0, 1, 2, 4, 8, 16, 32, 64,
-        100, 110, 120, 127, -127, -100, -50, 25,
+        -10, -5, -1, 0, 1, 5, 10, 20, -128, -64, -32, -16, -8, -4, -2, -1, 0, 1, 2, 4, 8, 16, 32,
+        64, 100, 110, 120, 127, -127, -100, -50, 25,
     ];
     let values = scalar_dequant_q8_0(&qs, d);
 
@@ -673,22 +758,26 @@ fn test_quant_codegen_scalar_reference_q8_0_values() {
     // Spot-check: qs[0] = -10, d = 0.125 → -10 * 0.125 = -1.25
     assert!(
         (values[0] - (-1.25)).abs() < TOLERANCE as f32,
-        "Q8_0 values[0] should be -1.25, got {}", values[0]
+        "Q8_0 values[0] should be -1.25, got {}",
+        values[0]
     );
     // qs[3] = 0, d = 0.125 → 0.0
     assert!(
         (values[3] - 0.0).abs() < TOLERANCE as f32,
-        "Q8_0 values[3] should be 0.0, got {}", values[3]
+        "Q8_0 values[3] should be 0.0, got {}",
+        values[3]
     );
     // qs[6] = 10, d = 0.125 → 1.25
     assert!(
         (values[6] - 1.25).abs() < TOLERANCE as f32,
-        "Q8_0 values[6] should be 1.25, got {}", values[6]
+        "Q8_0 values[6] should be 1.25, got {}",
+        values[6]
     );
     // qs[7] = 20, d = 0.125 → 2.5
     assert!(
         (values[7] - 2.5).abs() < TOLERANCE as f32,
-        "Q8_0 values[7] should be 2.5, got {}", values[7]
+        "Q8_0 values[7] should be 2.5, got {}",
+        values[7]
     );
 
     // Verify all values are finite
@@ -704,7 +793,7 @@ fn test_quant_codegen_scalar_reference_q8_0_values() {
 #[test]
 fn test_quant_codegen_vminstr_quant_variants_exist() {
     use gllm_kernels::compiler::codegen::vm::instr::{
-        VmInstr, VmProgram, VRegId, VRegKind, SimdWidth, BlockUnpackMode,
+        BlockUnpackMode, SimdWidth, VRegId, VRegKind, VmInstr, VmProgram,
     };
     use gllm_kernels::compiler::quant_format::QuantDataKind;
 
@@ -764,7 +853,7 @@ fn test_quant_codegen_vminstr_quant_variants_exist() {
 #[test]
 fn test_quant_codegen_vminstr_dot_product_exists() {
     use gllm_kernels::compiler::codegen::vm::instr::{
-        VmInstr, VmProgram, VRegId, VRegKind, SimdWidth, DotDtype,
+        DotDtype, SimdWidth, VRegId, VRegKind, VmInstr, VmProgram,
     };
 
     let mut prog = VmProgram::new();
@@ -782,8 +871,17 @@ fn test_quant_codegen_vminstr_dot_product_exists() {
     });
 
     // alloc_vreg emits DeclareVReg per call (3 here), so total = 3 + 1 DotProduct = 4
-    let non_declare: Vec<_> = prog.instrs.iter().filter(|i| !matches!(i, VmInstr::DeclareVReg { .. })).collect();
-    assert_eq!(non_declare.len(), 1, "Expected 1 DotProduct, got {:?}", non_declare);
+    let non_declare: Vec<_> = prog
+        .instrs
+        .iter()
+        .filter(|i| !matches!(i, VmInstr::DeclareVReg { .. }))
+        .collect();
+    assert_eq!(
+        non_declare.len(),
+        1,
+        "Expected 1 DotProduct, got {:?}",
+        non_declare
+    );
     assert!(matches!(non_declare[0], VmInstr::DotProduct { .. }));
 }
 
@@ -794,7 +892,7 @@ fn test_quant_codegen_vminstr_dot_product_exists() {
 #[test]
 fn test_quant_codegen_dequant_fma_vminstr_encoding() {
     use gllm_kernels::compiler::codegen::vm::instr::{
-        VmInstr, VmProgram, VRegId, VRegKind, SimdWidth,
+        SimdWidth, VRegId, VRegKind, VmInstr, VmProgram,
     };
     use gllm_kernels::compiler::quant_format::QuantDataKind;
 
@@ -826,10 +924,17 @@ fn test_quant_codegen_dequant_fma_vminstr_encoding() {
         });
 
         // alloc_vreg emits DeclareVReg per call (4 here), so total = 4 + 1 QuantDequantFma = 5
-        let non_declare: Vec<_> = prog.instrs.iter().filter(|i| !matches!(i, VmInstr::DeclareVReg { .. })).collect();
+        let non_declare: Vec<_> = prog
+            .instrs
+            .iter()
+            .filter(|i| !matches!(i, VmInstr::DeclareVReg { .. }))
+            .collect();
         assert_eq!(
-            non_declare.len(), 1,
-            "QuantDequantFma variant for {} should be constructable, got {:?}", name, non_declare
+            non_declare.len(),
+            1,
+            "QuantDequantFma variant for {} should be constructable, got {:?}",
+            name,
+            non_declare
         );
         assert!(matches!(non_declare[0], VmInstr::QuantDequantFma { .. }));
     }
@@ -838,7 +943,7 @@ fn test_quant_codegen_dequant_fma_vminstr_encoding() {
 #[test]
 fn test_quant_codegen_dequant_fma_vminstr_roundtrip() {
     use gllm_kernels::compiler::codegen::vm::instr::{
-        VmInstr, VmProgram, VRegId, VRegKind, SimdWidth,
+        SimdWidth, VRegId, VRegKind, VmInstr, VmProgram,
     };
     use gllm_kernels::compiler::quant_format::QuantDataKind;
 
@@ -856,7 +961,11 @@ fn test_quant_codegen_dequant_fma_vminstr_roundtrip() {
     });
 
     // Verify the instruction encodes correctly (last non-DeclareVReg is QuantExtractBits)
-    let non_declare: Vec<_> = prog.instrs.iter().filter(|i| !matches!(i, VmInstr::DeclareVReg { .. })).collect();
+    let non_declare: Vec<_> = prog
+        .instrs
+        .iter()
+        .filter(|i| !matches!(i, VmInstr::DeclareVReg { .. }))
+        .collect();
     match non_declare.first() {
         Some(VmInstr::QuantExtractBits { bit_width, .. }) => {
             assert_eq!(*bit_width, 4);
@@ -875,7 +984,10 @@ fn test_quant_codegen_device_profile_quant_capabilities() {
 
     // F32 must always be in native_formats
     assert!(
-        profile.quant_capabilities.native_formats.contains(&QuantType::F32),
+        profile
+            .quant_capabilities
+            .native_formats
+            .contains(&QuantType::F32),
         "F32 must be in native_formats on any device"
     );
 
@@ -895,8 +1007,13 @@ fn test_quant_codegen_quant_capability_coverage_consistency() {
         let path = coverage_check(*qt, IsaKind::X86, OpCategory::Gemm);
         // Native formats should have Native or Assisted path on x86_64 (not DequantFMA)
         assert!(
-            matches!(path, CoveragePath::Native | CoveragePath::Assisted | CoveragePath::DequantFMA),
-            "Native format {:?} on x86_64 GEMM must have valid coverage path, got {:?}", qt, path
+            matches!(
+                path,
+                CoveragePath::Native | CoveragePath::Assisted | CoveragePath::DequantFMA
+            ),
+            "Native format {:?} on x86_64 GEMM must have valid coverage path, got {:?}",
+            qt,
+            path
         );
     }
 
@@ -904,8 +1021,13 @@ fn test_quant_codegen_quant_capability_coverage_consistency() {
     for qt in &profile.quant_capabilities.assisted_formats {
         let path = coverage_check(*qt, IsaKind::X86, OpCategory::Gemm);
         assert!(
-            matches!(path, CoveragePath::Native | CoveragePath::Assisted | CoveragePath::DequantFMA),
-            "Assisted format {:?} on x86_64 GEMM must have valid coverage path, got {:?}", qt, path
+            matches!(
+                path,
+                CoveragePath::Native | CoveragePath::Assisted | CoveragePath::DequantFMA
+            ),
+            "Assisted format {:?} on x86_64 GEMM must have valid coverage path, got {:?}",
+            qt,
+            path
         );
     }
 }
@@ -939,7 +1061,8 @@ fn test_quant_codegen_e2e_five_representative_formats() {
         assert!(!trace.is_empty(), "Trace for {:?} must not be empty", qt);
         assert!(
             final_slot.0 < trace.len() as u32,
-            "Final slot for {:?} out of range", qt
+            "Final slot for {:?} out of range",
+            qt
         );
 
         // Phase 2: Execute — run numerical simulation
@@ -948,18 +1071,14 @@ fn test_quant_codegen_e2e_five_representative_formats() {
         let sim_result = simulate_compile(&trace, desc, &block_data, inputs);
         assert!(
             sim_result.is_ok(),
-            "Numerical simulation failed for {:?}: {:?}", qt, sim_result.err()
+            "Numerical simulation failed for {:?}: {:?}",
+            qt,
+            sim_result.err()
         );
 
         let result = sim_result.unwrap();
-        assert!(
-            !result.has_nan,
-            "[{:?}] Simulation produced NaN", qt
-        );
-        assert!(
-            !result.has_inf,
-            "[{:?}] Simulation produced Inf", qt
-        );
+        assert!(!result.has_nan, "[{:?}] Simulation produced NaN", qt);
+        assert!(!result.has_inf, "[{:?}] Simulation produced Inf", qt);
 
         // Phase 3: Verify coverage path is consistent
         let path = coverage_check(*qt, IsaKind::X86, OpCategory::Gemm);
@@ -982,8 +1101,8 @@ fn test_quant_codegen_e2e_five_representative_formats() {
 fn debug_q5_0_trace_dump() {
     use gllm_kernels::compiler::codegen::vm::quant_decode::DecodeTraceBuilder;
     use gllm_kernels::compiler::quant_format::registry;
-    use gllm_kernels::quant::QuantType;
     use gllm_kernels::compiler::trace::TraceOp;
+    use gllm_kernels::quant::QuantType;
 
     let reg = registry();
     let desc = reg.get(&QuantType::Q5_0).expect("Q5_0");

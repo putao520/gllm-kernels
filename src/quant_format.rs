@@ -35,14 +35,12 @@ impl QuantFormatDescriptor {
     /// at library init via [`QuantFormatRegistry::new`]).
     pub fn for_type(quant_type: QuantType) -> QuantFormatDescriptor {
         let reg = registry();
-        reg.get(&quant_type)
-            .cloned()
-            .unwrap_or_else(|| {
-                panic!(
-                    "QuantFormatDescriptor::for_type: no descriptor registered for {:?}",
-                    quant_type
-                )
-            })
+        reg.get(&quant_type).cloned().unwrap_or_else(|| {
+            panic!(
+                "QuantFormatDescriptor::for_type: no descriptor registered for {:?}",
+                quant_type
+            )
+        })
     }
 }
 
@@ -163,7 +161,10 @@ pub enum ScaleLayout {
     /// No scale (native float formats: BF16, FP16, F32).
     None,
     /// Single f16 / f32 / bf16 scale at fixed offset, broadcast to all lanes.
-    BlockScalar { offset_bytes: usize, dtype: ScaleDType },
+    BlockScalar {
+        offset_bytes: usize,
+        dtype: ScaleDType,
+    },
     /// Block-level d + min, both scalars broadcast.
     BlockScalarWithMin {
         d_offset: usize,
@@ -329,7 +330,9 @@ fn quant_type_key(qt: &QuantType) -> u32 {
 
 impl QuantFormatRegistry {
     pub fn new() -> Self {
-        let mut r = Self { descriptors: HashMap::new() };
+        let mut r = Self {
+            descriptors: HashMap::new(),
+        };
         r.register_float();
         r.register_classic();
         r.register_kquant();
@@ -344,7 +347,8 @@ impl QuantFormatRegistry {
     }
 
     fn insert(&mut self, desc: QuantFormatDescriptor) {
-        self.descriptors.insert(quant_type_key(&desc.quant_type), desc);
+        self.descriptors
+            .insert(quant_type_key(&desc.quant_type), desc);
     }
 
     fn register_classic(&mut self) {
@@ -356,9 +360,15 @@ impl QuantFormatRegistry {
             block_size: 32,
             block_bytes: 18,
             bits_per_element: 4,
-            scale_layout: ScaleLayout::BlockScalar { offset_bytes: 0, dtype: ScaleDType::F16 },
+            scale_layout: ScaleLayout::BlockScalar {
+                offset_bytes: 0,
+                dtype: ScaleDType::F16,
+            },
             zero_layout: ZeroLayout::StaticBias { value: 8 },
-            data_layout: DataLayout::PackedNibbles { offset: 2, low_first: true },
+            data_layout: DataLayout::PackedNibbles {
+                offset: 2,
+                low_first: true,
+            },
             data_kind: QuantDataKind::SignedPackedInt4,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
@@ -378,8 +388,14 @@ impl QuantFormatRegistry {
                 m_offset: 2,
                 dtype: ScaleDType::F16,
             },
-            zero_layout: ZeroLayout::BlockMin { offset_bytes: 2, dtype: ScaleDType::F16 },
-            data_layout: DataLayout::PackedNibbles { offset: 4, low_first: true },
+            zero_layout: ZeroLayout::BlockMin {
+                offset_bytes: 2,
+                dtype: ScaleDType::F16,
+            },
+            data_layout: DataLayout::PackedNibbles {
+                offset: 4,
+                low_first: true,
+            },
             data_kind: QuantDataKind::PackedInt4,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
@@ -393,7 +409,10 @@ impl QuantFormatRegistry {
             block_size: 32,
             block_bytes: 22,
             bits_per_element: 5,
-            scale_layout: ScaleLayout::BlockScalar { offset_bytes: 0, dtype: ScaleDType::F16 },
+            scale_layout: ScaleLayout::BlockScalar {
+                offset_bytes: 0,
+                dtype: ScaleDType::F16,
+            },
             zero_layout: ZeroLayout::StaticBias { value: 16 },
             data_layout: DataLayout::NibbleWithHighBits {
                 low_offset: 6,
@@ -419,7 +438,10 @@ impl QuantFormatRegistry {
                 m_offset: 2,
                 dtype: ScaleDType::F16,
             },
-            zero_layout: ZeroLayout::BlockMin { offset_bytes: 2, dtype: ScaleDType::F16 },
+            zero_layout: ZeroLayout::BlockMin {
+                offset_bytes: 2,
+                dtype: ScaleDType::F16,
+            },
             data_layout: DataLayout::NibbleWithHighBits {
                 low_offset: 8,
                 high_offset: 4,
@@ -438,9 +460,15 @@ impl QuantFormatRegistry {
             block_size: 32,
             block_bytes: 34,
             bits_per_element: 8,
-            scale_layout: ScaleLayout::BlockScalar { offset_bytes: 0, dtype: ScaleDType::F16 },
+            scale_layout: ScaleLayout::BlockScalar {
+                offset_bytes: 0,
+                dtype: ScaleDType::F16,
+            },
             zero_layout: ZeroLayout::None,
-            data_layout: DataLayout::Bytes { offset: 2, signed: true },
+            data_layout: DataLayout::Bytes {
+                offset: 2,
+                signed: true,
+            },
             data_kind: QuantDataKind::Int8,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
@@ -460,8 +488,14 @@ impl QuantFormatRegistry {
                 m_offset: 2,
                 dtype: ScaleDType::F16,
             },
-            zero_layout: ZeroLayout::BlockMin { offset_bytes: 2, dtype: ScaleDType::F16 },
-            data_layout: DataLayout::Bytes { offset: 4, signed: true },
+            zero_layout: ZeroLayout::BlockMin {
+                offset_bytes: 2,
+                dtype: ScaleDType::F16,
+            },
+            data_layout: DataLayout::Bytes {
+                offset: 4,
+                signed: true,
+            },
             data_kind: QuantDataKind::Int8,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
@@ -492,7 +526,10 @@ impl QuantFormatRegistry {
                 dmin_offset: 2,
                 sub_m_offset: 4,
             },
-            data_layout: DataLayout::PackedNibbles { offset: 16, low_first: true },
+            data_layout: DataLayout::PackedNibbles {
+                offset: 16,
+                low_first: true,
+            },
             data_kind: QuantDataKind::PackedInt4,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
@@ -572,10 +609,18 @@ impl QuantFormatRegistry {
                 sub_scales_bits: 4,
                 sub_scales_count: 16,
                 sub_block_elements: 16,
-                packed_layout: PackedScaleLayout { algorithm: PackedScaleAlgorithm::KQuant6Bit },
+                packed_layout: PackedScaleLayout {
+                    algorithm: PackedScaleAlgorithm::KQuant6Bit,
+                },
             },
-            zero_layout: ZeroLayout::Hierarchical { dmin_offset: 82, sub_m_offset: 0 },
-            data_layout: DataLayout::PackedNibbles { offset: 16, low_first: true },
+            zero_layout: ZeroLayout::Hierarchical {
+                dmin_offset: 82,
+                sub_m_offset: 0,
+            },
+            data_layout: DataLayout::PackedNibbles {
+                offset: 16,
+                low_first: true,
+            },
             data_kind: QuantDataKind::SuperLowBit,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
@@ -598,7 +643,9 @@ impl QuantFormatRegistry {
                 sub_scales_bits: 6,
                 sub_scales_count: 16,
                 sub_block_elements: 16,
-                packed_layout: PackedScaleLayout { algorithm: PackedScaleAlgorithm::Q3KExtended },
+                packed_layout: PackedScaleLayout {
+                    algorithm: PackedScaleAlgorithm::Q3KExtended,
+                },
             },
             zero_layout: ZeroLayout::StaticBias { value: 4 },
             data_layout: DataLayout::TwoBitConditionalBias {
@@ -618,9 +665,15 @@ impl QuantFormatRegistry {
             block_size: 256,
             block_bytes: 292,
             bits_per_element: 8,
-            scale_layout: ScaleLayout::BlockScalar { offset_bytes: 0, dtype: ScaleDType::F32 },
+            scale_layout: ScaleLayout::BlockScalar {
+                offset_bytes: 0,
+                dtype: ScaleDType::F32,
+            },
             zero_layout: ZeroLayout::None,
-            data_layout: DataLayout::Bytes { offset: 4, signed: true },
+            data_layout: DataLayout::Bytes {
+                offset: 4,
+                signed: true,
+            },
             data_kind: QuantDataKind::Int8,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
@@ -636,9 +689,15 @@ impl QuantFormatRegistry {
             block_size: 32,
             block_bytes: 18,
             bits_per_element: 4,
-            scale_layout: ScaleLayout::BlockScalar { offset_bytes: 0, dtype: ScaleDType::F16 },
+            scale_layout: ScaleLayout::BlockScalar {
+                offset_bytes: 0,
+                dtype: ScaleDType::F16,
+            },
             zero_layout: ZeroLayout::None,
-            data_layout: DataLayout::CodebookIndex { offset: 2, index_bits: 4 },
+            data_layout: DataLayout::CodebookIndex {
+                offset: 2,
+                index_bits: 4,
+            },
             data_kind: QuantDataKind::SuperLowBit,
             codebook: Some(CodebookSpec {
                 codebook_data: &IQ4_NL_CODEBOOK,
@@ -663,10 +722,15 @@ impl QuantFormatRegistry {
                 sub_scales_bits: 6,
                 sub_scales_count: 8,
                 sub_block_elements: 32,
-                packed_layout: PackedScaleLayout { algorithm: PackedScaleAlgorithm::KQuant6Bit },
+                packed_layout: PackedScaleLayout {
+                    algorithm: PackedScaleAlgorithm::KQuant6Bit,
+                },
             },
             zero_layout: ZeroLayout::None,
-            data_layout: DataLayout::CodebookIndex { offset: 8, index_bits: 4 },
+            data_layout: DataLayout::CodebookIndex {
+                offset: 8,
+                index_bits: 4,
+            },
             data_kind: QuantDataKind::SuperLowBit,
             codebook: Some(CodebookSpec {
                 codebook_data: &IQ4_NL_CODEBOOK,
@@ -686,9 +750,15 @@ impl QuantFormatRegistry {
             block_size: 256,
             block_bytes: 50,
             bits_per_element: 1,
-            scale_layout: ScaleLayout::BlockScalar { offset_bytes: 0, dtype: ScaleDType::F16 },
+            scale_layout: ScaleLayout::BlockScalar {
+                offset_bytes: 0,
+                dtype: ScaleDType::F16,
+            },
             zero_layout: ZeroLayout::None,
-            data_layout: DataLayout::CodebookIndex { offset: 34, index_bits: 1 },
+            data_layout: DataLayout::CodebookIndex {
+                offset: 34,
+                index_bits: 1,
+            },
             data_kind: QuantDataKind::SuperLowBit,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
@@ -702,9 +772,15 @@ impl QuantFormatRegistry {
             block_size: 256,
             block_bytes: 56,
             bits_per_element: 1,
-            scale_layout: ScaleLayout::BlockScalar { offset_bytes: 40, dtype: ScaleDType::U8Range },
+            scale_layout: ScaleLayout::BlockScalar {
+                offset_bytes: 40,
+                dtype: ScaleDType::U8Range,
+            },
             zero_layout: ZeroLayout::None,
-            data_layout: DataLayout::CodebookIndex { offset: 0, index_bits: 1 },
+            data_layout: DataLayout::CodebookIndex {
+                offset: 0,
+                index_bits: 1,
+            },
             data_kind: QuantDataKind::SuperLowBit,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
@@ -718,9 +794,15 @@ impl QuantFormatRegistry {
             block_size: 256,
             block_bytes: 66,
             bits_per_element: 2,
-            scale_layout: ScaleLayout::BlockScalar { offset_bytes: 0, dtype: ScaleDType::F16 },
+            scale_layout: ScaleLayout::BlockScalar {
+                offset_bytes: 0,
+                dtype: ScaleDType::F16,
+            },
             zero_layout: ZeroLayout::None,
-            data_layout: DataLayout::CodebookIndex { offset: 2, index_bits: 2 },
+            data_layout: DataLayout::CodebookIndex {
+                offset: 2,
+                index_bits: 2,
+            },
             data_kind: QuantDataKind::SuperLowBit,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
@@ -734,9 +816,15 @@ impl QuantFormatRegistry {
             block_size: 256,
             block_bytes: 74,
             bits_per_element: 2,
-            scale_layout: ScaleLayout::BlockScalar { offset_bytes: 0, dtype: ScaleDType::F16 },
+            scale_layout: ScaleLayout::BlockScalar {
+                offset_bytes: 0,
+                dtype: ScaleDType::F16,
+            },
             zero_layout: ZeroLayout::None,
-            data_layout: DataLayout::CodebookIndex { offset: 2, index_bits: 2 },
+            data_layout: DataLayout::CodebookIndex {
+                offset: 2,
+                index_bits: 2,
+            },
             data_kind: QuantDataKind::SuperLowBit,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
@@ -750,9 +838,15 @@ impl QuantFormatRegistry {
             block_size: 256,
             block_bytes: 82,
             bits_per_element: 2,
-            scale_layout: ScaleLayout::BlockScalar { offset_bytes: 0, dtype: ScaleDType::F16 },
+            scale_layout: ScaleLayout::BlockScalar {
+                offset_bytes: 0,
+                dtype: ScaleDType::F16,
+            },
             zero_layout: ZeroLayout::None,
-            data_layout: DataLayout::CodebookIndex { offset: 2, index_bits: 2 },
+            data_layout: DataLayout::CodebookIndex {
+                offset: 2,
+                index_bits: 2,
+            },
             data_kind: QuantDataKind::SuperLowBit,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
@@ -766,9 +860,15 @@ impl QuantFormatRegistry {
             block_size: 256,
             block_bytes: 98,
             bits_per_element: 3,
-            scale_layout: ScaleLayout::BlockScalar { offset_bytes: 0, dtype: ScaleDType::F16 },
+            scale_layout: ScaleLayout::BlockScalar {
+                offset_bytes: 0,
+                dtype: ScaleDType::F16,
+            },
             zero_layout: ZeroLayout::None,
-            data_layout: DataLayout::CodebookIndex { offset: 2, index_bits: 3 },
+            data_layout: DataLayout::CodebookIndex {
+                offset: 2,
+                index_bits: 3,
+            },
             data_kind: QuantDataKind::SuperLowBit,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
@@ -782,9 +882,15 @@ impl QuantFormatRegistry {
             block_size: 256,
             block_bytes: 110,
             bits_per_element: 3,
-            scale_layout: ScaleLayout::BlockScalar { offset_bytes: 106, dtype: ScaleDType::U8Range },
+            scale_layout: ScaleLayout::BlockScalar {
+                offset_bytes: 106,
+                dtype: ScaleDType::U8Range,
+            },
             zero_layout: ZeroLayout::None,
-            data_layout: DataLayout::CodebookIndex { offset: 2, index_bits: 3 },
+            data_layout: DataLayout::CodebookIndex {
+                offset: 2,
+                index_bits: 3,
+            },
             data_kind: QuantDataKind::SuperLowBit,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
@@ -801,9 +907,18 @@ impl QuantFormatRegistry {
             block_size: 128,
             block_bytes: 72,
             bits_per_element: 4,
-            scale_layout: ScaleLayout::BlockScalar { offset_bytes: 0, dtype: ScaleDType::F16 },
-            zero_layout: ZeroLayout::BlockScalar { offset_bytes: 4, dtype: ScaleDType::F16 },
-            data_layout: DataLayout::PackedNibbles { offset: 8, low_first: true },
+            scale_layout: ScaleLayout::BlockScalar {
+                offset_bytes: 0,
+                dtype: ScaleDType::F16,
+            },
+            zero_layout: ZeroLayout::BlockScalar {
+                offset_bytes: 4,
+                dtype: ScaleDType::F16,
+            },
+            data_layout: DataLayout::PackedNibbles {
+                offset: 8,
+                low_first: true,
+            },
             data_kind: QuantDataKind::PackedInt4,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
@@ -817,13 +932,22 @@ impl QuantFormatRegistry {
             block_size: 128,
             block_bytes: 72,
             bits_per_element: 4,
-            scale_layout: ScaleLayout::BlockScalar { offset_bytes: 0, dtype: ScaleDType::F16 },
-            zero_layout: ZeroLayout::BlockScalar { offset_bytes: 4, dtype: ScaleDType::F16 },
-            data_layout: DataLayout::PackedNibbles { offset: 8, low_first: true },
+            scale_layout: ScaleLayout::BlockScalar {
+                offset_bytes: 0,
+                dtype: ScaleDType::F16,
+            },
+            zero_layout: ZeroLayout::BlockScalar {
+                offset_bytes: 4,
+                dtype: ScaleDType::F16,
+            },
+            data_layout: DataLayout::PackedNibbles {
+                offset: 8,
+                low_first: true,
+            },
             data_kind: QuantDataKind::PackedInt4,
             codebook: None,
             storage_layout: StorageLayout::ColInterleaved, // g_idx reordering
-            native_isa: None, // INT4: software-assisted on all ISAs
+            native_isa: None,                              // INT4: software-assisted on all ISAs
         });
 
         // SqueezeLLM: d(f16) + qs[128] = 130 bytes, 256 elements
@@ -836,9 +960,15 @@ impl QuantFormatRegistry {
             block_size: 256,
             block_bytes: 130,
             bits_per_element: 3,
-            scale_layout: ScaleLayout::BlockScalar { offset_bytes: 0, dtype: ScaleDType::F16 },
+            scale_layout: ScaleLayout::BlockScalar {
+                offset_bytes: 0,
+                dtype: ScaleDType::F16,
+            },
             zero_layout: ZeroLayout::StaticBias { value: 4 },
-            data_layout: DataLayout::PackedNibbles { offset: 2, low_first: true },
+            data_layout: DataLayout::PackedNibbles {
+                offset: 2,
+                low_first: true,
+            },
             data_kind: QuantDataKind::SuperLowBit,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
@@ -855,9 +985,15 @@ impl QuantFormatRegistry {
             block_size: 32,
             block_bytes: 17, // 1 byte scale + 32/2 = 16 bytes packed
             bits_per_element: 4,
-            scale_layout: ScaleLayout::BlockScalar { offset_bytes: 0, dtype: ScaleDType::E8M0 },
+            scale_layout: ScaleLayout::BlockScalar {
+                offset_bytes: 0,
+                dtype: ScaleDType::E8M0,
+            },
             zero_layout: ZeroLayout::None,
-            data_layout: DataLayout::PackedNibbles { offset: 1, low_first: true },
+            data_layout: DataLayout::PackedNibbles {
+                offset: 1,
+                low_first: true,
+            },
             data_kind: QuantDataKind::Float4,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
@@ -880,7 +1016,10 @@ impl QuantFormatRegistry {
                 dtype: ScaleDType::F8E4M3,
             },
             zero_layout: ZeroLayout::None,
-            data_layout: DataLayout::PackedNibbles { offset: 4, low_first: true },
+            data_layout: DataLayout::PackedNibbles {
+                offset: 4,
+                low_first: true,
+            },
             data_kind: QuantDataKind::Nvfp4,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
@@ -896,14 +1035,20 @@ impl QuantFormatRegistry {
             quant_type: QuantType::TQ1_0,
             block_size: 256,
             block_bytes: 54,
-            bits_per_element: 3,  // log2(3) ≈ 1.58 → engineering aligned to 3-bit upper bound
-            scale_layout: ScaleLayout::BlockScalar { offset_bytes: 0, dtype: ScaleDType::F16 },
-            zero_layout: ZeroLayout::StaticBias { value: 1 },  // trit - 1 (symmetric)
-            data_layout: DataLayout::PackedNibbles { offset: 2, low_first: true },
+            bits_per_element: 3, // log2(3) ≈ 1.58 → engineering aligned to 3-bit upper bound
+            scale_layout: ScaleLayout::BlockScalar {
+                offset_bytes: 0,
+                dtype: ScaleDType::F16,
+            },
+            zero_layout: ZeroLayout::StaticBias { value: 1 }, // trit - 1 (symmetric)
+            data_layout: DataLayout::PackedNibbles {
+                offset: 2,
+                low_first: true,
+            },
             data_kind: QuantDataKind::SuperLowBit,
             codebook: None,
             storage_layout: StorageLayout::Packed, // 5-trit packing across byte boundaries
-            native_isa: None, // ternary: no native hardware
+            native_isa: None,                      // ternary: no native hardware
         });
 
         // TQ2_0 (Ternary 2.0, GGUF type 35): 256 elements, 66 bytes per block.
@@ -915,13 +1060,19 @@ impl QuantFormatRegistry {
             block_size: 256,
             block_bytes: 66,
             bits_per_element: 2,
-            scale_layout: ScaleLayout::BlockScalar { offset_bytes: 0, dtype: ScaleDType::F16 },
+            scale_layout: ScaleLayout::BlockScalar {
+                offset_bytes: 0,
+                dtype: ScaleDType::F16,
+            },
             zero_layout: ZeroLayout::StaticBias { value: 1 },
-            data_layout: DataLayout::PackedNibbles { offset: 2, low_first: true },
+            data_layout: DataLayout::PackedNibbles {
+                offset: 2,
+                low_first: true,
+            },
             data_kind: QuantDataKind::SuperLowBit,
             codebook: None,
             storage_layout: StorageLayout::Packed, // 2-bit packed ternary
-            native_isa: None, // ternary: no native hardware
+            native_isa: None,                      // ternary: no native hardware
         });
 
         // FP8 E4M3 (NVIDIA/AMD hardware-native 8-bit float).
@@ -936,7 +1087,10 @@ impl QuantFormatRegistry {
             bits_per_element: 8,
             scale_layout: ScaleLayout::None,
             zero_layout: ZeroLayout::None,
-            data_layout: DataLayout::Bytes { offset: 0, signed: false },
+            data_layout: DataLayout::Bytes {
+                offset: 0,
+                signed: false,
+            },
             data_kind: QuantDataKind::Float8,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
@@ -954,7 +1108,10 @@ impl QuantFormatRegistry {
             bits_per_element: 8,
             scale_layout: ScaleLayout::None,
             zero_layout: ZeroLayout::None,
-            data_layout: DataLayout::Bytes { offset: 0, signed: false },
+            data_layout: DataLayout::Bytes {
+                offset: 0,
+                signed: false,
+            },
             data_kind: QuantDataKind::Float8,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
@@ -972,7 +1129,10 @@ impl QuantFormatRegistry {
             bits_per_element: 16,
             scale_layout: ScaleLayout::None,
             zero_layout: ZeroLayout::None,
-            data_layout: DataLayout::Bytes { offset: 0, signed: false },
+            data_layout: DataLayout::Bytes {
+                offset: 0,
+                signed: false,
+            },
             data_kind: QuantDataKind::Bfloat16,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
@@ -988,7 +1148,10 @@ impl QuantFormatRegistry {
             bits_per_element: 16,
             scale_layout: ScaleLayout::None,
             zero_layout: ZeroLayout::None,
-            data_layout: DataLayout::Bytes { offset: 0, signed: false },
+            data_layout: DataLayout::Bytes {
+                offset: 0,
+                signed: false,
+            },
             data_kind: QuantDataKind::Float16,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
@@ -1004,7 +1167,10 @@ impl QuantFormatRegistry {
             bits_per_element: 32,
             scale_layout: ScaleLayout::None,
             zero_layout: ZeroLayout::None,
-            data_layout: DataLayout::Bytes { offset: 0, signed: false },
+            data_layout: DataLayout::Bytes {
+                offset: 0,
+                signed: false,
+            },
             data_kind: QuantDataKind::Float32,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
@@ -1034,8 +1200,12 @@ mod tests {
     fn classic_formats_registered() {
         let r = registry();
         for qt in &[
-            QuantType::Q4_0, QuantType::Q4_1, QuantType::Q5_0,
-            QuantType::Q5_1, QuantType::Q8_0, QuantType::Q8_1,
+            QuantType::Q4_0,
+            QuantType::Q4_1,
+            QuantType::Q5_0,
+            QuantType::Q5_1,
+            QuantType::Q8_0,
+            QuantType::Q8_1,
         ] {
             let d = r.get(qt).expect("classic format must be registered");
             assert_eq!(d.block_size, 32);
@@ -1046,7 +1216,14 @@ mod tests {
     #[test]
     fn kquant_formats_registered() {
         let r = registry();
-        for qt in &[QuantType::Q2K, QuantType::Q3K, QuantType::Q4K, QuantType::Q5K, QuantType::Q6K, QuantType::Q8K] {
+        for qt in &[
+            QuantType::Q2K,
+            QuantType::Q3K,
+            QuantType::Q4K,
+            QuantType::Q5K,
+            QuantType::Q6K,
+            QuantType::Q8K,
+        ] {
             let d = r.get(qt).expect("k-quant format must be registered");
             assert_eq!(d.block_size, 256);
             assert_eq!(d.block_bytes, qt.block_bytes());
@@ -1067,10 +1244,15 @@ mod tests {
     fn iq_algo_kind_coverage() {
         use crate::compiler::quant_format::QuantAlgoKind;
         let iq_kinds = [
-            QuantAlgoKind::IQ1S, QuantAlgoKind::IQ1M,
-            QuantAlgoKind::IQ2XXS, QuantAlgoKind::IQ2XS, QuantAlgoKind::IQ2S,
-            QuantAlgoKind::IQ3XXS, QuantAlgoKind::IQ3S,
-            QuantAlgoKind::IQ4NL, QuantAlgoKind::IQ4XS,
+            QuantAlgoKind::IQ1S,
+            QuantAlgoKind::IQ1M,
+            QuantAlgoKind::IQ2XXS,
+            QuantAlgoKind::IQ2XS,
+            QuantAlgoKind::IQ2S,
+            QuantAlgoKind::IQ3XXS,
+            QuantAlgoKind::IQ3S,
+            QuantAlgoKind::IQ4NL,
+            QuantAlgoKind::IQ4XS,
         ];
         assert_eq!(iq_kinds.len(), 9, "all 9 IQ QuantAlgoKind variants present");
         for kind in &iq_kinds {
@@ -1078,13 +1260,18 @@ mod tests {
             assert!(
                 matches!(desc.data_kind, QuantDataKind::SuperLowBit),
                 "{:?}: expected SuperLowBit data_kind, got {:?}",
-                kind, desc.data_kind,
+                kind,
+                desc.data_kind,
             );
         }
         // All 9 must appear in QuantAlgoKind::all()
         let all = QuantAlgoKind::all();
         for kind in &iq_kinds {
-            assert!(all.contains(kind), "QuantAlgoKind::all() missing {:?}", kind);
+            assert!(
+                all.contains(kind),
+                "QuantAlgoKind::all() missing {:?}",
+                kind
+            );
         }
     }
 
@@ -1102,29 +1289,67 @@ mod tests {
     fn all_quant_types_have_descriptor() {
         let r = registry();
         let all_qt = [
-            QuantType::F32, QuantType::Bf16, QuantType::F16,
-            QuantType::Q4_0, QuantType::Q4_1, QuantType::Q5_0, QuantType::Q5_1,
-            QuantType::Q8_0, QuantType::Q8_1,
-            QuantType::Q2K, QuantType::Q3K, QuantType::Q4K, QuantType::Q5K,
-            QuantType::Q6K, QuantType::Q8K,
-            QuantType::IQ1S, QuantType::IQ1M, QuantType::IQ2XXS, QuantType::IQ2XS,
-            QuantType::IQ2S, QuantType::IQ3XXS, QuantType::IQ3S,
-            QuantType::IQ4NL, QuantType::IQ4XS,
-            QuantType::AWQ4, QuantType::GPTQ4,
+            QuantType::F32,
+            QuantType::Bf16,
+            QuantType::F16,
+            QuantType::Q4_0,
+            QuantType::Q4_1,
+            QuantType::Q5_0,
+            QuantType::Q5_1,
+            QuantType::Q8_0,
+            QuantType::Q8_1,
+            QuantType::Q2K,
+            QuantType::Q3K,
+            QuantType::Q4K,
+            QuantType::Q5K,
+            QuantType::Q6K,
+            QuantType::Q8K,
+            QuantType::IQ1S,
+            QuantType::IQ1M,
+            QuantType::IQ2XXS,
+            QuantType::IQ2XS,
+            QuantType::IQ2S,
+            QuantType::IQ3XXS,
+            QuantType::IQ3S,
+            QuantType::IQ4NL,
+            QuantType::IQ4XS,
+            QuantType::AWQ4,
+            QuantType::GPTQ4,
             QuantType::Squeeze,
             QuantType::Mxfp4 { block_size: 32 },
             QuantType::Nvfp4,
-            QuantType::TQ1_0, QuantType::TQ2_0,
+            QuantType::TQ1_0,
+            QuantType::TQ2_0,
         ];
         assert_eq!(all_qt.len(), 31);
         for qt in &all_qt {
-            let desc = r.get(qt).unwrap_or_else(|| panic!("missing descriptor for {:?}", qt));
-            assert_eq!(desc.block_size, qt.block_size(),
-                "{:?}: descriptor.block_size {} != qt.block_size() {}", qt, desc.block_size, qt.block_size());
-            assert_eq!(desc.block_bytes, qt.block_bytes(),
-                "{:?}: descriptor.block_bytes {} != qt.block_bytes() {}", qt, desc.block_bytes, qt.block_bytes());
-            assert_eq!(desc.bits_per_element, qt.bits(),
-                "{:?}: descriptor.bits {} != qt.bits() {}", qt, desc.bits_per_element, qt.bits());
+            let desc = r
+                .get(qt)
+                .unwrap_or_else(|| panic!("missing descriptor for {:?}", qt));
+            assert_eq!(
+                desc.block_size,
+                qt.block_size(),
+                "{:?}: descriptor.block_size {} != qt.block_size() {}",
+                qt,
+                desc.block_size,
+                qt.block_size()
+            );
+            assert_eq!(
+                desc.block_bytes,
+                qt.block_bytes(),
+                "{:?}: descriptor.block_bytes {} != qt.block_bytes() {}",
+                qt,
+                desc.block_bytes,
+                qt.block_bytes()
+            );
+            assert_eq!(
+                desc.bits_per_element,
+                qt.bits(),
+                "{:?}: descriptor.bits {} != qt.bits() {}",
+                qt,
+                desc.bits_per_element,
+                qt.bits()
+            );
         }
     }
 
@@ -1137,7 +1362,10 @@ mod tests {
         assert_eq!(d.block_bytes, 36);
         assert!(matches!(d.data_kind, QuantDataKind::Nvfp4));
         assert!(matches!(d.zero_layout, ZeroLayout::None));
-        assert!(matches!(d.scale_layout, ScaleLayout::SubBlockScalars { .. }));
+        assert!(matches!(
+            d.scale_layout,
+            ScaleLayout::SubBlockScalars { .. }
+        ));
     }
 
     /// Verify Squeeze descriptor: 3-bit linear with StaticBias(4).
@@ -1159,12 +1387,18 @@ mod tests {
         let tq10 = r.get(&QuantType::TQ1_0).expect("TQ1_0 registered");
         assert_eq!(tq10.block_bytes, 54);
         assert!(matches!(tq10.data_kind, QuantDataKind::SuperLowBit));
-        assert!(matches!(tq10.zero_layout, ZeroLayout::StaticBias { value: 1 }));
+        assert!(matches!(
+            tq10.zero_layout,
+            ZeroLayout::StaticBias { value: 1 }
+        ));
 
         let tq20 = r.get(&QuantType::TQ2_0).expect("TQ2_0 registered");
         assert_eq!(tq20.block_bytes, 66);
         assert!(matches!(tq20.data_kind, QuantDataKind::SuperLowBit));
-        assert!(matches!(tq20.zero_layout, ZeroLayout::StaticBias { value: 1 }));
+        assert!(matches!(
+            tq20.zero_layout,
+            ZeroLayout::StaticBias { value: 1 }
+        ));
     }
 
     /// Verify BF16/FP16/F32 descriptors: native float, no scale/zero.
@@ -1200,7 +1434,11 @@ mod tests {
 
     #[test]
     fn storage_layout_all_variants_distinct() {
-        let variants = [StorageLayout::RowMajor, StorageLayout::ColInterleaved, StorageLayout::Packed];
+        let variants = [
+            StorageLayout::RowMajor,
+            StorageLayout::ColInterleaved,
+            StorageLayout::Packed,
+        ];
         for (i, v1) in variants.iter().enumerate() {
             for (j, v2) in variants.iter().enumerate() {
                 assert_eq!(i == j, v1 == v2, "variant {} == {} mismatch", i, j);
@@ -1251,7 +1489,13 @@ mod tests {
 
     #[test]
     fn native_isa_gpu_variants_distinct() {
-        let gpu = [NativeIsa::Hmma, NativeIsa::Wgmma, NativeIsa::Tcgen05Fp4, NativeIsa::Wmma, NativeIsa::Gfx12WmmaIU4IU8];
+        let gpu = [
+            NativeIsa::Hmma,
+            NativeIsa::Wgmma,
+            NativeIsa::Tcgen05Fp4,
+            NativeIsa::Wmma,
+            NativeIsa::Gfx12WmmaIU4IU8,
+        ];
         for (i, a) in gpu.iter().enumerate() {
             for (j, b) in gpu.iter().enumerate() {
                 assert_eq!(i == j, a == b);
@@ -1310,9 +1554,14 @@ mod tests {
     #[test]
     fn scale_dtype_all_variants_distinct() {
         let all = [
-            ScaleDType::F16, ScaleDType::F32, ScaleDType::BF16,
-            ScaleDType::U8Range, ScaleDType::I8Range,
-            ScaleDType::F8E4M3, ScaleDType::F8E5M2, ScaleDType::E8M0,
+            ScaleDType::F16,
+            ScaleDType::F32,
+            ScaleDType::BF16,
+            ScaleDType::U8Range,
+            ScaleDType::I8Range,
+            ScaleDType::F8E4M3,
+            ScaleDType::F8E5M2,
+            ScaleDType::E8M0,
         ];
         for (i, a) in all.iter().enumerate() {
             for (j, b) in all.iter().enumerate() {
@@ -1340,38 +1589,98 @@ mod tests {
 
     #[test]
     fn zero_layout_block_scalar() {
-        let layout = ZeroLayout::BlockScalar { offset_bytes: 4, dtype: ScaleDType::F16 };
-        assert!(matches!(&layout, ZeroLayout::BlockScalar { offset_bytes: 4, dtype: ScaleDType::F16 }));
-        assert!(!matches!(&layout, ZeroLayout::BlockScalar { offset_bytes: 0, dtype: ScaleDType::F16 }));
+        let layout = ZeroLayout::BlockScalar {
+            offset_bytes: 4,
+            dtype: ScaleDType::F16,
+        };
+        assert!(matches!(
+            &layout,
+            ZeroLayout::BlockScalar {
+                offset_bytes: 4,
+                dtype: ScaleDType::F16
+            }
+        ));
+        assert!(!matches!(
+            &layout,
+            ZeroLayout::BlockScalar {
+                offset_bytes: 0,
+                dtype: ScaleDType::F16
+            }
+        ));
     }
 
     // ========== DataLayout tests ==========
 
     #[test]
     fn data_layout_packed_nibbles_fields() {
-        let layout = DataLayout::PackedNibbles { offset: 2, low_first: true };
-        assert!(matches!(&layout, DataLayout::PackedNibbles { offset: 2, low_first: true }));
-        assert!(!matches!(&layout, DataLayout::PackedNibbles { offset: 2, low_first: false }));
+        let layout = DataLayout::PackedNibbles {
+            offset: 2,
+            low_first: true,
+        };
+        assert!(matches!(
+            &layout,
+            DataLayout::PackedNibbles {
+                offset: 2,
+                low_first: true
+            }
+        ));
+        assert!(!matches!(
+            &layout,
+            DataLayout::PackedNibbles {
+                offset: 2,
+                low_first: false
+            }
+        ));
     }
 
     #[test]
     fn data_layout_bytes_signed_vs_unsigned() {
-        let signed = DataLayout::Bytes { offset: 0, signed: true };
-        let unsigned = DataLayout::Bytes { offset: 0, signed: false };
+        let signed = DataLayout::Bytes {
+            offset: 0,
+            signed: true,
+        };
+        let unsigned = DataLayout::Bytes {
+            offset: 0,
+            signed: false,
+        };
         assert!(matches!(&signed, DataLayout::Bytes { signed: true, .. }));
         assert!(matches!(&unsigned, DataLayout::Bytes { signed: false, .. }));
     }
 
     #[test]
     fn data_layout_codebook_index_bits() {
-        let idx1 = DataLayout::CodebookIndex { offset: 34, index_bits: 1 };
-        let idx2 = DataLayout::CodebookIndex { offset: 2, index_bits: 2 };
-        let idx3 = DataLayout::CodebookIndex { offset: 2, index_bits: 3 };
-        let idx4 = DataLayout::CodebookIndex { offset: 2, index_bits: 4 };
-        assert!(matches!(&idx1, DataLayout::CodebookIndex { index_bits: 1, .. }));
-        assert!(matches!(&idx2, DataLayout::CodebookIndex { index_bits: 2, .. }));
-        assert!(matches!(&idx3, DataLayout::CodebookIndex { index_bits: 3, .. }));
-        assert!(matches!(&idx4, DataLayout::CodebookIndex { index_bits: 4, .. }));
+        let idx1 = DataLayout::CodebookIndex {
+            offset: 34,
+            index_bits: 1,
+        };
+        let idx2 = DataLayout::CodebookIndex {
+            offset: 2,
+            index_bits: 2,
+        };
+        let idx3 = DataLayout::CodebookIndex {
+            offset: 2,
+            index_bits: 3,
+        };
+        let idx4 = DataLayout::CodebookIndex {
+            offset: 2,
+            index_bits: 4,
+        };
+        assert!(matches!(
+            &idx1,
+            DataLayout::CodebookIndex { index_bits: 1, .. }
+        ));
+        assert!(matches!(
+            &idx2,
+            DataLayout::CodebookIndex { index_bits: 2, .. }
+        ));
+        assert!(matches!(
+            &idx3,
+            DataLayout::CodebookIndex { index_bits: 3, .. }
+        ));
+        assert!(matches!(
+            &idx4,
+            DataLayout::CodebookIndex { index_bits: 4, .. }
+        ));
     }
 
     // ========== PackedScaleAlgorithm tests ==========
@@ -1392,7 +1701,11 @@ mod tests {
         let r = registry();
         for qt in &[QuantType::Bf16, QuantType::F16, QuantType::F32] {
             let d = r.get(qt).unwrap();
-            assert!(matches!(d.scale_layout, ScaleLayout::None), "{:?} should have ScaleLayout::None", qt);
+            assert!(
+                matches!(d.scale_layout, ScaleLayout::None),
+                "{:?} should have ScaleLayout::None",
+                qt
+            );
         }
     }
 
@@ -1401,8 +1714,11 @@ mod tests {
         let r = registry();
         for qt in &[QuantType::Q4_0, QuantType::Q5_0, QuantType::Q8_0] {
             let d = r.get(qt).unwrap();
-            assert!(matches!(d.scale_layout, ScaleLayout::BlockScalar { .. }),
-                "{:?} should have BlockScalar scale", qt);
+            assert!(
+                matches!(d.scale_layout, ScaleLayout::BlockScalar { .. }),
+                "{:?} should have BlockScalar scale",
+                qt
+            );
         }
     }
 
@@ -1411,18 +1727,29 @@ mod tests {
         let r = registry();
         for qt in &[QuantType::Q4_1, QuantType::Q5_1, QuantType::Q8_1] {
             let d = r.get(qt).unwrap();
-            assert!(matches!(d.scale_layout, ScaleLayout::BlockScalarWithMin { .. }),
-                "{:?} should have BlockScalarWithMin scale", qt);
+            assert!(
+                matches!(d.scale_layout, ScaleLayout::BlockScalarWithMin { .. }),
+                "{:?} should have BlockScalarWithMin scale",
+                qt
+            );
         }
     }
 
     #[test]
     fn scale_layout_hierarchical_for_kquant() {
         let r = registry();
-        for qt in &[QuantType::Q2K, QuantType::Q3K, QuantType::Q4K, QuantType::Q5K] {
+        for qt in &[
+            QuantType::Q2K,
+            QuantType::Q3K,
+            QuantType::Q4K,
+            QuantType::Q5K,
+        ] {
             let d = r.get(qt).unwrap();
-            assert!(matches!(d.scale_layout, ScaleLayout::Hierarchical { .. }),
-                "{:?} should have Hierarchical scale", qt);
+            assert!(
+                matches!(d.scale_layout, ScaleLayout::Hierarchical { .. }),
+                "{:?} should have Hierarchical scale",
+                qt
+            );
         }
     }
 
@@ -1438,7 +1765,11 @@ mod tests {
         let r = registry();
         let d = r.get(&QuantType::Nvfp4).unwrap();
         match &d.scale_layout {
-            ScaleLayout::SubBlockScalars { offset_bytes, sub_block_size, dtype } => {
+            ScaleLayout::SubBlockScalars {
+                offset_bytes,
+                sub_block_size,
+                dtype,
+            } => {
                 assert_eq!(*offset_bytes, 0);
                 assert_eq!(*sub_block_size, 16);
                 assert_eq!(*dtype, ScaleDType::F8E4M3);
@@ -1462,7 +1793,12 @@ mod tests {
     #[test]
     fn for_type_consistent_with_registry_get() {
         let r = registry();
-        for qt in [QuantType::Bf16, QuantType::Q8_0, QuantType::Nvfp4, QuantType::TQ1_0] {
+        for qt in [
+            QuantType::Bf16,
+            QuantType::Q8_0,
+            QuantType::Nvfp4,
+            QuantType::TQ1_0,
+        ] {
             let via_for_type = QuantFormatDescriptor::for_type(qt);
             let via_registry = r.get(&qt).unwrap();
             assert_eq!(via_for_type.name, via_registry.name);
@@ -1501,10 +1837,18 @@ mod tests {
     fn codebook_absent_for_classic_and_kquant() {
         let r = registry();
         for qt in &[
-            QuantType::Q4_0, QuantType::Q4_1, QuantType::Q5_0, QuantType::Q5_1,
-            QuantType::Q8_0, QuantType::Q8_1,
-            QuantType::Q2K, QuantType::Q3K, QuantType::Q4K, QuantType::Q5K,
-            QuantType::Q6K, QuantType::Q8K,
+            QuantType::Q4_0,
+            QuantType::Q4_1,
+            QuantType::Q5_0,
+            QuantType::Q5_1,
+            QuantType::Q8_0,
+            QuantType::Q8_1,
+            QuantType::Q2K,
+            QuantType::Q3K,
+            QuantType::Q4K,
+            QuantType::Q5K,
+            QuantType::Q6K,
+            QuantType::Q8K,
         ] {
             let d = r.get(qt).unwrap();
             assert!(d.codebook.is_none(), "{:?} should have no codebook", qt);
@@ -1514,7 +1858,12 @@ mod tests {
     #[test]
     fn codebook_absent_for_external_formats() {
         let r = registry();
-        for qt in &[QuantType::AWQ4, QuantType::GPTQ4, QuantType::Squeeze, QuantType::Nvfp4] {
+        for qt in &[
+            QuantType::AWQ4,
+            QuantType::GPTQ4,
+            QuantType::Squeeze,
+            QuantType::Nvfp4,
+        ] {
             let d = r.get(qt).unwrap();
             assert!(d.codebook.is_none(), "{:?} should have no codebook", qt);
         }
@@ -1583,8 +1932,12 @@ mod tests {
         let r = registry();
         for qt in &[QuantType::Q8_0, QuantType::Q8_1, QuantType::Q8K] {
             let d = r.get(qt).unwrap();
-            assert_eq!(d.native_isa, Some(NativeIsa::Vpdpbusd),
-                "{:?} should have VPDPBUSD native ISA", qt);
+            assert_eq!(
+                d.native_isa,
+                Some(NativeIsa::Vpdpbusd),
+                "{:?} should have VPDPBUSD native ISA",
+                qt
+            );
         }
     }
 
@@ -1609,7 +1962,13 @@ mod tests {
     #[test]
     fn native_isa_none_for_low_bit_formats() {
         let r = registry();
-        for qt in &[QuantType::Q4_0, QuantType::Q5_0, QuantType::Q6K, QuantType::Q2K, QuantType::Q3K] {
+        for qt in &[
+            QuantType::Q4_0,
+            QuantType::Q5_0,
+            QuantType::Q6K,
+            QuantType::Q2K,
+            QuantType::Q3K,
+        ] {
             let d = r.get(qt).unwrap();
             assert!(d.native_isa.is_none(), "{:?} should have no native ISA", qt);
         }
@@ -1634,7 +1993,13 @@ mod tests {
         assert_eq!(d.block_bytes, 1);
         assert_eq!(d.bits_per_element, 8);
         assert!(matches!(d.data_kind, QuantDataKind::Float8));
-        assert!(matches!(d.data_layout, DataLayout::Bytes { offset: 0, signed: false }));
+        assert!(matches!(
+            d.data_layout,
+            DataLayout::Bytes {
+                offset: 0,
+                signed: false
+            }
+        ));
     }
 
     #[test]
@@ -1653,21 +2018,30 @@ mod tests {
         let d = QuantFormatDescriptor::for_type(QuantType::IQ1S);
         assert_eq!(d.bits_per_element, 1);
         assert_eq!(d.block_size, 256);
-        assert!(matches!(d.data_layout, DataLayout::CodebookIndex { index_bits: 1, .. }));
+        assert!(matches!(
+            d.data_layout,
+            DataLayout::CodebookIndex { index_bits: 1, .. }
+        ));
     }
 
     #[test]
     fn iq2xxs_descriptor_fields() {
         let d = QuantFormatDescriptor::for_type(QuantType::IQ2XXS);
         assert_eq!(d.bits_per_element, 2);
-        assert!(matches!(d.data_layout, DataLayout::CodebookIndex { index_bits: 2, .. }));
+        assert!(matches!(
+            d.data_layout,
+            DataLayout::CodebookIndex { index_bits: 2, .. }
+        ));
     }
 
     #[test]
     fn iq3xxs_descriptor_fields() {
         let d = QuantFormatDescriptor::for_type(QuantType::IQ3XXS);
         assert_eq!(d.bits_per_element, 3);
-        assert!(matches!(d.data_layout, DataLayout::CodebookIndex { index_bits: 3, .. }));
+        assert!(matches!(
+            d.data_layout,
+            DataLayout::CodebookIndex { index_bits: 3, .. }
+        ));
     }
 
     // ========== MXFP4 descriptor details ==========
@@ -1680,7 +2054,13 @@ mod tests {
         assert_eq!(d.block_bytes, 17);
         assert_eq!(d.bits_per_element, 4);
         assert!(matches!(d.data_kind, QuantDataKind::Float4));
-        assert!(matches!(d.scale_layout, ScaleLayout::BlockScalar { dtype: ScaleDType::E8M0, .. }));
+        assert!(matches!(
+            d.scale_layout,
+            ScaleLayout::BlockScalar {
+                dtype: ScaleDType::E8M0,
+                ..
+            }
+        ));
     }
 
     // ========== QuantType round-trip through registry ==========
@@ -1688,20 +2068,39 @@ mod tests {
     #[test]
     fn registry_round_trip_all_registered() {
         let all_qt = [
-            QuantType::F32, QuantType::Bf16, QuantType::F16,
-            QuantType::Q4_0, QuantType::Q4_1, QuantType::Q5_0, QuantType::Q5_1,
-            QuantType::Q8_0, QuantType::Q8_1,
-            QuantType::Q2K, QuantType::Q3K, QuantType::Q4K, QuantType::Q5K,
-            QuantType::Q6K, QuantType::Q8K,
-            QuantType::IQ1S, QuantType::IQ1M, QuantType::IQ2XXS, QuantType::IQ2XS,
-            QuantType::IQ2S, QuantType::IQ3XXS, QuantType::IQ3S,
-            QuantType::IQ4NL, QuantType::IQ4XS,
-            QuantType::AWQ4, QuantType::GPTQ4,
+            QuantType::F32,
+            QuantType::Bf16,
+            QuantType::F16,
+            QuantType::Q4_0,
+            QuantType::Q4_1,
+            QuantType::Q5_0,
+            QuantType::Q5_1,
+            QuantType::Q8_0,
+            QuantType::Q8_1,
+            QuantType::Q2K,
+            QuantType::Q3K,
+            QuantType::Q4K,
+            QuantType::Q5K,
+            QuantType::Q6K,
+            QuantType::Q8K,
+            QuantType::IQ1S,
+            QuantType::IQ1M,
+            QuantType::IQ2XXS,
+            QuantType::IQ2XS,
+            QuantType::IQ2S,
+            QuantType::IQ3XXS,
+            QuantType::IQ3S,
+            QuantType::IQ4NL,
+            QuantType::IQ4XS,
+            QuantType::AWQ4,
+            QuantType::GPTQ4,
             QuantType::Squeeze,
             QuantType::Mxfp4 { block_size: 32 },
             QuantType::Nvfp4,
-            QuantType::TQ1_0, QuantType::TQ2_0,
-            QuantType::Fp8E4M3, QuantType::Fp8E5M2,
+            QuantType::TQ1_0,
+            QuantType::TQ2_0,
+            QuantType::Fp8E4M3,
+            QuantType::Fp8E5M2,
         ];
         // 33 types (31 from original test + 2 FP8)
         assert!(all_qt.len() >= 31);
@@ -1719,8 +2118,12 @@ mod tests {
         let d = r.get(&QuantType::Q4K).unwrap();
         match &d.scale_layout {
             ScaleLayout::Hierarchical {
-                block_d_offset, block_dmin_offset, sub_scales_offset,
-                sub_scales_bits, sub_scales_count, sub_block_elements,
+                block_d_offset,
+                block_dmin_offset,
+                sub_scales_offset,
+                sub_scales_bits,
+                sub_scales_count,
+                sub_block_elements,
                 packed_layout,
             } => {
                 assert_eq!(*block_d_offset, 0);
@@ -1729,7 +2132,10 @@ mod tests {
                 assert_eq!(*sub_scales_bits, 6);
                 assert_eq!(*sub_scales_count, 8);
                 assert_eq!(*sub_block_elements, 32);
-                assert!(matches!(packed_layout.algorithm, PackedScaleAlgorithm::KQuant6Bit));
+                assert!(matches!(
+                    packed_layout.algorithm,
+                    PackedScaleAlgorithm::KQuant6Bit
+                ));
             }
             other => panic!("expected Hierarchical, got {:?}", other),
         }
@@ -1740,9 +2146,16 @@ mod tests {
         let r = registry();
         let d = r.get(&QuantType::Q3K).unwrap();
         match &d.scale_layout {
-            ScaleLayout::Hierarchical { block_dmin_offset, packed_layout, .. } => {
+            ScaleLayout::Hierarchical {
+                block_dmin_offset,
+                packed_layout,
+                ..
+            } => {
                 assert_eq!(*block_dmin_offset, None);
-                assert!(matches!(packed_layout.algorithm, PackedScaleAlgorithm::Q3KExtended));
+                assert!(matches!(
+                    packed_layout.algorithm,
+                    PackedScaleAlgorithm::Q3KExtended
+                ));
             }
             other => panic!("expected Hierarchical, got {:?}", other),
         }
@@ -1765,7 +2178,10 @@ mod tests {
             let d = r.get(qt).unwrap();
             assert!(
                 matches!(&d.zero_layout, ZeroLayout::StaticBias { value } if *value == *expected_bias),
-                "{:?}: expected StaticBias({}), got {:?}", qt, expected_bias, d.zero_layout
+                "{:?}: expected StaticBias({}), got {:?}",
+                qt,
+                expected_bias,
+                d.zero_layout
             );
         }
     }
@@ -1775,8 +2191,11 @@ mod tests {
         let r = registry();
         for qt in &[QuantType::Q4K, QuantType::Q5K] {
             let d = r.get(qt).unwrap();
-            assert!(matches!(d.zero_layout, ZeroLayout::Hierarchical { .. }),
-                "{:?} should have Hierarchical zero layout", qt);
+            assert!(
+                matches!(d.zero_layout, ZeroLayout::Hierarchical { .. }),
+                "{:?} should have Hierarchical zero layout",
+                qt
+            );
         }
     }
 
@@ -1785,8 +2204,11 @@ mod tests {
         let r = registry();
         for qt in &[QuantType::AWQ4, QuantType::GPTQ4] {
             let d = r.get(qt).unwrap();
-            assert!(matches!(d.zero_layout, ZeroLayout::BlockScalar { .. }),
-                "{:?} should have BlockScalar zero layout", qt);
+            assert!(
+                matches!(d.zero_layout, ZeroLayout::BlockScalar { .. }),
+                "{:?} should have BlockScalar zero layout",
+                qt
+            );
         }
     }
 }

@@ -102,10 +102,15 @@ impl DeviceTensor {
     }
 
     #[inline]
-    pub fn as_ptr(&self) -> *const u8 { self.ptr }
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
     #[inline]
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        assert!(!self.immutable, "cannot mutate immutable tensor created from from_slice");
+        assert!(
+            !self.immutable,
+            "cannot mutate immutable tensor created from from_slice"
+        );
         self.ptr
     }
 
@@ -125,21 +130,34 @@ impl DeviceTensor {
     /// Caller must ensure the dtype matches E and the tensor is on CPU.
     #[inline]
     pub unsafe fn as_mut_slice<E: Element>(&mut self) -> &mut [E] {
-        assert!(!self.immutable, "cannot mutate immutable tensor created from from_slice");
+        assert!(
+            !self.immutable,
+            "cannot mutate immutable tensor created from from_slice"
+        );
         debug_assert_eq!(self.device, DeviceKind::Cpu);
         std::slice::from_raw_parts_mut(self.ptr as *mut E, self.num_elements)
     }
 
     #[inline]
-    pub fn len_bytes(&self) -> usize { self.len_bytes }
+    pub fn len_bytes(&self) -> usize {
+        self.len_bytes
+    }
     #[inline]
-    pub fn num_elements(&self) -> usize { self.num_elements }
+    pub fn num_elements(&self) -> usize {
+        self.num_elements
+    }
     #[inline]
-    pub fn dtype(&self) -> DType { self.dtype }
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
     #[inline]
-    pub fn device(&self) -> DeviceKind { self.device }
+    pub fn device(&self) -> DeviceKind {
+        self.device
+    }
     #[inline]
-    pub fn is_cpu(&self) -> bool { self.device == DeviceKind::Cpu }
+    pub fn is_cpu(&self) -> bool {
+        self.device == DeviceKind::Cpu
+    }
 }
 
 impl Drop for DeviceTensor {
@@ -148,7 +166,9 @@ impl Drop for DeviceTensor {
             if let DeviceKind::Cpu = self.device {
                 if let Ok(layout) = std::alloc::Layout::from_size_align(self.len_bytes, 64) {
                     // SAFETY: ptr was allocated with this exact layout in DeviceTensor::new().
-                    unsafe { std::alloc::dealloc(self.ptr, layout); }
+                    unsafe {
+                        std::alloc::dealloc(self.ptr, layout);
+                    }
                 }
             }
         }

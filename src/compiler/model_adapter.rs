@@ -11,8 +11,8 @@
 //! - **编译时友好**: 配置适配在编译时完成，运行时零开销
 //! - **架构隔离**: 每个架构族有独立的适配器实现
 
-use crate::types::{ModelConfig, ModelArch, DType};
 use crate::types::CompilerError;
+use crate::types::{DType, ModelArch, ModelConfig};
 
 /// 架构特定的融合提示。
 ///
@@ -32,8 +32,7 @@ pub struct FusionHints {
 }
 
 /// FFN 激活函数类型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FfnActivation {
     /// SwiGLU (Llama, Qwen, Mistral)
     #[default]
@@ -44,10 +43,8 @@ pub enum FfnActivation {
     Gelu,
 }
 
-
 /// RoPE 模式。
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum RopeMode {
     /// 标准 RoPE (Llama)
     #[default]
@@ -57,7 +54,6 @@ pub enum RopeMode {
     /// 交错 RoPE (某些 GLM 变体)
     Interleaved,
 }
-
 
 /// 权重布局描述。
 ///
@@ -150,13 +146,15 @@ pub trait ModelAdapter: Send + Sync + 'static {
             return Err(format!(
                 "num_kv_heads ({}) cannot exceed num_heads ({})",
                 config.num_kv_heads, config.num_heads
-            ).into());
+            )
+            .into());
         }
         if config.num_heads % config.num_kv_heads != 0 {
             return Err(format!(
                 "num_heads ({}) must be divisible by num_kv_heads ({})",
                 config.num_heads, config.num_kv_heads
-            ).into());
+            )
+            .into());
         }
         if config.head_dim == 0 {
             return Err("head_dim cannot be zero".to_string().into());
@@ -174,7 +172,8 @@ pub trait ModelAdapter: Send + Sync + 'static {
             return Err(format!(
                 "config.arch ({:?}) does not match adapter arch ({:?})",
                 config.arch, expected_arch
-            ).into());
+            )
+            .into());
         }
 
         Ok(())
@@ -653,11 +652,11 @@ mod tests {
     fn test_llama_adapter_config() {
         let adapter = LlamaAdapter;
         let config = adapter.adapt_config(
-            4096, // hidden_size
-            32,   // num_layers
-            32,   // num_heads
-            8,    // num_kv_heads (GQA)
-            128,  // head_dim
+            4096,  // hidden_size
+            32,    // num_layers
+            32,    // num_heads
+            8,     // num_kv_heads (GQA)
+            128,   // head_dim
             11008, // intermediate_size
             32000, // vocab_size
             4096,  // max_seq_len
@@ -678,9 +677,7 @@ mod tests {
     #[test]
     fn test_qwen_adapter_config() {
         let adapter = QwenAdapter;
-        let config = adapter.adapt_config(
-            4096, 32, 32, 32, 128, 11008, 151936, 8192, DType::F16,
-        );
+        let config = adapter.adapt_config(4096, 32, 32, 32, 128, 11008, 151936, 8192, DType::F16);
 
         assert_eq!(config.arch, ModelArch::Qwen);
         assert_eq!(config.rope_theta, 1_000_000.0);
@@ -691,9 +688,7 @@ mod tests {
     #[test]
     fn test_gemma_adapter_config() {
         let adapter = GemmaAdapter;
-        let config = adapter.adapt_config(
-            2048, 18, 8, 1, 256, 16384, 256000, 8192, DType::BF16,
-        );
+        let config = adapter.adapt_config(2048, 18, 8, 1, 256, 16384, 256000, 8192, DType::BF16);
 
         assert_eq!(config.arch, ModelArch::Gemma);
         assert_eq!(config.norm_eps, 1e-6);
@@ -704,9 +699,7 @@ mod tests {
         let adapter = MistralAdapter {
             sliding_window: Some(4096),
         };
-        let config = adapter.adapt_config(
-            4096, 32, 32, 8, 128, 14336, 32000, 32768, DType::F32,
-        );
+        let config = adapter.adapt_config(4096, 32, 32, 8, 128, 14336, 32000, 32768, DType::F32);
 
         assert_eq!(config.arch, ModelArch::Mistral);
         assert_eq!(config.sliding_window, Some(4096));
@@ -717,9 +710,7 @@ mod tests {
         let adapter = PhiAdapter {
             partial_rotary_factor: 0.5,
         };
-        let config = adapter.adapt_config(
-            2560, 32, 32, 32, 80, 10240, 51200, 2048, DType::F32,
-        );
+        let config = adapter.adapt_config(2560, 32, 32, 32, 80, 10240, 51200, 2048, DType::F32);
 
         assert_eq!(config.arch, ModelArch::Phi);
         assert_eq!(config.num_kv_heads, 32); // MHA
@@ -758,18 +749,14 @@ mod tests {
     #[test]
     fn test_validate_config_success() {
         let adapter = LlamaAdapter;
-        let config = adapter.adapt_config(
-            4096, 32, 32, 8, 128, 11008, 32000, 4096, DType::F32,
-        );
+        let config = adapter.adapt_config(4096, 32, 32, 8, 128, 11008, 32000, 4096, DType::F32);
         assert!(adapter.validate_config(&config).is_ok());
     }
 
     #[test]
     fn test_validate_config_invalid_kv_heads() {
         let adapter = LlamaAdapter;
-        let mut config = adapter.adapt_config(
-            4096, 32, 32, 8, 128, 11008, 32000, 4096, DType::F32,
-        );
+        let mut config = adapter.adapt_config(4096, 32, 32, 8, 128, 11008, 32000, 4096, DType::F32);
         config.num_kv_heads = 33; // 不能超过 num_heads
         assert!(adapter.validate_config(&config).is_err());
     }
@@ -777,9 +764,7 @@ mod tests {
     #[test]
     fn test_validate_config_not_divisible() {
         let adapter = LlamaAdapter;
-        let mut config = adapter.adapt_config(
-            4096, 32, 32, 8, 128, 11008, 32000, 4096, DType::F32,
-        );
+        let mut config = adapter.adapt_config(4096, 32, 32, 8, 128, 11008, 32000, 4096, DType::F32);
         config.num_kv_heads = 7; // 32 不能被 7 整除
         assert!(adapter.validate_config(&config).is_err());
     }
@@ -787,9 +772,7 @@ mod tests {
     #[test]
     fn test_weight_layout_llama() {
         let adapter = LlamaAdapter;
-        let config = adapter.adapt_config(
-            4096, 32, 32, 8, 128, 11008, 32000, 4096, DType::F32,
-        );
+        let config = adapter.adapt_config(4096, 32, 32, 8, 128, 11008, 32000, 4096, DType::F32);
         let layout = adapter.weight_layout(&config);
 
         assert_eq!(layout.dtype, DType::F32);
@@ -806,9 +789,7 @@ mod tests {
         let adapter = Gpt2Adapter;
 
         // Act: pass num_kv_heads=1 but GPT-2 overrides to num_heads (MHA)
-        let config = adapter.adapt_config(
-            768, 12, 12, 1, 64, 3072, 50257, 1024, DType::F32,
-        );
+        let config = adapter.adapt_config(768, 12, 12, 1, 64, 3072, 50257, 1024, DType::F32);
 
         // Assert
         assert_eq!(config.arch, ModelArch::Gpt2);
@@ -835,9 +816,7 @@ mod tests {
     fn test_gpt2_adapter_weight_layout_uses_wte() {
         // Arrange
         let adapter = Gpt2Adapter;
-        let config = adapter.adapt_config(
-            768, 12, 12, 12, 64, 3072, 50257, 1024, DType::F32,
-        );
+        let config = adapter.adapt_config(768, 12, 12, 12, 64, 3072, 50257, 1024, DType::F32);
 
         // Act
         let layout = adapter.weight_layout(&config);
@@ -901,9 +880,7 @@ mod tests {
         let adapter = MistralAdapter::default();
 
         // Act
-        let config = adapter.adapt_config(
-            4096, 32, 32, 8, 128, 14336, 32000, 32768, DType::BF16,
-        );
+        let config = adapter.adapt_config(4096, 32, 32, 8, 128, 14336, 32000, 32768, DType::BF16);
         let hints = adapter.fusion_hints();
 
         // Assert
@@ -936,23 +913,21 @@ mod tests {
         };
 
         // Act
-        let config = adapter.adapt_config(
-            2560, 32, 32, 32, 80, 10240, 51200, 2048, DType::F16,
-        );
+        let config = adapter.adapt_config(2560, 32, 32, 32, 80, 10240, 51200, 2048, DType::F16);
         let hints = adapter.fusion_hints();
 
         // Assert
         assert_eq!(config.partial_rotary_factor, 0.25);
-        assert!(matches!(hints.rope_mode, RopeMode::Partial { factor } if (factor - 0.25).abs() < f32::EPSILON));
+        assert!(
+            matches!(hints.rope_mode, RopeMode::Partial { factor } if (factor - 0.25).abs() < f32::EPSILON)
+        );
     }
 
     #[test]
     fn test_validate_config_rejects_zero_hidden_size() {
         // Arrange
         let adapter = LlamaAdapter;
-        let mut config = adapter.adapt_config(
-            4096, 32, 32, 8, 128, 11008, 32000, 4096, DType::F32,
-        );
+        let mut config = adapter.adapt_config(4096, 32, 32, 8, 128, 11008, 32000, 4096, DType::F32);
         config.hidden_size = 0;
 
         // Act
@@ -966,9 +941,8 @@ mod tests {
     fn test_validate_config_rejects_zero_max_seq_len() {
         // Arrange
         let adapter = QwenAdapter;
-        let mut config = adapter.adapt_config(
-            4096, 32, 32, 32, 128, 11008, 151936, 8192, DType::F16,
-        );
+        let mut config =
+            adapter.adapt_config(4096, 32, 32, 32, 128, 11008, 151936, 8192, DType::F16);
         config.max_seq_len = 0;
 
         // Act
@@ -983,9 +957,7 @@ mod tests {
         // Arrange: create a Llama config but validate against QwenAdapter
         let adapter = QwenAdapter;
         let llama = LlamaAdapter;
-        let config = llama.adapt_config(
-            4096, 32, 32, 8, 128, 11008, 32000, 4096, DType::F32,
-        );
+        let config = llama.adapt_config(4096, 32, 32, 8, 128, 11008, 32000, 4096, DType::F32);
 
         // Act
         let result = adapter.validate_config(&config);
@@ -1011,9 +983,7 @@ mod tests {
     fn test_weight_layout_gpt2_has_two_entries() {
         // Arrange
         let adapter = Gpt2Adapter;
-        let config = adapter.adapt_config(
-            768, 12, 12, 12, 64, 3072, 50257, 1024, DType::F32,
-        );
+        let config = adapter.adapt_config(768, 12, 12, 12, 64, 3072, 50257, 1024, DType::F32);
 
         // Act
         let layout = adapter.weight_layout(&config);
@@ -1031,9 +1001,7 @@ mod tests {
     fn test_validate_config_rejects_zero_num_layers() {
         // Arrange
         let adapter = LlamaAdapter;
-        let mut config = adapter.adapt_config(
-            4096, 32, 32, 8, 128, 11008, 32000, 4096, DType::F32,
-        );
+        let mut config = adapter.adapt_config(4096, 32, 32, 8, 128, 11008, 32000, 4096, DType::F32);
         config.num_layers = 0;
 
         // Act
@@ -1047,9 +1015,8 @@ mod tests {
     fn test_validate_config_rejects_zero_num_heads() {
         // Arrange
         let adapter = GemmaAdapter;
-        let mut config = adapter.adapt_config(
-            2048, 18, 8, 1, 256, 16384, 256000, 8192, DType::BF16,
-        );
+        let mut config =
+            adapter.adapt_config(2048, 18, 8, 1, 256, 16384, 256000, 8192, DType::BF16);
         config.num_heads = 0;
 
         // Act
@@ -1063,9 +1030,8 @@ mod tests {
     fn test_validate_config_rejects_zero_head_dim() {
         // Arrange
         let adapter = QwenAdapter;
-        let mut config = adapter.adapt_config(
-            4096, 32, 32, 32, 128, 11008, 151936, 8192, DType::F16,
-        );
+        let mut config =
+            adapter.adapt_config(4096, 32, 32, 32, 128, 11008, 151936, 8192, DType::F16);
         config.head_dim = 0;
 
         // Act
@@ -1081,9 +1047,8 @@ mod tests {
         let adapter = MistralAdapter {
             sliding_window: Some(4096),
         };
-        let mut config = adapter.adapt_config(
-            4096, 32, 32, 8, 128, 14336, 32000, 32768, DType::F32,
-        );
+        let mut config =
+            adapter.adapt_config(4096, 32, 32, 8, 128, 14336, 32000, 32768, DType::F32);
         config.vocab_size = 0;
 
         // Act
@@ -1097,9 +1062,7 @@ mod tests {
     fn test_validate_config_rejects_zero_num_kv_heads() {
         // Arrange
         let adapter = LlamaAdapter;
-        let mut config = adapter.adapt_config(
-            4096, 32, 32, 8, 128, 11008, 32000, 4096, DType::F32,
-        );
+        let mut config = adapter.adapt_config(4096, 32, 32, 8, 128, 11008, 32000, 4096, DType::F32);
         config.num_kv_heads = 0;
 
         // Act
@@ -1113,9 +1076,7 @@ mod tests {
     fn test_validate_config_accepts_mha_equal_kv_heads() {
         // Arrange: num_kv_heads == num_heads is valid MHA (not just GQA)
         let adapter = QwenAdapter;
-        let config = adapter.adapt_config(
-            4096, 32, 32, 32, 128, 11008, 151936, 8192, DType::F16,
-        );
+        let config = adapter.adapt_config(4096, 32, 32, 32, 128, 11008, 151936, 8192, DType::F16);
 
         // Act
         let result = adapter.validate_config(&config);
@@ -1132,9 +1093,7 @@ mod tests {
         };
 
         // Act
-        let config = adapter.adapt_config(
-            2560, 32, 32, 1, 80, 10240, 51200, 2048, DType::F32,
-        );
+        let config = adapter.adapt_config(2560, 32, 32, 1, 80, 10240, 51200, 2048, DType::F32);
 
         // Assert
         assert_eq!(config.num_kv_heads, 32); // forced to num_heads, ignoring the 1 we passed
@@ -1145,9 +1104,7 @@ mod tests {
     fn test_qwen_weight_layout_propagates_f16_dtype() {
         // Arrange
         let adapter = QwenAdapter;
-        let config = adapter.adapt_config(
-            4096, 32, 32, 32, 128, 11008, 151936, 8192, DType::F16,
-        );
+        let config = adapter.adapt_config(4096, 32, 32, 32, 128, 11008, 151936, 8192, DType::F16);
 
         // Act
         let layout = adapter.weight_layout(&config);
@@ -1183,9 +1140,7 @@ mod tests {
         };
 
         // Act
-        let config = adapter.adapt_config(
-            4096, 32, 32, 8, 128, 14336, 32000, 65536, DType::BF16,
-        );
+        let config = adapter.adapt_config(4096, 32, 32, 8, 128, 14336, 32000, 65536, DType::BF16);
         let layout = adapter.weight_layout(&config);
 
         // Assert
@@ -1223,7 +1178,11 @@ mod tests {
     #[test]
     fn test_ffn_activation_copy_and_equality_all_variants() {
         // Arrange & Act
-        let variants = [FfnActivation::SwiGlu, FfnActivation::GeGlu, FfnActivation::Gelu];
+        let variants = [
+            FfnActivation::SwiGlu,
+            FfnActivation::GeGlu,
+            FfnActivation::Gelu,
+        ];
 
         // Assert: each variant equals itself via Copy
         for v in &variants {
@@ -1263,18 +1222,24 @@ mod tests {
     fn test_adapter_weight_layout_shapes_contain_correct_vocab_and_hidden() {
         // Arrange
         let adapter = GemmaAdapter;
-        let config = adapter.adapt_config(
-            1024, 6, 4, 1, 256, 4096, 50000, 2048, DType::BF16,
-        );
+        let config = adapter.adapt_config(1024, 6, 4, 1, 256, 4096, 50000, 2048, DType::BF16);
 
         // Act
         let layout = adapter.weight_layout(&config);
 
         // Assert: embed_tokens shape is [vocab_size, hidden_size]
-        let embed = layout.shapes.iter().find(|(n, _)| *n == "embed_tokens").unwrap();
+        let embed = layout
+            .shapes
+            .iter()
+            .find(|(n, _)| *n == "embed_tokens")
+            .unwrap();
         assert_eq!(embed.1, vec![50000, 1024]);
         // Assert: norm.weight shape is [hidden_size]
-        let norm = layout.shapes.iter().find(|(n, _)| *n == "norm.weight").unwrap();
+        let norm = layout
+            .shapes
+            .iter()
+            .find(|(n, _)| *n == "norm.weight")
+            .unwrap();
         assert_eq!(norm.1, vec![1024]);
     }
 
@@ -1282,9 +1247,7 @@ mod tests {
     fn test_llama_weight_layout_lm_head_shape_matches_vocab_and_hidden() {
         // Arrange
         let adapter = LlamaAdapter;
-        let config = adapter.adapt_config(
-            512, 4, 8, 2, 64, 1024, 1000, 512, DType::F32,
-        );
+        let config = adapter.adapt_config(512, 4, 8, 2, 64, 1024, 1000, 512, DType::F32);
 
         // Act
         let layout = adapter.weight_layout(&config);
@@ -1298,9 +1261,7 @@ mod tests {
     fn test_validate_config_error_message_contains_field_name() {
         // Arrange
         let adapter = LlamaAdapter;
-        let mut config = adapter.adapt_config(
-            4096, 32, 32, 8, 128, 11008, 32000, 4096, DType::F32,
-        );
+        let mut config = adapter.adapt_config(4096, 32, 32, 8, 128, 11008, 32000, 4096, DType::F32);
         config.vocab_size = 0;
 
         // Act
@@ -1316,9 +1277,7 @@ mod tests {
         // Arrange
         let adapter = QwenAdapter;
         let llama = LlamaAdapter;
-        let config = llama.adapt_config(
-            4096, 32, 32, 8, 128, 11008, 32000, 4096, DType::F32,
-        );
+        let config = llama.adapt_config(4096, 32, 32, 8, 128, 11008, 32000, 4096, DType::F32);
 
         // Act
         let err = adapter.validate_config(&config).unwrap_err();
@@ -1334,16 +1293,18 @@ mod tests {
         let adapter = MistralAdapter {
             sliding_window: Some(4096),
         };
-        let config = adapter.adapt_config(
-            4096, 32, 32, 8, 128, 14336, 32000, 32768, DType::F32,
-        );
+        let config = adapter.adapt_config(4096, 32, 32, 8, 128, 14336, 32000, 32768, DType::F32);
 
         // Act
         let layout = adapter.weight_layout(&config);
 
         // Assert: weight layout has 3 entries and correct embed shape
         assert_eq!(layout.shapes.len(), 3);
-        let embed = layout.shapes.iter().find(|(n, _)| *n == "embed_tokens").unwrap();
+        let embed = layout
+            .shapes
+            .iter()
+            .find(|(n, _)| *n == "embed_tokens")
+            .unwrap();
         assert_eq!(embed.1, vec![32000, 4096]);
         assert_eq!(layout.dtype, DType::F32);
     }
@@ -1354,9 +1315,7 @@ mod tests {
         let adapter = PhiAdapter::default();
 
         // Act
-        let config = adapter.adapt_config(
-            2560, 32, 32, 32, 80, 10240, 51200, 2048, DType::F32,
-        );
+        let config = adapter.adapt_config(2560, 32, 32, 32, 80, 10240, 51200, 2048, DType::F32);
 
         // Assert: default partial_rotary_factor is 0.5
         assert!((adapter.partial_rotary_factor - 0.5).abs() < f32::EPSILON);
@@ -1372,9 +1331,7 @@ mod tests {
         let adapter = LlamaAdapter;
 
         // Act
-        let config = adapter.adapt_config(
-            4096, 32, 32, 8, 128, 11008, 32000, 4096, DType::F8E4M3,
-        );
+        let config = adapter.adapt_config(4096, 32, 32, 8, 128, 11008, 32000, 4096, DType::F8E4M3);
         let layout = adapter.weight_layout(&config);
 
         // Assert: dtype propagates to both config and layout
@@ -1386,9 +1343,7 @@ mod tests {
     fn test_gpt2_validate_config_succeeds_with_own_arch() {
         // Arrange
         let adapter = Gpt2Adapter;
-        let config = adapter.adapt_config(
-            768, 12, 12, 12, 64, 3072, 50257, 1024, DType::F32,
-        );
+        let config = adapter.adapt_config(768, 12, 12, 12, 64, 3072, 50257, 1024, DType::F32);
 
         // Act
         let result = adapter.validate_config(&config);
@@ -1403,9 +1358,7 @@ mod tests {
         let adapter = QwenAdapter;
 
         // Act
-        let config = adapter.adapt_config(
-            4096, 32, 32, 32, 128, 11008, 151936, 8192, DType::F16,
-        );
+        let config = adapter.adapt_config(4096, 32, 32, 32, 128, 11008, 151936, 8192, DType::F16);
 
         // Assert
         assert!(config.sliding_window.is_none());
@@ -1423,7 +1376,15 @@ mod tests {
 
         // Act
         let config = adapter.adapt_config(
-            hidden, 18, 8, 1, 256, intermediate, vocab, 8192, DType::BF16,
+            hidden,
+            18,
+            8,
+            1,
+            256,
+            intermediate,
+            vocab,
+            8192,
+            DType::BF16,
         );
 
         // Assert: all dimensions passed through unchanged
@@ -1440,9 +1401,7 @@ mod tests {
         let adapter = PhiAdapter {
             partial_rotary_factor: 0.5,
         };
-        let config = adapter.adapt_config(
-            2560, 32, 32, 32, 80, 10240, 51200, 2048, DType::F32,
-        );
+        let config = adapter.adapt_config(2560, 32, 32, 32, 80, 10240, 51200, 2048, DType::F32);
 
         // Act
         let layout = adapter.weight_layout(&config);
@@ -1460,9 +1419,7 @@ mod tests {
         };
 
         // Act
-        let config = adapter.adapt_config(
-            1024, 8, 8, 2, 128, 4096, 8000, 2048, DType::F16,
-        );
+        let config = adapter.adapt_config(1024, 8, 8, 2, 128, 4096, 8000, 2048, DType::F16);
         let hints = adapter.fusion_hints();
 
         // Assert: sliding window value propagates to both config and hints
@@ -1475,9 +1432,8 @@ mod tests {
     fn test_validate_config_rejects_kv_heads_larger_than_heads_on_qwen() {
         // Arrange
         let adapter = QwenAdapter;
-        let mut config = adapter.adapt_config(
-            4096, 32, 32, 32, 128, 11008, 151936, 8192, DType::F16,
-        );
+        let mut config =
+            adapter.adapt_config(4096, 32, 32, 32, 128, 11008, 151936, 8192, DType::F16);
         config.num_kv_heads = 64; // exceeds num_heads=32
 
         // Act
@@ -1493,9 +1449,8 @@ mod tests {
         let adapter = MistralAdapter {
             sliding_window: Some(4096),
         };
-        let mut config = adapter.adapt_config(
-            4096, 32, 32, 8, 128, 14336, 32000, 32768, DType::F32,
-        );
+        let mut config =
+            adapter.adapt_config(4096, 32, 32, 8, 128, 14336, 32000, 32768, DType::F32);
         config.num_kv_heads = 5; // 32 % 5 != 0
 
         // Act
@@ -1530,9 +1485,7 @@ mod tests {
         let adapter = LlamaAdapter;
 
         // Act
-        let config = adapter.adapt_config(
-            512, 4, 8, 2, 64, 1024, 1000, 512, DType::BF16,
-        );
+        let config = adapter.adapt_config(512, 4, 8, 2, 64, 1024, 1000, 512, DType::BF16);
 
         // Assert: verify full field consistency for a small model config
         assert_eq!(config.arch, ModelArch::Llama);

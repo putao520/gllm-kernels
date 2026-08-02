@@ -21,8 +21,8 @@ use super::isa_profile::*;
 use super::reg_alloc::RegAllocation;
 use super::stack_frame::StackFrame;
 use crate::compiler::trace::AArch64ElemStrategy;
-use crate::compiler::trace::QuantPrecision;
 use crate::compiler::trace::DTypeKind;
+use crate::compiler::trace::QuantPrecision;
 use crate::types::CompilerError;
 use crate::types::DType;
 
@@ -78,18 +78,16 @@ pub struct AArch64Lower {
 /// 原实现只用 `..` 丢弃了 has_bf16/has_dotprod/has_i8mm/has_sve, 导致 lower 层无法
 /// 感知这些特性 → BFDOT/SDOT 无条件发出 (无该特性的 CPU SIGILL) + SVE1-only CPU
 /// 被降级为 NEON。扩展后 lower 层可按特性门控指令选择 (NO-SILENT-FALLBACK: 不支持返回 Err)。
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 struct AArch64Features {
-    has_sve: bool,       // SVE 基础 (LD1W/FADD Z/WHILELT/PTRUE — SVE1 指令, has_sve 即可用)
-    has_sve2: bool,      // SVE2 (SMMLA/USDOT/BFDOT-Z 等 SVE2 专属指令)
-    has_sme2: bool,      // SME2 (multi-vec FMLA, ZA tile)
-    has_bf16: bool,      // FEAT_BF16 (BFDOT/BFMMLA — NEON dot 指令)
-    has_dotprod: bool,   // FEAT_DotProd (SDOT/UDOT — NEON dot 指令)
-    has_i8mm: bool,      // FEAT_I8MM (SMMLA/UMMLA — i8mm 矩阵乘指令)
-    sve_vl: usize, // bytes, 0 if no SVE
+    has_sve: bool,     // SVE 基础 (LD1W/FADD Z/WHILELT/PTRUE — SVE1 指令, has_sve 即可用)
+    has_sve2: bool,    // SVE2 (SMMLA/USDOT/BFDOT-Z 等 SVE2 专属指令)
+    has_sme2: bool,    // SME2 (multi-vec FMLA, ZA tile)
+    has_bf16: bool,    // FEAT_BF16 (BFDOT/BFMMLA — NEON dot 指令)
+    has_dotprod: bool, // FEAT_DotProd (SDOT/UDOT — NEON dot 指令)
+    has_i8mm: bool,    // FEAT_I8MM (SMMLA/UMMLA — i8mm 矩阵乘指令)
+    sve_vl: usize,     // bytes, 0 if no SVE
 }
-
 
 /// 循环上下文 — NEON 或 SVE2 路径各自的状态。
 #[derive(Debug, Clone)]

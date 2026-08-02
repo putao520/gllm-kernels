@@ -1,12 +1,12 @@
 //! Fusion cost model — roofline-based benefit estimation.
 
-use std::collections::HashSet;
+use super::types::{FusionCost, FusionGroup, FusionMode};
 use crate::compiler::graph::{CompilerGraph, CompilerOp, Op, OpId};
-use crate::compiler::trace::{OpTrace, TraceOp, ComputePattern, ScalarParam};
-use crate::types::DType;
-use crate::compiler::pain_point::OpBottleneckMap;
 use crate::compiler::hardware_profile::HardwareProfile;
-use super::types::{FusionGroup, FusionMode, FusionCost};
+use crate::compiler::pain_point::OpBottleneckMap;
+use crate::compiler::trace::{ComputePattern, OpTrace, ScalarParam, TraceOp};
+use crate::types::DType;
+use std::collections::HashSet;
 
 /// Compute roofline scaling factor for a fusion group's benefit.
 ///
@@ -23,9 +23,9 @@ pub(crate) fn compute_group_roofline_scale(
         if let Some(bn) = map.gemm_bottlenecks.get(&group.anchor) {
             return match bn.bottleneck {
                 crate::compiler::pain_point::BottleneckType::MemoryBound { .. } => 1.0,
-                crate::compiler::pain_point::BottleneckType::ComputeBound { compute_utilization } => {
-                    compute_utilization.max(0.1)
-                }
+                crate::compiler::pain_point::BottleneckType::ComputeBound {
+                    compute_utilization,
+                } => compute_utilization.max(0.1),
                 crate::compiler::pain_point::BottleneckType::LatencyBound { .. } => 0.5,
             };
         }
@@ -58,7 +58,9 @@ pub(crate) fn compute_group_ai(group: &FusionGroup, graph: &CompilerGraph) -> f3
             }
         }
     }
-    if total_bytes == 0 { return 0.0; }
+    if total_bytes == 0 {
+        return 0.0;
+    }
     total_flops as f32 / total_bytes as f32
 }
 
@@ -69,7 +71,13 @@ pub(crate) fn compute_group_ai(group: &FusionGroup, graph: &CompilerGraph) -> f3
 // symbolic-bound propagation is deferred — current upper-bound is sufficient for roofline classification.
 fn estimate_op_flops(op: &CompilerOp, graph: &CompilerGraph) -> usize {
     match op.op_gemm_dims(graph) {
-        Some((m, n, k)) => 2 * m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model") * n * k,
+        Some((m, n, k)) => {
+            2 * m
+                .max_for_allocation_strict()
+                .expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model")
+                * n
+                * k
+        }
         None => 0,
     }
 }
@@ -81,7 +89,9 @@ pub(crate) fn is_memory_bound_group(
     plan: &crate::compiler::planner::ExecutionPlan,
 ) -> bool {
     let ridge = plan.roofline.ridge_point;
-    if ridge <= 0.0 { return true; }
+    if ridge <= 0.0 {
+        return true;
+    }
     let ai = compute_group_ai(group, graph);
     (ai as f64) < ridge
 }
@@ -89,7 +99,8 @@ pub(crate) fn is_memory_bound_group(
 /// Extract GEMM dtype from the anchor op of a fusion group.
 /// ARCH-DTYPE-FULLCHAIN-ORCH: QuantGemm and non-GEMM anchors use graph-level dtype inference.
 fn extract_anchor_dtype(group: &FusionGroup, graph: &CompilerGraph) -> crate::types::DType {
-    graph.op(group.anchor)
+    graph
+        .op(group.anchor)
         .and_then(|op| {
             if op.op_is_quant_gemm(graph) {
                 Some(graph.infer_computation_dtype())
@@ -104,10 +115,16 @@ fn extract_anchor_dtype(group: &FusionGroup, graph: &CompilerGraph) -> crate::ty
 // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate;
 // symbolic-bound propagation is deferred — current upper-bound is sufficient for roofline classification.
 fn extract_anchor_gemm_dims(group: &FusionGroup, graph: &CompilerGraph) -> (usize, usize, usize) {
-    graph.op(group.anchor)
+    graph
+        .op(group.anchor)
         .and_then(|op| op.op_gemm_dims(graph))
         .map(|(m, n, k)| {
-            (m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model"), n, k)
+            (
+                m.max_for_allocation_strict()
+                    .expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model"),
+                n,
+                k,
+            )
         })
         .unwrap_or((0, 0, 0))
 }
@@ -143,10 +160,7 @@ pub fn estimate_fusion_cost(
                 None => continue,
             };
             // If all consumers are within the group, this intermediate is eliminated
-            let all_internal = tensor
-                .consumers
-                .iter()
-                .all(|c| group_ops.contains(c));
+            let all_internal = tensor.consumers.iter().all(|c| group_ops.contains(c));
             if all_internal && !tensor.consumers.is_empty() {
                 // Write + read-back eliminated
                 let size = tensor.concrete_bytes();
@@ -161,7 +175,12 @@ pub fn estimate_fusion_cost(
     let base_regs = match group.mode {
         FusionMode::EpilogueInjection => {
             // GEMM accumulators + epilogue temporaries (dynamic based on register file)
-            let blocking = plan.profile.gemm_blocking(anchor_dims.0, anchor_dims.1, anchor_dims.2, anchor_dtype);
+            let blocking = plan.profile.gemm_blocking(
+                anchor_dims.0,
+                anchor_dims.1,
+                anchor_dims.2,
+                anchor_dtype,
+            );
             let simd_w = plan.profile.simd_width_bytes() / anchor_dtype.size_bytes();
             let acc = (blocking.mr * blocking.nr) / simd_w.max(1);
             let avail = plan.profile.num_simd_regs();
@@ -171,7 +190,12 @@ pub fn estimate_fusion_cost(
             acc + 2 + no_spill + spill_ops.min(1)
         }
         FusionMode::TileLevelFusion { .. } => {
-            let blocking = plan.profile.gemm_blocking(anchor_dims.0, anchor_dims.1, anchor_dims.2, anchor_dtype);
+            let blocking = plan.profile.gemm_blocking(
+                anchor_dims.0,
+                anchor_dims.1,
+                anchor_dims.2,
+                anchor_dtype,
+            );
             let simd_w = plan.profile.simd_width_bytes() / anchor_dtype.size_bytes();
             let acc = (blocking.mr * blocking.nr) / simd_w.max(1);
             acc + 3 // norm scratch: mean, rsqrt, weight
@@ -188,14 +212,17 @@ pub fn estimate_fusion_cost(
     let scratch_bytes = match group.mode {
         FusionMode::TileLevelFusion { tile_rows, .. } => {
             // Scratch = tile_rows x K x elem_bytes for the tiled norm output
-            let k = group.ops.iter().find_map(|&oid| {
-                graph.op(oid).and_then(|o| match &o.op {
-                    Op::Gemm(spec)
-                    | Op::GemmBias(spec) => Some(spec.k),
-                    Op::QuantGemm(spec) => Some(spec.k),
-                    _ => None,
+            let k = group
+                .ops
+                .iter()
+                .find_map(|&oid| {
+                    graph.op(oid).and_then(|o| match &o.op {
+                        Op::Gemm(spec) | Op::GemmBias(spec) => Some(spec.k),
+                        Op::QuantGemm(spec) => Some(spec.k),
+                        _ => None,
+                    })
                 })
-            }).unwrap_or(0);
+                .unwrap_or(0);
             tile_rows * k * anchor_dtype.size_bytes()
         }
         _ => 0,
@@ -257,7 +284,11 @@ pub struct Cost {
 fn trace_op_flops(op: &TraceOp) -> u64 {
     match op {
         TraceOp::Input(_) | TraceOp::Const(_) => 0,
-        TraceOp::Add(..) | TraceOp::Sub(..) | TraceOp::Mul(..) | TraceOp::Div(..) | TraceOp::Pow(..) => 1,
+        TraceOp::Add(..)
+        | TraceOp::Sub(..)
+        | TraceOp::Mul(..)
+        | TraceOp::Div(..)
+        | TraceOp::Pow(..) => 1,
         TraceOp::Neg(..) | TraceOp::Abs(..) | TraceOp::Recip(..) => 1,
         TraceOp::Fma(..) => 2,
         TraceOp::Sqrt(..) | TraceOp::Rsqrt(..) => 2,
@@ -302,18 +333,30 @@ fn trace_op_flops(op: &TraceOp) -> u64 {
         // Quant decode ops: memory load + bit manipulation + dequant algebra
         TraceOp::QuantBitAnd { .. } | TraceOp::QuantBitOr { .. } => 1,
         TraceOp::QuantBroadcast { .. } => 1,
-        TraceOp::QuantCastF16toF32 { .. } | TraceOp::QuantCastI8toF32 { .. } | TraceOp::QuantCastFp8toF32 { .. } => 1,
+        TraceOp::QuantCastF16toF32 { .. }
+        | TraceOp::QuantCastI8toF32 { .. }
+        | TraceOp::QuantCastFp8toF32 { .. } => 1,
         TraceOp::QuantCodebookLookup { vector_size, .. } => *vector_size as u64,
         TraceOp::QuantExtractBits { .. } => 1,
         TraceOp::QuantDequantFma { .. } => 2,
         TraceOp::QuantIntDivConst { .. } | TraceOp::QuantIntMul { .. } => 1,
         TraceOp::QuantInterleave { .. } | TraceOp::QuantConcatSeq { .. } => 1,
-        TraceOp::QuantPtrAddOffset { .. } | TraceOp::QuantPtrAddDynamic { .. } | TraceOp::QuantAndMask { .. } | TraceOp::QuantScalarLoad { .. } | TraceOp::QuantLoadF16toF32 { .. } | TraceOp::QuantLoadI8toF32 { .. } | TraceOp::QuantLoadBytesVec { .. } | TraceOp::QuantKQuantPackedScaleLookup { .. } => 0,
+        TraceOp::QuantPtrAddOffset { .. }
+        | TraceOp::QuantPtrAddDynamic { .. }
+        | TraceOp::QuantAndMask { .. }
+        | TraceOp::QuantScalarLoad { .. }
+        | TraceOp::QuantLoadF16toF32 { .. }
+        | TraceOp::QuantLoadI8toF32 { .. }
+        | TraceOp::QuantLoadBytesVec { .. }
+        | TraceOp::QuantKQuantPackedScaleLookup { .. } => 0,
         TraceOp::QuantShiftLeft { .. } | TraceOp::QuantShiftRight { .. } => 1,
         // SPEC 24-QUANT-PIPELINE-JIT: quant block-level load TraceOps
-        TraceOp::QuantScaleLoad { .. } | TraceOp::QuantDataLoad { .. }
-        | TraceOp::QuantZeroLoad { .. } | TraceOp::QuantSubScaleLoad { .. }
-        | TraceOp::QuantHighBitsLoad { .. } | TraceOp::QuantE2m1LutDecode { .. } => 0,
+        TraceOp::QuantScaleLoad { .. }
+        | TraceOp::QuantDataLoad { .. }
+        | TraceOp::QuantZeroLoad { .. }
+        | TraceOp::QuantSubScaleLoad { .. }
+        | TraceOp::QuantHighBitsLoad { .. }
+        | TraceOp::QuantE2m1LutDecode { .. } => 0,
         TraceOp::QuantCodebookDequant { .. } => 4,
         TraceOp::QuantQ3KDecode { .. } => 8,
         TraceOp::QuantQ6KDecode { .. } => 8,
@@ -324,8 +367,10 @@ fn trace_op_flops(op: &TraceOp) -> u64 {
         TraceOp::Loop { .. } => 0,
         TraceOp::PanelLoad { .. } | TraceOp::PanelStore { .. } => 0,
         TraceOp::PackBuffer { .. } => 0,
-        TraceOp::SharedMemDeclare { .. } | TraceOp::AsyncCopyToShared { .. }
-        | TraceOp::AsyncWaitGroup { .. } | TraceOp::SyncBarrier { .. } => 0,
+        TraceOp::SharedMemDeclare { .. }
+        | TraceOp::AsyncCopyToShared { .. }
+        | TraceOp::AsyncWaitGroup { .. }
+        | TraceOp::SyncBarrier { .. } => 0,
         TraceOp::TileConfig { .. } => 0,
         TraceOp::TileMma { .. } => 2,
         TraceOp::TileRelease => 0,
@@ -348,19 +393,19 @@ fn pattern_per_element_flops(pattern: &ComputePattern) -> u64 {
         ComputePattern::Elementwise { body }
         | ComputePattern::BinaryElementwise { body }
         | ComputePattern::Injective { body, .. }
-        | ComputePattern::QuantDecode { decode: body, .. } => {
-            body.iter().map(trace_op_flops).sum()
-        }
-        ComputePattern::NormLike { reduce, finalize, transform } => {
+        | ComputePattern::QuantDecode { decode: body, .. } => body.iter().map(trace_op_flops).sum(),
+        ComputePattern::NormLike {
+            reduce,
+            finalize,
+            transform,
+        } => {
             // reduce and transform run per-element; finalize runs once (amortized to ~0)
             let r: u64 = reduce.iter().map(trace_op_flops).sum();
             let t: u64 = transform.iter().map(trace_op_flops).sum();
             let f: u64 = finalize.iter().map(trace_op_flops).sum();
             r + t + f
         }
-        ComputePattern::Reduction { combine, .. } => {
-            combine.iter().map(trace_op_flops).sum()
-        }
+        ComputePattern::Reduction { combine, .. } => combine.iter().map(trace_op_flops).sum(),
     }
 }
 
@@ -392,21 +437,39 @@ impl Cost {
         let (max_dim, input_ptrs, output_ptrs) = parse_signature(&trace.signature);
 
         // Determine element size from trace dtype hint (default F32 = 4 bytes).
-        let elem_bytes: u64 = trace.signature.params.iter().find_map(|p| {
-            if let ScalarParam::Scalar(v) = p {
-                // dtype encoded as size_bytes (1/2/4) in the scalar slot
-                let v = *v as u64;
-                if v == 1 || v == 2 || v == 4 { Some(v) } else { None }
-            } else {
-                None
-            }
-        }).unwrap_or(DType::F32.size_bytes() as u64); // default F32
+        let elem_bytes: u64 = trace
+            .signature
+            .params
+            .iter()
+            .find_map(|p| {
+                if let ScalarParam::Scalar(v) = p {
+                    // dtype encoded as size_bytes (1/2/4) in the scalar slot
+                    let v = *v as u64;
+                    if v == 1 || v == 2 || v == 4 {
+                        Some(v)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(DType::F32.size_bytes() as u64); // default F32
 
         let (flops, bytes) = if matches!(trace.pattern, ComputePattern::Gemm) {
             // GEMM: extract M, N, K from Dim params -> flops = 2*M*N*K
-            let dims: Vec<u64> = trace.signature.params.iter().filter_map(|p| {
-                if let ScalarParam::Dim(d) = p { Some(*d as u64) } else { None }
-            }).collect();
+            let dims: Vec<u64> = trace
+                .signature
+                .params
+                .iter()
+                .filter_map(|p| {
+                    if let ScalarParam::Dim(d) = p {
+                        Some(*d as u64)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
             let (m, n, k) = if dims.len() >= 3 {
                 (dims[0], dims[1], dims[2])
             } else {
@@ -445,14 +508,22 @@ impl Cost {
             0.0
         };
 
-        Cost { flops, bytes, compute_cycles, memory_cycles }
+        Cost {
+            flops,
+            bytes,
+            compute_cycles,
+            memory_cycles,
+        }
     }
 
     /// Compute the memory-cycle savings from eliminating intermediate traffic.
     ///
     /// Returns saved nanoseconds (as integer) from not writing + reading back
     /// `eliminated_bytes` of intermediate data.
-    pub fn fusion_benefit(eliminated_bytes: usize, plan: &crate::compiler::planner::ExecutionPlan) -> u64 {
+    pub fn fusion_benefit(
+        eliminated_bytes: usize,
+        plan: &crate::compiler::planner::ExecutionPlan,
+    ) -> u64 {
         if plan.roofline.peak_bandwidth_gbs > 0.0 {
             (eliminated_bytes as f64 / plan.roofline.peak_bandwidth_gbs) as u64
         } else {
@@ -473,7 +544,11 @@ impl Cost {
 ///
 /// Each intermediate tensor between adjacent ops in the chain is written then
 /// read back — fusion eliminates both accesses (2x tensor size).
-pub(crate) fn chain_eliminated_bytes(graph: &CompilerGraph, anchor: &CompilerOp, chain: &[&CompilerOp]) -> usize {
+pub(crate) fn chain_eliminated_bytes(
+    graph: &CompilerGraph,
+    anchor: &CompilerOp,
+    chain: &[&CompilerOp],
+) -> usize {
     if chain.is_empty() {
         return 0;
     }
@@ -498,7 +573,6 @@ pub(crate) fn chain_eliminated_bytes(graph: &CompilerGraph, anchor: &CompilerOp,
     }
     eliminated
 }
-
 
 // -- REQ-FUS-009: Fusion Cost Model --------------------------------
 
@@ -566,21 +640,30 @@ impl FusionCostModel {
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::FusionGroup;
     use super::*;
     use crate::compiler::fusion::GroupMarker;
-    use crate::compiler::graph::{CompilerGraph, OpId, Op, GemmSpec, NormSpec, SymDim, MultiOutputConfig};
-    use crate::compiler::planner::ExecutionPlan;
+    use crate::compiler::graph::{
+        CompilerGraph, GemmSpec, MultiOutputConfig, NormSpec, Op, OpId, SymDim,
+    };
     use crate::compiler::hardware_profile::HardwareProfile;
-    use crate::compiler::trace::{OpTrace, ComputePattern, ScalarFnSignature, ScalarParam, TraceOp, ValueId};
-    use crate::compiler::pain_point::{OpBottleneckMap, GemmBottleneck, GemmRole, BottleneckType, FusionPriority, ExecPattern, ParallelismDesc};
+    use crate::compiler::pain_point::{
+        BottleneckType, ExecPattern, FusionPriority, GemmBottleneck, GemmRole, OpBottleneckMap,
+        ParallelismDesc,
+    };
+    use crate::compiler::planner::ExecutionPlan;
+    use crate::compiler::trace::{
+        ComputePattern, OpTrace, ScalarFnSignature, ScalarParam, TraceOp, ValueId,
+    };
     use crate::dispatch::DeviceProfile;
     use crate::types::DType;
-    use super::super::types::FusionGroup;
     use std::collections::HashMap;
 
     // ── Helpers ──
 
-    fn vid(n: u32) -> ValueId { ValueId(n) }
+    fn vid(n: u32) -> ValueId {
+        ValueId(n)
+    }
 
     fn make_plan() -> ExecutionPlan {
         ExecutionPlan::from_profile(&DeviceProfile::detect())
@@ -640,7 +723,10 @@ mod tests {
             id: 0,
             anchor,
             epilogue: vec![predecessor],
-            mode: FusionMode::TileLevelFusion { predecessor, tile_rows },
+            mode: FusionMode::TileLevelFusion {
+                predecessor,
+                tile_rows,
+            },
             ops: vec![predecessor, anchor],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
@@ -652,17 +738,23 @@ mod tests {
 
     fn make_bottleneck_map(op_id: OpId, bn: BottleneckType) -> OpBottleneckMap {
         let mut gemm_bottlenecks = HashMap::new();
-        gemm_bottlenecks.insert(op_id, GemmBottleneck {
-            gemm_role: GemmRole::Other,
-            shape: (1, 4096, 4096),
-            arithmetic_intensity: 1.0,
-            ridge_point: 10.0,
-            bottleneck: bn,
-            optimal_fusion: FusionPriority::EpilogueInjection,
-            fusion_benefits: HashMap::new(),
-            exec_pattern: ExecPattern::ScalarLoop,
-            parallelism: ParallelismDesc::SimdVectorize { element_width: 4, unroll_factor: 1 },
-        });
+        gemm_bottlenecks.insert(
+            op_id,
+            GemmBottleneck {
+                gemm_role: GemmRole::Other,
+                shape: (1, 4096, 4096),
+                arithmetic_intensity: 1.0,
+                ridge_point: 10.0,
+                bottleneck: bn,
+                optimal_fusion: FusionPriority::EpilogueInjection,
+                fusion_benefits: HashMap::new(),
+                exec_pattern: ExecPattern::ScalarLoop,
+                parallelism: ParallelismDesc::SimdVectorize {
+                    element_width: 4,
+                    unroll_factor: 1,
+                },
+            },
+        );
         OpBottleneckMap {
             gemm_bottlenecks,
             ridge_point: 10.0,
@@ -682,7 +774,12 @@ mod tests {
 
     #[test]
     fn cost_construct_and_clone() {
-        let c = Cost { flops: 100, bytes: 400, compute_cycles: 10.0, memory_cycles: 20.0 };
+        let c = Cost {
+            flops: 100,
+            bytes: 400,
+            compute_cycles: 10.0,
+            memory_cycles: 20.0,
+        };
         let cloned = c.clone();
         assert_eq!(cloned.flops, 100);
         assert_eq!(cloned.bytes, 400);
@@ -692,25 +789,45 @@ mod tests {
 
     #[test]
     fn cost_is_compute_bound_true() {
-        let c = Cost { flops: 2000, bytes: 100, compute_cycles: 50.0, memory_cycles: 10.0 };
+        let c = Cost {
+            flops: 2000,
+            bytes: 100,
+            compute_cycles: 50.0,
+            memory_cycles: 10.0,
+        };
         assert!(c.is_compute_bound());
     }
 
     #[test]
     fn cost_is_compute_bound_false() {
-        let c = Cost { flops: 100, bytes: 2000, compute_cycles: 5.0, memory_cycles: 50.0 };
+        let c = Cost {
+            flops: 100,
+            bytes: 2000,
+            compute_cycles: 5.0,
+            memory_cycles: 50.0,
+        };
         assert!(!c.is_compute_bound());
     }
 
     #[test]
     fn cost_is_compute_bound_equal() {
-        let c = Cost { flops: 100, bytes: 100, compute_cycles: 20.0, memory_cycles: 20.0 };
+        let c = Cost {
+            flops: 100,
+            bytes: 100,
+            compute_cycles: 20.0,
+            memory_cycles: 20.0,
+        };
         assert!(!c.is_compute_bound()); // strictly greater
     }
 
     #[test]
     fn cost_zero_flops_and_bytes() {
-        let c = Cost { flops: 0, bytes: 0, compute_cycles: 0.0, memory_cycles: 0.0 };
+        let c = Cost {
+            flops: 0,
+            bytes: 0,
+            compute_cycles: 0.0,
+            memory_cycles: 0.0,
+        };
         assert!(!c.is_compute_bound());
         assert_eq!(c.flops, 0);
         assert_eq!(c.bytes, 0);
@@ -726,7 +843,9 @@ mod tests {
             ScalarParam::Dim(1024),
         ]);
         let trace = OpTrace {
-            pattern: ComputePattern::Elementwise { body: vec![TraceOp::Exp(vid(0))] },
+            pattern: ComputePattern::Elementwise {
+                body: vec![TraceOp::Exp(vid(0))],
+            },
             signature: sig,
         };
         let plan = make_plan();
@@ -823,18 +942,17 @@ mod tests {
 
     #[test]
     fn cost_compute_no_dims_defaults_to_zero() {
-        let sig = make_sig(vec![
-            ScalarParam::InputPtr,
-            ScalarParam::OutputPtr,
-        ]);
+        let sig = make_sig(vec![ScalarParam::InputPtr, ScalarParam::OutputPtr]);
         let trace = OpTrace {
-            pattern: ComputePattern::Elementwise { body: vec![TraceOp::Exp(vid(0))] },
+            pattern: ComputePattern::Elementwise {
+                body: vec![TraceOp::Exp(vid(0))],
+            },
             signature: sig,
         };
         let plan = make_plan();
         let cost = Cost::compute(&trace, &plan);
         assert_eq!(cost.flops, 0); // 10 * 0 = 0
-        assert_eq!(cost.bytes, 0);  // (1+1)*0*4 = 0
+        assert_eq!(cost.bytes, 0); // (1+1)*0*4 = 0
     }
 
     #[test]
@@ -914,7 +1032,11 @@ mod tests {
         ];
         for hw in &profiles {
             let model = FusionCostModel::from_profile(*hw);
-            assert!(model.compute_roi_weight > 0.0, "compute_roi_weight for {:?}", hw);
+            assert!(
+                model.compute_roi_weight > 0.0,
+                "compute_roi_weight for {:?}",
+                hw
+            );
             assert!(model.max_depth > 0, "max_depth for {:?}", hw);
         }
     }
@@ -985,7 +1107,15 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[1, 4096], dt);
 
-        let op0 = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        let op0 = g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -1040,7 +1170,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[1, 4096], dt);
-        let op0 = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        let op0 = g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -1048,7 +1186,12 @@ mod tests {
 
         let group = make_standalone_group(op0);
         let plan = make_plan();
-        let bmap = make_bottleneck_map(op0, BottleneckType::MemoryBound { bandwidth_utilization: 0.8 });
+        let bmap = make_bottleneck_map(
+            op0,
+            BottleneckType::MemoryBound {
+                bandwidth_utilization: 0.8,
+            },
+        );
         let scale = compute_group_roofline_scale(&group, &g, &plan, Some(&bmap));
         assert_eq!(scale, 1.0);
     }
@@ -1060,7 +1203,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[1, 4096], dt);
-        let op0 = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        let op0 = g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -1068,7 +1219,12 @@ mod tests {
 
         let group = make_standalone_group(op0);
         let plan = make_plan();
-        let bmap = make_bottleneck_map(op0, BottleneckType::ComputeBound { compute_utilization: 0.5 });
+        let bmap = make_bottleneck_map(
+            op0,
+            BottleneckType::ComputeBound {
+                compute_utilization: 0.5,
+            },
+        );
         let scale = compute_group_roofline_scale(&group, &g, &plan, Some(&bmap));
         assert!((scale - 0.5).abs() < 1e-6);
     }
@@ -1080,7 +1236,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[1, 4096], dt);
-        let op0 = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        let op0 = g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -1088,7 +1252,12 @@ mod tests {
 
         let group = make_standalone_group(op0);
         let plan = make_plan();
-        let bmap = make_bottleneck_map(op0, BottleneckType::LatencyBound { estimated_latency_ns: 5.0 });
+        let bmap = make_bottleneck_map(
+            op0,
+            BottleneckType::LatencyBound {
+                estimated_latency_ns: 5.0,
+            },
+        );
         let scale = compute_group_roofline_scale(&group, &g, &plan, Some(&bmap));
         assert_eq!(scale, 0.5);
     }
@@ -1100,7 +1269,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[1, 4096], dt);
-        let op0 = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        let op0 = g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -1154,7 +1331,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 4], dt);
         let w = g.add_tensor_concrete("w", &[4, 4], dt);
         let out = g.add_tensor_concrete("out", &[1, 4], dt);
-        let op0 = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
+        let op0 = g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 4,
+                k: 4,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -1176,7 +1361,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[4096, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[4096, 4096], dt);
-        let op0 = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(4096), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        let op0 = g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(4096),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -1200,7 +1393,15 @@ mod tests {
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 128], dt);
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 128], dt);
 
-        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }),
+        let gemm = g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 128,
+                k: 128,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
@@ -1290,7 +1491,15 @@ mod tests {
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 128], dt);
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 128], dt);
 
-        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }),
+        let gemm = g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 128,
+                k: 128,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
@@ -1299,7 +1508,12 @@ mod tests {
 
         let group = make_epilogue_group(gemm, vec![silu]);
         let plan = make_plan();
-        let bmap = make_bottleneck_map(gemm, BottleneckType::MemoryBound { bandwidth_utilization: 0.9 });
+        let bmap = make_bottleneck_map(
+            gemm,
+            BottleneckType::MemoryBound {
+                bandwidth_utilization: 0.9,
+            },
+        );
         let cost = estimate_fusion_cost(&group, &g, &plan, Some(&bmap));
 
         // With memory-bound bottleneck, roofline_scale = 1.0 (full benefit)
@@ -1316,8 +1530,26 @@ mod tests {
         let norm_out = g.add_tensor_concrete("norm_out", &[1, 4096], dt);
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 4096], dt);
 
-        let norm = g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![norm_in], vec![norm_out], "norm");
-        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        let norm = g.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![norm_in],
+            vec![norm_out],
+            "norm",
+        );
+        let gemm = g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
@@ -1428,12 +1660,16 @@ mod tests {
         let body = vec![
             TraceOp::Input(0),
             TraceOp::Input(1),
-            TraceOp::Mul(vid(0), vid(1)),   // 1
-            TraceOp::Exp(vid(2)),            // 10
-            TraceOp::Add(vid(2), vid(3)),    // 1
+            TraceOp::Mul(vid(0), vid(1)), // 1
+            TraceOp::Exp(vid(2)),         // 10
+            TraceOp::Add(vid(2), vid(3)), // 1
         ];
         let trace = OpTrace {
-            pattern: ComputePattern::Injective { body, num_inputs: 2, num_outputs: 2 },
+            pattern: ComputePattern::Injective {
+                body,
+                num_inputs: 2,
+                num_outputs: 2,
+            },
             signature: sig,
         };
         let plan = make_plan();
@@ -1451,11 +1687,21 @@ mod tests {
         ]);
         let body = vec![
             TraceOp::Input(0),
-            TraceOp::QuantBitAnd { lhs: vid(0), rhs: vid(0) },  // 1
-            TraceOp::QuantDequantFma { acc: vid(1), a: vid(0), b: vid(0) }, // 2
+            TraceOp::QuantBitAnd {
+                lhs: vid(0),
+                rhs: vid(0),
+            }, // 1
+            TraceOp::QuantDequantFma {
+                acc: vid(1),
+                a: vid(0),
+                b: vid(0),
+            }, // 2
         ];
         let trace = OpTrace {
-            pattern: ComputePattern::QuantDecode { block_size: 32, decode: body },
+            pattern: ComputePattern::QuantDecode {
+                block_size: 32,
+                decode: body,
+            },
             signature: sig,
         };
         let plan = make_plan();
@@ -1511,5 +1757,3 @@ mod tests {
         assert!(model.latency_roi_weight > 0.0);
     }
 }
-
-

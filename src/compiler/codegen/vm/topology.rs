@@ -102,7 +102,6 @@ pub struct GraphTopologyAnalysis {
     pub seq_len_source: SeqLenSource,
 
     // ── 从图 OpKind 存在性推导的属性 ──
-
     /// KV cache source — from graph ops (MHA/CachedGQA/MLA presence).
     pub kv_cache_source: KvCacheSource,
 
@@ -146,7 +145,6 @@ pub struct GraphTopologyAnalysis {
     pub sg_inject_hidden_dim: Option<usize>,
 
     // ── 层循环拓扑属性 ──
-
     /// 同构层循环的层数
     pub layer_num_layers: Option<usize>,
 
@@ -185,9 +183,21 @@ impl GraphTopologyAnalysis {
                 Some(Op::CheckStopCondition) => has_check_stop = true,
                 // kv_cache_source 由 op.kv_source 驱动（op-level 自描述）。
                 // 只有 FromCache 的 attention 才需要加载 kv_cache_ptr。
-                Some(Op::MultiHeadAttention(spec)) if spec.kv_source == crate::compiler::graph::KvSource::FromCache => has_mha_from_cache = true,
-                Some(Op::CachedGqa(spec)) if spec.kv_source == crate::compiler::graph::KvSource::FromCache => has_cached_gqa_from_cache = true,
-                Some(Op::MlaAttention(spec)) if spec.kv_source == crate::compiler::graph::KvSource::FromCache => has_mla_from_cache = true,
+                Some(Op::MultiHeadAttention(spec))
+                    if spec.kv_source == crate::compiler::graph::KvSource::FromCache =>
+                {
+                    has_mha_from_cache = true
+                }
+                Some(Op::CachedGqa(spec))
+                    if spec.kv_source == crate::compiler::graph::KvSource::FromCache =>
+                {
+                    has_cached_gqa_from_cache = true
+                }
+                Some(Op::MlaAttention(spec))
+                    if spec.kv_source == crate::compiler::graph::KvSource::FromCache =>
+                {
+                    has_mla_from_cache = true
+                }
                 Some(Op::SgDetect { hidden_dim, .. }) => {
                     has_sg_ops = true;
                     if sg_detect_hidden_dim.is_none() {
@@ -201,16 +211,30 @@ impl GraphTopologyAnalysis {
                     }
                 }
                 Some(Op::QkNorm { .. }) => has_qk_norm = true,
-                Some(ref o) if o.is_gemm_like() || o.is_quant_gemm()
-                    || matches!(o, Op::RmsNorm(_) | Op::LayerNorm(_) | Op::HeadRmsNorm { .. }
-                        | Op::DepthwiseConv1D { .. } | Op::PatchEmbed { .. })
-                => has_weight_ops = true,
+                Some(ref o)
+                    if o.is_gemm_like()
+                        || o.is_quant_gemm()
+                        || matches!(
+                            o,
+                            Op::RmsNorm(_)
+                                | Op::LayerNorm(_)
+                                | Op::HeadRmsNorm { .. }
+                                | Op::DepthwiseConv1D { .. }
+                                | Op::PatchEmbed { .. }
+                        ) =>
+                {
+                    has_weight_ops = true
+                }
                 _ => {}
             }
         }
 
         let is_generate = has_argmax && has_store_token && has_check_stop;
-        let loop_topology = if is_generate { LoopTopology::GenerateLoop } else { LoopTopology::SinglePass };
+        let loop_topology = if is_generate {
+            LoopTopology::GenerateLoop
+        } else {
+            LoopTopology::SinglePass
+        };
 
         let outer_loop_bound = if is_generate {
             TopologyBound::DynamicTotalIters
@@ -239,14 +263,16 @@ impl GraphTopologyAnalysis {
 
         // logits_producer: Argmax 的直接前驱 op 索引
         let logits_producer_op_idx = if let Some(target_tid) = argmax_input_tid {
-            graph.ops.iter().position(|op| op.outputs.contains(&target_tid))
+            graph
+                .ops
+                .iter()
+                .position(|op| op.outputs.contains(&target_tid))
         } else {
             None
         };
 
-        let logits_output_tid = logits_producer_op_idx.and_then(|idx| {
-            graph.ops.get(idx)?.outputs.first().copied()
-        });
+        let logits_output_tid =
+            logits_producer_op_idx.and_then(|idx| graph.ops.get(idx)?.outputs.first().copied());
         // Keep topology and buffer allocation on the same chain derivation.
         // The helper starts at Argmax/WriteLogits sinks and stops at the
         // vocabulary GEMM producer, so every skipped tensor is materializable
@@ -254,29 +280,56 @@ impl GraphTopologyAnalysis {
         let logits_chain_tids = logits_chain_tensors(graph);
 
         // MTP 配置从 Op::MtpDraft 推导（胖 opcode 自描述）
-        let mtp_config = graph.ops.iter().find_map(|op| {
-            match op.op_resolved(graph) {
-                Some(Op::MtpDraft { depth, hidden_size, vocab_size }) =>
-                    Some(MtpKernelConfig { depth, hidden_size, vocab_size }),
-                _ => None,
-            }
+        let mtp_config = graph.ops.iter().find_map(|op| match op.op_resolved(graph) {
+            Some(Op::MtpDraft {
+                depth,
+                hidden_size,
+                vocab_size,
+            }) => Some(MtpKernelConfig {
+                depth,
+                hidden_size,
+                vocab_size,
+            }),
+            _ => None,
         });
 
         // 层循环拓扑属性 (standard / hetero / mixed-quant 三路径统一推导)
-        let layer_num_layers = graph.layer_loop_config.as_ref().map(|cfg| cfg.num_layers)
-            .or_else(|| graph.mixed_quant_layer_loop_config.as_ref().map(|cfg| cfg.num_layers));
-        let layer_activation_alias = graph.layer_loop_config.as_ref()
+        let layer_num_layers = graph
+            .layer_loop_config
+            .as_ref()
+            .map(|cfg| cfg.num_layers)
+            .or_else(|| {
+                graph
+                    .mixed_quant_layer_loop_config
+                    .as_ref()
+                    .map(|cfg| cfg.num_layers)
+            });
+        let layer_activation_alias = graph
+            .layer_loop_config
+            .as_ref()
             .and_then(|cfg| cfg.activation_alias)
-            .or_else(|| graph.mixed_quant_layer_loop_config.as_ref()
-                .and_then(|cfg| cfg.activation_alias));
+            .or_else(|| {
+                graph
+                    .mixed_quant_layer_loop_config
+                    .as_ref()
+                    .and_then(|cfg| cfg.activation_alias)
+            });
 
         Self {
             loop_topology,
             outer_loop_bound,
             seq_len_source,
             kv_cache_source,
-            sg_ops: if has_sg_ops { SgOpsPresence::Present } else { SgOpsPresence::None },
-            weight_source: if has_weight_ops { WeightSource::WeightRequired } else { WeightSource::NoWeight },
+            sg_ops: if has_sg_ops {
+                SgOpsPresence::Present
+            } else {
+                SgOpsPresence::None
+            },
+            weight_source: if has_weight_ops {
+                WeightSource::WeightRequired
+            } else {
+                WeightSource::NoWeight
+            },
             has_qk_norm,
             vocab_size,
             logits_producer_op_idx,
@@ -294,22 +347,17 @@ impl GraphTopologyAnalysis {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::graph::{CompilerGraph, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+    use crate::compiler::graph::{
+        AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+        DualRopeSpec, GemmSpec, MlaSpec, NormSpec, Op, QuantGemmSpec, RopeSpec, SinksSpec, SymDim,
+    };
     use crate::types::DType;
 
     fn make_test_graph(ops: Vec<Op>) -> CompilerGraph {
         let mut graph = CompilerGraph::default();
         for (i, op) in ops.into_iter().enumerate() {
-            let input_tid = graph.add_tensor_concrete(
-                &format!("input_{}", i),
-                &[1],
-                DType::F32,
-            );
-            let output_tid = graph.add_tensor_concrete(
-                &format!("output_{}", i),
-                &[1],
-                DType::F32,
-            );
+            let input_tid = graph.add_tensor_concrete(&format!("input_{}", i), &[1], DType::F32);
+            let output_tid = graph.add_tensor_concrete(&format!("output_{}", i), &[1], DType::F32);
             graph.add_op(op, vec![input_tid], vec![output_tid], &format!("op_{}", i));
         }
         graph
@@ -318,7 +366,14 @@ mod tests {
     #[test]
     fn generate_loop_detected_from_ops() {
         let graph = make_test_graph(vec![
-            Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             Op::Argmax { vocab_size: 32000 },
             Op::StoreToken,
             Op::CheckStopCondition,
@@ -334,8 +389,19 @@ mod tests {
     #[test]
     fn no_generate_loop_without_argmax() {
         let graph = make_test_graph(vec![
-            Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
-            Op::MeanPool { seq_len: 128, hidden: 768, cls_mode: false },
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            Op::MeanPool {
+                seq_len: 128,
+                hidden: 768,
+                cls_mode: false,
+            },
         ]);
         let topo = GraphTopologyAnalysis::analyze(&graph);
 
@@ -347,9 +413,7 @@ mod tests {
 
     #[test]
     fn partial_argmax_without_store_token() {
-        let graph = make_test_graph(vec![
-            Op::Argmax { vocab_size: 32000 },
-        ]);
+        let graph = make_test_graph(vec![Op::Argmax { vocab_size: 32000 }]);
         let topo = GraphTopologyAnalysis::analyze(&graph);
 
         assert_eq!(topo.loop_topology, LoopTopology::SinglePass);
@@ -358,7 +422,14 @@ mod tests {
     #[test]
     fn vocab_size_derived_from_argmax() {
         let graph = make_test_graph(vec![
-            Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             Op::Argmax { vocab_size: 152344 },
             Op::StoreToken,
             Op::CheckStopCondition,
@@ -373,17 +444,35 @@ mod tests {
         let mut graph = CompilerGraph::default();
         let gemm_in = graph.add_tensor_concrete("gemm_in", &[1], DType::F32);
         let gemm_out = graph.add_tensor_concrete("gemm_out", &[1], DType::F32);
-        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![gemm_in], vec![gemm_out], "final_proj",
+        graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![gemm_in],
+            vec![gemm_out],
+            "final_proj",
         );
         let argmax_out = graph.add_tensor_concrete("argmax_out", &[1], DType::F32);
-        graph.add_op(Op::Argmax { vocab_size: 32000 },
-            vec![gemm_out], vec![argmax_out], "argmax",
+        graph.add_op(
+            Op::Argmax { vocab_size: 32000 },
+            vec![gemm_out],
+            vec![argmax_out],
+            "argmax",
         );
         let store_out = graph.add_tensor_concrete("store_out", &[1], DType::F32);
         graph.add_op(Op::StoreToken, vec![argmax_out], vec![store_out], "store");
         let check_out = graph.add_tensor_concrete("check_out", &[1], DType::F32);
-        graph.add_op(Op::CheckStopCondition, vec![store_out], vec![check_out], "check");
+        graph.add_op(
+            Op::CheckStopCondition,
+            vec![store_out],
+            vec![check_out],
+            "check",
+        );
 
         let topo = GraphTopologyAnalysis::analyze(&graph);
 
@@ -396,8 +485,14 @@ mod tests {
     #[test]
     fn sg_ops_detected_from_graph() {
         let graph = make_test_graph(vec![
-            Op::SgDetect { detect_offset: 0, hidden_dim: 0 },
-            Op::SgInject { knowledge_offset: 0, dim: 256 },
+            Op::SgDetect {
+                detect_offset: 0,
+                hidden_dim: 0,
+            },
+            Op::SgInject {
+                knowledge_offset: 0,
+                dim: 256,
+            },
         ]);
         let topo = GraphTopologyAnalysis::analyze(&graph);
 
@@ -407,9 +502,14 @@ mod tests {
 
     #[test]
     fn no_sg_ops_in_plain_graph() {
-        let graph = make_test_graph(vec![
-            Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
-        ]);
+        let graph = make_test_graph(vec![Op::Gemm(GemmSpec {
+            m: SymDim::Concrete(1),
+            n: 4096,
+            k: 4096,
+            dtype: DType::F32,
+            trans_b: false,
+            has_bias: false,
+        })]);
         let topo = GraphTopologyAnalysis::analyze(&graph);
 
         assert_eq!(topo.sg_ops, SgOpsPresence::None);
@@ -417,18 +517,26 @@ mod tests {
 
     #[test]
     fn weight_source_detected_from_graph() {
-        let graph = make_test_graph(vec![
-            Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
-        ]);
+        let graph = make_test_graph(vec![Op::Gemm(GemmSpec {
+            m: SymDim::Concrete(1),
+            n: 4096,
+            k: 4096,
+            dtype: DType::F32,
+            trans_b: false,
+            has_bias: false,
+        })]);
         let topo = GraphTopologyAnalysis::analyze(&graph);
         assert_eq!(topo.weight_source, WeightSource::WeightRequired);
     }
 
     #[test]
     fn no_weight_ops_in_value_norm_only_graph() {
-        let graph = make_test_graph(vec![
-            Op::ValueNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: false }),
-        ]);
+        let graph = make_test_graph(vec![Op::ValueNorm(NormSpec {
+            feature_dim: 4096,
+            eps: 1e-6,
+            dtype: DType::F32,
+            has_weight: false,
+        })]);
         let topo = GraphTopologyAnalysis::analyze(&graph);
         assert_eq!(topo.weight_source, WeightSource::NoWeight);
     }

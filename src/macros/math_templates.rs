@@ -22,12 +22,23 @@ macro_rules! define_exp_f32 {
         /// Cephes-style degree-5 polynomial with Cody-Waite range reduction.
         /// Input clamped to [-88.376, 88.376] to avoid NaN/Inf.
         #[inline(always)]
-        pub unsafe fn exp_f32_impl(x: $crate::define_exp_f32!(@vec_type $isa)) -> $crate::define_exp_f32!(@vec_type $isa) {
+        pub unsafe fn exp_f32_impl(
+    x: $crate::define_exp_f32!(@vec_type $isa),
+) -> $crate::define_exp_f32!(@vec_type $isa) {
             // Clamp input to avoid overflow/underflow in 2^k computation
-            let x = $crate::simd_primitive!($isa, f32, min,
-                $crate::simd_primitive!($isa, f32, max, x,
-                    $crate::simd_primitive!($isa, f32, splat, -88.376_f32)),
-                $crate::simd_primitive!($isa, f32, splat, 88.376_f32));
+            let x = $crate::simd_primitive!(
+                $isa,
+                f32,
+                min,
+                $crate::simd_primitive!(
+                    $isa,
+                    f32,
+                    max,
+                    x,
+                    $crate::simd_primitive!($isa, f32, splat, -88.376_f32)
+                ),
+                $crate::simd_primitive!($isa, f32, splat, 88.376_f32)
+            );
 
             let v_log2e = $crate::simd_primitive!($isa, f32, splat, 1.442_695_04_f32);
             let v_127 = $crate::simd_primitive!($isa, i32, splat, 127);
@@ -38,8 +49,12 @@ macro_rules! define_exp_f32 {
 
             // k = round(x * log2e)
             let t = $crate::simd_primitive!($isa, f32, mul, x, v_log2e);
-            let k = $crate::simd_primitive!($isa, f32, cvt_to_i32,
-                $crate::simd_primitive!($isa, f32, round_nearest, t));
+            let k = $crate::simd_primitive!(
+                $isa,
+                f32,
+                cvt_to_i32,
+                $crate::simd_primitive!($isa, f32, round_nearest, t)
+            );
             let k_ps = $crate::simd_primitive!($isa, i32, cast_f32, k);
 
             // y = x - k*ln2 (two-step for precision)
@@ -65,8 +80,12 @@ macro_rules! define_exp_f32 {
             p = $crate::simd_primitive!($isa, f32, fma, p, y, one);
 
             // 2^k via IEEE-754 exponent manipulation: (k + 127) << 23
-            let v_exp = $crate::simd_primitive!($isa, i32, shl_23,
-                $crate::simd_primitive!($isa, i32, add, k, v_127));
+            let v_exp = $crate::simd_primitive!(
+                $isa,
+                i32,
+                shl_23,
+                $crate::simd_primitive!($isa, i32, add, k, v_127)
+            );
             let fact = $crate::simd_primitive!($isa, i32, cast_bits_f32, v_exp);
 
             $crate::simd_primitive!($isa, f32, mul, p, fact)
@@ -74,9 +93,15 @@ macro_rules! define_exp_f32 {
     };
 
     // Vector type mapping: ISA → concrete SIMD type
-    (@vec_type avx2) => { std::arch::x86_64::__m256 };
-    (@vec_type avx512) => { std::arch::x86_64::__m512 };
-    (@vec_type neon) => { std::arch::aarch64::float32x4_t };
+    (@vec_type avx2) => {
+        std::arch::x86_64::__m256
+    };
+    (@vec_type avx512) => {
+        std::arch::x86_64::__m512
+    };
+    (@vec_type neon) => {
+        std::arch::aarch64::float32x4_t
+    };
 }
 
 /// Generates `store_f32_as_bf16` and `load_bf16_as_f32` helper functions
@@ -119,12 +144,23 @@ macro_rules! define_exp_fast_f32 {
         /// 4 FMAs (1 more than old degree-3), but much better softmax precision.
         /// Coefficients from Sollya minimax on [-ln2/2, ln2/2].
         #[inline(always)]
-        pub unsafe fn exp_fast_f32_impl(x: $crate::define_exp_f32!(@vec_type $isa)) -> $crate::define_exp_f32!(@vec_type $isa) {
+        pub unsafe fn exp_fast_f32_impl(
+    x: $crate::define_exp_f32!(@vec_type $isa),
+) -> $crate::define_exp_f32!(@vec_type $isa) {
             // Clamp input
-            let x = $crate::simd_primitive!($isa, f32, min,
-                $crate::simd_primitive!($isa, f32, max, x,
-                    $crate::simd_primitive!($isa, f32, splat, -88.376_f32)),
-                $crate::simd_primitive!($isa, f32, splat, 88.376_f32));
+            let x = $crate::simd_primitive!(
+                $isa,
+                f32,
+                min,
+                $crate::simd_primitive!(
+                    $isa,
+                    f32,
+                    max,
+                    x,
+                    $crate::simd_primitive!($isa, f32, splat, -88.376_f32)
+                ),
+                $crate::simd_primitive!($isa, f32, splat, 88.376_f32)
+            );
 
             let v_log2e = $crate::simd_primitive!($isa, f32, splat, 1.442_695_04_f32);
             let v_127 = $crate::simd_primitive!($isa, i32, splat, 127);
@@ -134,8 +170,12 @@ macro_rules! define_exp_fast_f32 {
             let c2 = $crate::simd_primitive!($isa, f32, splat, 2.121_944_4e-4_f32);
 
             let t = $crate::simd_primitive!($isa, f32, mul, x, v_log2e);
-            let k = $crate::simd_primitive!($isa, f32, cvt_to_i32,
-                $crate::simd_primitive!($isa, f32, round_nearest, t));
+            let k = $crate::simd_primitive!(
+                $isa,
+                f32,
+                cvt_to_i32,
+                $crate::simd_primitive!($isa, f32, round_nearest, t)
+            );
             let k_ps = $crate::simd_primitive!($isa, i32, cast_f32, k);
 
             let mut y = $crate::simd_primitive!($isa, f32, fma, k_ps, c1, x);
@@ -155,8 +195,12 @@ macro_rules! define_exp_fast_f32 {
             p = $crate::simd_primitive!($isa, f32, fma, p, y, one);
 
             // 2^k
-            let v_exp = $crate::simd_primitive!($isa, i32, shl_23,
-                $crate::simd_primitive!($isa, i32, add, k, v_127));
+            let v_exp = $crate::simd_primitive!(
+                $isa,
+                i32,
+                shl_23,
+                $crate::simd_primitive!($isa, i32, add, k, v_127)
+            );
             let fact = $crate::simd_primitive!($isa, i32, cast_bits_f32, v_exp);
 
             $crate::simd_primitive!($isa, f32, mul, p, fact)

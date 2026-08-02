@@ -3,8 +3,8 @@
 //! 每个加速指令声明: 硬件要求、算子模式、输入/输出布局约束、收益函数。
 //! LayoutNegotiator (R1.5) 消费此注册表进行流水线级联布局协商。
 
-use crate::compiler::semantic_dag::OpClass;
 use crate::compiler::pain_point::BottleneckType;
+use crate::compiler::semantic_dag::OpClass;
 use crate::dispatch::device_profile::{DeviceProfile, IsaLevel};
 
 /// Unique identifier for an acceleration feature.
@@ -41,14 +41,24 @@ impl HardwareRequirement {
     /// Check if this requirement is satisfied by the given device profile.
     pub fn satisfied_by(&self, device: &DeviceProfile) -> bool {
         match self {
-            HardwareRequirement::Avx512 => matches!(device.isa, IsaLevel::Avx512 | IsaLevel::Avx512Amx),
+            HardwareRequirement::Avx512 => {
+                matches!(device.isa, IsaLevel::Avx512 | IsaLevel::Avx512Amx)
+            }
             HardwareRequirement::Avx512Amx => matches!(device.isa, IsaLevel::Avx512Amx),
-            HardwareRequirement::Avx2 => matches!(device.isa, IsaLevel::Avx2 | IsaLevel::Avx512 | IsaLevel::Avx512Amx),
-            HardwareRequirement::Neon => matches!(device.isa, IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2 | IsaLevel::NeonAmx),
+            HardwareRequirement::Avx2 => matches!(
+                device.isa,
+                IsaLevel::Avx2 | IsaLevel::Avx512 | IsaLevel::Avx512Amx
+            ),
+            HardwareRequirement::Neon => matches!(
+                device.isa,
+                IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2 | IsaLevel::NeonAmx
+            ),
             HardwareRequirement::Sve => matches!(device.isa, IsaLevel::Sve | IsaLevel::Sve2),
             HardwareRequirement::Sve2 => matches!(device.isa, IsaLevel::Sve2),
             HardwareRequirement::NeonAmx => matches!(device.isa, IsaLevel::NeonAmx),
-            HardwareRequirement::GpuSm80 | HardwareRequirement::GpuSm90 | HardwareRequirement::GpuSm100 => {
+            HardwareRequirement::GpuSm80
+            | HardwareRequirement::GpuSm90
+            | HardwareRequirement::GpuSm100 => {
                 // GPU requirements checked via GPU backend detection.
                 // For CPU-only builds, these are never satisfied.
                 false
@@ -74,7 +84,11 @@ pub enum LayoutConstraint {
     /// Intel AMX tile: 16×32 BF16 format.
     AmxTileBF16 { rows: usize, cols: usize },
     /// GPU shared memory tile with padding for bank-conflict avoidance.
-    SharedMemTile { tile_rows: usize, tile_cols: usize, padding_bytes: usize },
+    SharedMemTile {
+        tile_rows: usize,
+        tile_cols: usize,
+        padding_bytes: usize,
+    },
     /// GPU TMA 2D-compatible layout (128-byte aligned).
     TmaAligned2D { tile_m: usize, tile_n: usize },
     /// VNNI u8×i4 packed format.
@@ -93,7 +107,10 @@ impl LayoutConstraint {
             // Same type → compatible.
             (a, b) if a == b => true,
             // RowMajor with different alignment → compatible (lower alignment is fine).
-            (LayoutConstraint::RowMajor { align_bytes: a }, LayoutConstraint::RowMajor { align_bytes: b }) => a <= b,
+            (
+                LayoutConstraint::RowMajor { align_bytes: a },
+                LayoutConstraint::RowMajor { align_bytes: b },
+            ) => a <= b,
             // HeadSplit is a reshaped view of RowMajor — compatible for element-wise access.
             (LayoutConstraint::RowMajor { .. }, LayoutConstraint::HeadSplit { .. }) => true,
             (LayoutConstraint::HeadSplit { .. }, LayoutConstraint::RowMajor { .. }) => true,
@@ -150,7 +167,9 @@ pub struct AccelerationRegistry {
 impl AccelerationRegistry {
     /// Create a registry populated with all built-in acceleration features.
     pub fn new() -> Self {
-        let mut reg = AccelerationRegistry { entries: Vec::new() };
+        let mut reg = AccelerationRegistry {
+            entries: Vec::new(),
+        };
 
         // ── x86_64 AVX-512 GEMM ──
         reg.register(AccelerationDecl {
@@ -174,9 +193,7 @@ impl AccelerationRegistry {
             id: "avx512_gemm_headsplit",
             hw_req: HardwareRequirement::Avx512,
             applicable_patterns: vec![ApplicablePattern::Gemm],
-            input_layouts: vec![
-                LayoutConstraint::RowMajor { align_bytes: 64 },
-            ],
+            input_layouts: vec![LayoutConstraint::RowMajor { align_bytes: 64 }],
             output_layout: LayoutConstraint::Any, // Can output any layout via store stride
             benefit_fn: |bn| match bn {
                 BottleneckType::MemoryBound { .. } => 1.8,
@@ -190,9 +207,7 @@ impl AccelerationRegistry {
             id: "amx_tile_bf16",
             hw_req: HardwareRequirement::Avx512Amx,
             applicable_patterns: vec![ApplicablePattern::Gemm],
-            input_layouts: vec![
-                LayoutConstraint::AmxTileBF16 { rows: 16, cols: 32 },
-            ],
+            input_layouts: vec![LayoutConstraint::AmxTileBF16 { rows: 16, cols: 32 }],
             output_layout: LayoutConstraint::RowMajor { align_bytes: 64 },
             benefit_fn: |bn| match bn {
                 BottleneckType::MemoryBound { .. } => 1.5,
@@ -223,9 +238,7 @@ impl AccelerationRegistry {
             id: "neon_gemm_f32",
             hw_req: HardwareRequirement::Neon,
             applicable_patterns: vec![ApplicablePattern::Gemm],
-            input_layouts: vec![
-                LayoutConstraint::RowMajor { align_bytes: 16 },
-            ],
+            input_layouts: vec![LayoutConstraint::RowMajor { align_bytes: 16 }],
             output_layout: LayoutConstraint::RowMajor { align_bytes: 16 },
             benefit_fn: |bn| match bn {
                 BottleneckType::MemoryBound { .. } => 1.3,
@@ -239,9 +252,7 @@ impl AccelerationRegistry {
             id: "sve_gemm_f32",
             hw_req: HardwareRequirement::Sve,
             applicable_patterns: vec![ApplicablePattern::Gemm],
-            input_layouts: vec![
-                LayoutConstraint::RowMajor { align_bytes: 16 },
-            ],
+            input_layouts: vec![LayoutConstraint::RowMajor { align_bytes: 16 }],
             output_layout: LayoutConstraint::RowMajor { align_bytes: 16 },
             benefit_fn: |bn| match bn {
                 BottleneckType::MemoryBound { .. } => 1.5,
@@ -299,7 +310,10 @@ impl AccelerationRegistry {
             hw_req: HardwareRequirement::Any,
             applicable_patterns: vec![ApplicablePattern::Attention],
             input_layouts: vec![
-                LayoutConstraint::HeadSplit { num_heads: 0, head_dim: 0 },
+                LayoutConstraint::HeadSplit {
+                    num_heads: 0,
+                    head_dim: 0,
+                },
                 LayoutConstraint::RowMajor { align_bytes: 64 },
             ],
             output_layout: LayoutConstraint::RowMajor { align_bytes: 64 },
@@ -315,11 +329,7 @@ impl AccelerationRegistry {
     }
 
     /// Query all features applicable to the given OpClass on the given device.
-    pub fn query(
-        &self,
-        op_class: OpClass,
-        device: &DeviceProfile,
-    ) -> Vec<&AccelerationDecl> {
+    pub fn query(&self, op_class: OpClass, device: &DeviceProfile) -> Vec<&AccelerationDecl> {
         let pattern = match op_class {
             OpClass::Gemm => ApplicablePattern::Gemm,
             OpClass::ElemWise => ApplicablePattern::Elementwise,
@@ -328,7 +338,8 @@ impl AccelerationRegistry {
             OpClass::Opaque => ApplicablePattern::Any,
         };
 
-        self.entries.iter()
+        self.entries
+            .iter()
             .filter(|e| {
                 e.hw_req.satisfied_by(device)
                     && (e.applicable_patterns.contains(&pattern)
@@ -345,12 +356,11 @@ impl AccelerationRegistry {
         bottleneck: BottleneckType,
     ) -> Option<&AccelerationDecl> {
         let candidates = self.query(op_class, device);
-        candidates.into_iter()
-            .max_by(|a, b| {
-                let ba = (a.benefit_fn)(bottleneck);
-                let bb = (b.benefit_fn)(bottleneck);
-                ba.partial_cmp(&bb).unwrap_or(std::cmp::Ordering::Equal)
-            })
+        candidates.into_iter().max_by(|a, b| {
+            let ba = (a.benefit_fn)(bottleneck);
+            let bb = (b.benefit_fn)(bottleneck);
+            ba.partial_cmp(&bb).unwrap_or(std::cmp::Ordering::Equal)
+        })
     }
 
     /// Number of registered features.
@@ -371,7 +381,11 @@ mod tests {
     #[test]
     fn test_registry_populated() {
         let reg = AccelerationRegistry::new();
-        assert!(reg.len() >= 10, "Registry should have at least 10 entries, got {}", reg.len());
+        assert!(
+            reg.len() >= 10,
+            "Registry should have at least 10 entries, got {}",
+            reg.len()
+        );
     }
 
     #[test]
@@ -380,7 +394,10 @@ mod tests {
         let device = DeviceProfile::detect();
         let results = reg.query(OpClass::Gemm, &device);
         // Should find at least one GEMM feature (either AVX2 or AVX-512 depending on CPU).
-        assert!(!results.is_empty(), "Should find at least one GEMM acceleration feature");
+        assert!(
+            !results.is_empty(),
+            "Should find at least one GEMM acceleration feature"
+        );
         for r in &results {
             assert!(r.applicable_patterns.contains(&ApplicablePattern::Gemm));
         }
@@ -391,23 +408,44 @@ mod tests {
         let reg = AccelerationRegistry::new();
         let device = DeviceProfile::detect();
         let results = reg.query(OpClass::ElemWise, &device);
-        assert!(!results.is_empty(), "Elementwise should always find simd_elementwise");
+        assert!(
+            !results.is_empty(),
+            "Elementwise should always find simd_elementwise"
+        );
     }
 
     #[test]
     fn test_best_for_gemm() {
         let reg = AccelerationRegistry::new();
         let device = DeviceProfile::detect();
-        let best = reg.best_for(OpClass::Gemm, &device, BottleneckType::MemoryBound { bandwidth_utilization: 0.5 });
+        let best = reg.best_for(
+            OpClass::Gemm,
+            &device,
+            BottleneckType::MemoryBound {
+                bandwidth_utilization: 0.5,
+            },
+        );
         assert!(best.is_some(), "Should find a best GEMM feature");
     }
 
     #[test]
     fn test_layout_compatibility() {
-        assert!(LayoutConstraint::Any.compatible_with(&LayoutConstraint::RowMajor { align_bytes: 64 }));
-        assert!(LayoutConstraint::RowMajor { align_bytes: 64 }.compatible_with(&LayoutConstraint::Any));
-        assert!(LayoutConstraint::RowMajor { align_bytes: 32 }.compatible_with(&LayoutConstraint::RowMajor { align_bytes: 64 }));
-        assert!(LayoutConstraint::RowMajor { align_bytes: 64 }.compatible_with(&LayoutConstraint::HeadSplit { num_heads: 32, head_dim: 128 }));
+        assert!(
+            LayoutConstraint::Any.compatible_with(&LayoutConstraint::RowMajor { align_bytes: 64 })
+        );
+        assert!(
+            LayoutConstraint::RowMajor { align_bytes: 64 }.compatible_with(&LayoutConstraint::Any)
+        );
+        assert!(LayoutConstraint::RowMajor { align_bytes: 32 }
+            .compatible_with(&LayoutConstraint::RowMajor { align_bytes: 64 }));
+        assert!(
+            LayoutConstraint::RowMajor { align_bytes: 64 }.compatible_with(
+                &LayoutConstraint::HeadSplit {
+                    num_heads: 32,
+                    head_dim: 128
+                }
+            )
+        );
     }
 
     #[test]
@@ -427,17 +465,30 @@ mod tests {
             LayoutConstraint::PanelPacked { mr: 6, nr: 8 },
             LayoutConstraint::InterleavedPairs,
             LayoutConstraint::AmxTileBF16 { rows: 16, cols: 32 },
-            LayoutConstraint::SharedMemTile { tile_rows: 16, tile_cols: 16, padding_bytes: 4 },
-            LayoutConstraint::TmaAligned2D { tile_m: 128, tile_n: 128 },
+            LayoutConstraint::SharedMemTile {
+                tile_rows: 16,
+                tile_cols: 16,
+                padding_bytes: 4,
+            },
+            LayoutConstraint::TmaAligned2D {
+                tile_m: 128,
+                tile_n: 128,
+            },
             LayoutConstraint::VnniPacked4,
         ];
 
         // Act & Assert — Any is compatible with every layout variant, both directions.
         for variant in &variants {
-            assert!(any.compatible_with(variant),
-                "Any should be compatible with {:?}", variant);
-            assert!(variant.compatible_with(&any),
-                "{:?} should be compatible with Any", variant);
+            assert!(
+                any.compatible_with(variant),
+                "Any should be compatible with {:?}",
+                variant
+            );
+            assert!(
+                variant.compatible_with(&any),
+                "{:?} should be compatible with Any",
+                variant
+            );
         }
     }
 
@@ -449,10 +500,14 @@ mod tests {
         let low_align = LayoutConstraint::RowMajor { align_bytes: 32 };
 
         // Act & Assert — only the lower-align → higher-align direction is compatible.
-        assert!(low_align.compatible_with(&high_align),
-            "Lower alignment (32) should be compatible with higher alignment (128)");
-        assert!(!high_align.compatible_with(&low_align),
-            "Higher alignment (128) should NOT be compatible with lower alignment (32)");
+        assert!(
+            low_align.compatible_with(&high_align),
+            "Lower alignment (32) should be compatible with higher alignment (128)"
+        );
+        assert!(
+            !high_align.compatible_with(&low_align),
+            "Higher alignment (128) should NOT be compatible with lower alignment (32)"
+        );
     }
 
     // @trace TEST-AR-09 [req:REQ-CG] [level:unit]
@@ -467,18 +522,30 @@ mod tests {
         let vnni = LayoutConstraint::VnniPacked4;
 
         // Act & Assert — all these pairs require transformation.
-        assert!(!row_major.compatible_with(&col_major),
-            "RowMajor and ColMajor should be incompatible");
-        assert!(!row_major.compatible_with(&panel),
-            "RowMajor and PanelPacked should be incompatible");
-        assert!(!row_major.compatible_with(&interleaved),
-            "RowMajor and InterleavedPairs should be incompatible");
-        assert!(!row_major.compatible_with(&amx),
-            "RowMajor and AmxTileBF16 should be incompatible");
-        assert!(!row_major.compatible_with(&vnni),
-            "RowMajor and VnniPacked4 should be incompatible");
-        assert!(!col_major.compatible_with(&panel),
-            "ColMajor and PanelPacked should be incompatible");
+        assert!(
+            !row_major.compatible_with(&col_major),
+            "RowMajor and ColMajor should be incompatible"
+        );
+        assert!(
+            !row_major.compatible_with(&panel),
+            "RowMajor and PanelPacked should be incompatible"
+        );
+        assert!(
+            !row_major.compatible_with(&interleaved),
+            "RowMajor and InterleavedPairs should be incompatible"
+        );
+        assert!(
+            !row_major.compatible_with(&amx),
+            "RowMajor and AmxTileBF16 should be incompatible"
+        );
+        assert!(
+            !row_major.compatible_with(&vnni),
+            "RowMajor and VnniPacked4 should be incompatible"
+        );
+        assert!(
+            !col_major.compatible_with(&panel),
+            "ColMajor and PanelPacked should be incompatible"
+        );
     }
 
     // @trace TEST-AR-10 [req:REQ-CG] [level:unit]
@@ -486,13 +553,20 @@ mod tests {
     fn test_layout_headsplit_rowmajor_bidirectional() {
         // Arrange
         let row = LayoutConstraint::RowMajor { align_bytes: 64 };
-        let head = LayoutConstraint::HeadSplit { num_heads: 32, head_dim: 128 };
+        let head = LayoutConstraint::HeadSplit {
+            num_heads: 32,
+            head_dim: 128,
+        };
 
         // Act & Assert — HeadSplit and RowMajor are compatible in both directions.
-        assert!(row.compatible_with(&head),
-            "RowMajor should be compatible with HeadSplit");
-        assert!(head.compatible_with(&row),
-            "HeadSplit should be compatible with RowMajor");
+        assert!(
+            row.compatible_with(&head),
+            "RowMajor should be compatible with HeadSplit"
+        );
+        assert!(
+            head.compatible_with(&row),
+            "HeadSplit should be compatible with RowMajor"
+        );
     }
 
     // @trace TEST-AR-11 [req:REQ-CG] [level:unit]
@@ -508,8 +582,11 @@ mod tests {
 
         // Act & Assert — GPU requirements are never satisfied on CPU-only builds.
         for req in &gpu_reqs {
-            assert!(!req.satisfied_by(&device),
-                "{:?} should not be satisfied on a CPU-only build", req);
+            assert!(
+                !req.satisfied_by(&device),
+                "{:?} should not be satisfied on a CPU-only build",
+                req
+            );
         }
     }
 
@@ -526,21 +603,29 @@ mod tests {
         let opaque = reg.query(OpClass::Opaque, &device);
 
         // Assert — Reduction and Injective have dedicated "Any"-hw entries.
-        assert!(!reduction.is_empty(),
-            "Reduction should always find simd_reduction");
-        assert!(!injective.is_empty(),
-            "Injective should always find simd_injective");
+        assert!(
+            !reduction.is_empty(),
+            "Reduction should always find simd_reduction"
+        );
+        assert!(
+            !injective.is_empty(),
+            "Injective should always find simd_injective"
+        );
         // Opaque maps to ApplicablePattern::Any; no built-in feature declares that pattern,
         // so the result is legitimately empty on a default registry.
-        assert!(opaque.is_empty(),
-            "Opaque has no matching ApplicablePattern::Any feature in default registry");
+        assert!(
+            opaque.is_empty(),
+            "Opaque has no matching ApplicablePattern::Any feature in default registry"
+        );
     }
 
     // @trace TEST-AR-13 [req:REQ-CG] [level:unit]
     #[test]
     fn test_best_for_picks_highest_benefit() {
         // Arrange — register two features for the same pattern with known benefit deltas.
-        let mut reg = AccelerationRegistry { entries: Vec::new() };
+        let mut reg = AccelerationRegistry {
+            entries: Vec::new(),
+        };
         reg.register(AccelerationDecl {
             id: "low_benefit_gemm",
             hw_req: HardwareRequirement::Any,
@@ -560,12 +645,21 @@ mod tests {
         let device = DeviceProfile::detect();
 
         // Act
-        let best = reg.best_for(OpClass::Gemm, &device, BottleneckType::MemoryBound { bandwidth_utilization: 0.5 });
+        let best = reg.best_for(
+            OpClass::Gemm,
+            &device,
+            BottleneckType::MemoryBound {
+                bandwidth_utilization: 0.5,
+            },
+        );
 
         // Assert
         assert!(best.is_some());
-        assert_eq!(best.unwrap().id, "high_benefit_gemm",
-            "best_for should pick the feature with the highest benefit multiplier");
+        assert_eq!(
+            best.unwrap().id,
+            "high_benefit_gemm",
+            "best_for should pick the feature with the highest benefit multiplier"
+        );
     }
 
     // @trace TEST-AR-14 [req:REQ-CG] [level:unit]
@@ -576,23 +670,39 @@ mod tests {
         let device = DeviceProfile::detect();
 
         // Act
-        let compute_best = reg.best_for(OpClass::Gemm, &device,
-            BottleneckType::ComputeBound { compute_utilization: 0.9 });
-        let latency_best = reg.best_for(OpClass::Gemm, &device,
-            BottleneckType::LatencyBound { estimated_latency_ns: 100.0 });
+        let compute_best = reg.best_for(
+            OpClass::Gemm,
+            &device,
+            BottleneckType::ComputeBound {
+                compute_utilization: 0.9,
+            },
+        );
+        let latency_best = reg.best_for(
+            OpClass::Gemm,
+            &device,
+            BottleneckType::LatencyBound {
+                estimated_latency_ns: 100.0,
+            },
+        );
 
         // Assert — both should find a feature (at minimum the Any-hw GEMM features).
-        assert!(compute_best.is_some(),
-            "Should find a GEMM feature for compute-bound bottleneck");
-        assert!(latency_best.is_some(),
-            "Should find a GEMM feature for latency-bound bottleneck");
+        assert!(
+            compute_best.is_some(),
+            "Should find a GEMM feature for compute-bound bottleneck"
+        );
+        assert!(
+            latency_best.is_some(),
+            "Should find a GEMM feature for latency-bound bottleneck"
+        );
     }
 
     // @trace TEST-AR-15 [req:REQ-CG] [level:unit]
     #[test]
     fn test_empty_registry() {
         // Arrange
-        let reg = AccelerationRegistry { entries: Vec::new() };
+        let reg = AccelerationRegistry {
+            entries: Vec::new(),
+        };
 
         // Act & Assert
         assert!(reg.is_empty(), "New empty registry should be empty");
@@ -600,18 +710,31 @@ mod tests {
 
         let device = DeviceProfile::detect();
         let results = reg.query(OpClass::Gemm, &device);
-        assert!(results.is_empty(), "Query on empty registry should return no results");
+        assert!(
+            results.is_empty(),
+            "Query on empty registry should return no results"
+        );
 
-        let best = reg.best_for(OpClass::Gemm, &device,
-            BottleneckType::MemoryBound { bandwidth_utilization: 0.5 });
-        assert!(best.is_none(), "best_for on empty registry should return None");
+        let best = reg.best_for(
+            OpClass::Gemm,
+            &device,
+            BottleneckType::MemoryBound {
+                bandwidth_utilization: 0.5,
+            },
+        );
+        assert!(
+            best.is_none(),
+            "best_for on empty registry should return None"
+        );
     }
 
     // @trace TEST-AR-16 [req:REQ-CG] [level:unit]
     #[test]
     fn test_register_increments_len() {
         // Arrange
-        let mut reg = AccelerationRegistry { entries: Vec::new() };
+        let mut reg = AccelerationRegistry {
+            entries: Vec::new(),
+        };
         let initial_len = reg.len();
 
         let decl = AccelerationDecl {
@@ -635,7 +758,9 @@ mod tests {
     #[test]
     fn test_query_filters_by_hw_requirement() {
         // Arrange — register one GPU-only feature.
-        let mut reg = AccelerationRegistry { entries: Vec::new() };
+        let mut reg = AccelerationRegistry {
+            entries: Vec::new(),
+        };
         reg.register(AccelerationDecl {
             id: "gpu_only_gemm",
             hw_req: HardwareRequirement::GpuSm80,
@@ -650,15 +775,19 @@ mod tests {
         let results = reg.query(OpClass::Gemm, &device);
 
         // Assert — GPU feature should not appear on CPU-only build.
-        assert!(results.is_empty(),
-            "GPU-only feature should not match on CPU device profile");
+        assert!(
+            results.is_empty(),
+            "GPU-only feature should not match on CPU device profile"
+        );
     }
 
     // @trace TEST-AR-18 [req:REQ-CG] [level:unit]
     #[test]
     fn test_query_applicable_pattern_any_matches_all_classes() {
         // Arrange — register a feature with ApplicablePattern::Any.
-        let mut reg = AccelerationRegistry { entries: Vec::new() };
+        let mut reg = AccelerationRegistry {
+            entries: Vec::new(),
+        };
         reg.register(AccelerationDecl {
             id: "universal_accel",
             hw_req: HardwareRequirement::Any,
@@ -670,10 +799,19 @@ mod tests {
         let device = DeviceProfile::detect();
 
         // Act & Assert — it should be returned for every OpClass.
-        for op_class in &[OpClass::Gemm, OpClass::ElemWise, OpClass::Reduction, OpClass::Injective, OpClass::Opaque] {
+        for op_class in &[
+            OpClass::Gemm,
+            OpClass::ElemWise,
+            OpClass::Reduction,
+            OpClass::Injective,
+            OpClass::Opaque,
+        ] {
             let results = reg.query(*op_class, &device);
-            assert!(results.iter().any(|r| r.id == "universal_accel"),
-                "ApplicablePattern::Any should match OpClass {:?}", op_class);
+            assert!(
+                results.iter().any(|r| r.id == "universal_accel"),
+                "ApplicablePattern::Any should match OpClass {:?}",
+                op_class
+            );
         }
     }
 
@@ -684,9 +822,15 @@ mod tests {
         let reg = AccelerationRegistry::new();
         let device = DeviceProfile::detect();
 
-        let mem = BottleneckType::MemoryBound { bandwidth_utilization: 0.5 };
-        let compute = BottleneckType::ComputeBound { compute_utilization: 0.9 };
-        let latency = BottleneckType::LatencyBound { estimated_latency_ns: 100.0 };
+        let mem = BottleneckType::MemoryBound {
+            bandwidth_utilization: 0.5,
+        };
+        let compute = BottleneckType::ComputeBound {
+            compute_utilization: 0.9,
+        };
+        let latency = BottleneckType::LatencyBound {
+            estimated_latency_ns: 100.0,
+        };
 
         // Act — find the avx512_gemm_f32 benefit values (it has distinct values per bottleneck).
         let entry = reg.entries.iter().find(|e| e.id == "avx512_gemm_f32");
@@ -697,12 +841,18 @@ mod tests {
             let b_compute = (e.benefit_fn)(compute);
             let b_latency = (e.benefit_fn)(latency);
             // MemoryBound has highest benefit for this entry.
-            assert!(b_mem > b_compute,
+            assert!(
+                b_mem > b_compute,
                 "avx512_gemm_f32: memory-bound benefit ({}) should exceed compute-bound ({})",
-                b_mem, b_compute);
-            assert!(b_compute > b_latency,
+                b_mem,
+                b_compute
+            );
+            assert!(
+                b_compute > b_latency,
                 "avx512_gemm_f32: compute-bound benefit ({}) should exceed latency-bound ({})",
-                b_compute, b_latency);
+                b_compute,
+                b_latency
+            );
         }
     }
 
@@ -717,9 +867,15 @@ mod tests {
         let satisfied = avx2_req.satisfied_by(&device);
 
         // Assert — if the device has AVX-512 or AVX2, the Avx2 requirement should be met.
-        if matches!(device.isa, IsaLevel::Avx2 | IsaLevel::Avx512 | IsaLevel::Avx512Amx) {
-            assert!(satisfied,
-                "Avx2 requirement should be satisfied on {:?} device", device.isa);
+        if matches!(
+            device.isa,
+            IsaLevel::Avx2 | IsaLevel::Avx512 | IsaLevel::Avx512Amx
+        ) {
+            assert!(
+                satisfied,
+                "Avx2 requirement should be satisfied on {:?} device",
+                device.isa
+            );
         }
     }
 
@@ -734,9 +890,15 @@ mod tests {
         let satisfied = neon_req.satisfied_by(&device);
 
         // Assert — if the device has NEON, SVE, SVE2, or NeonAmx, NEON req is met.
-        if matches!(device.isa, IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2 | IsaLevel::NeonAmx) {
-            assert!(satisfied,
-                "Neon requirement should be satisfied on {:?} device", device.isa);
+        if matches!(
+            device.isa,
+            IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2 | IsaLevel::NeonAmx
+        ) {
+            assert!(
+                satisfied,
+                "Neon requirement should be satisfied on {:?} device",
+                device.isa
+            );
         }
     }
 
@@ -752,8 +914,10 @@ mod tests {
 
         // Assert — Avx512 requirement should NOT be met on an Avx2-only device.
         if matches!(device.isa, IsaLevel::Avx2) {
-            assert!(!satisfied,
-                "Avx512 requirement should NOT be satisfied on Avx2-only device");
+            assert!(
+                !satisfied,
+                "Avx512 requirement should NOT be satisfied on Avx2-only device"
+            );
         }
     }
 
@@ -769,8 +933,10 @@ mod tests {
 
         // Assert — SVE requirement should NOT be met on a NEON-only device.
         if matches!(device.isa, IsaLevel::Neon) {
-            assert!(!satisfied,
-                "Sve requirement should NOT be satisfied on Neon-only device");
+            assert!(
+                !satisfied,
+                "Sve requirement should NOT be satisfied on Neon-only device"
+            );
         }
     }
 
@@ -791,38 +957,52 @@ mod tests {
         let debug_str = format!("{:?}", decl);
 
         // Assert — Debug output should contain the id and key fields.
-        assert!(debug_str.contains("test_debug_decl"),
-            "Debug output should contain the acceleration id");
-        assert!(debug_str.contains("Avx512"),
-            "Debug output should contain the hardware requirement");
-        assert!(debug_str.contains("Gemm"),
-            "Debug output should contain the applicable patterns");
+        assert!(
+            debug_str.contains("test_debug_decl"),
+            "Debug output should contain the acceleration id"
+        );
+        assert!(
+            debug_str.contains("Avx512"),
+            "Debug output should contain the hardware requirement"
+        );
+        assert!(
+            debug_str.contains("Gemm"),
+            "Debug output should contain the applicable patterns"
+        );
     }
 
     // @trace TEST-AR-25 [req:REQ-CG] [level:unit]
     #[test]
     fn test_best_for_empty_registry_returns_none() {
         // Arrange
-        let reg = AccelerationRegistry { entries: Vec::new() };
+        let reg = AccelerationRegistry {
+            entries: Vec::new(),
+        };
         let device = DeviceProfile::detect();
 
         // Act
         let result = reg.best_for(
             OpClass::ElemWise,
             &device,
-            BottleneckType::ComputeBound { compute_utilization: 0.5 },
+            BottleneckType::ComputeBound {
+                compute_utilization: 0.5,
+            },
         );
 
         // Assert
-        assert!(result.is_none(),
-            "best_for on empty registry should return None for any OpClass");
+        assert!(
+            result.is_none(),
+            "best_for on empty registry should return None for any OpClass"
+        );
     }
 
     // @trace TEST-AR-26 [req:REQ-CG] [level:unit]
     #[test]
     fn test_query_returns_only_matching_patterns() {
         // Arrange — register features for Gemm only and Elementwise only.
-        let mut reg = AccelerationRegistry { entries: Vec::new() };
+        let mut reg = AccelerationRegistry {
+            entries: Vec::new(),
+        };
         reg.register(AccelerationDecl {
             id: "gemm_only",
             hw_req: HardwareRequirement::Any,
@@ -845,15 +1025,20 @@ mod tests {
         let injective_results = reg.query(OpClass::Injective, &device);
 
         // Assert — no features should match Injective.
-        assert!(injective_results.is_empty(),
-            "Query for Injective should return empty when no Injective features are registered");
+        assert!(
+            injective_results.is_empty(),
+            "Query for Injective should return empty when no Injective features are registered"
+        );
 
         // Act — query for Gemm.
         let gemm_results = reg.query(OpClass::Gemm, &device);
 
         // Assert — only the Gemm feature should match.
-        assert_eq!(gemm_results.len(), 1,
-            "Query for Gemm should return exactly one feature");
+        assert_eq!(
+            gemm_results.len(),
+            1,
+            "Query for Gemm should return exactly one feature"
+        );
         assert_eq!(gemm_results[0].id, "gemm_only");
     }
 
@@ -869,9 +1054,18 @@ mod tests {
         let amx_b = LayoutConstraint::AmxTileBF16 { rows: 16, cols: 32 };
 
         // Act & Assert — same types should be compatible.
-        assert!(a.compatible_with(&b), "Identical ColMajor should be compatible");
-        assert!(panel_a.compatible_with(&panel_b), "Identical PanelPacked should be compatible");
-        assert!(amx_a.compatible_with(&amx_b), "Identical AmxTileBF16 should be compatible");
+        assert!(
+            a.compatible_with(&b),
+            "Identical ColMajor should be compatible"
+        );
+        assert!(
+            panel_a.compatible_with(&panel_b),
+            "Identical PanelPacked should be compatible"
+        );
+        assert!(
+            amx_a.compatible_with(&amx_b),
+            "Identical AmxTileBF16 should be compatible"
+        );
     }
 
     // @trace TEST-AR-28 [req:REQ-CG] [level:unit]
@@ -883,17 +1077,23 @@ mod tests {
         let high = LayoutConstraint::ColMajor { align_bytes: 64 };
 
         // Act & Assert — different alignment on ColMajor requires transformation.
-        assert!(!low.compatible_with(&high),
-            "ColMajor with different alignment should be incompatible");
-        assert!(!high.compatible_with(&low),
-            "ColMajor with different alignment should be incompatible (reverse)");
+        assert!(
+            !low.compatible_with(&high),
+            "ColMajor with different alignment should be incompatible"
+        );
+        assert!(
+            !high.compatible_with(&low),
+            "ColMajor with different alignment should be incompatible (reverse)"
+        );
     }
 
     // @trace TEST-AR-29 [req:REQ-CG] [level:unit]
     #[test]
     fn test_best_for_ties_prefers_any_result() {
         // Arrange — two features with identical benefit, both Any-hw + Gemm.
-        let mut reg = AccelerationRegistry { entries: Vec::new() };
+        let mut reg = AccelerationRegistry {
+            entries: Vec::new(),
+        };
         reg.register(AccelerationDecl {
             id: "tie_a",
             hw_req: HardwareRequirement::Any,
@@ -913,14 +1113,24 @@ mod tests {
         let device = DeviceProfile::detect();
 
         // Act
-        let best = reg.best_for(OpClass::Gemm, &device,
-            BottleneckType::MemoryBound { bandwidth_utilization: 0.5 });
+        let best = reg.best_for(
+            OpClass::Gemm,
+            &device,
+            BottleneckType::MemoryBound {
+                bandwidth_utilization: 0.5,
+            },
+        );
 
         // Assert — a result should be returned (either one); both have equal benefit.
-        assert!(best.is_some(),
-            "best_for should return a result even when benefits are tied");
+        assert!(
+            best.is_some(),
+            "best_for should return a result even when benefits are tied"
+        );
         let id = best.unwrap().id;
-        assert!(id == "tie_a" || id == "tie_b",
-            "best_for should return one of the tied features, got {}", id);
+        assert!(
+            id == "tie_a" || id == "tie_b",
+            "best_for should return one of the tied features, got {}",
+            id
+        );
     }
 }

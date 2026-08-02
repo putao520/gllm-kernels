@@ -47,34 +47,29 @@ pub const NR: usize = 12;
 #[cfg(target_arch = "aarch64")]
 global_asm!(
     ".text",
-    ".align 6",  // 64-byte alignment for cache line
+    ".align 6", // 64-byte alignment for cache line
     ".global _gllm_gemm_8x12_neon_f32",
     ".type _gllm_gemm_8x12_neon_f32, %function",
     "_gllm_gemm_8x12_neon_f32:",
-
     // Save callee-saved NEON registers (v8-v15 per AAPCS64)
     "stp d8, d9, [sp, #-64]!",
     "stp d10, d11, [sp, #16]",
     "stp d12, d13, [sp, #32]",
     "stp d14, d15, [sp, #48]",
-
     // x0=packed_a, x1=packed_b, x2=c_ptr, x3=kc, x4=ldc, x5=accumulate
     // Convert ldc from elements to bytes: ldc_bytes = ldc * 4
     "lsl x4, x4, #2",
-
     // Compute C row pointers: x6..x13 = c + row*ldc_bytes
-    "mov x6, x2",                // row 0
-    "add x7, x6, x4",           // row 1
-    "add x8, x7, x4",           // row 2
-    "add x9, x8, x4",           // row 3
-    "add x10, x9, x4",          // row 4
-    "add x11, x10, x4",         // row 5
-    "add x12, x11, x4",         // row 6
-    "add x13, x12, x4",         // row 7
-
+    "mov x6, x2",       // row 0
+    "add x7, x6, x4",   // row 1
+    "add x8, x7, x4",   // row 2
+    "add x9, x8, x4",   // row 3
+    "add x10, x9, x4",  // row 4
+    "add x11, x10, x4", // row 5
+    "add x12, x11, x4", // row 6
+    "add x13, x12, x4", // row 7
     // Branch: accumulate or zero-init C accumulators
     "cbz x5, .Lzero_c_f32",
-
     // Load existing C values into accumulators
     "ldp q0, q1, [x6]",
     "ldr q2, [x6, #32]",
@@ -93,7 +88,6 @@ global_asm!(
     "ldp q21, q22, [x13]",
     "ldr q23, [x13, #32]",
     "b .Lk_loop_setup_f32",
-
     ".Lzero_c_f32:",
     // Zero all 24 accumulator registers
     "movi v0.4s, #0",
@@ -120,30 +114,24 @@ global_asm!(
     "movi v21.4s, #0",
     "movi v22.4s, #0",
     "movi v23.4s, #0",
-
     ".Lk_loop_setup_f32:",
     // Check if kc >= 4 for unrolled loop
     "cmp x3, #4",
     "b.lt .Lk_remainder_f32",
-
     // Preload first B panel (3 vectors = 12 floats = 48 bytes)
     "ldp q28, q29, [x1]",
     "ldr q30, [x1, #32]",
-
     // Main K-loop: 4x unrolled with software pipeline
     // Each iteration: load A[k], compute FMA with B[k], load B[k+1]
-    "sub x3, x3, #4",  // pre-decrement for pipeline
-
+    "sub x3, x3, #4", // pre-decrement for pipeline
     ".align 5",
     ".Lk_loop_4x_f32:",
     // ---- k+0 ----
     // Load A column k+0 (8 floats = 32 bytes)
-    "ldp q24, q25, [x0]",       // a[0..3], a[4..7] for k+0
-
+    "ldp q24, q25, [x0]", // a[0..3], a[4..7] for k+0
     // Prefetch A and B ahead
     "prfm pldl1keep, [x0, #256]",
     "prfm pldl1keep, [x1, #256]",
-
     // FMA: row 0-3 with B[k+0]
     "fmla v0.4s, v28.4s, v24.s[0]",
     "fmla v1.4s, v29.4s, v24.s[0]",
@@ -157,7 +145,6 @@ global_asm!(
     "fmla v9.4s, v28.4s, v24.s[3]",
     "fmla v10.4s, v29.4s, v24.s[3]",
     "fmla v11.4s, v30.4s, v24.s[3]",
-
     // FMA: row 4-7 with B[k+0]
     "fmla v12.4s, v28.4s, v25.s[0]",
     "fmla v13.4s, v29.4s, v25.s[0]",
@@ -171,14 +158,11 @@ global_asm!(
     "fmla v21.4s, v28.4s, v25.s[3]",
     "fmla v22.4s, v29.4s, v25.s[3]",
     "fmla v23.4s, v30.4s, v25.s[3]",
-
     // Load B[k+1] (pipeline: load next B while FMA for k+0 completes)
     "ldp q28, q29, [x1, #48]",
     "ldr q30, [x1, #80]",
-
     // ---- k+1 ----
-    "ldp q24, q25, [x0, #32]",  // A column k+1
-
+    "ldp q24, q25, [x0, #32]", // A column k+1
     "fmla v0.4s, v28.4s, v24.s[0]",
     "fmla v1.4s, v29.4s, v24.s[0]",
     "fmla v2.4s, v30.4s, v24.s[0]",
@@ -191,7 +175,6 @@ global_asm!(
     "fmla v9.4s, v28.4s, v24.s[3]",
     "fmla v10.4s, v29.4s, v24.s[3]",
     "fmla v11.4s, v30.4s, v24.s[3]",
-
     "fmla v12.4s, v28.4s, v25.s[0]",
     "fmla v13.4s, v29.4s, v25.s[0]",
     "fmla v14.4s, v30.4s, v25.s[0]",
@@ -204,17 +187,13 @@ global_asm!(
     "fmla v21.4s, v28.4s, v25.s[3]",
     "fmla v22.4s, v29.4s, v25.s[3]",
     "fmla v23.4s, v30.4s, v25.s[3]",
-
     // Load B[k+2]
     "ldp q28, q29, [x1, #96]",
     "ldr q30, [x1, #128]",
-
     // ---- k+2 ----
-    "ldp q24, q25, [x0, #64]",  // A column k+2
-
+    "ldp q24, q25, [x0, #64]", // A column k+2
     "prfm pldl1keep, [x0, #384]",
     "prfm pldl1keep, [x1, #384]",
-
     "fmla v0.4s, v28.4s, v24.s[0]",
     "fmla v1.4s, v29.4s, v24.s[0]",
     "fmla v2.4s, v30.4s, v24.s[0]",
@@ -227,7 +206,6 @@ global_asm!(
     "fmla v9.4s, v28.4s, v24.s[3]",
     "fmla v10.4s, v29.4s, v24.s[3]",
     "fmla v11.4s, v30.4s, v24.s[3]",
-
     "fmla v12.4s, v28.4s, v25.s[0]",
     "fmla v13.4s, v29.4s, v25.s[0]",
     "fmla v14.4s, v30.4s, v25.s[0]",
@@ -240,14 +218,11 @@ global_asm!(
     "fmla v21.4s, v28.4s, v25.s[3]",
     "fmla v22.4s, v29.4s, v25.s[3]",
     "fmla v23.4s, v30.4s, v25.s[3]",
-
     // Load B[k+3]
     "ldp q28, q29, [x1, #144]",
     "ldr q30, [x1, #176]",
-
     // ---- k+3 ----
-    "ldp q24, q25, [x0, #96]",  // A column k+3
-
+    "ldp q24, q25, [x0, #96]", // A column k+3
     "fmla v0.4s, v28.4s, v24.s[0]",
     "fmla v1.4s, v29.4s, v24.s[0]",
     "fmla v2.4s, v30.4s, v24.s[0]",
@@ -260,7 +235,6 @@ global_asm!(
     "fmla v9.4s, v28.4s, v24.s[3]",
     "fmla v10.4s, v29.4s, v24.s[3]",
     "fmla v11.4s, v30.4s, v24.s[3]",
-
     "fmla v12.4s, v28.4s, v25.s[0]",
     "fmla v13.4s, v29.4s, v25.s[0]",
     "fmla v14.4s, v30.4s, v25.s[0]",
@@ -273,33 +247,27 @@ global_asm!(
     "fmla v21.4s, v28.4s, v25.s[3]",
     "fmla v22.4s, v29.4s, v25.s[3]",
     "fmla v23.4s, v30.4s, v25.s[3]",
-
     // Advance pointers: A += 4*MR*4 = 128 bytes, B += 4*NR*4 = 192 bytes
     "add x0, x0, #128",
     "add x1, x1, #192",
-
     // Loop: pre-load next B[k+0] for next iteration
     "subs x3, x3, #4",
     "b.lt .Lk_loop_4x_done_f32",
     "ldp q28, q29, [x1]",
     "ldr q30, [x1, #32]",
     "b .Lk_loop_4x_f32",
-
     ".Lk_loop_4x_done_f32:",
     // Restore kc remainder: x3 = x3 + 4 (was pre-decremented)
     "add x3, x3, #4",
-
     ".Lk_remainder_f32:",
     // Handle remaining k iterations (0..3)
     "cbz x3, .Lstore_c_f32",
-
     ".Lk_tail_f32:",
     // Load B[k] (3 vectors)
     "ldp q28, q29, [x1]",
     "ldr q30, [x1, #32]",
     // Load A[k] (8 elements = 2 vectors)
     "ldp q24, q25, [x0]",
-
     // FMA all 8 rows
     "fmla v0.4s, v28.4s, v24.s[0]",
     "fmla v1.4s, v29.4s, v24.s[0]",
@@ -313,7 +281,6 @@ global_asm!(
     "fmla v9.4s, v28.4s, v24.s[3]",
     "fmla v10.4s, v29.4s, v24.s[3]",
     "fmla v11.4s, v30.4s, v24.s[3]",
-
     "fmla v12.4s, v28.4s, v25.s[0]",
     "fmla v13.4s, v29.4s, v25.s[0]",
     "fmla v14.4s, v30.4s, v25.s[0]",
@@ -326,13 +293,11 @@ global_asm!(
     "fmla v21.4s, v28.4s, v25.s[3]",
     "fmla v22.4s, v29.4s, v25.s[3]",
     "fmla v23.4s, v30.4s, v25.s[3]",
-
     // Advance: A += MR*4 = 32 bytes, B += NR*4 = 48 bytes
     "add x0, x0, #32",
     "add x1, x1, #48",
     "subs x3, x3, #1",
     "b.ne .Lk_tail_f32",
-
     ".Lstore_c_f32:",
     // Store C accumulators back to memory
     "stp q0, q1, [x6]",
@@ -351,14 +316,12 @@ global_asm!(
     "str q20, [x12, #32]",
     "stp q21, q22, [x13]",
     "str q23, [x13, #32]",
-
     // Restore callee-saved registers
     "ldp d10, d11, [sp, #16]",
     "ldp d12, d13, [sp, #32]",
     "ldp d14, d15, [sp, #48]",
     "ldp d8, d9, [sp], #64",
     "ret",
-
     ".size _gllm_gemm_8x12_neon_f32, . - _gllm_gemm_8x12_neon_f32",
 );
 
@@ -409,12 +372,5 @@ pub unsafe fn gemm_kernel_8x12_f32(
     ldc: usize,
     accumulate: bool,
 ) {
-    _gllm_gemm_8x12_neon_f32(
-        packed_a,
-        packed_b,
-        c_ptr,
-        kc,
-        ldc,
-        accumulate as usize,
-    );
+    _gllm_gemm_8x12_neon_f32(packed_a, packed_b, c_ptr, kc, ldc, accumulate as usize);
 }

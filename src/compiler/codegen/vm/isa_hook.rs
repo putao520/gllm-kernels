@@ -66,7 +66,6 @@ impl ResourceBudget {
     }
 }
 
-
 /// 超越函数实现策略。
 #[derive(Debug, Clone)]
 pub enum TransImpl {
@@ -90,7 +89,12 @@ pub struct PrefetchConfig {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum PrefetchHint { T0, T1, T2, Nta }
+pub enum PrefetchHint {
+    T0,
+    T1,
+    T2,
+    Nta,
+}
 
 /// 内存访问模式。
 #[derive(Debug, Clone)]
@@ -104,15 +108,33 @@ pub struct AccessPattern {
 #[derive(Debug, Clone)]
 pub enum AttentionStrategy {
     Naive,
-    FlashV2 { tile_q: usize, tile_kv: usize },
+    FlashV2 {
+        tile_q: usize,
+        tile_kv: usize,
+    },
     /// SM90 Hopper: WGMMA + TMA pipeline
-    FlashV3 { tile_q: usize, tile_kv: usize, tma: bool, warp_spec: bool },
+    FlashV3 {
+        tile_q: usize,
+        tile_kv: usize,
+        tma: bool,
+        warp_spec: bool,
+    },
     /// SM100+ Blackwell: tcgen05 + TMEM
-    FlashV4 { tile_q: usize, tile_kv: usize, tmem: bool, block_scaled: bool },
+    FlashV4 {
+        tile_q: usize,
+        tile_kv: usize,
+        tmem: bool,
+        block_scaled: bool,
+    },
     /// FlashDecoding: Split-K decode attention parallelism.
     /// Each warp computes partial (max, sum, O) over a KV chunk, then warp-reduce merges.
-    FlashDecoding { split_k: usize, tile_kv: usize },
-    SlidingWindow { window_size: usize },
+    FlashDecoding {
+        split_k: usize,
+        tile_kv: usize,
+    },
+    SlidingWindow {
+        window_size: usize,
+    },
 }
 
 /// §15 MoE 分发策略。
@@ -127,7 +149,10 @@ pub enum MoeDispatchStrategy {
 
 /// §11 KV 量化实现。
 #[derive(Debug, Clone, Copy)]
-pub enum KvQuantImpl { PerChannel, PerToken }
+pub enum KvQuantImpl {
+    PerChannel,
+    PerToken,
+}
 
 /// §16 残差总线端口。
 #[derive(Debug, Clone)]
@@ -147,19 +172,32 @@ pub trait IsaHook: Send + Sync {
     fn prefetch_hint(&self, access: &AccessPattern) -> Option<PrefetchConfig>;
 
     /// Returns true for GPU backends (CUDA/HIP/Metal) that support shared memory.
-    fn is_gpu(&self) -> bool { false }
-
-    fn moe_dispatch(&self, expert_count: usize) -> MoeDispatchStrategy {
-        if expert_count <= 8 { MoeDispatchStrategy::CmpChain }
-        else { MoeDispatchStrategy::JmpTable }
+    fn is_gpu(&self) -> bool {
+        false
     }
 
-    fn kv_quant_codegen(&self) -> KvQuantImpl { KvQuantImpl::PerToken }
+    fn moe_dispatch(&self, expert_count: usize) -> MoeDispatchStrategy {
+        if expert_count <= 8 {
+            MoeDispatchStrategy::CmpChain
+        } else {
+            MoeDispatchStrategy::JmpTable
+        }
+    }
+
+    fn kv_quant_codegen(&self) -> KvQuantImpl {
+        KvQuantImpl::PerToken
+    }
 
     fn select_attention(&self, seq_len: usize, head_dim: usize) -> AttentionStrategy {
         let _ = head_dim;
-        if seq_len <= 32 { AttentionStrategy::Naive }
-        else { AttentionStrategy::FlashV2 { tile_q: 64, tile_kv: 64 } }
+        if seq_len <= 32 {
+            AttentionStrategy::Naive
+        } else {
+            AttentionStrategy::FlashV2 {
+                tile_q: 64,
+                tile_kv: 64,
+            }
+        }
     }
 
     /// 若返回 Some(cfg)，ResidualBusPass 在匹配到 VecBinOp(Add) → VecStore
@@ -186,28 +224,61 @@ impl IsaHook for X86Avx2Hook {
     // 必须 ≤ 13。历史 (6,2) = 14 超池,触发 "v16 not allocated to YMM"。改为 (4,2) = 10
     // + 2 scratch = 12,留 1 slot 缓冲;微内核带宽损失由 AVX2 L1 带宽本身有限
     // (32 B/cycle) 吸收。AVX-512 有 32 ZMM,保持 (14, 2) 不变。
-    fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::Polynomial { degree: 5 } }
+    fn gemm_microkernel_shape(&self) -> (usize, usize) {
+        (4, 2)
+    }
+    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl {
+        TransImpl::Polynomial { degree: 5 }
+    }
     fn epilogue_strategy(&self, acc: usize, epi: usize) -> EpiloguePlace {
-        if acc + epi * 2 <= 16 { EpiloguePlace::OnAccumulators } else { EpiloguePlace::AfterStore }
+        if acc + epi * 2 <= 16 {
+            EpiloguePlace::OnAccumulators
+        } else {
+            EpiloguePlace::AfterStore
+        }
     }
     fn prefetch_hint(&self, a: &AccessPattern) -> Option<PrefetchConfig> {
-        if a.total_bytes > 4096 { Some(PrefetchConfig { distance: 512, hint: PrefetchHint::T0 }) } else { None }
+        if a.total_bytes > 4096 {
+            Some(PrefetchConfig {
+                distance: 512,
+                hint: PrefetchHint::T0,
+            })
+        } else {
+            None
+        }
     }
 }
 
 pub struct X86Avx512Hook;
 impl IsaHook for X86Avx512Hook {
-    fn gemm_microkernel_shape(&self) -> (usize, usize) { (14, 2) }
-    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::Polynomial { degree: 5 } }
+    fn gemm_microkernel_shape(&self) -> (usize, usize) {
+        (14, 2)
+    }
+    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl {
+        TransImpl::Polynomial { degree: 5 }
+    }
     fn epilogue_strategy(&self, acc: usize, epi: usize) -> EpiloguePlace {
-        if acc + epi * 2 <= 32 { EpiloguePlace::OnAccumulators } else { EpiloguePlace::AfterStore }
+        if acc + epi * 2 <= 32 {
+            EpiloguePlace::OnAccumulators
+        } else {
+            EpiloguePlace::AfterStore
+        }
     }
     fn prefetch_hint(&self, _: &AccessPattern) -> Option<PrefetchConfig> {
-        Some(PrefetchConfig { distance: 768, hint: PrefetchHint::T0 })
+        Some(PrefetchConfig {
+            distance: 768,
+            hint: PrefetchHint::T0,
+        })
     }
     fn select_attention(&self, seq_len: usize, _: usize) -> AttentionStrategy {
-        if seq_len <= 64 { AttentionStrategy::Naive } else { AttentionStrategy::FlashV2 { tile_q: 128, tile_kv: 128 } }
+        if seq_len <= 64 {
+            AttentionStrategy::Naive
+        } else {
+            AttentionStrategy::FlashV2 {
+                tile_q: 128,
+                tile_kv: 128,
+            }
+        }
     }
 }
 
@@ -224,13 +295,24 @@ pub struct X86AmxHook {
 }
 
 impl IsaHook for X86AmxHook {
-    fn gemm_microkernel_shape(&self) -> (usize, usize) { (16, 16) }
-    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::Polynomial { degree: 5 } }
+    fn gemm_microkernel_shape(&self) -> (usize, usize) {
+        (16, 16)
+    }
+    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl {
+        TransImpl::Polynomial { degree: 5 }
+    }
     fn epilogue_strategy(&self, acc: usize, epi: usize) -> EpiloguePlace {
-        if acc + epi * 2 <= 32 { EpiloguePlace::OnAccumulators } else { EpiloguePlace::AfterStore }
+        if acc + epi * 2 <= 32 {
+            EpiloguePlace::OnAccumulators
+        } else {
+            EpiloguePlace::AfterStore
+        }
     }
     fn prefetch_hint(&self, _: &AccessPattern) -> Option<PrefetchConfig> {
-        Some(PrefetchConfig { distance: 1024, hint: PrefetchHint::T0 })
+        Some(PrefetchConfig {
+            distance: 1024,
+            hint: PrefetchHint::T0,
+        })
     }
 }
 
@@ -241,77 +323,180 @@ impl IsaHook for X86AmxHook {
 /// SM70 (Volta/Turing): wmma 16×16×16, FP16 TC, 无异步。
 pub struct GpuSm70Hook;
 impl IsaHook for GpuSm70Hook {
-    fn gemm_microkernel_shape(&self) -> (usize, usize) { (16, 16) }
-    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::HardwareInstr }
-    fn epilogue_strategy(&self, _: usize, _: usize) -> EpiloguePlace { EpiloguePlace::AfterStore }
-    fn prefetch_hint(&self, _: &AccessPattern) -> Option<PrefetchConfig> { None }
-    fn moe_dispatch(&self, _: usize) -> MoeDispatchStrategy { MoeDispatchStrategy::InKernelJmp }
-    fn select_attention(&self, seq_len: usize, _: usize) -> AttentionStrategy {
-        if seq_len <= 1 { AttentionStrategy::FlashDecoding { split_k: 4, tile_kv: 512 } }
-        else if seq_len <= 64 { AttentionStrategy::Naive }
-        else { AttentionStrategy::FlashV2 { tile_q: 64, tile_kv: 64 } }
+    fn gemm_microkernel_shape(&self) -> (usize, usize) {
+        (16, 16)
     }
-    fn is_gpu(&self) -> bool { true }
+    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl {
+        TransImpl::HardwareInstr
+    }
+    fn epilogue_strategy(&self, _: usize, _: usize) -> EpiloguePlace {
+        EpiloguePlace::AfterStore
+    }
+    fn prefetch_hint(&self, _: &AccessPattern) -> Option<PrefetchConfig> {
+        None
+    }
+    fn moe_dispatch(&self, _: usize) -> MoeDispatchStrategy {
+        MoeDispatchStrategy::InKernelJmp
+    }
+    fn select_attention(&self, seq_len: usize, _: usize) -> AttentionStrategy {
+        if seq_len <= 1 {
+            AttentionStrategy::FlashDecoding {
+                split_k: 4,
+                tile_kv: 512,
+            }
+        } else if seq_len <= 64 {
+            AttentionStrategy::Naive
+        } else {
+            AttentionStrategy::FlashV2 {
+                tile_q: 64,
+                tile_kv: 64,
+            }
+        }
+    }
+    fn is_gpu(&self) -> bool {
+        true
+    }
 }
 
 /// SM80-89 (Ampere/Ada): mma.sync 16×8×16, cp.async, BF16/TF32。
-pub struct GpuSm80Hook { pub sm_version: u32 }
+pub struct GpuSm80Hook {
+    pub sm_version: u32,
+}
 impl IsaHook for GpuSm80Hook {
-    fn gemm_microkernel_shape(&self) -> (usize, usize) { (16, 8) }
-    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::HardwareInstr }
+    fn gemm_microkernel_shape(&self) -> (usize, usize) {
+        (16, 8)
+    }
+    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl {
+        TransImpl::HardwareInstr
+    }
     fn epilogue_strategy(&self, _: usize, epi: usize) -> EpiloguePlace {
-        if epi <= 4 { EpiloguePlace::OnAccumulators } else { EpiloguePlace::AfterStore }
+        if epi <= 4 {
+            EpiloguePlace::OnAccumulators
+        } else {
+            EpiloguePlace::AfterStore
+        }
     }
     fn prefetch_hint(&self, _: &AccessPattern) -> Option<PrefetchConfig> {
-        Some(PrefetchConfig { distance: 2048, hint: PrefetchHint::T0 }) // cp.async 预取
+        Some(PrefetchConfig {
+            distance: 2048,
+            hint: PrefetchHint::T0,
+        }) // cp.async 预取
     }
-    fn moe_dispatch(&self, _: usize) -> MoeDispatchStrategy { MoeDispatchStrategy::InKernelJmp }
+    fn moe_dispatch(&self, _: usize) -> MoeDispatchStrategy {
+        MoeDispatchStrategy::InKernelJmp
+    }
     fn select_attention(&self, seq_len: usize, _: usize) -> AttentionStrategy {
-        if seq_len <= 1 { AttentionStrategy::FlashDecoding { split_k: 4, tile_kv: 1024 } }
-        else if seq_len <= 64 { AttentionStrategy::Naive }
-        else { AttentionStrategy::FlashV2 { tile_q: 128, tile_kv: 128 } }
+        if seq_len <= 1 {
+            AttentionStrategy::FlashDecoding {
+                split_k: 4,
+                tile_kv: 1024,
+            }
+        } else if seq_len <= 64 {
+            AttentionStrategy::Naive
+        } else {
+            AttentionStrategy::FlashV2 {
+                tile_q: 128,
+                tile_kv: 128,
+            }
+        }
     }
-    fn is_gpu(&self) -> bool { true }
+    fn is_gpu(&self) -> bool {
+        true
+    }
 }
 
 /// SM90 (Hopper H100): WGMMA 16×N×K, TMA 2D/5D, warp specialization。
 pub struct GpuSm90Hook;
 impl IsaHook for GpuSm90Hook {
-    fn gemm_microkernel_shape(&self) -> (usize, usize) { (64, 16) } // Warpgroup 64×N
-    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::HardwareInstr }
+    fn gemm_microkernel_shape(&self) -> (usize, usize) {
+        (64, 16)
+    } // Warpgroup 64×N
+    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl {
+        TransImpl::HardwareInstr
+    }
     fn epilogue_strategy(&self, _: usize, epi: usize) -> EpiloguePlace {
-        if epi <= 6 { EpiloguePlace::OnAccumulators } else { EpiloguePlace::AfterStore }
+        if epi <= 6 {
+            EpiloguePlace::OnAccumulators
+        } else {
+            EpiloguePlace::AfterStore
+        }
     }
     fn prefetch_hint(&self, _: &AccessPattern) -> Option<PrefetchConfig> {
-        Some(PrefetchConfig { distance: 4096, hint: PrefetchHint::T0 }) // TMA 预取
+        Some(PrefetchConfig {
+            distance: 4096,
+            hint: PrefetchHint::T0,
+        }) // TMA 预取
     }
-    fn moe_dispatch(&self, _: usize) -> MoeDispatchStrategy { MoeDispatchStrategy::InKernelJmp }
+    fn moe_dispatch(&self, _: usize) -> MoeDispatchStrategy {
+        MoeDispatchStrategy::InKernelJmp
+    }
     fn select_attention(&self, seq_len: usize, _: usize) -> AttentionStrategy {
-        if seq_len <= 1 { AttentionStrategy::FlashDecoding { split_k: 8, tile_kv: 1024 } }
-        else if seq_len <= 64 { AttentionStrategy::Naive }
-        else { AttentionStrategy::FlashV3 { tile_q: 128, tile_kv: 128, tma: true, warp_spec: true } }
+        if seq_len <= 1 {
+            AttentionStrategy::FlashDecoding {
+                split_k: 8,
+                tile_kv: 1024,
+            }
+        } else if seq_len <= 64 {
+            AttentionStrategy::Naive
+        } else {
+            AttentionStrategy::FlashV3 {
+                tile_q: 128,
+                tile_kv: 128,
+                tma: true,
+                warp_spec: true,
+            }
+        }
     }
-    fn is_gpu(&self) -> bool { true }
+    fn is_gpu(&self) -> bool {
+        true
+    }
 }
 
 /// SM100+ (Blackwell B100/B200): tcgen05.mma, TMEM, block-scaled, FP4/FP6。
 pub struct GpuSm100Hook;
 impl IsaHook for GpuSm100Hook {
-    fn gemm_microkernel_shape(&self) -> (usize, usize) { (64, 64) }
-    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::HardwareInstr }
+    fn gemm_microkernel_shape(&self) -> (usize, usize) {
+        (64, 64)
+    }
+    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl {
+        TransImpl::HardwareInstr
+    }
     fn epilogue_strategy(&self, _: usize, epi: usize) -> EpiloguePlace {
-        if epi <= 8 { EpiloguePlace::OnAccumulators } else { EpiloguePlace::AfterStore }
+        if epi <= 8 {
+            EpiloguePlace::OnAccumulators
+        } else {
+            EpiloguePlace::AfterStore
+        }
     }
     fn prefetch_hint(&self, _: &AccessPattern) -> Option<PrefetchConfig> {
-        Some(PrefetchConfig { distance: 8192, hint: PrefetchHint::T0 }) // TMEM + TMA
+        Some(PrefetchConfig {
+            distance: 8192,
+            hint: PrefetchHint::T0,
+        }) // TMEM + TMA
     }
-    fn moe_dispatch(&self, _: usize) -> MoeDispatchStrategy { MoeDispatchStrategy::InKernelJmp }
+    fn moe_dispatch(&self, _: usize) -> MoeDispatchStrategy {
+        MoeDispatchStrategy::InKernelJmp
+    }
     fn select_attention(&self, seq_len: usize, _: usize) -> AttentionStrategy {
-        if seq_len <= 1 { AttentionStrategy::FlashDecoding { split_k: 8, tile_kv: 2048 } }
-        else if seq_len <= 64 { AttentionStrategy::Naive }
-        else { AttentionStrategy::FlashV4 { tile_q: 128, tile_kv: 256, tmem: true, block_scaled: true } }
+        if seq_len <= 1 {
+            AttentionStrategy::FlashDecoding {
+                split_k: 8,
+                tile_kv: 2048,
+            }
+        } else if seq_len <= 64 {
+            AttentionStrategy::Naive
+        } else {
+            AttentionStrategy::FlashV4 {
+                tile_q: 128,
+                tile_kv: 256,
+                tmem: true,
+                block_scaled: true,
+            }
+        }
     }
-    fn is_gpu(&self) -> bool { true }
+    fn is_gpu(&self) -> bool {
+        true
+    }
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -321,47 +506,100 @@ impl IsaHook for GpuSm100Hook {
 /// CDNA2 (gfx908/MI250): MFMA 16×16×16, wave64。
 pub struct GpuCdna2Hook;
 impl IsaHook for GpuCdna2Hook {
-    fn gemm_microkernel_shape(&self) -> (usize, usize) { (16, 16) }
-    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::Polynomial { degree: 5 } }
-    fn epilogue_strategy(&self, _: usize, epi: usize) -> EpiloguePlace {
-        if epi <= 4 { EpiloguePlace::OnAccumulators } else { EpiloguePlace::AfterStore }
+    fn gemm_microkernel_shape(&self) -> (usize, usize) {
+        (16, 16)
     }
-    fn prefetch_hint(&self, _: &AccessPattern) -> Option<PrefetchConfig> { None }
-    fn moe_dispatch(&self, _: usize) -> MoeDispatchStrategy { MoeDispatchStrategy::InKernelJmp }
-    fn is_gpu(&self) -> bool { true }
+    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl {
+        TransImpl::Polynomial { degree: 5 }
+    }
+    fn epilogue_strategy(&self, _: usize, epi: usize) -> EpiloguePlace {
+        if epi <= 4 {
+            EpiloguePlace::OnAccumulators
+        } else {
+            EpiloguePlace::AfterStore
+        }
+    }
+    fn prefetch_hint(&self, _: &AccessPattern) -> Option<PrefetchConfig> {
+        None
+    }
+    fn moe_dispatch(&self, _: usize) -> MoeDispatchStrategy {
+        MoeDispatchStrategy::InKernelJmp
+    }
+    fn is_gpu(&self) -> bool {
+        true
+    }
 }
 
 /// CDNA3 (gfx942/MI300): MFMA 16×16×16, XCD 拓扑隔离。
 pub struct GpuCdna3Hook;
 impl IsaHook for GpuCdna3Hook {
-    fn gemm_microkernel_shape(&self) -> (usize, usize) { (16, 16) }
-    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::Polynomial { degree: 5 } }
-    fn epilogue_strategy(&self, _: usize, epi: usize) -> EpiloguePlace {
-        if epi <= 4 { EpiloguePlace::OnAccumulators } else { EpiloguePlace::AfterStore }
+    fn gemm_microkernel_shape(&self) -> (usize, usize) {
+        (16, 16)
     }
-    fn prefetch_hint(&self, _: &AccessPattern) -> Option<PrefetchConfig> { None }
-    fn moe_dispatch(&self, _: usize) -> MoeDispatchStrategy { MoeDispatchStrategy::InKernelJmp }
-    fn is_gpu(&self) -> bool { true }
+    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl {
+        TransImpl::Polynomial { degree: 5 }
+    }
+    fn epilogue_strategy(&self, _: usize, epi: usize) -> EpiloguePlace {
+        if epi <= 4 {
+            EpiloguePlace::OnAccumulators
+        } else {
+            EpiloguePlace::AfterStore
+        }
+    }
+    fn prefetch_hint(&self, _: &AccessPattern) -> Option<PrefetchConfig> {
+        None
+    }
+    fn moe_dispatch(&self, _: usize) -> MoeDispatchStrategy {
+        MoeDispatchStrategy::InKernelJmp
+    }
+    fn is_gpu(&self) -> bool {
+        true
+    }
 }
 
 /// CDNA4 (gfx950/MI400): MFMA v2 32×32×16, FP8/FP4, wave64, 128KB LDS。
 pub struct GpuCdna4Hook;
 impl IsaHook for GpuCdna4Hook {
-    fn gemm_microkernel_shape(&self) -> (usize, usize) { (32, 32) }
-    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::Polynomial { degree: 5 } }
+    fn gemm_microkernel_shape(&self) -> (usize, usize) {
+        (32, 32)
+    }
+    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl {
+        TransImpl::Polynomial { degree: 5 }
+    }
     fn epilogue_strategy(&self, _: usize, epi: usize) -> EpiloguePlace {
-        if epi <= 6 { EpiloguePlace::OnAccumulators } else { EpiloguePlace::AfterStore }
+        if epi <= 6 {
+            EpiloguePlace::OnAccumulators
+        } else {
+            EpiloguePlace::AfterStore
+        }
     }
     fn prefetch_hint(&self, _: &AccessPattern) -> Option<PrefetchConfig> {
-        Some(PrefetchConfig { distance: 4096, hint: PrefetchHint::T0 })
+        Some(PrefetchConfig {
+            distance: 4096,
+            hint: PrefetchHint::T0,
+        })
     }
-    fn moe_dispatch(&self, _: usize) -> MoeDispatchStrategy { MoeDispatchStrategy::InKernelJmp }
+    fn moe_dispatch(&self, _: usize) -> MoeDispatchStrategy {
+        MoeDispatchStrategy::InKernelJmp
+    }
     fn select_attention(&self, seq_len: usize, _: usize) -> AttentionStrategy {
-        if seq_len <= 1 { AttentionStrategy::FlashDecoding { split_k: 4, tile_kv: 1024 } }
-        else if seq_len <= 64 { AttentionStrategy::Naive }
-        else { AttentionStrategy::FlashV2 { tile_q: 128, tile_kv: 128 } }
+        if seq_len <= 1 {
+            AttentionStrategy::FlashDecoding {
+                split_k: 4,
+                tile_kv: 1024,
+            }
+        } else if seq_len <= 64 {
+            AttentionStrategy::Naive
+        } else {
+            AttentionStrategy::FlashV2 {
+                tile_q: 128,
+                tile_kv: 128,
+            }
+        }
     }
-    fn is_gpu(&self) -> bool { true }
+    fn is_gpu(&self) -> bool {
+        true
+    }
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -371,45 +609,82 @@ impl IsaHook for GpuCdna4Hook {
 /// ARM NEON Hook: 128-bit 固定宽度, FMLA v.4s。
 pub struct ArmNeonHook;
 impl IsaHook for ArmNeonHook {
-    fn gemm_microkernel_shape(&self) -> (usize, usize) { (8, 12) }
-    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::Polynomial { degree: 5 } }
+    fn gemm_microkernel_shape(&self) -> (usize, usize) {
+        (8, 12)
+    }
+    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl {
+        TransImpl::Polynomial { degree: 5 }
+    }
     fn epilogue_strategy(&self, acc: usize, epi: usize) -> EpiloguePlace {
-        if acc + epi * 2 <= 32 { EpiloguePlace::OnAccumulators } else { EpiloguePlace::AfterStore }
+        if acc + epi * 2 <= 32 {
+            EpiloguePlace::OnAccumulators
+        } else {
+            EpiloguePlace::AfterStore
+        }
     }
     fn prefetch_hint(&self, a: &AccessPattern) -> Option<PrefetchConfig> {
-        if a.total_bytes > 4096 { Some(PrefetchConfig { distance: 512, hint: PrefetchHint::T0 }) } else { None }
+        if a.total_bytes > 4096 {
+            Some(PrefetchConfig {
+                distance: 512,
+                hint: PrefetchHint::T0,
+            })
+        } else {
+            None
+        }
     }
 }
 
 /// ARM SVE2 Hook: scalable vector, predicated ops, BLIS-style GEMM。
-pub struct ArmSveHook { pub sve_vl: usize }
+pub struct ArmSveHook {
+    pub sve_vl: usize,
+}
 impl IsaHook for ArmSveHook {
     fn gemm_microkernel_shape(&self) -> (usize, usize) {
         let lanes = self.sve_vl / 4; // f32 lanes
         (lanes * 2, 2) // 类似 BLIS 但利用 SVE 宽度
     }
-    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::Polynomial { degree: 5 } }
+    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl {
+        TransImpl::Polynomial { degree: 5 }
+    }
     fn epilogue_strategy(&self, acc: usize, epi: usize) -> EpiloguePlace {
-        if acc + epi * 2 <= 32 { EpiloguePlace::OnAccumulators } else { EpiloguePlace::AfterStore }
+        if acc + epi * 2 <= 32 {
+            EpiloguePlace::OnAccumulators
+        } else {
+            EpiloguePlace::AfterStore
+        }
     }
     fn prefetch_hint(&self, _: &AccessPattern) -> Option<PrefetchConfig> {
-        Some(PrefetchConfig { distance: 1024, hint: PrefetchHint::T0 })
+        Some(PrefetchConfig {
+            distance: 1024,
+            hint: PrefetchHint::T0,
+        })
     }
 }
 
 /// ARM SME2 Hook: ZA tile outer product, multi-vec FMLA, streaming SVE。
-pub struct ArmSmeHook { pub sme_vl: usize }
+pub struct ArmSmeHook {
+    pub sme_vl: usize,
+}
 impl IsaHook for ArmSmeHook {
     fn gemm_microkernel_shape(&self) -> (usize, usize) {
         let za_dim = self.sme_vl / 4;
         (za_dim, za_dim)
     }
-    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::Polynomial { degree: 5 } }
+    fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl {
+        TransImpl::Polynomial { degree: 5 }
+    }
     fn epilogue_strategy(&self, acc: usize, epi: usize) -> EpiloguePlace {
-        if acc + epi * 2 <= 32 { EpiloguePlace::OnAccumulators } else { EpiloguePlace::AfterStore }
+        if acc + epi * 2 <= 32 {
+            EpiloguePlace::OnAccumulators
+        } else {
+            EpiloguePlace::AfterStore
+        }
     }
     fn prefetch_hint(&self, _: &AccessPattern) -> Option<PrefetchConfig> {
-        Some(PrefetchConfig { distance: 2048, hint: PrefetchHint::T0 })
+        Some(PrefetchConfig {
+            distance: 2048,
+            hint: PrefetchHint::T0,
+        })
     }
 }
 
@@ -421,26 +696,33 @@ impl IsaHook for ArmSmeHook {
 pub fn select_hook(profile: &IsaProfile) -> Box<dyn IsaHook> {
     match &profile.platform {
         // ── x86_64 ──
-        Platform::X86_64 { has_amx: true, has_amx_fp16, has_amx_complex, has_amx_fp8, has_amx_transpose, .. } => {
-            Box::new(X86AmxHook {
-                has_amx_fp16: *has_amx_fp16,
-                has_amx_complex: *has_amx_complex,
-                has_amx_fp8: *has_amx_fp8,
-                has_amx_transpose: *has_amx_transpose,
-            })
-        }
-        Platform::X86_64 { has_avx512: true, .. } => Box::new(X86Avx512Hook),
+        Platform::X86_64 {
+            has_amx: true,
+            has_amx_fp16,
+            has_amx_complex,
+            has_amx_fp8,
+            has_amx_transpose,
+            ..
+        } => Box::new(X86AmxHook {
+            has_amx_fp16: *has_amx_fp16,
+            has_amx_complex: *has_amx_complex,
+            has_amx_fp8: *has_amx_fp8,
+            has_amx_transpose: *has_amx_transpose,
+        }),
+        Platform::X86_64 {
+            has_avx512: true, ..
+        } => Box::new(X86Avx512Hook),
         Platform::X86_64 { .. } => Box::new(X86Avx2Hook),
 
         // ── NVIDIA CUDA ──
-        Platform::Cuda { sm_version, .. } => {
-            match *sm_version {
-                100.. => Box::new(GpuSm100Hook),
-                90..=99 => Box::new(GpuSm90Hook),
-                80..=89 => Box::new(GpuSm80Hook { sm_version: *sm_version }),
-                _ => Box::new(GpuSm70Hook),
-            }
-        }
+        Platform::Cuda { sm_version, .. } => match *sm_version {
+            100.. => Box::new(GpuSm100Hook),
+            90..=99 => Box::new(GpuSm90Hook),
+            80..=89 => Box::new(GpuSm80Hook {
+                sm_version: *sm_version,
+            }),
+            _ => Box::new(GpuSm70Hook),
+        },
 
         // ── AMD HIP ──
         Platform::Hip { gfx_arch, .. } => {
@@ -453,12 +735,16 @@ pub fn select_hook(profile: &IsaProfile) -> Box<dyn IsaHook> {
         }
 
         // ── ARM AArch64 ──
-        Platform::AArch64 { has_sme2: true, sme_vl, .. } => {
-            Box::new(ArmSmeHook { sme_vl: *sme_vl })
-        }
-        Platform::AArch64 { has_sve: true, sve_vl, .. } => {
-            Box::new(ArmSveHook { sve_vl: *sve_vl })
-        }
+        Platform::AArch64 {
+            has_sme2: true,
+            sme_vl,
+            ..
+        } => Box::new(ArmSmeHook { sme_vl: *sme_vl }),
+        Platform::AArch64 {
+            has_sve: true,
+            sve_vl,
+            ..
+        } => Box::new(ArmSveHook { sve_vl: *sve_vl }),
         Platform::AArch64 { .. } => Box::new(ArmNeonHook),
 
         // ── Apple Metal ──
@@ -492,7 +778,13 @@ mod tests {
         assert_eq!(h.gemm_microkernel_shape(), (14, 2));
         assert_eq!(h.epilogue_strategy(10, 4), EpiloguePlace::OnAccumulators);
         assert_eq!(h.epilogue_strategy(28, 3), EpiloguePlace::AfterStore);
-        let pf = h.prefetch_hint(&AccessPattern { stride: 64, total_bytes: 8192, reuse_count: 2 }).unwrap();
+        let pf = h
+            .prefetch_hint(&AccessPattern {
+                stride: 64,
+                total_bytes: 8192,
+                reuse_count: 2,
+            })
+            .unwrap();
         assert_eq!(pf.distance, 768);
     }
 
@@ -512,7 +804,9 @@ mod tests {
     fn test_sm100_hook_attention() {
         let h = GpuSm100Hook;
         match h.select_attention(4096, 128) {
-            AttentionStrategy::FlashV4 { tmem, block_scaled, .. } => {
+            AttentionStrategy::FlashV4 {
+                tmem, block_scaled, ..
+            } => {
                 assert!(tmem);
                 assert!(block_scaled);
             }
@@ -531,7 +825,10 @@ mod tests {
                 (80, AttentionStrategy::FlashV2 { .. }) => {}
                 (90, AttentionStrategy::FlashV3 { .. }) => {}
                 (100, AttentionStrategy::FlashV4 { .. }) => {}
-                _ => panic!("unexpected attention strategy for SM{}: {:?} (expected {})", sm, strategy, expected_type),
+                _ => panic!(
+                    "unexpected attention strategy for SM{}: {:?} (expected {})",
+                    sm, strategy, expected_type
+                ),
             }
         }
     }
@@ -544,7 +841,10 @@ mod tests {
             select_hook(&super::super::isa_profile::IsaProfile::cuda(100)),
             select_hook(&super::super::isa_profile::IsaProfile::hip(950)),
         ] {
-            assert!(matches!(hook.moe_dispatch(64), MoeDispatchStrategy::InKernelJmp));
+            assert!(matches!(
+                hook.moe_dispatch(64),
+                MoeDispatchStrategy::InKernelJmp
+            ));
         }
     }
 
@@ -568,8 +868,14 @@ mod tests {
     #[test]
     fn test_default_select_attention_threshold() {
         let h = ArmNeonHook;
-        assert!(matches!(h.select_attention(16, 128), AttentionStrategy::Naive));
-        assert!(matches!(h.select_attention(32, 128), AttentionStrategy::Naive));
+        assert!(matches!(
+            h.select_attention(16, 128),
+            AttentionStrategy::Naive
+        ));
+        assert!(matches!(
+            h.select_attention(32, 128),
+            AttentionStrategy::Naive
+        ));
         match h.select_attention(33, 128) {
             AttentionStrategy::FlashV2 { tile_q, tile_kv } => {
                 assert_eq!(tile_q, 64);
@@ -584,8 +890,20 @@ mod tests {
         let h = ArmNeonHook;
         assert_eq!(h.gemm_microkernel_shape(), (8, 12));
         assert_eq!(h.epilogue_strategy(10, 4), EpiloguePlace::OnAccumulators);
-        assert!(h.prefetch_hint(&AccessPattern { stride: 64, total_bytes: 1024, reuse_count: 1 }).is_none());
-        let pf = h.prefetch_hint(&AccessPattern { stride: 64, total_bytes: 8192, reuse_count: 2 }).unwrap();
+        assert!(h
+            .prefetch_hint(&AccessPattern {
+                stride: 64,
+                total_bytes: 1024,
+                reuse_count: 1
+            })
+            .is_none());
+        let pf = h
+            .prefetch_hint(&AccessPattern {
+                stride: 64,
+                total_bytes: 8192,
+                reuse_count: 2,
+            })
+            .unwrap();
         assert_eq!(pf.distance, 512);
         assert!(!h.is_gpu());
     }
@@ -607,9 +925,17 @@ mod tests {
     #[test]
     fn test_access_pattern_prefetch_variants() {
         let h = X86Avx2Hook;
-        let small = AccessPattern { stride: 16, total_bytes: 256, reuse_count: 1 };
+        let small = AccessPattern {
+            stride: 16,
+            total_bytes: 256,
+            reuse_count: 1,
+        };
         assert!(h.prefetch_hint(&small).is_none());
-        let large = AccessPattern { stride: 256, total_bytes: 65536, reuse_count: 4 };
+        let large = AccessPattern {
+            stride: 256,
+            total_bytes: 65536,
+            reuse_count: 4,
+        };
         let pf = h.prefetch_hint(&large).unwrap();
         assert!(matches!(pf.hint, PrefetchHint::T0));
     }
@@ -649,17 +975,23 @@ mod tests {
             other => panic!("expected FlashDecoding for seq_len=1, got {:?}", other),
         }
         assert!(h.is_gpu());
-        assert!(matches!(h.moe_dispatch(8), MoeDispatchStrategy::InKernelJmp));
-        assert!(matches!(h.transcendental_impl(super::super::instr::TranscendentalFn::Exp), TransImpl::HardwareInstr));
+        assert!(matches!(
+            h.moe_dispatch(8),
+            MoeDispatchStrategy::InKernelJmp
+        ));
+        assert!(matches!(
+            h.transcendental_impl(super::super::instr::TranscendentalFn::Exp),
+            TransImpl::HardwareInstr
+        ));
     }
 
     #[test]
     fn test_avx2_epilogue_strategy_boundary() {
         let h = X86Avx2Hook;
         assert_eq!(h.epilogue_strategy(8, 4), EpiloguePlace::OnAccumulators); // 8 + 4*2 = 16
-        assert_eq!(h.epilogue_strategy(9, 4), EpiloguePlace::AfterStore);     // 9 + 4*2 = 17 > 16
+        assert_eq!(h.epilogue_strategy(9, 4), EpiloguePlace::AfterStore); // 9 + 4*2 = 17 > 16
         assert_eq!(h.epilogue_strategy(14, 1), EpiloguePlace::OnAccumulators); // 14 + 1*2 = 16
-        assert_eq!(h.epilogue_strategy(15, 1), EpiloguePlace::AfterStore);     // 15 + 1*2 = 17 > 16
+        assert_eq!(h.epilogue_strategy(15, 1), EpiloguePlace::AfterStore); // 15 + 1*2 = 17 > 16
     }
 
     #[test]
@@ -697,9 +1029,12 @@ mod tests {
 
     #[test]
     fn test_select_hook_aarch64_neon_sve_sme_profiles() {
-        let neon_profile = super::super::isa_profile::IsaProfile::aarch64(false, false, 0, false, false, true);
-        let sve_profile = super::super::isa_profile::IsaProfile::aarch64(true, false, 32, false, false, true);
-        let sme_profile = super::super::isa_profile::IsaProfile::aarch64(true, true, 64, true, true, true);
+        let neon_profile =
+            super::super::isa_profile::IsaProfile::aarch64(false, false, 0, false, false, true);
+        let sve_profile =
+            super::super::isa_profile::IsaProfile::aarch64(true, false, 32, false, false, true);
+        let sme_profile =
+            super::super::isa_profile::IsaProfile::aarch64(true, true, 64, true, true, true);
 
         let neon_hook = select_hook(&neon_profile);
         let sve_hook = select_hook(&sve_profile);
@@ -723,9 +1058,17 @@ mod tests {
             }
             other => panic!("expected FlashDecoding for seq=1, got {:?}", other),
         }
-        assert!(matches!(h.select_attention(64, 128), AttentionStrategy::Naive));
+        assert!(matches!(
+            h.select_attention(64, 128),
+            AttentionStrategy::Naive
+        ));
         match h.select_attention(1024, 128) {
-            AttentionStrategy::FlashV4 { tile_q, tile_kv, tmem, block_scaled } => {
+            AttentionStrategy::FlashV4 {
+                tile_q,
+                tile_kv,
+                tmem,
+                block_scaled,
+            } => {
                 assert!(tile_q > 0);
                 assert!(tile_kv > 0);
                 assert!(tmem);

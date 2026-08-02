@@ -31,8 +31,7 @@
 /// Codes 0..7 are non-negative (sign=0); codes 8..15 are negative (sign=1).
 /// Both code 0 (+0) and code 8 (-0) decode to `0.0`.
 pub const E2M1_LUT_F32: [f32; 16] = [
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 ];
 
 /// Decode an e8m0 scale byte to its f32 power-of-2 multiplier.
@@ -70,12 +69,7 @@ pub fn decode_e8m0_scale(byte: u8) -> f32 {
 /// # Numerical contract
 /// `output[block_idx * block_size + i] = E2M1_LUT_F32[nibble] * decode_e8m0_scale(scales[block_idx])`
 #[inline]
-pub fn dequant_mxfp4_scalar(
-    blocks: &[u8],
-    scales: &[u8],
-    output: &mut [f32],
-    block_size: usize,
-) {
+pub fn dequant_mxfp4_scalar(blocks: &[u8], scales: &[u8], output: &mut [f32], block_size: usize) {
     debug_assert!(
         block_size % 2 == 0,
         "mxfp4 block_size must be even (two e2m1 per byte); got {block_size}"
@@ -150,12 +144,24 @@ pub unsafe fn dequant_mxfp4_avx2(
     // Split E2M1 LUT into two 8-lane halves, indexed 0..7 (positive) and 8..15 (negative).
     // Note `_mm256_permutevar8x32_ps` uses each i32 lane modulo 8 as the source lane index.
     let lut_pos = _mm256_setr_ps(
-        E2M1_LUT_F32[0], E2M1_LUT_F32[1], E2M1_LUT_F32[2], E2M1_LUT_F32[3],
-        E2M1_LUT_F32[4], E2M1_LUT_F32[5], E2M1_LUT_F32[6], E2M1_LUT_F32[7],
+        E2M1_LUT_F32[0],
+        E2M1_LUT_F32[1],
+        E2M1_LUT_F32[2],
+        E2M1_LUT_F32[3],
+        E2M1_LUT_F32[4],
+        E2M1_LUT_F32[5],
+        E2M1_LUT_F32[6],
+        E2M1_LUT_F32[7],
     );
     let lut_neg = _mm256_setr_ps(
-        E2M1_LUT_F32[8],  E2M1_LUT_F32[9],  E2M1_LUT_F32[10], E2M1_LUT_F32[11],
-        E2M1_LUT_F32[12], E2M1_LUT_F32[13], E2M1_LUT_F32[14], E2M1_LUT_F32[15],
+        E2M1_LUT_F32[8],
+        E2M1_LUT_F32[9],
+        E2M1_LUT_F32[10],
+        E2M1_LUT_F32[11],
+        E2M1_LUT_F32[12],
+        E2M1_LUT_F32[13],
+        E2M1_LUT_F32[14],
+        E2M1_LUT_F32[15],
     );
     let nibble_mask = _mm_set1_epi8(0x0F);
     let sign_bit_i32 = _mm256_set1_epi32(0x8); // 4-bit sign mask in lane
@@ -233,14 +239,18 @@ pub unsafe fn dequant_mxfp4_avx2(
         // Tail: any remaining bytes when block_size/2 not multiple of 8 — fall through to scalar.
         let processed_bytes = chunks * 8;
         if processed_bytes < bytes_per_block {
-            let qs_tail = std::slice::from_raw_parts(qs_ptr.add(processed_bytes),
-                                                     bytes_per_block - processed_bytes);
-            let out_tail = std::slice::from_raw_parts_mut(dst.add(processed_bytes * 2),
-                                                         (bytes_per_block - processed_bytes) * 2);
+            let qs_tail = std::slice::from_raw_parts(
+                qs_ptr.add(processed_bytes),
+                bytes_per_block - processed_bytes,
+            );
+            let out_tail = std::slice::from_raw_parts_mut(
+                dst.add(processed_bytes * 2),
+                (bytes_per_block - processed_bytes) * 2,
+            );
             for (i, &byte) in qs_tail.iter().enumerate() {
                 let lo = (byte & 0x0F) as usize;
                 let hi = ((byte >> 4) & 0x0F) as usize;
-                out_tail[2 * i]     = E2M1_LUT_F32[lo] * scale;
+                out_tail[2 * i] = E2M1_LUT_F32[lo] * scale;
                 out_tail[2 * i + 1] = E2M1_LUT_F32[hi] * scale;
             }
         }
@@ -264,7 +274,9 @@ pub fn dequant_mxfp4(
     {
         if std::is_x86_feature_detected!("avx2") {
             // SAFETY: AVX2 confirmed at runtime; slice contracts checked inside.
-            unsafe { dequant_mxfp4_avx2(blocks, scales, output, block_size); }
+            unsafe {
+                dequant_mxfp4_avx2(blocks, scales, output, block_size);
+            }
             return Ok(());
         }
     }
@@ -272,8 +284,11 @@ pub fn dequant_mxfp4(
     {
         let _ = (blocks, scales, output, block_size);
     }
-    Err("dequant_mxfp4: no SIMD path available — AVX2 required on x86_64; \
-         other architectures not yet supported".to_string())
+    Err(
+        "dequant_mxfp4: no SIMD path available — AVX2 required on x86_64; \
+         other architectures not yet supported"
+            .to_string(),
+    )
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -306,14 +321,16 @@ mod tests {
         // Verify: out[2*i]   = LUT[i],  out[2*i+1] = LUT[15-i].
         for i in 0..16 {
             let expected_even = E2M1_LUT_F32[i];
-            let expected_odd  = E2M1_LUT_F32[15 - i];
+            let expected_odd = E2M1_LUT_F32[15 - i];
             assert_eq!(
-                out[2 * i], expected_even,
+                out[2 * i],
+                expected_even,
                 "block byte {i} low nibble decoded to {} expected {expected_even}",
                 out[2 * i]
             );
             assert_eq!(
-                out[2 * i + 1], expected_odd,
+                out[2 * i + 1],
+                expected_odd,
                 "block byte {i} high nibble decoded to {} expected {expected_odd}",
                 out[2 * i + 1]
             );
@@ -328,16 +345,16 @@ mod tests {
         //   code 4 = +2,    code 5 = +3,    code 6 = +4,    code 7 = +6,
         //   code 8 = -0,    code 9 = -0.5,  code 10 = -1,   code 11 = -1.5,
         //   code 12 = -2,   code 13 = -3,   code 14 = -4,   code 15 = -6.
-        assert_eq!(E2M1_LUT_F32[0],   0.0);
-        assert_eq!(E2M1_LUT_F32[1],   0.5);
-        assert_eq!(E2M1_LUT_F32[2],   1.0);
-        assert_eq!(E2M1_LUT_F32[3],   1.5);
-        assert_eq!(E2M1_LUT_F32[4],   2.0);
-        assert_eq!(E2M1_LUT_F32[5],   3.0);
-        assert_eq!(E2M1_LUT_F32[6],   4.0);
-        assert_eq!(E2M1_LUT_F32[7],   6.0);
-        assert_eq!(E2M1_LUT_F32[8],  -0.0);
-        assert_eq!(E2M1_LUT_F32[9],  -0.5);
+        assert_eq!(E2M1_LUT_F32[0], 0.0);
+        assert_eq!(E2M1_LUT_F32[1], 0.5);
+        assert_eq!(E2M1_LUT_F32[2], 1.0);
+        assert_eq!(E2M1_LUT_F32[3], 1.5);
+        assert_eq!(E2M1_LUT_F32[4], 2.0);
+        assert_eq!(E2M1_LUT_F32[5], 3.0);
+        assert_eq!(E2M1_LUT_F32[6], 4.0);
+        assert_eq!(E2M1_LUT_F32[7], 6.0);
+        assert_eq!(E2M1_LUT_F32[8], -0.0);
+        assert_eq!(E2M1_LUT_F32[9], -0.5);
         assert_eq!(E2M1_LUT_F32[10], -1.0);
         assert_eq!(E2M1_LUT_F32[11], -1.5);
         assert_eq!(E2M1_LUT_F32[12], -2.0);
@@ -364,7 +381,10 @@ mod tests {
         let expected = 2.0_f32.powi(127);
         assert_eq!(s, expected, "byte=254 scale {s} ≠ expected {expected}");
         // byte = 255 → NaN per OCP.
-        assert!(decode_e8m0_scale(255).is_nan(), "byte=255 must decode to NaN");
+        assert!(
+            decode_e8m0_scale(255).is_nan(),
+            "byte=255 must decode to NaN"
+        );
     }
 
     /// Two-block decode with non-identity scales — verifies per-block scale application.
@@ -381,12 +401,12 @@ mod tests {
 
         // Block 0: pairs (0.5*2, 1.0*2) = (1.0, 2.0) repeated.
         for i in 0..16 {
-            assert_eq!(out[2 * i],     1.0, "blk0 idx {} (lo)", 2 * i);
+            assert_eq!(out[2 * i], 1.0, "blk0 idx {} (lo)", 2 * i);
             assert_eq!(out[2 * i + 1], 2.0, "blk0 idx {} (hi)", 2 * i + 1);
         }
         // Block 1: pairs (6.0*0.5, 4.0*0.5) = (3.0, 2.0) repeated.
         for i in 0..16 {
-            assert_eq!(out[32 + 2 * i],     3.0, "blk1 idx {} (lo)", 32 + 2 * i);
+            assert_eq!(out[32 + 2 * i], 3.0, "blk1 idx {} (lo)", 32 + 2 * i);
             assert_eq!(out[32 + 2 * i + 1], 2.0, "blk1 idx {} (hi)", 32 + 2 * i + 1);
         }
     }
@@ -418,7 +438,7 @@ mod tests {
         }
 
         let mut out_scalar = vec![0f32; num_blocks * block_size];
-        let mut out_avx2   = vec![0f32; num_blocks * block_size];
+        let mut out_avx2 = vec![0f32; num_blocks * block_size];
 
         dequant_mxfp4_scalar(&blocks, &scales, &mut out_scalar, block_size);
         unsafe {
@@ -427,9 +447,11 @@ mod tests {
 
         for i in 0..out_scalar.len() {
             assert_eq!(
-                out_scalar[i].to_bits(), out_avx2[i].to_bits(),
+                out_scalar[i].to_bits(),
+                out_avx2[i].to_bits(),
                 "AVX2 mismatch at index {i}: scalar={} avx2={}",
-                out_scalar[i], out_avx2[i]
+                out_scalar[i],
+                out_avx2[i]
             );
         }
     }
@@ -447,8 +469,11 @@ mod tests {
             .expect("dequant_mxfp4 requires AVX2 on x86_64");
 
         for i in 0..64 {
-            assert_eq!(out_scalar[i].to_bits(), out_dispatch[i].to_bits(),
-                "dispatcher mismatch at {i}");
+            assert_eq!(
+                out_scalar[i].to_bits(),
+                out_dispatch[i].to_bits(),
+                "dispatcher mismatch at {i}"
+            );
         }
     }
 
@@ -473,13 +498,21 @@ mod tests {
     fn e8m0_scale_byte_zero_is_subnormal_2_pow_neg127() {
         let s = decode_e8m0_scale(0);
         let expected = 2.0_f32.powi(-127);
-        assert_eq!(s.to_bits(), expected.to_bits(),
-            "byte=0 decoded to {:e} but expected {:e}", s, expected);
+        assert_eq!(
+            s.to_bits(),
+            expected.to_bits(),
+            "byte=0 decoded to {:e} but expected {:e}",
+            s,
+            expected
+        );
         // Confirm it is actually subnormal (exponent field all zeros, mantissa nonzero).
         let bits = s.to_bits();
         let exp_field = (bits >> 23) & 0xFF;
         let mant_field = bits & 0x7F_FFFF;
-        assert_eq!(exp_field, 0, "byte=0 result should be subnormal (exp_field=0)");
+        assert_eq!(
+            exp_field, 0,
+            "byte=0 result should be subnormal (exp_field=0)"
+        );
         assert_ne!(mant_field, 0, "byte=0 result should be nonzero subnormal");
     }
 
@@ -488,8 +521,13 @@ mod tests {
     fn e8m0_scale_byte_one_is_2_pow_neg126() {
         let s = decode_e8m0_scale(1);
         let expected = 2.0_f32.powi(-126);
-        assert_eq!(s.to_bits(), expected.to_bits(),
-            "byte=1 decoded to {:e} but expected {:e}", s, expected);
+        assert_eq!(
+            s.to_bits(),
+            expected.to_bits(),
+            "byte=1 decoded to {:e} but expected {:e}",
+            s,
+            expected
+        );
         assert!(s.is_normal(), "byte=1 result should be a normal f32");
     }
 
@@ -504,7 +542,10 @@ mod tests {
             assert!(
                 pos + neg == 0.0,
                 "LUT[{}] = {} but LUT[{}] = {} — not negations",
-                i, pos, i + 8, neg
+                i,
+                pos,
+                i + 8,
+                neg
             );
         }
     }
@@ -516,8 +557,16 @@ mod tests {
         assert_eq!(E2M1_LUT_F32[0], 0.0f32);
         assert_eq!(E2M1_LUT_F32[8], 0.0f32);
         // Also verify via sign bit that code 8 is the negative zero.
-        assert_eq!(E2M1_LUT_F32[0].to_bits() & 0x8000_0000, 0, "code 0 should be +0");
-        assert_ne!(E2M1_LUT_F32[8].to_bits() & 0x8000_0000, 0, "code 8 should be -0");
+        assert_eq!(
+            E2M1_LUT_F32[0].to_bits() & 0x8000_0000,
+            0,
+            "code 0 should be +0"
+        );
+        assert_ne!(
+            E2M1_LUT_F32[8].to_bits() & 0x8000_0000,
+            0,
+            "code 8 should be -0"
+        );
     }
 
     /// Verify single-element decode at various scale factors.
@@ -611,7 +660,12 @@ mod tests {
         // Block 1 should be scaled by 4.0: pairs (4.0, 2.0).
         for i in 0..16 {
             assert_eq!(out[32 + 2 * i], 4.0f32, "blk1 lo idx={}", 32 + 2 * i);
-            assert_eq!(out[32 + 2 * i + 1], 2.0f32, "blk1 hi idx={}", 32 + 2 * i + 1);
+            assert_eq!(
+                out[32 + 2 * i + 1],
+                2.0f32,
+                "blk1 hi idx={}",
+                32 + 2 * i + 1
+            );
         }
     }
 
@@ -631,10 +685,18 @@ mod tests {
         for i in 0..8 {
             let expected_even = E2M1_LUT_F32[i];
             let expected_odd = E2M1_LUT_F32[15 - i];
-            assert_eq!(out[2 * i], expected_even,
-                "block_size=16 byte {i} lo: got {} expected {expected_even}", out[2 * i]);
-            assert_eq!(out[2 * i + 1], expected_odd,
-                "block_size=16 byte {i} hi: got {} expected {expected_odd}", out[2 * i + 1]);
+            assert_eq!(
+                out[2 * i],
+                expected_even,
+                "block_size=16 byte {i} lo: got {} expected {expected_even}",
+                out[2 * i]
+            );
+            assert_eq!(
+                out[2 * i + 1],
+                expected_odd,
+                "block_size=16 byte {i} hi: got {} expected {expected_odd}",
+                out[2 * i + 1]
+            );
         }
     }
 
@@ -643,7 +705,7 @@ mod tests {
     fn custom_block_size_64() {
         let block_size = 64;
         let bytes_per_block = block_size / 2; // 32
-        // Fill with a repeating pattern: byte = 0x43 → lo=3(+1.5), hi=4(+2.0).
+                                              // Fill with a repeating pattern: byte = 0x43 → lo=3(+1.5), hi=4(+2.0).
         let blocks = vec![0x43u8; bytes_per_block];
         let scales = [125u8]; // 2^-2 = 0.25
         let mut out = vec![0f32; block_size];
@@ -653,10 +715,18 @@ mod tests {
         let expected_lo = 1.5f32 * 0.25f32; // 0.375
         let expected_hi = 2.0f32 * 0.25f32; // 0.5
         for i in 0..bytes_per_block {
-            assert_eq!(out[2 * i], expected_lo,
-                "block_size=64 byte {i} lo: got {} expected {expected_lo}", out[2 * i]);
-            assert_eq!(out[2 * i + 1], expected_hi,
-                "block_size=64 byte {i} hi: got {} expected {expected_hi}", out[2 * i + 1]);
+            assert_eq!(
+                out[2 * i],
+                expected_lo,
+                "block_size=64 byte {i} lo: got {} expected {expected_lo}",
+                out[2 * i]
+            );
+            assert_eq!(
+                out[2 * i + 1],
+                expected_hi,
+                "block_size=64 byte {i} hi: got {} expected {expected_hi}",
+                out[2 * i + 1]
+            );
         }
     }
 
@@ -670,7 +740,10 @@ mod tests {
         dequant_mxfp4_scalar(&blocks, &scales, &mut out, 32);
 
         for (i, &v) in out.iter().enumerate() {
-            assert!(v.is_nan(), "NaN scale at idx={i} should produce NaN, got {v}");
+            assert!(
+                v.is_nan(),
+                "NaN scale at idx={i} should produce NaN, got {v}"
+            );
         }
     }
 
@@ -693,8 +766,11 @@ mod tests {
                 let mut out_scalar = vec![0f32; 32];
                 dequant_mxfp4_scalar(&blocks, &scales, &mut out_scalar, 32);
                 for i in 0..32 {
-                    assert_eq!(out_dispatch[i].to_bits(), out_scalar[i].to_bits(),
-                        "dispatcher mismatch at {i}");
+                    assert_eq!(
+                        out_dispatch[i].to_bits(),
+                        out_scalar[i].to_bits(),
+                        "dispatcher mismatch at {i}"
+                    );
                 }
             } else {
                 assert!(result.is_err(), "dispatcher should fail without AVX2");
@@ -704,8 +780,10 @@ mod tests {
         {
             assert!(result.is_err(), "dispatcher should fail on non-x86_64");
             let msg = result.unwrap_err();
-            assert!(msg.contains("no SIMD path") || msg.contains("not yet supported"),
-                "unexpected error message: {msg}");
+            assert!(
+                msg.contains("no SIMD path") || msg.contains("not yet supported"),
+                "unexpected error message: {msg}"
+            );
         }
     }
 
@@ -738,14 +816,26 @@ mod tests {
         for i in 0..16 {
             let expected_lo = E2M1_LUT_F32[i] * scale;
             let expected_hi = E2M1_LUT_F32[15 - i] * scale;
-            assert_eq!(out_scalar[2 * i].to_bits(), expected_lo.to_bits(),
-                "scalar lo mismatch at byte {i}");
-            assert_eq!(out_scalar[2 * i + 1].to_bits(), expected_hi.to_bits(),
-                "scalar hi mismatch at byte {i}");
-            assert_eq!(out_avx2[2 * i].to_bits(), expected_lo.to_bits(),
-                "avx2 lo mismatch at byte {i}");
-            assert_eq!(out_avx2[2 * i + 1].to_bits(), expected_hi.to_bits(),
-                "avx2 hi mismatch at byte {i}");
+            assert_eq!(
+                out_scalar[2 * i].to_bits(),
+                expected_lo.to_bits(),
+                "scalar lo mismatch at byte {i}"
+            );
+            assert_eq!(
+                out_scalar[2 * i + 1].to_bits(),
+                expected_hi.to_bits(),
+                "scalar hi mismatch at byte {i}"
+            );
+            assert_eq!(
+                out_avx2[2 * i].to_bits(),
+                expected_lo.to_bits(),
+                "avx2 lo mismatch at byte {i}"
+            );
+            assert_eq!(
+                out_avx2[2 * i + 1].to_bits(),
+                expected_hi.to_bits(),
+                "avx2 hi mismatch at byte {i}"
+            );
         }
     }
 
@@ -780,15 +870,22 @@ mod tests {
 
             // Even-index elements (low nibble) should be expected_raw * scale.
             for i in 0..16 {
-                assert_eq!(out[2 * i], expected_raw * scale,
+                assert_eq!(
+                    out[2 * i],
+                    expected_raw * scale,
                     "code={code} low nibble at byte {i}: got {} expected {}",
-                    out[2 * i], expected_raw * scale);
+                    out[2 * i],
+                    expected_raw * scale
+                );
             }
             // Odd-index elements (high nibble = 0) should be 0.0.
             for i in 0..16 {
-                assert_eq!(out[2 * i + 1], 0.0f32,
+                assert_eq!(
+                    out[2 * i + 1],
+                    0.0f32,
                     "code={code} high nibble (0) at byte {i}: got {} expected 0.0",
-                    out[2 * i + 1]);
+                    out[2 * i + 1]
+                );
             }
         }
     }
@@ -819,15 +916,22 @@ mod tests {
 
             // Even-index elements (low nibble = 0) should be 0.0.
             for i in 0..16 {
-                assert_eq!(out[2 * i], 0.0f32,
+                assert_eq!(
+                    out[2 * i],
+                    0.0f32,
                     "code={code} low nibble (0) at byte {i}: got {} expected 0.0",
-                    out[2 * i]);
+                    out[2 * i]
+                );
             }
             // Odd-index elements (high nibble) should be expected_raw * scale.
             for i in 0..16 {
-                assert_eq!(out[2 * i + 1], expected_raw * scale,
+                assert_eq!(
+                    out[2 * i + 1],
+                    expected_raw * scale,
                     "code={code} high nibble at byte {i}: got {} expected {}",
-                    out[2 * i + 1], expected_raw * scale);
+                    out[2 * i + 1],
+                    expected_raw * scale
+                );
             }
         }
     }
@@ -843,11 +947,19 @@ mod tests {
         for &byte in test_bytes {
             let s = decode_e8m0_scale(byte);
             let expected = 2.0_f32.powi(byte as i32 - 127);
-            assert_eq!(s.to_bits(), expected.to_bits(),
-                "byte={byte}: decoded to {:e} but expected {:e}", s, expected);
+            assert_eq!(
+                s.to_bits(),
+                expected.to_bits(),
+                "byte={byte}: decoded to {:e} but expected {:e}",
+                s,
+                expected
+            );
             // All normal-range bytes should produce normal (non-subnormal, non-inf, non-NaN) f32.
-            assert!(s.is_normal() || s == 1.0f32,
-                "byte={byte}: result {:e} should be normal f32", s);
+            assert!(
+                s.is_normal() || s == 1.0f32,
+                "byte={byte}: result {:e} should be normal f32",
+                s
+            );
         }
     }
 
@@ -857,8 +969,12 @@ mod tests {
     fn e8m0_scale_max_normal_is_not_inf() {
         let s = decode_e8m0_scale(254);
         let expected = 2.0_f32.powi(127);
-        assert_eq!(s.to_bits(), expected.to_bits(),
-            "byte=254 should be 2^127, got {:e}", s);
+        assert_eq!(
+            s.to_bits(),
+            expected.to_bits(),
+            "byte=254 should be 2^127, got {:e}",
+            s
+        );
         assert!(s.is_finite(), "byte=254 result should be finite, not inf");
         assert!(!s.is_nan(), "byte=254 result should not be NaN");
     }
@@ -883,10 +999,20 @@ mod tests {
         // Verify: out[2*i] = LUT[i], out[2*i+1] = LUT[i].
         for i in 0..8 {
             let expected = E2M1_LUT_F32[i];
-            assert_eq!(out[2 * i], expected,
-                "roundtrip byte {i} lo: got {} expected {}", out[2 * i], expected);
-            assert_eq!(out[2 * i + 1], expected,
-                "roundtrip byte {i} hi: got {} expected {}", out[2 * i + 1], expected);
+            assert_eq!(
+                out[2 * i],
+                expected,
+                "roundtrip byte {i} lo: got {} expected {}",
+                out[2 * i],
+                expected
+            );
+            assert_eq!(
+                out[2 * i + 1],
+                expected,
+                "roundtrip byte {i} hi: got {} expected {}",
+                out[2 * i + 1],
+                expected
+            );
         }
     }
 
@@ -906,10 +1032,20 @@ mod tests {
 
         for i in 0..8 {
             let expected = E2M1_LUT_F32[i + 8];
-            assert_eq!(out[2 * i], expected,
-                "negative roundtrip byte {i} lo: got {} expected {}", out[2 * i], expected);
-            assert_eq!(out[2 * i + 1], expected,
-                "negative roundtrip byte {i} hi: got {} expected {}", out[2 * i + 1], expected);
+            assert_eq!(
+                out[2 * i],
+                expected,
+                "negative roundtrip byte {i} lo: got {} expected {}",
+                out[2 * i],
+                expected
+            );
+            assert_eq!(
+                out[2 * i + 1],
+                expected,
+                "negative roundtrip byte {i} hi: got {} expected {}",
+                out[2 * i + 1],
+                expected
+            );
         }
     }
 
@@ -925,8 +1061,16 @@ mod tests {
 
         dequant_mxfp4_scalar(&blocks, &scales, &mut out, 2);
 
-        assert_eq!(out[0], 3.0f32, "smallest block lo: got {} expected 3.0", out[0]);
-        assert_eq!(out[1], -0.5f32, "smallest block hi: got {} expected -0.5", out[1]);
+        assert_eq!(
+            out[0], 3.0f32,
+            "smallest block lo: got {} expected 3.0",
+            out[0]
+        );
+        assert_eq!(
+            out[1], -0.5f32,
+            "smallest block hi: got {} expected -0.5",
+            out[1]
+        );
     }
 
     /// Edge case: all-zero values across multiple blocks.
@@ -943,9 +1087,11 @@ mod tests {
         for blk in 0..num_blocks {
             for i in 0..32 {
                 let idx = blk * 32 + i;
-                assert_eq!(out[idx], 0.0f32,
+                assert_eq!(
+                    out[idx], 0.0f32,
                     "all-zero block {} idx {} with scale byte {}: got {} expected 0.0",
-                    blk, i, scales[blk], out[idx]);
+                    blk, i, scales[blk], out[idx]
+                );
             }
         }
     }
@@ -966,31 +1112,51 @@ mod tests {
         let scale_byte = 127u8;
         let scale = decode_e8m0_scale(scale_byte);
         let amax = 6.0f32;
-        assert!(scale * 6.0f32 >= amax,
-            "scale byte 127: {} * 6.0 = {} < amax {}", scale, scale * 6.0, amax);
+        assert!(
+            scale * 6.0f32 >= amax,
+            "scale byte 127: {} * 6.0 = {} < amax {}",
+            scale,
+            scale * 6.0,
+            amax
+        );
 
         // Test case 2: amax = 12.0 → need scale >= 2.0 → byte = 128.
         let scale_byte = 128u8;
         let scale = decode_e8m0_scale(scale_byte);
         let amax = 12.0f32;
-        assert!(scale * 6.0f32 >= amax,
-            "scale byte 128: {} * 6.0 = {} < amax {}", scale, scale * 6.0, amax);
+        assert!(
+            scale * 6.0f32 >= amax,
+            "scale byte 128: {} * 6.0 = {} < amax {}",
+            scale,
+            scale * 6.0,
+            amax
+        );
 
         // Test case 3: amax = 0.75 → need scale >= 0.125 → byte = 124 (2^-3 = 0.125).
         // 0.125 * 6.0 = 0.75 >= 0.75 ✓
         let scale_byte = 124u8;
         let scale = decode_e8m0_scale(scale_byte);
         let amax = 0.75f32;
-        assert!(scale * 6.0f32 >= amax,
-            "scale byte 124: {} * 6.0 = {} < amax {}", scale, scale * 6.0, amax);
+        assert!(
+            scale * 6.0f32 >= amax,
+            "scale byte 124: {} * 6.0 = {} < amax {}",
+            scale,
+            scale * 6.0,
+            amax
+        );
 
         // Test case 4: amax = 1.5 → need scale >= 0.25 → byte = 125 (2^-2 = 0.25).
         // 0.25 * 6.0 = 1.5 >= 1.5 ✓
         let scale_byte = 125u8;
         let scale = decode_e8m0_scale(scale_byte);
         let amax = 1.5f32;
-        assert!(scale * 6.0f32 >= amax,
-            "scale byte 125: {} * 6.0 = {} < amax {}", scale, scale * 6.0, amax);
+        assert!(
+            scale * 6.0f32 >= amax,
+            "scale byte 125: {} * 6.0 = {} < amax {}",
+            scale,
+            scale * 6.0,
+            amax
+        );
     }
 
     /// Verify that the e2m1 LUT values are strictly ordered by magnitude within
@@ -1001,22 +1167,35 @@ mod tests {
     fn e2m1_lut_magnitude_ordering() {
         // Positive half: codes 1..7 should be strictly increasing.
         for i in 1..7 {
-            assert!(E2M1_LUT_F32[i] < E2M1_LUT_F32[i + 1],
+            assert!(
+                E2M1_LUT_F32[i] < E2M1_LUT_F32[i + 1],
                 "LUT ordering violated: LUT[{}] = {} >= LUT[{}] = {}",
-                i, E2M1_LUT_F32[i], i + 1, E2M1_LUT_F32[i + 1]);
+                i,
+                E2M1_LUT_F32[i],
+                i + 1,
+                E2M1_LUT_F32[i + 1]
+            );
         }
 
         // Negative half: codes 9..15 should be strictly decreasing (more negative).
         for i in 9..15 {
-            assert!(E2M1_LUT_F32[i] > E2M1_LUT_F32[i + 1],
+            assert!(
+                E2M1_LUT_F32[i] > E2M1_LUT_F32[i + 1],
                 "LUT ordering violated: LUT[{}] = {} >= LUT[{}] = {}",
-                i, E2M1_LUT_F32[i], i + 1, E2M1_LUT_F32[i + 1]);
+                i,
+                E2M1_LUT_F32[i],
+                i + 1,
+                E2M1_LUT_F32[i + 1]
+            );
         }
 
         // Verify the full dynamic range: max positive / min positive.
         let max_pos = E2M1_LUT_F32[7]; // 6.0
         let min_pos = E2M1_LUT_F32[1]; // 0.5
-        assert_eq!(max_pos / min_pos, 12.0f32,
-            "e2m1 dynamic range should be 12x (6.0/0.5)");
+        assert_eq!(
+            max_pos / min_pos,
+            12.0f32,
+            "e2m1 dynamic range should be 12x (6.0/0.5)"
+        );
     }
 }

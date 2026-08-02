@@ -4,9 +4,9 @@
 //! 推导每个 GEMM 的瓶颈类型和最优融合策略。
 //! 零运行时依赖 — 所有输入在编译时已知。
 
-use std::collections::HashMap;
 use crate::compiler::graph::{CompilerGraph, CompilerOp, Op, OpId};
 use crate::dispatch::device_profile::DeviceProfile;
+use std::collections::HashMap;
 
 /// GEMM 在模型中的角色 (影响融合策略选择)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -58,10 +58,7 @@ pub enum ExecPattern {
     },
     /// 共享内存 tile: 最大化缓存利用 (memory-bound 中等矩阵)
     /// CPU: cache-resident tile; GPU: shared memory tiling
-    SharedMemTile {
-        tile_rows: usize,
-        tile_cols: usize,
-    },
+    SharedMemTile { tile_rows: usize, tile_cols: usize },
     /// 异步流水线: producer-consumer 双缓冲
     /// CPU: prefetch + compute overlap; GPU: TMA + wgmma pipeline
     AsyncPipeline,
@@ -76,7 +73,9 @@ pub enum ExecPattern {
 /// - 窄高 (M<tm, N>tk): 减小 tile_m, 保持 tile_n
 /// - K 很大: 减小 tile_k 适应 L1
 pub fn derive_exec_pattern(
-    m: usize, n: usize, k: usize,
+    m: usize,
+    n: usize,
+    k: usize,
     bottleneck: &BottleneckType,
     profile: &DeviceProfile,
 ) -> ExecPattern {
@@ -116,12 +115,19 @@ pub fn derive_exec_pattern(
     let tn = if n < tn_base { n } else { tn_base };
 
     match bottleneck {
-        BottleneckType::ComputeBound { .. } => {
-            ExecPattern::TileGemm { tile_m: tm, tile_n: tn, tile_k: tk, warp_m: 0, warp_n: 0, mma_k: 0, pipeline_depth: 0 }
-        }
-        BottleneckType::MemoryBound { .. } => {
-            ExecPattern::SharedMemTile { tile_rows: tm, tile_cols: tn }
-        }
+        BottleneckType::ComputeBound { .. } => ExecPattern::TileGemm {
+            tile_m: tm,
+            tile_n: tn,
+            tile_k: tk,
+            warp_m: 0,
+            warp_n: 0,
+            mma_k: 0,
+            pipeline_depth: 0,
+        },
+        BottleneckType::MemoryBound { .. } => ExecPattern::SharedMemTile {
+            tile_rows: tm,
+            tile_cols: tn,
+        },
         BottleneckType::LatencyBound { .. } => ExecPattern::ScalarLoop,
     }
 }
@@ -150,9 +156,7 @@ pub enum ParallelismDesc {
     },
     /// Wave 并行: Multi-Wave 内部调度
     /// GPU: Grid launch 多 Thread Block; CPU: NUMA 绑定多线程
-    WaveParallel {
-        num_waves: usize,
-    },
+    WaveParallel { num_waves: usize },
     /// Warp 协作: producer-consumer 双缓冲
     /// GPU: Thread Block Cluster; CPU: N/A
     WarpCooperative,
@@ -165,7 +169,9 @@ pub enum ParallelismDesc {
 /// - prefill (M>1): 正常 SIMD 向量化 + K 展开
 pub fn derive_parallelism(
     profile: &DeviceProfile,
-    m: usize, _n: usize, _k: usize,
+    m: usize,
+    _n: usize,
+    _k: usize,
 ) -> ParallelismDesc {
     let simd_width = profile.simd_width_f32();
     let k_unroll = profile.k_unroll_factor();
@@ -239,10 +245,7 @@ impl PainPointAnalyzer {
     /// 纯静态分析: (CompilerGraph × DeviceProfile) → OpBottleneckMap
     ///
     /// 零运行时依赖 — M 使用 max_for_allocation，结果保守但安全。
-    pub fn analyze(
-        graph: &CompilerGraph,
-        device: &DeviceProfile,
-    ) -> OpBottleneckMap {
+    pub fn analyze(graph: &CompilerGraph, device: &DeviceProfile) -> OpBottleneckMap {
         let ridge = if device.peak_bandwidth_gbs > 0.0 {
             device.peak_gflops_f32 * 1e9 / (device.peak_bandwidth_gbs * 1e9)
         } else {
@@ -253,11 +256,16 @@ impl PainPointAnalyzer {
 
         // ARCH-JIT-DATA-YIELDS: pre-compute GEMM op list in topological order
         // to avoid per-call full-graph scans in classify_gemm_role.
-        let all_gemms_in_order: Vec<OpId> = graph.topological_sort()
+        let all_gemms_in_order: Vec<OpId> = graph
+            .topological_sort()
             .into_iter()
             .filter(|&op_id| {
-                graph.op(op_id).is_some_and(|op| matches!(op.op_resolved(graph),
-                    Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_))))
+                graph.op(op_id).is_some_and(|op| {
+                    matches!(
+                        op.op_resolved(graph),
+                        Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_))
+                    )
+                })
             })
             .collect();
 
@@ -272,7 +280,8 @@ impl PainPointAnalyzer {
                 Some((m_dim, n_val, k_val)) => {
                     // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate;
                     // symbolic-bound propagation is deferred — current upper-bound is sufficient for roofline classification.
-                    let m_val = m_dim.max_for_allocation_strict()
+                    let m_val = m_dim
+                        .max_for_allocation_strict()
                         .expect("ARCH-SYMDIM: SymDim must have max_value in pain_point analysis");
                     (m_val, n_val, k_val)
                 }
@@ -287,7 +296,9 @@ impl PainPointAnalyzer {
             let ai = if bytes > 0.0 { flops / bytes } else { 0.0 };
 
             let bottleneck = if m <= 1 && n * k <= 256 {
-                BottleneckType::LatencyBound { estimated_latency_ns: 100.0 }
+                BottleneckType::LatencyBound {
+                    estimated_latency_ns: 100.0,
+                }
             } else if ai < ridge {
                 BottleneckType::MemoryBound {
                     bandwidth_utilization: if ridge > 0.0 { ai / ridge } else { 1.0 },
@@ -303,17 +314,20 @@ impl PainPointAnalyzer {
             let exec_pattern = derive_exec_pattern(m, n, k, &bottleneck, device);
             let parallelism = derive_parallelism(device, m, n, k);
 
-            gemm_bottlenecks.insert(op_id, GemmBottleneck {
-                gemm_role: role,
-                shape: (m, n, k),
-                arithmetic_intensity: ai,
-                ridge_point: ridge,
-                bottleneck,
-                optimal_fusion,
-                fusion_benefits,
-                exec_pattern,
-                parallelism,
-            });
+            gemm_bottlenecks.insert(
+                op_id,
+                GemmBottleneck {
+                    gemm_role: role,
+                    shape: (m, n, k),
+                    arithmetic_intensity: ai,
+                    ridge_point: ridge,
+                    bottleneck,
+                    optimal_fusion,
+                    fusion_benefits,
+                    exec_pattern,
+                    parallelism,
+                },
+            );
         }
 
         OpBottleneckMap {
@@ -329,27 +343,27 @@ impl PainPointAnalyzer {
 ///
 /// ARCH-JIT-DATA-YIELDS: 全部基于 tensor.consumers / tensor.producer 索引和预计算的
 /// `all_gemms_in_order` 列表，零全图扫描。
-fn classify_gemm_role(
-    op_id: OpId,
-    graph: &CompilerGraph,
-    all_gemms_in_order: &[OpId],
-) -> GemmRole {
+fn classify_gemm_role(op_id: OpId, graph: &CompilerGraph, all_gemms_in_order: &[OpId]) -> GemmRole {
     let op = match graph.op(op_id) {
         Some(o) => o,
         None => return GemmRole::Other,
     };
 
     // 胖 opcode 自描述 — Gemm/GemmBias/QuantGemm 分类。
-    let is_gemm_op = |op: &CompilerOp| matches!(&op.op,
-        Op::Gemm(_) | Op::GemmBias(_) | Op::QuantGemm(_));
+    let is_gemm_op =
+        |op: &CompilerOp| matches!(&op.op, Op::Gemm(_) | Op::GemmBias(_) | Op::QuantGemm(_));
 
     // 拓扑推导 1: 共享输入的 GEMM 三兄弟 → QkvProjection
     // ARCH-JIT-DATA-YIELDS: 使用 tensor.consumers 索引替代全图扫描。
     if let Some(&input_tid) = op.inputs.first() {
-        let shared_count = graph.tensor(input_tid)
-            .map(|t| t.consumers.iter()
-                .filter(|&&c| graph.op(c).is_some_and(is_gemm_op))
-                .count())
+        let shared_count = graph
+            .tensor(input_tid)
+            .map(|t| {
+                t.consumers
+                    .iter()
+                    .filter(|&&c| graph.op(c).is_some_and(is_gemm_op))
+                    .count()
+            })
             .unwrap_or(0);
         if shared_count >= 3 {
             return GemmRole::QkvProjection;
@@ -358,12 +372,14 @@ fn classify_gemm_role(
 
     // 拓扑推导 2: 此 GEMM 的输出被 softmax 或 attention 算子消费 → OutputProjection
     for &output_tid in &op.outputs {
-        let consumers = graph.tensor(output_tid).map(|t| &t.consumers).cloned().unwrap_or_default();
+        let consumers = graph
+            .tensor(output_tid)
+            .map(|t| &t.consumers)
+            .cloned()
+            .unwrap_or_default();
         for consumer_id in &consumers {
             if let Some(consumer) = graph.op(*consumer_id) {
-                if matches!(&consumer.op,
-                    Op::Softmax | Op::MultiHeadAttention(_)
-                ) {
+                if matches!(&consumer.op, Op::Softmax | Op::MultiHeadAttention(_)) {
                     return GemmRole::OutputProjection;
                 }
             }
@@ -372,18 +388,27 @@ fn classify_gemm_role(
 
     // 拓扑推导 3: 共享输入的 GEMM 两兄弟 + 后接 SiLU/SwiGLU → GateUpProjection
     if let Some(&input_tid) = op.inputs.first() {
-        let sibling_gemm_count = graph.tensor(input_tid)
-            .map(|t| t.consumers.iter()
-                .filter(|&&c| c != op_id && graph.op(c).is_some_and(is_gemm_op))
-                .count())
+        let sibling_gemm_count = graph
+            .tensor(input_tid)
+            .map(|t| {
+                t.consumers
+                    .iter()
+                    .filter(|&&c| c != op_id && graph.op(c).is_some_and(is_gemm_op))
+                    .count()
+            })
             .unwrap_or(0);
         if sibling_gemm_count == 1 {
             // 检查输出是否被 SwiGLU 或 SiLU 消费
             for &output_tid in &op.outputs {
-                let consumers = graph.tensor(output_tid).map(|t| &t.consumers).cloned().unwrap_or_default();
+                let consumers = graph
+                    .tensor(output_tid)
+                    .map(|t| &t.consumers)
+                    .cloned()
+                    .unwrap_or_default();
                 for consumer_id in &consumers {
                     if let Some(consumer) = graph.op(*consumer_id) {
-                        if matches!(&consumer.op,
+                        if matches!(
+                            &consumer.op,
                             Op::SwiGlu | Op::Silu | Op::SwiGluClipped { .. } | Op::GeGlu
                         ) {
                             return GemmRole::GateUpProjection;
@@ -399,7 +424,8 @@ fn classify_gemm_role(
         if let Some(input_tensor) = graph.tensor(input_tid) {
             if let Some(producer_id) = input_tensor.producer {
                 if let Some(producer) = graph.op(producer_id) {
-                    if matches!(&producer.op,
+                    if matches!(
+                        &producer.op,
                         Op::SwiGlu | Op::Silu | Op::SwiGluClipped { .. } | Op::GeGlu
                     ) {
                         return GemmRole::DownProjection;
@@ -421,26 +447,29 @@ fn classify_gemm_role(
 }
 
 /// 选择最优融合策略
-fn pick_strategy(role: GemmRole, bottleneck: &BottleneckType, m: usize, device: &DeviceProfile) -> FusionPriority {
+fn pick_strategy(
+    role: GemmRole,
+    bottleneck: &BottleneckType,
+    m: usize,
+    device: &DeviceProfile,
+) -> FusionPriority {
     let (mc, _, _) = device.gemm_tile_sizes();
     let tile_threshold = mc.max(2);
     match role {
         GemmRole::LmHead => FusionPriority::EpilogueInjection,
         GemmRole::QkvProjection => FusionPriority::QkvSharedInput,
         GemmRole::GateUpProjection => FusionPriority::FfnBlock,
-        GemmRole::OutputProjection | GemmRole::DownProjection => {
-            match bottleneck {
-                BottleneckType::MemoryBound { .. } => FusionPriority::EpilogueInjection,
-                BottleneckType::ComputeBound { .. } => {
-                    if m > tile_threshold {
-                        FusionPriority::TileLevelFusion
-                    } else {
-                        FusionPriority::EpilogueInjection
-                    }
+        GemmRole::OutputProjection | GemmRole::DownProjection => match bottleneck {
+            BottleneckType::MemoryBound { .. } => FusionPriority::EpilogueInjection,
+            BottleneckType::ComputeBound { .. } => {
+                if m > tile_threshold {
+                    FusionPriority::TileLevelFusion
+                } else {
+                    FusionPriority::EpilogueInjection
                 }
-                BottleneckType::LatencyBound { .. } => FusionPriority::EpilogueInjection,
             }
-        }
+            BottleneckType::LatencyBound { .. } => FusionPriority::EpilogueInjection,
+        },
         GemmRole::Other => match bottleneck {
             BottleneckType::MemoryBound { .. } => FusionPriority::EpilogueInjection,
             _ => FusionPriority::LoopFusion,
@@ -452,7 +481,9 @@ fn pick_strategy(role: GemmRole, bottleneck: &BottleneckType, m: usize, device: 
 fn compute_fusion_benefits(
     role: GemmRole,
     bottleneck: &BottleneckType,
-    m: usize, n: usize, k: usize,
+    m: usize,
+    n: usize,
+    k: usize,
 ) -> HashMap<FusionPriority, f64> {
     let mut benefits = HashMap::new();
     // PERF: F32 (4 字节) 作为保守估算上界,非统一精度假设
@@ -461,7 +492,9 @@ fn compute_fusion_benefits(
 
     let scale = match bottleneck {
         BottleneckType::MemoryBound { .. } => 1.0,
-        BottleneckType::ComputeBound { compute_utilization } => compute_utilization.max(0.1),
+        BottleneckType::ComputeBound {
+            compute_utilization,
+        } => compute_utilization.max(0.1),
         BottleneckType::LatencyBound { .. } => 0.5,
     };
 
@@ -472,7 +505,11 @@ fn compute_fusion_benefits(
     benefits.insert(FusionPriority::NormIntoGemm, input_bytes * scale * 0.5);
 
     // P1: TileLevelFusion — 仅 M > mc_min 有效
-    let tile_benefit = if m > 16 { input_bytes * scale * 0.8 } else { 0.0 };
+    let tile_benefit = if m > 16 {
+        input_bytes * scale * 0.8
+    } else {
+        0.0
+    };
     benefits.insert(FusionPriority::TileLevelFusion, tile_benefit);
 
     // P1: ComputeRoot — norm output 驻留 L1/L2
@@ -501,9 +538,13 @@ fn compute_fusion_benefits(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::graph::{CompilerGraph, KvSource, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
-    use crate::types::DType;
+    use crate::compiler::graph::{
+        AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+        DualRopeSpec, GemmSpec, KvSource, MlaSpec, NormSpec, Op, QuantGemmSpec, RopeSpec,
+        SinksSpec, SymDim,
+    };
     use crate::dispatch::device_profile::DeviceProfile;
+    use crate::types::DType;
 
     #[test]
     fn test_pain_point_decode_memory_bound() {
@@ -514,9 +555,38 @@ mod tests {
         let gate_out = g.add_tensor_concrete("gate_out", &[1, 11008], DType::F32);
         let up_out = g.add_tensor_concrete("up_out", &[1, 11008], DType::F32);
         let swiglu_out = g.add_tensor_concrete("swiglu_out", &[1, 11008], DType::F32);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 11008, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w_gate], vec![gate_out], "gate_proj");
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 11008, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w_up], vec![up_out], "up_proj");
-        g.add_op(Op::SwiGlu, vec![gate_out, up_out], vec![swiglu_out], "swiglu");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 11008,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![inp, w_gate],
+            vec![gate_out],
+            "gate_proj",
+        );
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 11008,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![inp, w_up],
+            vec![up_out],
+            "up_proj",
+        );
+        g.add_op(
+            Op::SwiGlu,
+            vec![gate_out, up_out],
+            vec![swiglu_out],
+            "swiglu",
+        );
 
         let device = DeviceProfile::detect();
         let map = PainPointAnalyzer::analyze(&g, &device);
@@ -536,7 +606,19 @@ mod tests {
         let w = g.add_tensor_concrete("weight", &[4096, 4096], DType::F32);
         let gemm_out = g.add_tensor_concrete("gemm_out", &[512, 4096], DType::F32);
         let soft_out = g.add_tensor_concrete("soft_out", &[512, 4096], DType::F32);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w], vec![gemm_out], "o_proj");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(512),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![inp, w],
+            vec![gemm_out],
+            "o_proj",
+        );
         g.add_op(Op::Softmax, vec![gemm_out], vec![soft_out], "attn_softmax");
 
         let device = DeviceProfile::detect();
@@ -558,13 +640,49 @@ mod tests {
         let oq = g.add_tensor_concrete("oq", &[1, 4096], DType::F32);
         let ok_ = g.add_tensor_concrete("ok", &[1, 4096], DType::F32);
         let ov = g.add_tensor_concrete("ov", &[1, 4096], DType::F32);
-        let q_op = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![inp, wq], vec![oq], "q");
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![inp, wk], vec![ok_], "k");
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![inp, wv], vec![ov], "v");
-        assert_eq!(classify_gemm_role(q_op, &g, &[q_op]), GemmRole::QkvProjection);
+        let q_op = g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![inp, wq],
+            vec![oq],
+            "q",
+        );
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![inp, wk],
+            vec![ok_],
+            "k",
+        );
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![inp, wv],
+            vec![ov],
+            "v",
+        );
+        assert_eq!(
+            classify_gemm_role(q_op, &g, &[q_op]),
+            GemmRole::QkvProjection
+        );
 
         // OutputProjection: GEMM 输出被 Softmax 消费
         let mut g2 = CompilerGraph::new();
@@ -572,27 +690,59 @@ mod tests {
         let w2 = g2.add_tensor_concrete("w", &[4096, 4096], DType::F32);
         let gemm_out2 = g2.add_tensor_concrete("go", &[1, 4096], DType::F32);
         let soft_out = g2.add_tensor_concrete("so", &[1, 4096], DType::F32);
-        let o_proj = g2.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![inp2, w2], vec![gemm_out2], "o");
+        let o_proj = g2.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![inp2, w2],
+            vec![gemm_out2],
+            "o",
+        );
         g2.add_op(Op::Softmax, vec![gemm_out2], vec![soft_out], "soft");
-        assert_eq!(classify_gemm_role(o_proj, &g2, &[o_proj]), GemmRole::OutputProjection);
+        assert_eq!(
+            classify_gemm_role(o_proj, &g2, &[o_proj]),
+            GemmRole::OutputProjection
+        );
 
         // 孤立 GEMM: Other
         let mut g3 = CompilerGraph::new();
         let inp3 = g3.add_tensor_concrete("x", &[1, 4096], DType::F32);
         let w3 = g3.add_tensor_concrete("w", &[4096, 4096], DType::F32);
         let out3 = g3.add_tensor_concrete("o", &[1, 4096], DType::F32);
-        let isolated = g3.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![inp3, w3], vec![out3], "generic");
-        assert_eq!(classify_gemm_role(isolated, &g3, &[isolated]), GemmRole::Other);
+        let isolated = g3.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![inp3, w3],
+            vec![out3],
+            "generic",
+        );
+        assert_eq!(
+            classify_gemm_role(isolated, &g3, &[isolated]),
+            GemmRole::Other
+        );
     }
 
     #[test]
     fn test_fusion_benefits_qkv() {
         let benefits = compute_fusion_benefits(
             GemmRole::QkvProjection,
-            &BottleneckType::MemoryBound { bandwidth_utilization: 0.5 },
-            1, 4096, 4096,
+            &BottleneckType::MemoryBound {
+                bandwidth_utilization: 0.5,
+            },
+            1,
+            4096,
+            4096,
         );
         assert!(benefits[&FusionPriority::QkvSharedInput] > 0.0);
         assert!(benefits[&FusionPriority::FfnBlock] == 0.0);
@@ -602,7 +752,15 @@ mod tests {
     fn test_derive_exec_pattern_gemv_decode() {
         // M=1 (decode GEMV) should produce TileGemm with tile_m=1.
         let device = DeviceProfile::detect();
-        let pattern = derive_exec_pattern(1, 4096, 4096, &BottleneckType::MemoryBound { bandwidth_utilization: 0.3 }, &device);
+        let pattern = derive_exec_pattern(
+            1,
+            4096,
+            4096,
+            &BottleneckType::MemoryBound {
+                bandwidth_utilization: 0.3,
+            },
+            &device,
+        );
         match pattern {
             ExecPattern::TileGemm { tile_m, .. } => assert_eq!(tile_m, 1),
             ExecPattern::ScalarLoop => {} // tiny matrix edge case acceptable
@@ -614,22 +772,54 @@ mod tests {
     fn test_derive_exec_pattern_latency_bound_tiny() {
         // Very tiny matrix (M<=1, N*K<=256) should be LatencyBound → ScalarLoop.
         let device = DeviceProfile::detect();
-        let pattern = derive_exec_pattern(1, 8, 16, &BottleneckType::LatencyBound { estimated_latency_ns: 50.0 }, &device);
+        let pattern = derive_exec_pattern(
+            1,
+            8,
+            16,
+            &BottleneckType::LatencyBound {
+                estimated_latency_ns: 50.0,
+            },
+            &device,
+        );
         assert_eq!(pattern, ExecPattern::ScalarLoop);
     }
 
     #[test]
     fn test_derive_exec_pattern_memory_bound_shared_mem_tile() {
         let device = DeviceProfile::detect();
-        let pattern = derive_exec_pattern(64, 256, 256, &BottleneckType::MemoryBound { bandwidth_utilization: 0.2 }, &device);
-        assert!(matches!(pattern, ExecPattern::SharedMemTile { .. }), "memory-bound mid-size should be SharedMemTile, got {:?}", pattern);
+        let pattern = derive_exec_pattern(
+            64,
+            256,
+            256,
+            &BottleneckType::MemoryBound {
+                bandwidth_utilization: 0.2,
+            },
+            &device,
+        );
+        assert!(
+            matches!(pattern, ExecPattern::SharedMemTile { .. }),
+            "memory-bound mid-size should be SharedMemTile, got {:?}",
+            pattern
+        );
     }
 
     #[test]
     fn test_derive_exec_pattern_compute_bound_tile_gemm() {
         let device = DeviceProfile::detect();
-        let pattern = derive_exec_pattern(512, 1024, 1024, &BottleneckType::ComputeBound { compute_utilization: 0.8 }, &device);
-        assert!(matches!(pattern, ExecPattern::TileGemm { .. }), "compute-bound large should be TileGemm, got {:?}", pattern);
+        let pattern = derive_exec_pattern(
+            512,
+            1024,
+            1024,
+            &BottleneckType::ComputeBound {
+                compute_utilization: 0.8,
+            },
+            &device,
+        );
+        assert!(
+            matches!(pattern, ExecPattern::TileGemm { .. }),
+            "compute-bound large should be TileGemm, got {:?}",
+            pattern
+        );
     }
 
     #[test]
@@ -649,7 +839,10 @@ mod tests {
         let device = DeviceProfile::detect();
         let par = derive_parallelism(&device, 512, 4096, 4096);
         match par {
-            ParallelismDesc::SimdVectorize { unroll_factor, element_width } => {
+            ParallelismDesc::SimdVectorize {
+                unroll_factor,
+                element_width,
+            } => {
                 assert!(unroll_factor >= 1);
                 assert!(element_width >= 1);
             }
@@ -662,7 +855,10 @@ mod tests {
         let device = DeviceProfile::detect();
         let par = derive_thread_parallelism(&device);
         match par {
-            ParallelismDesc::ThreadParallel { parallel_dim, granularity } => {
+            ParallelismDesc::ThreadParallel {
+                parallel_dim,
+                granularity,
+            } => {
                 assert_eq!(parallel_dim, device.physical_cores);
                 assert_eq!(granularity, 64);
             }
@@ -674,8 +870,12 @@ mod tests {
     fn test_compute_fusion_benefits_gate_up() {
         let benefits = compute_fusion_benefits(
             GemmRole::GateUpProjection,
-            &BottleneckType::MemoryBound { bandwidth_utilization: 1.0 },
-            1, 11008, 4096,
+            &BottleneckType::MemoryBound {
+                bandwidth_utilization: 1.0,
+            },
+            1,
+            11008,
+            4096,
         );
         assert!(benefits[&FusionPriority::FfnBlock] > 0.0);
         assert!(benefits[&FusionPriority::QkvSharedInput] == 0.0);
@@ -686,29 +886,48 @@ mod tests {
     fn test_compute_fusion_benefits_compute_bound_scales_down() {
         let mem_benefits = compute_fusion_benefits(
             GemmRole::Other,
-            &BottleneckType::MemoryBound { bandwidth_utilization: 1.0 },
-            64, 256, 256,
+            &BottleneckType::MemoryBound {
+                bandwidth_utilization: 1.0,
+            },
+            64,
+            256,
+            256,
         );
         let comp_benefits = compute_fusion_benefits(
             GemmRole::Other,
-            &BottleneckType::ComputeBound { compute_utilization: 0.2 },
-            64, 256, 256,
+            &BottleneckType::ComputeBound {
+                compute_utilization: 0.2,
+            },
+            64,
+            256,
+            256,
         );
         // Compute-bound should scale benefits down by compute_utilization.
-        assert!(comp_benefits[&FusionPriority::EpilogueInjection] < mem_benefits[&FusionPriority::EpilogueInjection]);
+        assert!(
+            comp_benefits[&FusionPriority::EpilogueInjection]
+                < mem_benefits[&FusionPriority::EpilogueInjection]
+        );
     }
 
     #[test]
     fn test_compute_fusion_benefits_tile_level_requires_large_m() {
         let small = compute_fusion_benefits(
             GemmRole::Other,
-            &BottleneckType::MemoryBound { bandwidth_utilization: 1.0 },
-            4, 256, 256,
+            &BottleneckType::MemoryBound {
+                bandwidth_utilization: 1.0,
+            },
+            4,
+            256,
+            256,
         );
         let large = compute_fusion_benefits(
             GemmRole::Other,
-            &BottleneckType::MemoryBound { bandwidth_utilization: 1.0 },
-            128, 256, 256,
+            &BottleneckType::MemoryBound {
+                bandwidth_utilization: 1.0,
+            },
+            128,
+            256,
+            256,
         );
         // TileLevelFusion benefit is 0 for small M, positive for large M.
         assert_eq!(small[&FusionPriority::TileLevelFusion], 0.0);
@@ -718,10 +937,24 @@ mod tests {
     #[test]
     fn test_pick_strategy_lm_head_always_epilogue() {
         let device = DeviceProfile::detect();
-        let strat = pick_strategy(GemmRole::LmHead, &BottleneckType::MemoryBound { bandwidth_utilization: 0.5 }, 1, &device);
+        let strat = pick_strategy(
+            GemmRole::LmHead,
+            &BottleneckType::MemoryBound {
+                bandwidth_utilization: 0.5,
+            },
+            1,
+            &device,
+        );
         assert_eq!(strat, FusionPriority::EpilogueInjection);
 
-        let strat2 = pick_strategy(GemmRole::LmHead, &BottleneckType::ComputeBound { compute_utilization: 0.9 }, 512, &device);
+        let strat2 = pick_strategy(
+            GemmRole::LmHead,
+            &BottleneckType::ComputeBound {
+                compute_utilization: 0.9,
+            },
+            512,
+            &device,
+        );
         assert_eq!(strat2, FusionPriority::EpilogueInjection);
     }
 
@@ -735,9 +968,24 @@ mod tests {
 
         let w_down = g.add_tensor_concrete("w_down", &[4096, 4096], DType::F32);
         let down_out = g.add_tensor_concrete("down_out", &[1, 4096], DType::F32);
-        let down_op = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), vec![silu_out, w_down], vec![down_out], "down_proj");
+        let down_op = g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![silu_out, w_down],
+            vec![down_out],
+            "down_proj",
+        );
 
-        assert_eq!(classify_gemm_role(down_op, &g, &[down_op]), GemmRole::DownProjection);
+        assert_eq!(
+            classify_gemm_role(down_op, &g, &[down_op]),
+            GemmRole::DownProjection
+        );
     }
 
     #[test]
@@ -751,11 +999,26 @@ mod tests {
             let inp = g.add_tensor_concrete(&format!("x{}", i), &[1, 256], DType::F32);
             let w = g.add_tensor_concrete(&format!("w{}", i), &[256, 256], DType::F32);
             let out = g.add_tensor_concrete(&format!("o{}", i), &[1, 256], DType::F32);
-            let op_id = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w], vec![out], &format!("gemm{}", i));
+            let op_id = g.add_op(
+                Op::Gemm(GemmSpec {
+                    m: SymDim::Concrete(1),
+                    n: 256,
+                    k: 256,
+                    dtype: DType::F32,
+                    trans_b: false,
+                    has_bias: false,
+                }),
+                vec![inp, w],
+                vec![out],
+                &format!("gemm{}", i),
+            );
             last_id = Some(op_id);
             gemm_ids_in_order.push(op_id);
         }
-        assert_eq!(classify_gemm_role(last_id.unwrap(), &g, &gemm_ids_in_order), GemmRole::LmHead);
+        assert_eq!(
+            classify_gemm_role(last_id.unwrap(), &g, &gemm_ids_in_order),
+            GemmRole::LmHead
+        );
     }
 
     #[test]
@@ -765,7 +1028,19 @@ mod tests {
         let inp = g.add_tensor_concrete("x", &[1, 256], DType::F32);
         let w = g.add_tensor_concrete("w", &[256, 256], DType::F32);
         let out = g.add_tensor_concrete("o", &[1, 256], DType::F32);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w], vec![out], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![inp, w],
+            vec![out],
+            "gemm",
+        );
 
         let device = DeviceProfile::detect();
         let map = PainPointAnalyzer::analyze(&g, &device);
@@ -787,7 +1062,19 @@ mod tests {
         let inp = g.add_tensor_concrete("x", &[1, 256], DType::F32);
         let w = g.add_tensor_concrete("w", &[256, 256], DType::F32);
         let out = g.add_tensor_concrete("o", &[1, 256], DType::F32);
-        g.add_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: true }), vec![inp, w], vec![out], "gemm_bias");
+        g.add_op(
+            Op::GemmBias(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: true,
+            }),
+            vec![inp, w],
+            vec![out],
+            "gemm_bias",
+        );
 
         let device = DeviceProfile::detect();
         let map = PainPointAnalyzer::analyze(&g, &device);
@@ -805,7 +1092,17 @@ mod tests {
         let inp = g.add_tensor_concrete("x", &[1, 256], DType::F32);
         let w = g.add_tensor_concrete("w", &[256, 256], DType::F32);
         let out = g.add_tensor_concrete("o", &[1, 256], DType::F32);
-        g.add_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, quant_type: crate::quant::QuantType::Q4K }), vec![inp, w], vec![out], "qgemm");
+        g.add_op(
+            Op::QuantGemm(QuantGemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                quant_type: crate::quant::QuantType::Q4K,
+            }),
+            vec![inp, w],
+            vec![out],
+            "qgemm",
+        );
 
         let device = DeviceProfile::detect();
         let map = PainPointAnalyzer::analyze(&g, &device);
@@ -824,7 +1121,22 @@ mod tests {
         let inp = g.add_tensor_concrete("x", &[512, 256], DType::F32);
         let w = g.add_tensor_concrete("w", &[256, 256], DType::F32);
         let out = g.add_tensor_concrete("o", &[512, 256], DType::F32);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Symbolic { name: "seq_len".to_string(), max_value: Some(1024) }, n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w], vec![out], "sym_gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Symbolic {
+                    name: "seq_len".to_string(),
+                    max_value: Some(1024),
+                },
+                n: 256,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![inp, w],
+            vec![out],
+            "sym_gemm",
+        );
 
         let device = DeviceProfile::detect();
         let map = PainPointAnalyzer::analyze(&g, &device);
@@ -845,8 +1157,32 @@ mod tests {
         let up_out = g.add_tensor_concrete("up_out", &[1, 1024], DType::F32);
         let geglu_out = g.add_tensor_concrete("geglu_out", &[1, 1024], DType::F32);
 
-        let gate_op = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w_gate], vec![gate_out], "gate");
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w_up], vec![up_out], "up");
+        let gate_op = g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 1024,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![inp, w_gate],
+            vec![gate_out],
+            "gate",
+        );
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 1024,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![inp, w_up],
+            vec![up_out],
+            "up",
+        );
         g.add_op(Op::GeGlu, vec![gate_out, up_out], vec![geglu_out], "geglu");
 
         // Act
@@ -867,10 +1203,38 @@ mod tests {
         let up_out = g.add_tensor_concrete("up_out", &[1, 512], DType::F32);
         let clipped_out = g.add_tensor_concrete("clipped_out", &[1, 512], DType::F32);
 
-        let gate_op = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w_gate], vec![gate_out], "gate");
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w_up], vec![up_out], "up");
-        g.add_op(Op::SwiGluClipped { limit: 7.0 },
-            vec![gate_out, up_out], vec![clipped_out], "clipped");
+        let gate_op = g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![inp, w_gate],
+            vec![gate_out],
+            "gate",
+        );
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![inp, w_up],
+            vec![up_out],
+            "up",
+        );
+        g.add_op(
+            Op::SwiGluClipped { limit: 7.0 },
+            vec![gate_out, up_out],
+            vec![clipped_out],
+            "clipped",
+        );
 
         // Act
         let role = classify_gemm_role(gate_op, &g, &[gate_op]);
@@ -888,8 +1252,45 @@ mod tests {
         let gemm_out = g.add_tensor_concrete("go", &[1, 256], DType::F32);
         let mha_out = g.add_tensor_concrete("mha_o", &[1, 256], DType::F32);
 
-        let o_proj = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w], vec![gemm_out], "o_proj");
-        g.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 4, num_kv_heads: 2, head_dim: 64 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), kv_cache_layer: 0, kv_write: false  }), vec![gemm_out], vec![mha_out], "mha");
+        let o_proj = g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![inp, w],
+            vec![gemm_out],
+            "o_proj",
+        );
+        g.add_op(
+            Op::MultiHeadAttention(AttentionSpec {
+                geometry: AttentionGeometry {
+                    num_q_heads: 4,
+                    num_kv_heads: 2,
+                    head_dim: 64,
+                },
+                mask: if true {
+                    AttentionMask::Causal
+                } else {
+                    AttentionMask::Full
+                },
+                kv_source: KvSource::FromTensor,
+                sinks: if false {
+                    SinksSpec::Learnable
+                } else {
+                    SinksSpec::None
+                },
+                seq_len: SymDim::Concrete(1),
+                kv_cache_layer: 0,
+                kv_write: false,
+            }),
+            vec![gemm_out],
+            vec![mha_out],
+            "mha",
+        );
 
         // Act
         let role = classify_gemm_role(o_proj, &g, &[o_proj]);
@@ -906,7 +1307,9 @@ mod tests {
         // Act
         let strat = pick_strategy(
             GemmRole::Other,
-            &BottleneckType::ComputeBound { compute_utilization: 0.7 },
+            &BottleneckType::ComputeBound {
+                compute_utilization: 0.7,
+            },
             64,
             &device,
         );
@@ -925,7 +1328,9 @@ mod tests {
         // Act
         let strat = pick_strategy(
             GemmRole::OutputProjection,
-            &BottleneckType::ComputeBound { compute_utilization: 0.9 },
+            &BottleneckType::ComputeBound {
+                compute_utilization: 0.9,
+            },
             large_m,
             &device,
         );
@@ -942,7 +1347,9 @@ mod tests {
         // Act
         let strat = pick_strategy(
             GemmRole::DownProjection,
-            &BottleneckType::LatencyBound { estimated_latency_ns: 200.0 },
+            &BottleneckType::LatencyBound {
+                estimated_latency_ns: 200.0,
+            },
             1,
             &device,
         );
@@ -956,8 +1363,12 @@ mod tests {
         // Arrange: LatencyBound should halve the scale factor to 0.5.
         let benefits = compute_fusion_benefits(
             GemmRole::Other,
-            &BottleneckType::LatencyBound { estimated_latency_ns: 100.0 },
-            32, 128, 128,
+            &BottleneckType::LatencyBound {
+                estimated_latency_ns: 100.0,
+            },
+            32,
+            128,
+            128,
         );
 
         // Act: compute expected EpilogueInjection benefit = output_bytes * 0.5
@@ -966,8 +1377,12 @@ mod tests {
         // Assert: LatencyBound scale=0.5, so EpilogueInjection = output_bytes * 0.5
         let expected = output_bytes * 0.5;
         let actual = benefits[&FusionPriority::EpilogueInjection];
-        assert!((actual - expected).abs() < 1e-6,
-            "expected EpilogueInjection benefit {}, got {}", expected, actual);
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "expected EpilogueInjection benefit {}, got {}",
+            expected,
+            actual
+        );
 
         // Also verify QkvSharedInput and FfnBlock are 0 for Other role.
         assert_eq!(benefits[&FusionPriority::QkvSharedInput], 0.0);
@@ -980,7 +1395,9 @@ mod tests {
     fn test_derive_exec_pattern_gemv_latency_returns_scalar_loop() {
         // Arrange: M=1 with N*K > 256 (not the tiny shortcut), but LatencyBound.
         let device = DeviceProfile::detect();
-        let bottleneck = BottleneckType::LatencyBound { estimated_latency_ns: 80.0 };
+        let bottleneck = BottleneckType::LatencyBound {
+            estimated_latency_ns: 80.0,
+        };
 
         // Act
         let pattern = derive_exec_pattern(1, 512, 512, &bottleneck, &device);
@@ -995,7 +1412,9 @@ mod tests {
         let device = DeviceProfile::detect();
         let (tm_base, _, _) = device.gemm_tile_sizes();
         let m = if tm_base > 2 { tm_base / 2 } else { 1 };
-        let bottleneck = BottleneckType::ComputeBound { compute_utilization: 0.9 };
+        let bottleneck = BottleneckType::ComputeBound {
+            compute_utilization: 0.9,
+        };
 
         // Act
         let pattern = derive_exec_pattern(m, 1024, 1024, &bottleneck, &device);
@@ -1013,7 +1432,9 @@ mod tests {
         let device = DeviceProfile::detect();
         let (_, tn_base, _) = device.gemm_tile_sizes();
         let n = if tn_base > 4 { tn_base / 2 } else { 2 };
-        let bottleneck = BottleneckType::ComputeBound { compute_utilization: 0.8 };
+        let bottleneck = BottleneckType::ComputeBound {
+            compute_utilization: 0.8,
+        };
 
         // Act
         let pattern = derive_exec_pattern(256, n, 1024, &bottleneck, &device);
@@ -1032,7 +1453,9 @@ mod tests {
         let (_, _, tk_base) = device.gemm_tile_sizes();
         let k = tk_base * 5 + 10; // definitely > 4 * tk_base
         let expected_tk = (tk_base / 2).max(1);
-        let bottleneck = BottleneckType::ComputeBound { compute_utilization: 0.9 };
+        let bottleneck = BottleneckType::ComputeBound {
+            compute_utilization: 0.9,
+        };
 
         // Act
         let pattern = derive_exec_pattern(256, 256, k, &bottleneck, &device);
@@ -1049,16 +1472,24 @@ mod tests {
         // Arrange: ComputeBound with very low utilization should clamp to 0.1.
         let benefits = compute_fusion_benefits(
             GemmRole::Other,
-            &BottleneckType::ComputeBound { compute_utilization: 0.01 },
-            64, 256, 256,
+            &BottleneckType::ComputeBound {
+                compute_utilization: 0.01,
+            },
+            64,
+            256,
+            256,
         );
         let output_bytes = (64usize * 256) as f64 * 4.0;
 
         // Assert: scale clamped to 0.1, so EpilogueInjection = output_bytes * 0.1.
         let expected = output_bytes * 0.1;
         let actual = benefits[&FusionPriority::EpilogueInjection];
-        assert!((actual - expected).abs() < 1e-6,
-            "expected clamped benefit {}, got {}", expected, actual);
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "expected clamped benefit {}, got {}",
+            expected,
+            actual
+        );
     }
 
     #[test]
@@ -1071,7 +1502,10 @@ mod tests {
 
         // Assert: unroll_factor == 1 (same as M=1 decode path).
         match par {
-            ParallelismDesc::SimdVectorize { unroll_factor, element_width } => {
+            ParallelismDesc::SimdVectorize {
+                unroll_factor,
+                element_width,
+            } => {
                 assert_eq!(unroll_factor, 1);
                 assert!(element_width >= 1);
             }
@@ -1087,7 +1521,9 @@ mod tests {
         // Act
         let strat = pick_strategy(
             GemmRole::OutputProjection,
-            &BottleneckType::MemoryBound { bandwidth_utilization: 0.4 },
+            &BottleneckType::MemoryBound {
+                bandwidth_utilization: 0.4,
+            },
             1,
             &device,
         );
@@ -1104,7 +1540,9 @@ mod tests {
         // Act
         let strat = pick_strategy(
             GemmRole::Other,
-            &BottleneckType::MemoryBound { bandwidth_utilization: 0.6 },
+            &BottleneckType::MemoryBound {
+                bandwidth_utilization: 0.6,
+            },
             32,
             &device,
         );
@@ -1120,7 +1558,19 @@ mod tests {
         let inp = g.add_tensor_concrete("x", &[64, 256], DType::F32);
         let w = g.add_tensor_concrete("w", &[256, 512], DType::F32);
         let out = g.add_tensor_concrete("o", &[64, 512], DType::F32);
-        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w], vec![out], "gemm");
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(64),
+                n: 512,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![inp, w],
+            vec![out],
+            "gemm",
+        );
 
         let device = DeviceProfile::detect();
         let map = PainPointAnalyzer::analyze(&g, &device);
@@ -1149,15 +1599,22 @@ mod tests {
             FusionPriority::FfnBlock,
             FusionPriority::LoopFusion,
         ] {
-            assert!(bn.fusion_benefits.contains_key(&priority),
-                "missing benefit for {:?}", priority);
+            assert!(
+                bn.fusion_benefits.contains_key(&priority),
+                "missing benefit for {:?}",
+                priority
+            );
         }
 
         // ExecPattern and parallelism are populated (not default-zero).
-        assert!(matches!(bn.exec_pattern,
-            ExecPattern::TileGemm { .. } | ExecPattern::SharedMemTile { .. }));
-        assert!(matches!(bn.parallelism,
-            ParallelismDesc::SimdVectorize { .. }));
+        assert!(matches!(
+            bn.exec_pattern,
+            ExecPattern::TileGemm { .. } | ExecPattern::SharedMemTile { .. }
+        ));
+        assert!(matches!(
+            bn.parallelism,
+            ParallelismDesc::SimdVectorize { .. }
+        ));
     }
 
     #[test]
@@ -1165,8 +1622,12 @@ mod tests {
         // Arrange: DownProjection role — ComputeRoot should always be positive.
         let benefits = compute_fusion_benefits(
             GemmRole::DownProjection,
-            &BottleneckType::MemoryBound { bandwidth_utilization: 1.0 },
-            64, 2048, 4096,
+            &BottleneckType::MemoryBound {
+                bandwidth_utilization: 1.0,
+            },
+            64,
+            2048,
+            4096,
         );
 
         // Assert: ComputeRoot is input_bytes * 1.0 * 0.3 > 0.
@@ -1187,11 +1648,15 @@ mod tests {
     #[test]
     fn test_bottleneck_memory_bound_propagates_utilization() {
         // Arrange: Create a MemoryBound bottleneck with a specific utilization.
-        let bn = BottleneckType::MemoryBound { bandwidth_utilization: 0.37 };
+        let bn = BottleneckType::MemoryBound {
+            bandwidth_utilization: 0.37,
+        };
 
         // Act & Assert: Verify the value is correctly stored and retrievable.
         match bn {
-            BottleneckType::MemoryBound { bandwidth_utilization } => {
+            BottleneckType::MemoryBound {
+                bandwidth_utilization,
+            } => {
                 assert!((bandwidth_utilization - 0.37).abs() < 1e-10);
             }
             other => panic!("expected MemoryBound, got {:?}", other),
@@ -1201,11 +1666,15 @@ mod tests {
     #[test]
     fn test_bottleneck_compute_bound_propagates_utilization() {
         // Arrange: Create a ComputeBound bottleneck with a specific utilization.
-        let bn = BottleneckType::ComputeBound { compute_utilization: 0.83 };
+        let bn = BottleneckType::ComputeBound {
+            compute_utilization: 0.83,
+        };
 
         // Act & Assert: Verify the value is correctly stored and retrievable.
         match bn {
-            BottleneckType::ComputeBound { compute_utilization } => {
+            BottleneckType::ComputeBound {
+                compute_utilization,
+            } => {
                 assert!((compute_utilization - 0.83).abs() < 1e-10);
             }
             other => panic!("expected ComputeBound, got {:?}", other),
@@ -1216,18 +1685,30 @@ mod tests {
     fn test_exec_pattern_tile_gemm_equality() {
         // Arrange: Two identical TileGemm patterns.
         let a = ExecPattern::TileGemm {
-            tile_m: 64, tile_n: 32, tile_k: 128,
-            warp_m: 16, warp_n: 8, mma_k: 4,
+            tile_m: 64,
+            tile_n: 32,
+            tile_k: 128,
+            warp_m: 16,
+            warp_n: 8,
+            mma_k: 4,
             pipeline_depth: 2,
         };
         let b = ExecPattern::TileGemm {
-            tile_m: 64, tile_n: 32, tile_k: 128,
-            warp_m: 16, warp_n: 8, mma_k: 4,
+            tile_m: 64,
+            tile_n: 32,
+            tile_k: 128,
+            warp_m: 16,
+            warp_n: 8,
+            mma_k: 4,
             pipeline_depth: 2,
         };
         let c = ExecPattern::TileGemm {
-            tile_m: 64, tile_n: 32, tile_k: 128,
-            warp_m: 16, warp_n: 8, mma_k: 4,
+            tile_m: 64,
+            tile_n: 32,
+            tile_k: 128,
+            warp_m: 16,
+            warp_n: 8,
+            mma_k: 4,
             pipeline_depth: 3, // different pipeline_depth
         };
 
@@ -1239,9 +1720,18 @@ mod tests {
     #[test]
     fn test_exec_pattern_shared_mem_tile_equality() {
         // Arrange: Two SharedMemTile patterns with same and different fields.
-        let a = ExecPattern::SharedMemTile { tile_rows: 32, tile_cols: 64 };
-        let b = ExecPattern::SharedMemTile { tile_rows: 32, tile_cols: 64 };
-        let c = ExecPattern::SharedMemTile { tile_rows: 16, tile_cols: 64 };
+        let a = ExecPattern::SharedMemTile {
+            tile_rows: 32,
+            tile_cols: 64,
+        };
+        let b = ExecPattern::SharedMemTile {
+            tile_rows: 32,
+            tile_cols: 64,
+        };
+        let c = ExecPattern::SharedMemTile {
+            tile_rows: 16,
+            tile_cols: 64,
+        };
 
         // Assert: PartialEq works on SharedMemTile fields.
         assert_eq!(a, b);
@@ -1258,7 +1748,10 @@ mod tests {
 
         // Act & Assert: Verify field extraction.
         match desc {
-            ParallelismDesc::SimdVectorize { element_width, unroll_factor } => {
+            ParallelismDesc::SimdVectorize {
+                element_width,
+                unroll_factor,
+            } => {
                 assert_eq!(element_width, 16);
                 assert_eq!(unroll_factor, 4);
             }
@@ -1289,8 +1782,12 @@ mod tests {
         // Arrange: compute_fusion_benefits for any valid input should produce 7 entries.
         let benefits = compute_fusion_benefits(
             GemmRole::LmHead,
-            &BottleneckType::ComputeBound { compute_utilization: 0.5 },
-            1, 4096, 4096,
+            &BottleneckType::ComputeBound {
+                compute_utilization: 0.5,
+            },
+            1,
+            4096,
+            4096,
         );
 
         // Assert: exactly 7 FusionPriority variants.
@@ -1306,8 +1803,11 @@ mod tests {
             FusionPriority::FfnBlock,
             FusionPriority::LoopFusion,
         ] {
-            assert!(benefits.contains_key(&priority),
-                "missing {:?} in benefits map", priority);
+            assert!(
+                benefits.contains_key(&priority),
+                "missing {:?} in benefits map",
+                priority
+            );
         }
     }
 
@@ -1316,13 +1816,21 @@ mod tests {
         // Arrange: M=0 yields zero output_bytes and zero input_bytes.
         let benefits = compute_fusion_benefits(
             GemmRole::Other,
-            &BottleneckType::MemoryBound { bandwidth_utilization: 1.0 },
-            0, 256, 256,
+            &BottleneckType::MemoryBound {
+                bandwidth_utilization: 1.0,
+            },
+            0,
+            256,
+            256,
         );
 
         // Assert: All benefits should be zero since M=0 → output_bytes=0, input_bytes=0.
         for (&priority, &val) in &benefits {
-            assert_eq!(val, 0.0, "benefit for {:?} should be 0 when M=0, got {}", priority, val);
+            assert_eq!(
+                val, 0.0,
+                "benefit for {:?} should be 0 when M=0, got {}",
+                priority, val
+            );
         }
     }
 
@@ -1332,7 +1840,15 @@ mod tests {
         let device = DeviceProfile::detect();
 
         // Act: M=1, N=8, K=32 → N*K = 256 <= 256.
-        let pattern = derive_exec_pattern(1, 8, 32, &BottleneckType::MemoryBound { bandwidth_utilization: 0.5 }, &device);
+        let pattern = derive_exec_pattern(
+            1,
+            8,
+            32,
+            &BottleneckType::MemoryBound {
+                bandwidth_utilization: 0.5,
+            },
+            &device,
+        );
 
         // Assert: tiny matrix → ScalarLoop regardless of bottleneck type.
         assert_eq!(pattern, ExecPattern::ScalarLoop);
@@ -1343,14 +1859,21 @@ mod tests {
         // Arrange: M=1 (GEMV) with MemoryBound — not LatencyBound and not tiny.
         let device = DeviceProfile::detect();
         let (_, tn_base, tk_base) = device.gemm_tile_sizes();
-        let bottleneck = BottleneckType::MemoryBound { bandwidth_utilization: 0.2 };
+        let bottleneck = BottleneckType::MemoryBound {
+            bandwidth_utilization: 0.2,
+        };
 
         // Act
         let pattern = derive_exec_pattern(1, 2048, 4096, &bottleneck, &device);
 
         // Assert: GEMV + non-LatencyBound → TileGemm with tile_m=1.
         match pattern {
-            ExecPattern::TileGemm { tile_m, tile_n, tile_k, .. } => {
+            ExecPattern::TileGemm {
+                tile_m,
+                tile_n,
+                tile_k,
+                ..
+            } => {
                 assert_eq!(tile_m, 1, "GEMV tile_m must be 1");
                 assert_eq!(tile_n, tn_base, "tile_n should be tn_base");
                 assert_eq!(tile_k, tk_base, "tile_k should be tk_base");

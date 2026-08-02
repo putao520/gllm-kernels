@@ -23,12 +23,17 @@ pub trait IsvGemm {
     /// # Safety
     /// Pointers must be valid and dimensions must match.
     unsafe fn sgemm(
-        m: usize, n: usize, k: usize,
+        m: usize,
+        n: usize,
+        k: usize,
         alpha: f32,
-        a: *const f32, lda: usize,
-        b: *const f32, ldb: usize,
+        a: *const f32,
+        lda: usize,
+        b: *const f32,
+        ldb: usize,
         beta: f32,
-        c: *mut f32, ldc: usize,
+        c: *mut f32,
+        ldc: usize,
     ) -> Result<(), CompilerError>;
 
     /// Execute HGEMM: C = alpha * A * B + beta * C (F16, stored as u16)
@@ -38,12 +43,17 @@ pub trait IsvGemm {
     /// # Safety
     /// Pointers must be valid and dimensions must match.
     unsafe fn hgemm(
-        _m: usize, _n: usize, _k: usize,
+        _m: usize,
+        _n: usize,
+        _k: usize,
         _alpha: f32,
-        _a: *const u16, _lda: usize,
-        _b: *const u16, _ldb: usize,
+        _a: *const u16,
+        _lda: usize,
+        _b: *const u16,
+        _ldb: usize,
         _beta: f32,
-        _c: *mut u16, _ldc: usize,
+        _c: *mut u16,
+        _ldc: usize,
     ) -> Result<(), CompilerError> {
         Err("HGEMM not supported by this backend".into())
     }
@@ -70,15 +80,24 @@ pub trait IsvGemm {
 /// Pointers must be valid and dimensions must match.
 #[no_mangle]
 pub unsafe extern "C" fn isv_sgemm_trampoline(
-    m: usize, n: usize, k: usize,
+    m: usize,
+    n: usize,
+    k: usize,
     alpha: f32,
-    a: *const f32, lda: usize,
-    b: *const f32, ldb: usize,
+    a: *const f32,
+    lda: usize,
+    b: *const f32,
+    ldb: usize,
     beta: f32,
-    c: *mut f32, ldc: usize,
+    c: *mut f32,
+    ldc: usize,
 ) -> i32 {
     let result = dispatch_isv_sgemm(m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
-    if result.is_ok() { 0 } else { -1 }
+    if result.is_ok() {
+        0
+    } else {
+        -1
+    }
 }
 
 /// Get the function pointer to the ISV SGEMM trampoline for embedding in JIT code.
@@ -87,12 +106,17 @@ pub fn isv_sgemm_fn_ptr() -> usize {
 }
 
 unsafe fn dispatch_isv_sgemm(
-    m: usize, n: usize, k: usize,
+    m: usize,
+    n: usize,
+    k: usize,
     alpha: f32,
-    a: *const f32, lda: usize,
-    b: *const f32, ldb: usize,
+    a: *const f32,
+    lda: usize,
+    b: *const f32,
+    ldb: usize,
     beta: f32,
-    c: *mut f32, ldc: usize,
+    c: *mut f32,
+    ldc: usize,
 ) -> Result<(), CompilerError> {
     // Try oneDNN first (x86_64 Linux)
     #[cfg(feature = "onednn")]
@@ -106,7 +130,9 @@ unsafe fn dispatch_isv_sgemm(
     #[cfg(feature = "accelerate")]
     {
         if accelerate::AccelerateBackend::is_available() {
-            return accelerate::AccelerateBackend::sgemm(m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
+            return accelerate::AccelerateBackend::sgemm(
+                m, n, k, alpha, a, lda, b, ldb, beta, c, ldc,
+            );
         }
     }
 
@@ -132,14 +158,21 @@ mod tests {
     struct MockBackend;
 
     impl IsvGemm for MockBackend {
-        fn is_available() -> bool { false }
+        fn is_available() -> bool {
+            false
+        }
         unsafe fn sgemm(
-            _m: usize, _n: usize, _k: usize,
+            _m: usize,
+            _n: usize,
+            _k: usize,
             _alpha: f32,
-            _a: *const f32, _lda: usize,
-            _b: *const f32, _ldb: usize,
+            _a: *const f32,
+            _lda: usize,
+            _b: *const f32,
+            _ldb: usize,
             _beta: f32,
-            _c: *mut f32, _ldc: usize,
+            _c: *mut f32,
+            _ldc: usize,
         ) -> Result<(), CompilerError> {
             Ok(())
         }
@@ -148,11 +181,25 @@ mod tests {
     #[test]
     fn isv_hgemm_default_returns_error() {
         let result = unsafe {
-            MockBackend::hgemm(0, 0, 0, 0.0, std::ptr::null(), 0,
-                std::ptr::null(), 0, 0.0, std::ptr::null_mut(), 0)
+            MockBackend::hgemm(
+                0,
+                0,
+                0,
+                0.0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                0.0,
+                std::ptr::null_mut(),
+                0,
+            )
         };
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("HGEMM not supported"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("HGEMM not supported"));
     }
 
     #[test]
@@ -168,7 +215,19 @@ mod tests {
         let a = [1.0f32; 4];
         let b = [1.0f32; 4];
         let result = unsafe {
-            dispatch_isv_sgemm(2, 2, 1, 1.0, a.as_ptr(), 2, b.as_ptr(), 2, 0.0, c.as_mut_ptr(), 2)
+            dispatch_isv_sgemm(
+                2,
+                2,
+                1,
+                1.0,
+                a.as_ptr(),
+                2,
+                b.as_ptr(),
+                2,
+                0.0,
+                c.as_mut_ptr(),
+                2,
+            )
         };
         // Without onednn/accelerate features, this should error
         assert!(result.is_err() || result.is_ok());
@@ -182,7 +241,19 @@ mod tests {
         let a = [1.0f32];
         let b = [1.0f32];
         let result = unsafe {
-            isv_sgemm_trampoline(1, 1, 1, 1.0, a.as_ptr(), 1, b.as_ptr(), 1, 0.0, c.as_mut_ptr(), 1)
+            isv_sgemm_trampoline(
+                1,
+                1,
+                1,
+                1.0,
+                a.as_ptr(),
+                1,
+                b.as_ptr(),
+                1,
+                0.0,
+                c.as_mut_ptr(),
+                1,
+            )
         };
         // Without ISV features enabled, should return -1
         #[cfg(not(any(feature = "onednn", feature = "accelerate")))]
@@ -199,7 +270,19 @@ mod tests {
         let a = [1.0f32];
         let b = [1.0f32];
         let result = unsafe {
-            MockBackend::sgemm(1, 1, 1, 1.0, a.as_ptr(), 1, b.as_ptr(), 1, 0.0, c.as_mut_ptr(), 1)
+            MockBackend::sgemm(
+                1,
+                1,
+                1,
+                1.0,
+                a.as_ptr(),
+                1,
+                b.as_ptr(),
+                1,
+                0.0,
+                c.as_mut_ptr(),
+                1,
+            )
         };
         assert!(result.is_ok());
     }
@@ -223,12 +306,36 @@ mod tests {
         let a = [0.0f32; 4];
         let b = [0.0f32; 4];
         let sgemm_result = unsafe {
-            MockBackend::sgemm(2, 2, 1, 1.0, a.as_ptr(), 2, b.as_ptr(), 2, 0.0, c.as_mut_ptr(), 2)
+            MockBackend::sgemm(
+                2,
+                2,
+                1,
+                1.0,
+                a.as_ptr(),
+                2,
+                b.as_ptr(),
+                2,
+                0.0,
+                c.as_mut_ptr(),
+                2,
+            )
         };
         assert!(sgemm_result.is_ok());
 
         let hgemm_result = unsafe {
-            MockBackend::hgemm(2, 2, 1, 1.0, std::ptr::null(), 2, std::ptr::null(), 2, 0.0, std::ptr::null_mut(), 2)
+            MockBackend::hgemm(
+                2,
+                2,
+                1,
+                1.0,
+                std::ptr::null(),
+                2,
+                std::ptr::null(),
+                2,
+                0.0,
+                std::ptr::null_mut(),
+                2,
+            )
         };
         assert!(hgemm_result.is_err());
     }

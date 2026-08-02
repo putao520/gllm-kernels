@@ -5,10 +5,10 @@
 //! them into `SymValue::Select` nodes. The simplifier then reduces
 //! `Select(a > b, a, b) → Max(a, b)` etc.
 
-use std::collections::HashMap;
 use super::cfg::{BasicBlock, BlockId, BranchKind, ControlFlowGraph, Terminator};
 use super::engine::SymbolicExecutor;
 use super::sym_value::{SelectKind, SymValue};
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Diamond pattern detection
@@ -35,10 +35,7 @@ pub struct Diamond {
 /// and both T and F have exactly one successor, and that successor is the same
 /// merge block M. Additionally, T and F must each be a single basic block
 /// (no further branching within the diamond arms).
-pub fn find_diamonds(
-    cfg: &ControlFlowGraph,
-    block_ids: &[BlockId],
-) -> Vec<Diamond> {
+pub fn find_diamonds(cfg: &ControlFlowGraph, block_ids: &[BlockId]) -> Vec<Diamond> {
     let block_set: std::collections::BTreeSet<BlockId> = block_ids.iter().copied().collect();
     let mut diamonds = Vec::new();
 
@@ -48,15 +45,28 @@ pub fn find_diamonds(
             None => continue,
         };
 
-        if let Terminator::CondBranch { kind, taken, fallthrough } = &block.terminator {
+        if let Terminator::CondBranch {
+            kind,
+            taken,
+            fallthrough,
+        } = &block.terminator
+        {
             // Both arms must be in our block set.
             if !block_set.contains(taken) || !block_set.contains(fallthrough) {
                 continue;
             }
 
             // Each arm must have exactly one successor (the merge point).
-            let taken_succs = cfg.successors.get(taken).map(|v| v.as_slice()).unwrap_or(&[]);
-            let fall_succs = cfg.successors.get(fallthrough).map(|v| v.as_slice()).unwrap_or(&[]);
+            let taken_succs = cfg
+                .successors
+                .get(taken)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let fall_succs = cfg
+                .successors
+                .get(fallthrough)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
 
             if taken_succs.len() != 1 || fall_succs.len() != 1 {
                 continue;
@@ -101,11 +111,12 @@ pub fn merge_diamond(
     let select_kind = branch_kind_to_select(&diamond.kind);
 
     // Get the comparison flags from the executor (set by ucomiss/comiss).
-    let (cond_lhs, cond_rhs) = exec.get_flags()
-        .unwrap_or_else(|| (
+    let (cond_lhs, cond_rhs) = exec.get_flags().unwrap_or_else(|| {
+        (
             SymValue::Unknown("cmp_lhs".into()),
             SymValue::Unknown("cmp_rhs".into()),
-        ));
+        )
+    });
 
     // Execute the "taken" path.
     let mut taken_exec = exec.snapshot();
@@ -128,7 +139,8 @@ pub fn merge_diamond(
     let mut merged = exec.snapshot();
 
     // Collect all registers that appear in either path.
-    let mut all_regs: Vec<String> = taken_state.keys()
+    let mut all_regs: Vec<String> = taken_state
+        .keys()
         .chain(fall_state.keys())
         .chain(pre_state.keys())
         .cloned()
@@ -137,10 +149,8 @@ pub fn merge_diamond(
     all_regs.dedup();
 
     for reg in &all_regs {
-        let taken_val = taken_state.get(reg)
-            .or_else(|| pre_state.get(reg));
-        let fall_val = fall_state.get(reg)
-            .or_else(|| pre_state.get(reg));
+        let taken_val = taken_state.get(reg).or_else(|| pre_state.get(reg));
+        let fall_val = fall_state.get(reg).or_else(|| pre_state.get(reg));
 
         match (taken_val, fall_val) {
             (Some(tv), Some(fv)) => {
@@ -173,7 +183,8 @@ pub fn merge_diamond(
     let fall_stack = fall_exec.stack_state();
     let pre_stack = exec.stack_state();
 
-    let mut all_offsets: Vec<i64> = taken_stack.keys()
+    let mut all_offsets: Vec<i64> = taken_stack
+        .keys()
         .chain(fall_stack.keys())
         .chain(pre_stack.keys())
         .copied()
@@ -182,10 +193,8 @@ pub fn merge_diamond(
     all_offsets.dedup();
 
     for offset in &all_offsets {
-        let taken_val = taken_stack.get(offset)
-            .or_else(|| pre_stack.get(offset));
-        let fall_val = fall_stack.get(offset)
-            .or_else(|| pre_stack.get(offset));
+        let taken_val = taken_stack.get(offset).or_else(|| pre_stack.get(offset));
+        let fall_val = fall_stack.get(offset).or_else(|| pre_stack.get(offset));
 
         match (taken_val, fall_val) {
             (Some(tv), Some(fv)) => {
@@ -260,8 +269,9 @@ fn branch_kind_to_select(kind: &BranchKind) -> SelectKind {
         BranchKind::Equal => SelectKind::Eq,
         BranchKind::NotEqual => SelectKind::Ne,
         // Parity/sign flags — rare for float select, map to Ne as fallback.
-        BranchKind::Sign | BranchKind::NotSign
-        | BranchKind::Parity | BranchKind::NotParity => SelectKind::Ne,
+        BranchKind::Sign | BranchKind::NotSign | BranchKind::Parity | BranchKind::NotParity => {
+            SelectKind::Ne
+        }
     }
 }
 
@@ -438,8 +448,8 @@ mod tests {
             kind: SelectKind::Gt,
             cond_lhs: Box::new(cond_lhs),
             cond_rhs: Box::new(cond_rhs),
-            true_val: Box::new(SymValue::Param(0)),       // taken: keep xmm0
-            false_val: Box::new(SymValue::Const(0.0)),     // fall: xmm0 = 0
+            true_val: Box::new(SymValue::Param(0)), // taken: keep xmm0
+            false_val: Box::new(SymValue::Const(0.0)), // fall: xmm0 = 0
         };
 
         let simplified = select.simplify();
@@ -590,7 +600,10 @@ mod tests {
         let diamonds = find_diamonds(&cfg, &block_ids);
 
         // Assert: no diamond because the merge points differ
-        assert!(diamonds.is_empty(), "divergent merge should not form a diamond");
+        assert!(
+            diamonds.is_empty(),
+            "divergent merge should not form a diamond"
+        );
     }
 
     // @trace TEST-BM-09 [req:REQ-JIT] [level:unit]
@@ -606,14 +619,20 @@ mod tests {
 
         // Act & Assert: empty input
         let diamonds = find_diamonds(&cfg, &[]);
-        assert!(diamonds.is_empty(), "empty block list should yield no diamonds");
+        assert!(
+            diamonds.is_empty(),
+            "empty block list should yield no diamonds"
+        );
 
         // Arrange: blocks with IDs not present in the CFG
         let block_ids = vec![BlockId(99), BlockId(100)];
 
         // Act & Assert: missing blocks should be skipped gracefully
         let diamonds = find_diamonds(&cfg, &block_ids);
-        assert!(diamonds.is_empty(), "missing blocks should yield no diamonds");
+        assert!(
+            diamonds.is_empty(),
+            "missing blocks should yield no diamonds"
+        );
     }
 
     // @trace TEST-BM-11 [req:REQ-JIT] [level:unit]
@@ -621,19 +640,34 @@ mod tests {
     fn test_branch_kind_to_select_all_mappings() {
         // Arrange & Act & Assert: verify every BranchKind maps to the correct SelectKind
         assert_eq!(branch_kind_to_select(&BranchKind::Above), SelectKind::Gt);
-        assert_eq!(branch_kind_to_select(&BranchKind::AboveEqual), SelectKind::Ge);
+        assert_eq!(
+            branch_kind_to_select(&BranchKind::AboveEqual),
+            SelectKind::Ge
+        );
         assert_eq!(branch_kind_to_select(&BranchKind::Below), SelectKind::Lt);
-        assert_eq!(branch_kind_to_select(&BranchKind::BelowEqual), SelectKind::Le);
+        assert_eq!(
+            branch_kind_to_select(&BranchKind::BelowEqual),
+            SelectKind::Le
+        );
         assert_eq!(branch_kind_to_select(&BranchKind::Greater), SelectKind::Gt);
-        assert_eq!(branch_kind_to_select(&BranchKind::GreaterEqual), SelectKind::Ge);
+        assert_eq!(
+            branch_kind_to_select(&BranchKind::GreaterEqual),
+            SelectKind::Ge
+        );
         assert_eq!(branch_kind_to_select(&BranchKind::Less), SelectKind::Lt);
-        assert_eq!(branch_kind_to_select(&BranchKind::LessEqual), SelectKind::Le);
+        assert_eq!(
+            branch_kind_to_select(&BranchKind::LessEqual),
+            SelectKind::Le
+        );
         assert_eq!(branch_kind_to_select(&BranchKind::Equal), SelectKind::Eq);
         assert_eq!(branch_kind_to_select(&BranchKind::NotEqual), SelectKind::Ne);
         assert_eq!(branch_kind_to_select(&BranchKind::Sign), SelectKind::Ne);
         assert_eq!(branch_kind_to_select(&BranchKind::NotSign), SelectKind::Ne);
         assert_eq!(branch_kind_to_select(&BranchKind::Parity), SelectKind::Ne);
-        assert_eq!(branch_kind_to_select(&BranchKind::NotParity), SelectKind::Ne);
+        assert_eq!(
+            branch_kind_to_select(&BranchKind::NotParity),
+            SelectKind::Ne
+        );
     }
 
     // @trace TEST-BM-12 [req:REQ-JIT] [level:unit]
@@ -794,7 +828,13 @@ mod tests {
 
         // Assert: should remain a Select since Eq with symbolic args doesn't match Max/Min
         assert!(
-            matches!(simplified, SymValue::Select { kind: SelectKind::Eq, .. }),
+            matches!(
+                simplified,
+                SymValue::Select {
+                    kind: SelectKind::Eq,
+                    ..
+                }
+            ),
             "symbolic Eq Select should stay as Select, got: {simplified}"
         );
     }
@@ -971,7 +1011,10 @@ mod tests {
 
         // Executor with no flags set (no ucomiss executed)
         let exec = SymbolicExecutor::new(1, 0);
-        assert!(exec.get_flags().is_none(), "precondition: no flags should be set");
+        assert!(
+            exec.get_flags().is_none(),
+            "precondition: no flags should be set"
+        );
 
         // Act
         let merged = merge_diamond(&diamond, &cfg, &exec);
@@ -1232,10 +1275,16 @@ mod tests {
         let mut successors = std::collections::BTreeMap::new();
         successors.insert(b0, vec![b1]);
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
         let diamonds = find_diamonds(&cfg, &[b0, b1]);
-        assert!(diamonds.is_empty(), "unconditional jump should not form diamond");
+        assert!(
+            diamonds.is_empty(),
+            "unconditional jump should not form diamond"
+        );
     }
 
     #[test]
@@ -1246,15 +1295,28 @@ mod tests {
         let b3 = BlockId(3);
         let b4 = BlockId(4);
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::Above, taken: b1, fallthrough: b2 },
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Above,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
         let block1 = BasicBlock {
-            id: b1, start_addr: 10, end_addr: 20, instructions: vec![],
+            id: b1,
+            start_addr: 10,
+            end_addr: 20,
+            instructions: vec![],
             terminator: Terminator::Jump(b3),
         };
         let block2 = BasicBlock {
-            id: b2, start_addr: 20, end_addr: 30, instructions: vec![],
+            id: b2,
+            start_addr: 20,
+            end_addr: 30,
+            instructions: vec![],
             terminator: Terminator::Jump(b4),
         };
         let mut blocks = std::collections::BTreeMap::new();
@@ -1266,10 +1328,16 @@ mod tests {
         successors.insert(b1, vec![b3]);
         successors.insert(b2, vec![b4]);
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
         let diamonds = find_diamonds(&cfg, &[b0, b1, b2, b3, b4]);
-        assert!(diamonds.is_empty(), "different merge points should not form diamond");
+        assert!(
+            diamonds.is_empty(),
+            "different merge points should not form diamond"
+        );
     }
 
     #[test]
@@ -1279,19 +1347,35 @@ mod tests {
         let b2 = BlockId(2);
         let b3 = BlockId(3);
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::Above, taken: b1, fallthrough: b2 },
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Above,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
         let block1 = BasicBlock {
-            id: b1, start_addr: 10, end_addr: 20, instructions: vec![],
+            id: b1,
+            start_addr: 10,
+            end_addr: 20,
+            instructions: vec![],
             terminator: Terminator::Jump(b3),
         };
         let block2 = BasicBlock {
-            id: b2, start_addr: 20, end_addr: 30, instructions: vec![],
+            id: b2,
+            start_addr: 20,
+            end_addr: 30,
+            instructions: vec![],
             terminator: Terminator::Jump(b3),
         };
         let block3 = BasicBlock {
-            id: b3, start_addr: 30, end_addr: 40, instructions: vec![],
+            id: b3,
+            start_addr: 30,
+            end_addr: 40,
+            instructions: vec![],
             terminator: Terminator::Return,
         };
         let mut blocks = std::collections::BTreeMap::new();
@@ -1304,10 +1388,16 @@ mod tests {
         successors.insert(b1, vec![b3]);
         successors.insert(b2, vec![b3]);
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
         let diamond = Diamond {
-            cond_block: b0, taken_block: b1, fallthrough_block: b2, merge_block: b3,
+            cond_block: b0,
+            taken_block: b1,
+            fallthrough_block: b2,
+            merge_block: b3,
             kind: BranchKind::Above,
         };
         let exec = SymbolicExecutor::new(1, 0);
@@ -1324,7 +1414,10 @@ mod tests {
         assert_eq!(branch_kind_to_select(&BranchKind::Sign), SelectKind::Ne);
         assert_eq!(branch_kind_to_select(&BranchKind::NotSign), SelectKind::Ne);
         assert_eq!(branch_kind_to_select(&BranchKind::Parity), SelectKind::Ne);
-        assert_eq!(branch_kind_to_select(&BranchKind::NotParity), SelectKind::Ne);
+        assert_eq!(
+            branch_kind_to_select(&BranchKind::NotParity),
+            SelectKind::Ne
+        );
     }
 
     #[test]
@@ -1338,7 +1431,13 @@ mod tests {
         };
         let simplified = select.simplify();
         assert!(
-            matches!(simplified, SymValue::Select { kind: SelectKind::Ne, .. }),
+            matches!(
+                simplified,
+                SymValue::Select {
+                    kind: SelectKind::Ne,
+                    ..
+                }
+            ),
             "symbolic Ne Select should stay as Select, got: {simplified}"
         );
     }
@@ -1360,8 +1459,16 @@ mod tests {
             start_addr: 10,
             end_addr: 20,
             instructions: vec![
-                DecodedInsn { mnemonic: "xorps".to_string(), operands: vec!["xmm1".to_string(), "xmm1".to_string()], addr: 10 },
-                DecodedInsn { mnemonic: "movss".to_string(), operands: vec!["[rsp+0]".to_string(), "xmm1".to_string()], addr: 14 },
+                DecodedInsn {
+                    mnemonic: "xorps".to_string(),
+                    operands: vec!["xmm1".to_string(), "xmm1".to_string()],
+                    addr: 10,
+                },
+                DecodedInsn {
+                    mnemonic: "movss".to_string(),
+                    operands: vec!["[rsp+0]".to_string(), "xmm1".to_string()],
+                    addr: 14,
+                },
             ],
             terminator: Terminator::Jump(b3),
         };
@@ -1371,9 +1478,11 @@ mod tests {
             id: b2,
             start_addr: 20,
             end_addr: 30,
-            instructions: vec![
-                DecodedInsn { mnemonic: "movss".to_string(), operands: vec!["[rsp+0]".to_string(), "xmm0".to_string()], addr: 20 },
-            ],
+            instructions: vec![DecodedInsn {
+                mnemonic: "movss".to_string(),
+                operands: vec!["[rsp+0]".to_string(), "xmm0".to_string()],
+                addr: 20,
+            }],
             terminator: Terminator::Jump(b3),
         };
         let block0 = BasicBlock {
@@ -1381,7 +1490,11 @@ mod tests {
             start_addr: 0,
             end_addr: 10,
             instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::Above, taken: b1, fallthrough: b2 },
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Above,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
         let block3 = BasicBlock {
             id: b3,
@@ -1403,10 +1516,16 @@ mod tests {
         successors.insert(b2, vec![b3]);
 
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
         let diamond = Diamond {
-            cond_block: b0, taken_block: b1, fallthrough_block: b2, merge_block: b3,
+            cond_block: b0,
+            taken_block: b1,
+            fallthrough_block: b2,
+            merge_block: b3,
             kind: BranchKind::Above,
         };
         let exec = SymbolicExecutor::new(1, 0);
@@ -1422,7 +1541,8 @@ mod tests {
         );
         assert!(
             matches!(stack_val.unwrap(), SymValue::Select { .. }),
-            "stack offset 0 should be a Select when arms diverge, got: {:?}", stack_val
+            "stack offset 0 should be a Select when arms diverge, got: {:?}",
+            stack_val
         );
     }
 
@@ -1437,11 +1557,20 @@ mod tests {
 
         // Only insert b0, b2, b3 — b1 is missing from cfg.blocks
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::Greater, taken: b1, fallthrough: b2 },
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Greater,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
         let block2 = BasicBlock {
-            id: b2, start_addr: 20, end_addr: 30,
+            id: b2,
+            start_addr: 20,
+            end_addr: 30,
             instructions: vec![DecodedInsn {
                 mnemonic: "xorps".to_string(),
                 operands: vec!["xmm0".to_string(), "xmm0".to_string()],
@@ -1450,7 +1579,10 @@ mod tests {
             terminator: Terminator::Jump(b3),
         };
         let block3 = BasicBlock {
-            id: b3, start_addr: 30, end_addr: 40, instructions: vec![],
+            id: b3,
+            start_addr: 30,
+            end_addr: 40,
+            instructions: vec![],
             terminator: Terminator::Return,
         };
 
@@ -1466,10 +1598,16 @@ mod tests {
         successors.insert(b2, vec![b3]);
 
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
         let diamond = Diamond {
-            cond_block: b0, taken_block: b1, fallthrough_block: b2, merge_block: b3,
+            cond_block: b0,
+            taken_block: b1,
+            fallthrough_block: b2,
+            merge_block: b3,
             kind: BranchKind::Greater,
         };
         let exec = SymbolicExecutor::new(1, 0);
@@ -1496,15 +1634,28 @@ mod tests {
         let b3 = BlockId(3);
 
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::Above, taken: b1, fallthrough: b2 },
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Above,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
         let block1 = BasicBlock {
-            id: b1, start_addr: 10, end_addr: 20, instructions: vec![],
+            id: b1,
+            start_addr: 10,
+            end_addr: 20,
+            instructions: vec![],
             terminator: Terminator::Jump(b3),
         };
         let block2 = BasicBlock {
-            id: b2, start_addr: 20, end_addr: 30, instructions: vec![],
+            id: b2,
+            start_addr: 20,
+            end_addr: 30,
+            instructions: vec![],
             terminator: Terminator::Jump(b3),
         };
 
@@ -1519,7 +1670,10 @@ mod tests {
         successors.insert(b2, vec![b3]);
 
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
 
         // Only provide b0, b2 — b1 is excluded from the block_ids list
@@ -1529,7 +1683,10 @@ mod tests {
         let diamonds = find_diamonds(&cfg, &block_ids);
 
         // Assert: taken arm b1 not in block_set → diamond rejected
-        assert!(diamonds.is_empty(), "diamond with arm outside block_ids should be rejected");
+        assert!(
+            diamonds.is_empty(),
+            "diamond with arm outside block_ids should be rejected"
+        );
     }
 
     #[test]
@@ -1542,15 +1699,28 @@ mod tests {
         let b4 = BlockId(4);
 
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::Less, taken: b1, fallthrough: b2 },
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Less,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
         let block1 = BasicBlock {
-            id: b1, start_addr: 10, end_addr: 20, instructions: vec![],
+            id: b1,
+            start_addr: 10,
+            end_addr: 20,
+            instructions: vec![],
             terminator: Terminator::Jump(b3),
         };
         let block2 = BasicBlock {
-            id: b2, start_addr: 20, end_addr: 30, instructions: vec![],
+            id: b2,
+            start_addr: 20,
+            end_addr: 30,
+            instructions: vec![],
             terminator: Terminator::Jump(b3),
         };
 
@@ -1565,7 +1735,10 @@ mod tests {
         successors.insert(b2, vec![b3]);
 
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
 
         let block_ids = vec![b0, b1, b2, b3, b4];
@@ -1574,7 +1747,10 @@ mod tests {
         let diamonds = find_diamonds(&cfg, &block_ids);
 
         // Assert: taken arm has multiple successors → diamond rejected
-        assert!(diamonds.is_empty(), "diamond with multi-successor arm should be rejected");
+        assert!(
+            diamonds.is_empty(),
+            "diamond with multi-successor arm should be rejected"
+        );
     }
 
     #[test]
@@ -1587,10 +1763,26 @@ mod tests {
             start_addr: 0,
             end_addr: 20,
             instructions: vec![
-                DecodedInsn { mnemonic: "xorps".to_string(), operands: vec!["xmm1".to_string(), "xmm1".to_string()], addr: 0 },
-                DecodedInsn { mnemonic: "ja".to_string(), operands: vec!["label".to_string()], addr: 4 },
-                DecodedInsn { mnemonic: "addss".to_string(), operands: vec!["xmm0".to_string(), "xmm1".to_string()], addr: 8 },
-                DecodedInsn { mnemonic: "jmp".to_string(), operands: vec!["somewhere".to_string()], addr: 12 },
+                DecodedInsn {
+                    mnemonic: "xorps".to_string(),
+                    operands: vec!["xmm1".to_string(), "xmm1".to_string()],
+                    addr: 0,
+                },
+                DecodedInsn {
+                    mnemonic: "ja".to_string(),
+                    operands: vec!["label".to_string()],
+                    addr: 4,
+                },
+                DecodedInsn {
+                    mnemonic: "addss".to_string(),
+                    operands: vec!["xmm0".to_string(), "xmm1".to_string()],
+                    addr: 8,
+                },
+                DecodedInsn {
+                    mnemonic: "jmp".to_string(),
+                    operands: vec!["somewhere".to_string()],
+                    addr: 12,
+                },
             ],
             terminator: Terminator::Return,
         };
@@ -1618,39 +1810,80 @@ mod tests {
         // Arrange: CFG with two independent diamonds:
         //   Diamond 1: B0(cond) → B1(taken), B2(fall) → B3(merge)
         //   Diamond 2: B4(cond) → B5(taken), B6(fall) → B7(merge)
-        let b0 = BlockId(0); let b1 = BlockId(1); let b2 = BlockId(2); let b3 = BlockId(3);
-        let b4 = BlockId(4); let b5 = BlockId(5); let b6 = BlockId(6); let b7 = BlockId(7);
+        let b0 = BlockId(0);
+        let b1 = BlockId(1);
+        let b2 = BlockId(2);
+        let b3 = BlockId(3);
+        let b4 = BlockId(4);
+        let b5 = BlockId(5);
+        let b6 = BlockId(6);
+        let b7 = BlockId(7);
 
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::Above, taken: b1, fallthrough: b2 },
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Above,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
         // Diamond 1 taken: xorps xmm0, xmm0
         let block1 = BasicBlock {
-            id: b1, start_addr: 10, end_addr: 20,
-            instructions: vec![DecodedInsn { mnemonic: "xorps".to_string(), operands: vec!["xmm0".to_string(), "xmm0".to_string()], addr: 10 }],
+            id: b1,
+            start_addr: 10,
+            end_addr: 20,
+            instructions: vec![DecodedInsn {
+                mnemonic: "xorps".to_string(),
+                operands: vec!["xmm0".to_string(), "xmm0".to_string()],
+                addr: 10,
+            }],
             terminator: Terminator::Jump(b3),
         };
         let block2 = BasicBlock {
-            id: b2, start_addr: 20, end_addr: 30, instructions: vec![],
+            id: b2,
+            start_addr: 20,
+            end_addr: 30,
+            instructions: vec![],
             terminator: Terminator::Jump(b3),
         };
         let block3 = BasicBlock {
-            id: b3, start_addr: 30, end_addr: 40, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::Greater, taken: b5, fallthrough: b6 },
+            id: b3,
+            start_addr: 30,
+            end_addr: 40,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Greater,
+                taken: b5,
+                fallthrough: b6,
+            },
         };
         // Diamond 2 taken: xorps xmm1, xmm1
         let block5 = BasicBlock {
-            id: b5, start_addr: 50, end_addr: 60,
-            instructions: vec![DecodedInsn { mnemonic: "xorps".to_string(), operands: vec!["xmm1".to_string(), "xmm1".to_string()], addr: 50 }],
+            id: b5,
+            start_addr: 50,
+            end_addr: 60,
+            instructions: vec![DecodedInsn {
+                mnemonic: "xorps".to_string(),
+                operands: vec!["xmm1".to_string(), "xmm1".to_string()],
+                addr: 50,
+            }],
             terminator: Terminator::Jump(b7),
         };
         let block6 = BasicBlock {
-            id: b6, start_addr: 60, end_addr: 70, instructions: vec![],
+            id: b6,
+            start_addr: 60,
+            end_addr: 70,
+            instructions: vec![],
             terminator: Terminator::Jump(b7),
         };
         let block7 = BasicBlock {
-            id: b7, start_addr: 70, end_addr: 80, instructions: vec![],
+            id: b7,
+            start_addr: 70,
+            end_addr: 80,
+            instructions: vec![],
             terminator: Terminator::Return,
         };
 
@@ -1672,7 +1905,10 @@ mod tests {
         successors.insert(b6, vec![b7]);
 
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
 
         let mut exec = SymbolicExecutor::new(2, 0);
@@ -1705,27 +1941,57 @@ mod tests {
 
         // Both arms: xorps xmm1,xmm1 then movss [rsp+0], xmm1 → both write 0.0 to stack
         let block1 = BasicBlock {
-            id: b1, start_addr: 10, end_addr: 20,
+            id: b1,
+            start_addr: 10,
+            end_addr: 20,
             instructions: vec![
-                DecodedInsn { mnemonic: "xorps".to_string(), operands: vec!["xmm1".to_string(), "xmm1".to_string()], addr: 10 },
-                DecodedInsn { mnemonic: "movss".to_string(), operands: vec!["[rsp+0]".to_string(), "xmm1".to_string()], addr: 14 },
+                DecodedInsn {
+                    mnemonic: "xorps".to_string(),
+                    operands: vec!["xmm1".to_string(), "xmm1".to_string()],
+                    addr: 10,
+                },
+                DecodedInsn {
+                    mnemonic: "movss".to_string(),
+                    operands: vec!["[rsp+0]".to_string(), "xmm1".to_string()],
+                    addr: 14,
+                },
             ],
             terminator: Terminator::Jump(b3),
         };
         let block2 = BasicBlock {
-            id: b2, start_addr: 20, end_addr: 30,
+            id: b2,
+            start_addr: 20,
+            end_addr: 30,
             instructions: vec![
-                DecodedInsn { mnemonic: "xorps".to_string(), operands: vec!["xmm1".to_string(), "xmm1".to_string()], addr: 20 },
-                DecodedInsn { mnemonic: "movss".to_string(), operands: vec!["[rsp+0]".to_string(), "xmm1".to_string()], addr: 24 },
+                DecodedInsn {
+                    mnemonic: "xorps".to_string(),
+                    operands: vec!["xmm1".to_string(), "xmm1".to_string()],
+                    addr: 20,
+                },
+                DecodedInsn {
+                    mnemonic: "movss".to_string(),
+                    operands: vec!["[rsp+0]".to_string(), "xmm1".to_string()],
+                    addr: 24,
+                },
             ],
             terminator: Terminator::Jump(b3),
         };
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::Above, taken: b1, fallthrough: b2 },
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Above,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
         let block3 = BasicBlock {
-            id: b3, start_addr: 30, end_addr: 40, instructions: vec![],
+            id: b3,
+            start_addr: 30,
+            end_addr: 40,
+            instructions: vec![],
             terminator: Terminator::Return,
         };
 
@@ -1741,10 +2007,16 @@ mod tests {
         successors.insert(b2, vec![b3]);
 
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
         let diamond = Diamond {
-            cond_block: b0, taken_block: b1, fallthrough_block: b2, merge_block: b3,
+            cond_block: b0,
+            taken_block: b1,
+            fallthrough_block: b2,
+            merge_block: b3,
             kind: BranchKind::Above,
         };
         let exec = SymbolicExecutor::new(1, 0);
@@ -1754,13 +2026,11 @@ mod tests {
 
         // Assert: stack offset 0 should NOT be a Select (identical on both paths)
         let stack_val = merged.stack_state().get(&0);
-        assert!(
-            stack_val.is_some(),
-            "stack offset 0 should have a value"
-        );
+        assert!(stack_val.is_some(), "stack offset 0 should have a value");
         assert!(
             !matches!(stack_val.unwrap(), SymValue::Select { .. }),
-            "identical stack values should not produce Select, got: {:?}", stack_val
+            "identical stack values should not produce Select, got: {:?}",
+            stack_val
         );
     }
 
@@ -1773,15 +2043,28 @@ mod tests {
         let b3 = BlockId(3);
 
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::AboveEqual, taken: b1, fallthrough: b2 },
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::AboveEqual,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
         let block1 = BasicBlock {
-            id: b1, start_addr: 10, end_addr: 20, instructions: vec![],
+            id: b1,
+            start_addr: 10,
+            end_addr: 20,
+            instructions: vec![],
             terminator: Terminator::Return,
         };
         let block2 = BasicBlock {
-            id: b2, start_addr: 20, end_addr: 30, instructions: vec![],
+            id: b2,
+            start_addr: 20,
+            end_addr: 30,
+            instructions: vec![],
             terminator: Terminator::Jump(b3),
         };
 
@@ -1796,7 +2079,10 @@ mod tests {
         successors.insert(b2, vec![b3]);
 
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
 
         let block_ids = vec![b0, b1, b2, b3];
@@ -1805,7 +2091,10 @@ mod tests {
         let diamonds = find_diamonds(&cfg, &block_ids);
 
         // Assert: taken arm b1 has 0 successors → not 1 → diamond rejected
-        assert!(diamonds.is_empty(), "diamond with arm having no successors should be rejected");
+        assert!(
+            diamonds.is_empty(),
+            "diamond with arm having no successors should be rejected"
+        );
     }
 
     #[test]
@@ -1820,16 +2109,24 @@ mod tests {
 
         // B0: regular block — movss xmm2, xmm0
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10,
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
             instructions: vec![DecodedInsn {
                 mnemonic: "movss".to_string(),
                 operands: vec!["xmm2".to_string(), "xmm0".to_string()],
                 addr: 0,
             }],
-            terminator: Terminator::CondBranch { kind: BranchKind::Above, taken: b1, fallthrough: b2 },
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Above,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
         let block1 = BasicBlock {
-            id: b1, start_addr: 10, end_addr: 20,
+            id: b1,
+            start_addr: 10,
+            end_addr: 20,
             instructions: vec![DecodedInsn {
                 mnemonic: "xorps".to_string(),
                 operands: vec!["xmm0".to_string(), "xmm0".to_string()],
@@ -1838,12 +2135,17 @@ mod tests {
             terminator: Terminator::Jump(b3),
         };
         let block2 = BasicBlock {
-            id: b2, start_addr: 20, end_addr: 30, instructions: vec![],
+            id: b2,
+            start_addr: 20,
+            end_addr: 30,
+            instructions: vec![],
             terminator: Terminator::Jump(b3),
         };
         // B3 (merge): also a regular block — movss xmm3, xmm0
         let block3 = BasicBlock {
-            id: b3, start_addr: 30, end_addr: 40,
+            id: b3,
+            start_addr: 30,
+            end_addr: 40,
             instructions: vec![DecodedInsn {
                 mnemonic: "movss".to_string(),
                 operands: vec!["xmm3".to_string(), "xmm0".to_string()],
@@ -1852,7 +2154,10 @@ mod tests {
             terminator: Terminator::Jump(b4),
         };
         let block4 = BasicBlock {
-            id: b4, start_addr: 40, end_addr: 50, instructions: vec![],
+            id: b4,
+            start_addr: 40,
+            end_addr: 50,
+            instructions: vec![],
             terminator: Terminator::Return,
         };
 
@@ -1870,7 +2175,10 @@ mod tests {
         successors.insert(b3, vec![b4]);
 
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
 
         let mut exec = SymbolicExecutor::new(1, 0);
@@ -1905,7 +2213,9 @@ mod tests {
 
         // Taken arm: movss xmm2, xmm1 → xmm2 = Param(1)
         let block1 = BasicBlock {
-            id: b1, start_addr: 10, end_addr: 20,
+            id: b1,
+            start_addr: 10,
+            end_addr: 20,
             instructions: vec![DecodedInsn {
                 mnemonic: "movss".to_string(),
                 operands: vec!["xmm2".to_string(), "xmm1".to_string()],
@@ -1915,15 +2225,28 @@ mod tests {
         };
         // Fallthrough arm: no instructions (xmm2 unchanged)
         let block2 = BasicBlock {
-            id: b2, start_addr: 20, end_addr: 30, instructions: vec![],
+            id: b2,
+            start_addr: 20,
+            end_addr: 30,
+            instructions: vec![],
             terminator: Terminator::Jump(b3),
         };
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::Greater, taken: b1, fallthrough: b2 },
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Greater,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
         let block3 = BasicBlock {
-            id: b3, start_addr: 30, end_addr: 40, instructions: vec![],
+            id: b3,
+            start_addr: 30,
+            end_addr: 40,
+            instructions: vec![],
             terminator: Terminator::Return,
         };
 
@@ -1939,10 +2262,16 @@ mod tests {
         successors.insert(b2, vec![b3]);
 
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
         let diamond = Diamond {
-            cond_block: b0, taken_block: b1, fallthrough_block: b2, merge_block: b3,
+            cond_block: b0,
+            taken_block: b1,
+            fallthrough_block: b2,
+            merge_block: b3,
             kind: BranchKind::Greater,
         };
 
@@ -1981,7 +2310,13 @@ mod tests {
 
         // Assert: should remain a Select (Eq with swapped branches does not collapse)
         assert!(
-            matches!(simplified, SymValue::Select { kind: SelectKind::Eq, .. }),
+            matches!(
+                simplified,
+                SymValue::Select {
+                    kind: SelectKind::Eq,
+                    ..
+                }
+            ),
             "Select(Eq, b, a) with symbolic condition should stay as Select, got: {simplified}"
         );
     }
@@ -1991,39 +2326,77 @@ mod tests {
         // Arrange: Two independent diamonds in one block set:
         //   Diamond 1: B0(cond) → B1(taken), B2(fall) → B3(merge)
         //   Diamond 2: B4(cond) → B5(taken), B6(fall) → B7(merge)
-        let b0 = BlockId(0); let b1 = BlockId(1); let b2 = BlockId(2); let b3 = BlockId(3);
-        let b4 = BlockId(4); let b5 = BlockId(5); let b6 = BlockId(6); let b7 = BlockId(7);
+        let b0 = BlockId(0);
+        let b1 = BlockId(1);
+        let b2 = BlockId(2);
+        let b3 = BlockId(3);
+        let b4 = BlockId(4);
+        let b5 = BlockId(5);
+        let b6 = BlockId(6);
+        let b7 = BlockId(7);
 
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::Above, taken: b1, fallthrough: b2 },
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Above,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
         let block1 = BasicBlock {
-            id: b1, start_addr: 10, end_addr: 20, instructions: vec![],
+            id: b1,
+            start_addr: 10,
+            end_addr: 20,
+            instructions: vec![],
             terminator: Terminator::Jump(b3),
         };
         let block2 = BasicBlock {
-            id: b2, start_addr: 20, end_addr: 30, instructions: vec![],
+            id: b2,
+            start_addr: 20,
+            end_addr: 30,
+            instructions: vec![],
             terminator: Terminator::Jump(b3),
         };
         let block3 = BasicBlock {
-            id: b3, start_addr: 30, end_addr: 40, instructions: vec![],
+            id: b3,
+            start_addr: 30,
+            end_addr: 40,
+            instructions: vec![],
             terminator: Terminator::Return,
         };
         let block4 = BasicBlock {
-            id: b4, start_addr: 40, end_addr: 50, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::Less, taken: b5, fallthrough: b6 },
+            id: b4,
+            start_addr: 40,
+            end_addr: 50,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Less,
+                taken: b5,
+                fallthrough: b6,
+            },
         };
         let block5 = BasicBlock {
-            id: b5, start_addr: 50, end_addr: 60, instructions: vec![],
+            id: b5,
+            start_addr: 50,
+            end_addr: 60,
+            instructions: vec![],
             terminator: Terminator::Jump(b7),
         };
         let block6 = BasicBlock {
-            id: b6, start_addr: 60, end_addr: 70, instructions: vec![],
+            id: b6,
+            start_addr: 60,
+            end_addr: 70,
+            instructions: vec![],
             terminator: Terminator::Jump(b7),
         };
         let block7 = BasicBlock {
-            id: b7, start_addr: 70, end_addr: 80, instructions: vec![],
+            id: b7,
+            start_addr: 70,
+            end_addr: 80,
+            instructions: vec![],
             terminator: Terminator::Return,
         };
 
@@ -2046,7 +2419,10 @@ mod tests {
         successors.insert(b6, vec![b7]);
 
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
 
         let block_ids = vec![b0, b1, b2, b3, b4, b5, b6, b7];
@@ -2071,7 +2447,9 @@ mod tests {
         let b3 = BlockId(3);
 
         let block1 = BasicBlock {
-            id: b1, start_addr: 10, end_addr: 20,
+            id: b1,
+            start_addr: 10,
+            end_addr: 20,
             instructions: vec![DecodedInsn {
                 mnemonic: "xorps".to_string(),
                 operands: vec!["xmm0".to_string(), "xmm0".to_string()],
@@ -2080,15 +2458,28 @@ mod tests {
             terminator: Terminator::Jump(b3),
         };
         let block2 = BasicBlock {
-            id: b2, start_addr: 20, end_addr: 30, instructions: vec![],
+            id: b2,
+            start_addr: 20,
+            end_addr: 30,
+            instructions: vec![],
             terminator: Terminator::Jump(b3),
         };
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::Less, taken: b1, fallthrough: b2 },
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Less,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
         let block3 = BasicBlock {
-            id: b3, start_addr: 30, end_addr: 40, instructions: vec![],
+            id: b3,
+            start_addr: 30,
+            end_addr: 40,
+            instructions: vec![],
             terminator: Terminator::Return,
         };
 
@@ -2104,10 +2495,16 @@ mod tests {
         successors.insert(b2, vec![b3]);
 
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
         let diamond = Diamond {
-            cond_block: b0, taken_block: b1, fallthrough_block: b2, merge_block: b3,
+            cond_block: b0,
+            taken_block: b1,
+            fallthrough_block: b2,
+            merge_block: b3,
             kind: BranchKind::Less,
         };
         let exec = SymbolicExecutor::new(1, 0);
@@ -2118,7 +2515,11 @@ mod tests {
         // Assert: xmm0 should be a Select with kind Lt
         let xmm0 = merged.get_value("xmm0");
         if let SymValue::Select { kind, .. } = &xmm0 {
-            assert_eq!(*kind, SelectKind::Lt, "Select kind should be Lt for BranchKind::Less");
+            assert_eq!(
+                *kind,
+                SelectKind::Lt,
+                "Select kind should be Lt for BranchKind::Less"
+            );
         } else {
             panic!("xmm0 should be a Select, got: {xmm0}");
         }
@@ -2133,7 +2534,9 @@ mod tests {
         let b2 = BlockId(2);
 
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10,
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
             instructions: vec![DecodedInsn {
                 mnemonic: "xorps".to_string(),
                 operands: vec!["xmm1".to_string(), "xmm1".to_string()],
@@ -2142,7 +2545,9 @@ mod tests {
             terminator: Terminator::Jump(b1),
         };
         let block1 = BasicBlock {
-            id: b1, start_addr: 10, end_addr: 20,
+            id: b1,
+            start_addr: 10,
+            end_addr: 20,
             instructions: vec![DecodedInsn {
                 mnemonic: "addss".to_string(),
                 operands: vec!["xmm0".to_string(), "xmm1".to_string()],
@@ -2151,7 +2556,10 @@ mod tests {
             terminator: Terminator::Jump(b2),
         };
         let block2 = BasicBlock {
-            id: b2, start_addr: 20, end_addr: 30, instructions: vec![],
+            id: b2,
+            start_addr: 20,
+            end_addr: 30,
+            instructions: vec![],
             terminator: Terminator::Return,
         };
 
@@ -2165,7 +2573,10 @@ mod tests {
         successors.insert(b1, vec![b2]);
 
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
 
         let mut exec = SymbolicExecutor::new(1, 0);
@@ -2202,19 +2613,35 @@ mod tests {
         let b3 = BlockId(3);
 
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::Greater, taken: b1, fallthrough: b2 },
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Greater,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
         let block1 = BasicBlock {
-            id: b1, start_addr: 10, end_addr: 20, instructions: vec![],
+            id: b1,
+            start_addr: 10,
+            end_addr: 20,
+            instructions: vec![],
             terminator: Terminator::Jump(b3),
         };
         let block2 = BasicBlock {
-            id: b2, start_addr: 20, end_addr: 30, instructions: vec![],
+            id: b2,
+            start_addr: 20,
+            end_addr: 30,
+            instructions: vec![],
             terminator: Terminator::Jump(b3),
         };
         let block3 = BasicBlock {
-            id: b3, start_addr: 30, end_addr: 40, instructions: vec![],
+            id: b3,
+            start_addr: 30,
+            end_addr: 40,
+            instructions: vec![],
             terminator: Terminator::Return,
         };
 
@@ -2230,7 +2657,10 @@ mod tests {
         successors.insert(b2, vec![b3]);
 
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
 
         // block_ids with b0 appearing twice
@@ -2240,7 +2670,11 @@ mod tests {
         let diamonds = find_diamonds(&cfg, &block_ids);
 
         // Assert: b0 is iterated twice -> two diamond detections for the same structure
-        assert_eq!(diamonds.len(), 2, "duplicate cond_block entry yields duplicate diamonds");
+        assert_eq!(
+            diamonds.len(),
+            2,
+            "duplicate cond_block entry yields duplicate diamonds"
+        );
         // Both should reference the same structural diamond
         assert_eq!(diamonds[0].cond_block, diamonds[1].cond_block);
         assert_eq!(diamonds[0].merge_block, diamonds[1].merge_block);
@@ -2277,7 +2711,9 @@ mod tests {
         let b3 = BlockId(3);
 
         let block1 = BasicBlock {
-            id: b1, start_addr: 10, end_addr: 20,
+            id: b1,
+            start_addr: 10,
+            end_addr: 20,
             instructions: vec![DecodedInsn {
                 mnemonic: "xorps".to_string(),
                 operands: vec!["xmm0".to_string(), "xmm0".to_string()],
@@ -2286,15 +2722,28 @@ mod tests {
             terminator: Terminator::Jump(b3),
         };
         let block2 = BasicBlock {
-            id: b2, start_addr: 20, end_addr: 30, instructions: vec![],
+            id: b2,
+            start_addr: 20,
+            end_addr: 30,
+            instructions: vec![],
             terminator: Terminator::Jump(b3),
         };
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::Equal, taken: b1, fallthrough: b2 },
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Equal,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
         let block3 = BasicBlock {
-            id: b3, start_addr: 30, end_addr: 40, instructions: vec![],
+            id: b3,
+            start_addr: 30,
+            end_addr: 40,
+            instructions: vec![],
             terminator: Terminator::Return,
         };
 
@@ -2310,10 +2759,16 @@ mod tests {
         successors.insert(b2, vec![b3]);
 
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
         let diamond = Diamond {
-            cond_block: b0, taken_block: b1, fallthrough_block: b2, merge_block: b3,
+            cond_block: b0,
+            taken_block: b1,
+            fallthrough_block: b2,
+            merge_block: b3,
             kind: BranchKind::Equal,
         };
         let exec = SymbolicExecutor::new(1, 0);
@@ -2324,7 +2779,11 @@ mod tests {
         // Assert: xmm0 should be a Select with kind Eq
         let xmm0 = merged.get_value("xmm0");
         if let SymValue::Select { kind, .. } = &xmm0 {
-            assert_eq!(*kind, SelectKind::Eq, "Select kind should be Eq for BranchKind::Equal");
+            assert_eq!(
+                *kind,
+                SelectKind::Eq,
+                "Select kind should be Eq for BranchKind::Equal"
+            );
         } else {
             panic!("xmm0 should be a Select, got: {xmm0}");
         }
@@ -2342,7 +2801,9 @@ mod tests {
 
         // Taken arm: only touches xmm0
         let block1 = BasicBlock {
-            id: b1, start_addr: 10, end_addr: 20,
+            id: b1,
+            start_addr: 10,
+            end_addr: 20,
             instructions: vec![DecodedInsn {
                 mnemonic: "xorps".to_string(),
                 operands: vec!["xmm0".to_string(), "xmm0".to_string()],
@@ -2352,15 +2813,28 @@ mod tests {
         };
         // Fallthrough arm: no instructions at all
         let block2 = BasicBlock {
-            id: b2, start_addr: 20, end_addr: 30, instructions: vec![],
+            id: b2,
+            start_addr: 20,
+            end_addr: 30,
+            instructions: vec![],
             terminator: Terminator::Jump(b3),
         };
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::Above, taken: b1, fallthrough: b2 },
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Above,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
         let block3 = BasicBlock {
-            id: b3, start_addr: 30, end_addr: 40, instructions: vec![],
+            id: b3,
+            start_addr: 30,
+            end_addr: 40,
+            instructions: vec![],
             terminator: Terminator::Return,
         };
 
@@ -2376,10 +2850,16 @@ mod tests {
         successors.insert(b2, vec![b3]);
 
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
         let diamond = Diamond {
-            cond_block: b0, taken_block: b1, fallthrough_block: b2, merge_block: b3,
+            cond_block: b0,
+            taken_block: b1,
+            fallthrough_block: b2,
+            merge_block: b3,
             kind: BranchKind::Above,
         };
 
@@ -2405,15 +2885,28 @@ mod tests {
         let b2 = BlockId(2);
 
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::Above, taken: b1, fallthrough: b2 },
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Above,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
         let block1 = BasicBlock {
-            id: b1, start_addr: 10, end_addr: 20, instructions: vec![],
+            id: b1,
+            start_addr: 10,
+            end_addr: 20,
+            instructions: vec![],
             terminator: Terminator::Jump(b0),
         };
         let block2 = BasicBlock {
-            id: b2, start_addr: 20, end_addr: 30, instructions: vec![],
+            id: b2,
+            start_addr: 20,
+            end_addr: 30,
+            instructions: vec![],
             terminator: Terminator::Jump(b0),
         };
 
@@ -2428,7 +2921,10 @@ mod tests {
         successors.insert(b2, vec![b0]);
 
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
 
         let block_ids = vec![b0, b1, b2];
@@ -2437,9 +2933,16 @@ mod tests {
         let diamonds = find_diamonds(&cfg, &block_ids);
 
         // Assert: this IS a valid diamond shape structurally — both arms merge to the same block.
-        assert_eq!(diamonds.len(), 1, "self-loop diamond should be detected structurally");
+        assert_eq!(
+            diamonds.len(),
+            1,
+            "self-loop diamond should be detected structurally"
+        );
         assert_eq!(diamonds[0].cond_block, b0);
-        assert_eq!(diamonds[0].merge_block, b0, "merge block should be b0 (self-loop)");
+        assert_eq!(
+            diamonds[0].merge_block, b0,
+            "merge block should be b0 (self-loop)"
+        );
     }
 
     #[test]
@@ -2534,7 +3037,10 @@ mod tests {
         let exec = SymbolicExecutor::new(0, 0);
 
         // Act & Assert
-        assert!(exec.get_flags().is_none(), "no flags should be set on fresh executor");
+        assert!(
+            exec.get_flags().is_none(),
+            "no flags should be set on fresh executor"
+        );
     }
 
     #[test]
@@ -2563,7 +3069,9 @@ mod tests {
         let b3 = BlockId(3);
 
         let block1 = BasicBlock {
-            id: b1, start_addr: 10, end_addr: 20,
+            id: b1,
+            start_addr: 10,
+            end_addr: 20,
             instructions: vec![DecodedInsn {
                 mnemonic: "xorps".to_string(),
                 operands: vec!["xmm0".to_string(), "xmm0".to_string()],
@@ -2572,15 +3080,28 @@ mod tests {
             terminator: Terminator::Jump(b3),
         };
         let block2 = BasicBlock {
-            id: b2, start_addr: 20, end_addr: 30, instructions: vec![],
+            id: b2,
+            start_addr: 20,
+            end_addr: 30,
+            instructions: vec![],
             terminator: Terminator::Jump(b3),
         };
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::NotEqual, taken: b1, fallthrough: b2 },
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::NotEqual,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
         let block3 = BasicBlock {
-            id: b3, start_addr: 30, end_addr: 40, instructions: vec![],
+            id: b3,
+            start_addr: 30,
+            end_addr: 40,
+            instructions: vec![],
             terminator: Terminator::Return,
         };
 
@@ -2596,10 +3117,16 @@ mod tests {
         successors.insert(b2, vec![b3]);
 
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
         let diamond = Diamond {
-            cond_block: b0, taken_block: b1, fallthrough_block: b2, merge_block: b3,
+            cond_block: b0,
+            taken_block: b1,
+            fallthrough_block: b2,
+            merge_block: b3,
             kind: BranchKind::NotEqual,
         };
         let exec = SymbolicExecutor::new(1, 0);
@@ -2610,7 +3137,11 @@ mod tests {
         // Assert
         let xmm0 = merged.get_value("xmm0");
         if let SymValue::Select { kind, .. } = &xmm0 {
-            assert_eq!(*kind, SelectKind::Ne, "Select kind should be Ne for BranchKind::NotEqual");
+            assert_eq!(
+                *kind,
+                SelectKind::Ne,
+                "Select kind should be Ne for BranchKind::NotEqual"
+            );
         } else {
             panic!("xmm0 should be a Select, got: {xmm0}");
         }
@@ -2643,8 +3174,11 @@ mod tests {
 
         // Assert: executor state unchanged
         let xmm0_after = exec.get_value("xmm0");
-        assert_eq!(format!("{xmm0_before}"), format!("{xmm0_after}"),
-            "empty block list should not modify executor state");
+        assert_eq!(
+            format!("{xmm0_before}"),
+            format!("{xmm0_after}"),
+            "empty block list should not modify executor state"
+        );
     }
 
     #[test]
@@ -2658,7 +3192,9 @@ mod tests {
         let b3 = BlockId(3);
 
         let block1 = BasicBlock {
-            id: b1, start_addr: 10, end_addr: 20,
+            id: b1,
+            start_addr: 10,
+            end_addr: 20,
             instructions: vec![DecodedInsn {
                 mnemonic: "xorps".to_string(),
                 operands: vec!["xmm0".to_string(), "xmm0".to_string()],
@@ -2667,7 +3203,9 @@ mod tests {
             terminator: Terminator::Jump(b3),
         };
         let block2 = BasicBlock {
-            id: b2, start_addr: 20, end_addr: 30,
+            id: b2,
+            start_addr: 20,
+            end_addr: 30,
             instructions: vec![DecodedInsn {
                 mnemonic: "addss".to_string(),
                 operands: vec!["xmm0".to_string(), "xmm1".to_string()],
@@ -2676,11 +3214,21 @@ mod tests {
             terminator: Terminator::Jump(b3),
         };
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::GreaterEqual, taken: b1, fallthrough: b2 },
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::GreaterEqual,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
         let block3 = BasicBlock {
-            id: b3, start_addr: 30, end_addr: 40, instructions: vec![],
+            id: b3,
+            start_addr: 30,
+            end_addr: 40,
+            instructions: vec![],
             terminator: Terminator::Return,
         };
 
@@ -2696,10 +3244,16 @@ mod tests {
         successors.insert(b2, vec![b3]);
 
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
         let diamond = Diamond {
-            cond_block: b0, taken_block: b1, fallthrough_block: b2, merge_block: b3,
+            cond_block: b0,
+            taken_block: b1,
+            fallthrough_block: b2,
+            merge_block: b3,
             kind: BranchKind::GreaterEqual,
         };
         let exec = SymbolicExecutor::new(2, 0);
@@ -2710,16 +3264,31 @@ mod tests {
         // Assert: xmm0 is a Select because both arms produce different values
         let xmm0 = merged.get_value("xmm0");
         assert!(
-            matches!(xmm0, SymValue::Select { kind: SelectKind::Ge, .. }),
+            matches!(
+                xmm0,
+                SymValue::Select {
+                    kind: SelectKind::Ge,
+                    ..
+                }
+            ),
             "xmm0 should be Select(Ge, ..) for BranchKind::GreaterEqual, got: {xmm0}"
         );
         // true_val = Const(0.0) from xorps, false_val = Add(Param(0), Param(1)) from addss
-        if let SymValue::Select { true_val, false_val, .. } = &xmm0 {
-            assert!(matches!(true_val.as_ref(), SymValue::Const(0.0)),
-                "true_val should be Const(0.0) from xorps, got: {true_val}");
+        if let SymValue::Select {
+            true_val,
+            false_val,
+            ..
+        } = &xmm0
+        {
+            assert!(
+                matches!(true_val.as_ref(), SymValue::Const(0.0)),
+                "true_val should be Const(0.0) from xorps, got: {true_val}"
+            );
             let fv_s = format!("{false_val}");
-            assert!(fv_s.contains("param(0)"),
-                "false_val should contain param(0) from addss, got: {false_val}");
+            assert!(
+                fv_s.contains("param(0)"),
+                "false_val should contain param(0) from addss, got: {false_val}"
+            );
         }
     }
 
@@ -2728,13 +3297,17 @@ mod tests {
         // Arrange: A single block with Return terminator — no CondBranch, no diamond possible.
         let b0 = BlockId(0);
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10, instructions: vec![],
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
+            instructions: vec![],
             terminator: Terminator::Return,
         };
         let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(b0, block0);
         let cfg = ControlFlowGraph {
-            blocks, entry: b0,
+            blocks,
+            entry: b0,
             successors: std::collections::BTreeMap::new(),
             predecessors: std::collections::BTreeMap::new(),
         };
@@ -2743,7 +3316,10 @@ mod tests {
         let diamonds = find_diamonds(&cfg, &[b0]);
 
         // Assert
-        assert!(diamonds.is_empty(), "single Return block should not form a diamond");
+        assert!(
+            diamonds.is_empty(),
+            "single Return block should not form a diamond"
+        );
     }
 
     // ── Wave 12x59: +10 additional tests ──
@@ -2758,19 +3334,35 @@ mod tests {
         let b3 = BlockId(3);
 
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::Above, taken: b1, fallthrough: b2 },
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Above,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
         let block1 = BasicBlock {
-            id: b1, start_addr: 10, end_addr: 20, instructions: vec![],
+            id: b1,
+            start_addr: 10,
+            end_addr: 20,
+            instructions: vec![],
             terminator: Terminator::Jump(b3),
         };
         let block2 = BasicBlock {
-            id: b2, start_addr: 20, end_addr: 30, instructions: vec![],
+            id: b2,
+            start_addr: 20,
+            end_addr: 30,
+            instructions: vec![],
             terminator: Terminator::Jump(b3),
         };
         let block3 = BasicBlock {
-            id: b3, start_addr: 30, end_addr: 40, instructions: vec![],
+            id: b3,
+            start_addr: 30,
+            end_addr: 40,
+            instructions: vec![],
             terminator: Terminator::Return,
         };
 
@@ -2786,10 +3378,16 @@ mod tests {
         successors.insert(b2, vec![b3]);
 
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
         let diamond = Diamond {
-            cond_block: b0, taken_block: b1, fallthrough_block: b2, merge_block: b3,
+            cond_block: b0,
+            taken_block: b1,
+            fallthrough_block: b2,
+            merge_block: b3,
             kind: BranchKind::Above,
         };
         let exec = SymbolicExecutor::new(2, 0);
@@ -2818,15 +3416,23 @@ mod tests {
         let b2 = BlockId(2);
 
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::Less, taken: b1, fallthrough: b2 },
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Less,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
 
         let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(b0, block0);
 
         let cfg = ControlFlowGraph {
-            blocks, entry: b0,
+            blocks,
+            entry: b0,
             successors: std::collections::BTreeMap::new(),
             predecessors: std::collections::BTreeMap::new(),
         };
@@ -2835,7 +3441,10 @@ mod tests {
         let diamonds = find_diamonds(&cfg, &[b0]);
 
         // Assert
-        assert!(diamonds.is_empty(), "cond block alone without arms should not form diamond");
+        assert!(
+            diamonds.is_empty(),
+            "cond block alone without arms should not form diamond"
+        );
     }
 
     #[test]
@@ -2850,7 +3459,9 @@ mod tests {
         let b3 = BlockId(3);
 
         let block1 = BasicBlock {
-            id: b1, start_addr: 10, end_addr: 20,
+            id: b1,
+            start_addr: 10,
+            end_addr: 20,
             instructions: vec![DecodedInsn {
                 mnemonic: "xorps".to_string(),
                 operands: vec!["xmm0".to_string(), "xmm0".to_string()],
@@ -2859,7 +3470,9 @@ mod tests {
             terminator: Terminator::Jump(b3),
         };
         let block2 = BasicBlock {
-            id: b2, start_addr: 20, end_addr: 30,
+            id: b2,
+            start_addr: 20,
+            end_addr: 30,
             instructions: vec![DecodedInsn {
                 mnemonic: "addss".to_string(),
                 operands: vec!["xmm0".to_string(), "xmm1".to_string()],
@@ -2868,11 +3481,21 @@ mod tests {
             terminator: Terminator::Jump(b3),
         };
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::Below, taken: b1, fallthrough: b2 },
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Below,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
         let block3 = BasicBlock {
-            id: b3, start_addr: 30, end_addr: 40, instructions: vec![],
+            id: b3,
+            start_addr: 30,
+            end_addr: 40,
+            instructions: vec![],
             terminator: Terminator::Return,
         };
 
@@ -2888,10 +3511,16 @@ mod tests {
         successors.insert(b2, vec![b3]);
 
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
         let diamond = Diamond {
-            cond_block: b0, taken_block: b1, fallthrough_block: b2, merge_block: b3,
+            cond_block: b0,
+            taken_block: b1,
+            fallthrough_block: b2,
+            merge_block: b3,
             kind: BranchKind::Below,
         };
         let exec = SymbolicExecutor::new(2, 0);
@@ -2902,7 +3531,13 @@ mod tests {
         // Assert: xmm0 diverges → Select with kind Lt (Below maps to Lt)
         let xmm0 = merged.get_value("xmm0");
         assert!(
-            matches!(xmm0, SymValue::Select { kind: SelectKind::Lt, .. }),
+            matches!(
+                xmm0,
+                SymValue::Select {
+                    kind: SelectKind::Lt,
+                    ..
+                }
+            ),
             "xmm0 should be Select(Lt, ..) for BranchKind::Below, got: {xmm0}"
         );
     }
@@ -2916,11 +3551,20 @@ mod tests {
         let b2 = BlockId(2);
 
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::Greater, taken: b1, fallthrough: b2 },
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Greater,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
         let block1 = BasicBlock {
-            id: b1, start_addr: 10, end_addr: 20,
+            id: b1,
+            start_addr: 10,
+            end_addr: 20,
             instructions: vec![DecodedInsn {
                 mnemonic: "xorps".to_string(),
                 operands: vec!["xmm0".to_string(), "xmm0".to_string()],
@@ -2929,7 +3573,10 @@ mod tests {
             terminator: Terminator::Jump(b0),
         };
         let block2 = BasicBlock {
-            id: b2, start_addr: 20, end_addr: 30, instructions: vec![],
+            id: b2,
+            start_addr: 20,
+            end_addr: 30,
+            instructions: vec![],
             terminator: Terminator::Jump(b0),
         };
 
@@ -2944,10 +3591,16 @@ mod tests {
         successors.insert(b2, vec![b0]);
 
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
         let diamond = Diamond {
-            cond_block: b0, taken_block: b1, fallthrough_block: b2, merge_block: b0,
+            cond_block: b0,
+            taken_block: b1,
+            fallthrough_block: b2,
+            merge_block: b0,
             kind: BranchKind::Greater,
         };
         let exec = SymbolicExecutor::new(1, 0);
@@ -2980,7 +3633,13 @@ mod tests {
 
         // Assert: cannot fold — stays as Select since condition is symbolic
         assert!(
-            matches!(simplified, SymValue::Select { kind: SelectKind::Gt, .. }),
+            matches!(
+                simplified,
+                SymValue::Select {
+                    kind: SelectKind::Gt,
+                    ..
+                }
+            ),
             "PHI merge of two different params should stay as Select, got: {simplified}"
         );
     }
@@ -3015,7 +3674,9 @@ mod tests {
         let b3 = BlockId(3);
 
         let block1 = BasicBlock {
-            id: b1, start_addr: 10, end_addr: 20,
+            id: b1,
+            start_addr: 10,
+            end_addr: 20,
             instructions: vec![DecodedInsn {
                 mnemonic: "xorps".to_string(),
                 operands: vec!["xmm0".to_string(), "xmm0".to_string()],
@@ -3024,15 +3685,28 @@ mod tests {
             terminator: Terminator::Jump(b3),
         };
         let block2 = BasicBlock {
-            id: b2, start_addr: 20, end_addr: 30, instructions: vec![],
+            id: b2,
+            start_addr: 20,
+            end_addr: 30,
+            instructions: vec![],
             terminator: Terminator::Jump(b3),
         };
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::BelowEqual, taken: b1, fallthrough: b2 },
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::BelowEqual,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
         let block3 = BasicBlock {
-            id: b3, start_addr: 30, end_addr: 40, instructions: vec![],
+            id: b3,
+            start_addr: 30,
+            end_addr: 40,
+            instructions: vec![],
             terminator: Terminator::Return,
         };
 
@@ -3048,10 +3722,16 @@ mod tests {
         successors.insert(b2, vec![b3]);
 
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
         let diamond = Diamond {
-            cond_block: b0, taken_block: b1, fallthrough_block: b2, merge_block: b3,
+            cond_block: b0,
+            taken_block: b1,
+            fallthrough_block: b2,
+            merge_block: b3,
             kind: BranchKind::BelowEqual,
         };
         let exec = SymbolicExecutor::new(1, 0);
@@ -3062,7 +3742,11 @@ mod tests {
         // Assert: Select kind should be Le (BelowEqual maps to Le)
         let xmm0 = merged.get_value("xmm0");
         if let SymValue::Select { kind, .. } = &xmm0 {
-            assert_eq!(*kind, SelectKind::Le, "BelowEqual should map to Le, got: {kind}");
+            assert_eq!(
+                *kind,
+                SelectKind::Le,
+                "BelowEqual should map to Le, got: {kind}"
+            );
         } else {
             panic!("xmm0 should be a Select, got: {xmm0}");
         }
@@ -3073,10 +3757,20 @@ mod tests {
         // Arrange: A single block with only arithmetic (no CondBranch).
         let b0 = BlockId(0);
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10,
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
             instructions: vec![
-                DecodedInsn { mnemonic: "xorps".to_string(), operands: vec!["xmm1".to_string(), "xmm1".to_string()], addr: 0 },
-                DecodedInsn { mnemonic: "addss".to_string(), operands: vec!["xmm0".to_string(), "xmm1".to_string()], addr: 4 },
+                DecodedInsn {
+                    mnemonic: "xorps".to_string(),
+                    operands: vec!["xmm1".to_string(), "xmm1".to_string()],
+                    addr: 0,
+                },
+                DecodedInsn {
+                    mnemonic: "addss".to_string(),
+                    operands: vec!["xmm0".to_string(), "xmm1".to_string()],
+                    addr: 4,
+                },
             ],
             terminator: Terminator::Return,
         };
@@ -3084,7 +3778,8 @@ mod tests {
         let mut blocks = std::collections::BTreeMap::new();
         blocks.insert(b0, block0);
         let cfg = ControlFlowGraph {
-            blocks, entry: b0,
+            blocks,
+            entry: b0,
             successors: std::collections::BTreeMap::new(),
             predecessors: std::collections::BTreeMap::new(),
         };
@@ -3112,24 +3807,47 @@ mod tests {
 
         // Taken arm: xorps xmm1, xmm1 then movss [rsp+0], xmm1 → stack[0] = 0.0
         let block1 = BasicBlock {
-            id: b1, start_addr: 10, end_addr: 20,
+            id: b1,
+            start_addr: 10,
+            end_addr: 20,
             instructions: vec![
-                DecodedInsn { mnemonic: "xorps".to_string(), operands: vec!["xmm1".to_string(), "xmm1".to_string()], addr: 10 },
-                DecodedInsn { mnemonic: "movss".to_string(), operands: vec!["[rsp+0]".to_string(), "xmm1".to_string()], addr: 14 },
+                DecodedInsn {
+                    mnemonic: "xorps".to_string(),
+                    operands: vec!["xmm1".to_string(), "xmm1".to_string()],
+                    addr: 10,
+                },
+                DecodedInsn {
+                    mnemonic: "movss".to_string(),
+                    operands: vec!["[rsp+0]".to_string(), "xmm1".to_string()],
+                    addr: 14,
+                },
             ],
             terminator: Terminator::Jump(b3),
         };
         // Fallthrough arm: no stack write
         let block2 = BasicBlock {
-            id: b2, start_addr: 20, end_addr: 30, instructions: vec![],
+            id: b2,
+            start_addr: 20,
+            end_addr: 30,
+            instructions: vec![],
             terminator: Terminator::Jump(b3),
         };
         let block0 = BasicBlock {
-            id: b0, start_addr: 0, end_addr: 10, instructions: vec![],
-            terminator: Terminator::CondBranch { kind: BranchKind::Above, taken: b1, fallthrough: b2 },
+            id: b0,
+            start_addr: 0,
+            end_addr: 10,
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                kind: BranchKind::Above,
+                taken: b1,
+                fallthrough: b2,
+            },
         };
         let block3 = BasicBlock {
-            id: b3, start_addr: 30, end_addr: 40, instructions: vec![],
+            id: b3,
+            start_addr: 30,
+            end_addr: 40,
+            instructions: vec![],
             terminator: Terminator::Return,
         };
 
@@ -3145,10 +3863,16 @@ mod tests {
         successors.insert(b2, vec![b3]);
 
         let cfg = ControlFlowGraph {
-            blocks, entry: b0, successors, predecessors: std::collections::BTreeMap::new(),
+            blocks,
+            entry: b0,
+            successors,
+            predecessors: std::collections::BTreeMap::new(),
         };
         let diamond = Diamond {
-            cond_block: b0, taken_block: b1, fallthrough_block: b2, merge_block: b3,
+            cond_block: b0,
+            taken_block: b1,
+            fallthrough_block: b2,
+            merge_block: b3,
             kind: BranchKind::Above,
         };
         let exec = SymbolicExecutor::new(1, 0);

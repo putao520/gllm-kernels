@@ -36,13 +36,25 @@ pub enum ConstraintViolation {
     /// Epilogue chain is too deep for register-resident execution.
     EpilogueTooDeep { depth: usize, max: usize },
     /// AMX tile configuration exceeds available tile registers.
-    AmxTileOverflow { tiles_needed: usize, tiles_available: usize },
+    AmxTileOverflow {
+        tiles_needed: usize,
+        tiles_available: usize,
+    },
     /// SME2 ZA array size exceeds streaming SVE mode capacity.
-    Sme2ZaOverflow { za_bytes: usize, max_za_bytes: usize },
+    Sme2ZaOverflow {
+        za_bytes: usize,
+        max_za_bytes: usize,
+    },
     /// GPU shared memory tile exceeds per-block shared memory budget.
-    SharedMemOverflow { tile_bytes: usize, smem_bytes: usize },
+    SharedMemOverflow {
+        tile_bytes: usize,
+        smem_bytes: usize,
+    },
     /// GPU tensor core GEMM requires unsupported instruction.
-    TensorCoreUnsupported { required_gen: u32, available_gen: u32 },
+    TensorCoreUnsupported {
+        required_gen: u32,
+        available_gen: u32,
+    },
 }
 
 /// Stateless hardware constraint checker bound to a device profile.
@@ -91,10 +103,7 @@ impl<'a> HwConstraintChecker<'a> {
     /// Deep epilogues increase register pressure and instruction-cache
     /// footprint inside the microkernel inner loop.
     /// Max depth is dynamic: AVX-512/NEON/SVE (32 regs) → 16, AVX2 (16 regs) → 8.
-    pub fn validate_epilogue_depth(
-        &self,
-        group: &FusionGroup,
-    ) -> Result<(), ConstraintViolation> {
+    pub fn validate_epilogue_depth(&self, group: &FusionGroup) -> Result<(), ConstraintViolation> {
         let max_depth = max_epilogue_depth(self.plan);
         let depth = group.epilogue.len();
         if depth > max_depth {
@@ -141,10 +150,7 @@ impl<'a> HwConstraintChecker<'a> {
     ///
     /// AMX provides 8 tile registers (TMM0-TMM7), each up to 16x16 elements.
     /// A fused GEMM+epilogue group needs tiles for: accumulator + B-panel + scratch.
-    pub fn validate_amx_tiles(
-        &self,
-        group: &FusionGroup,
-    ) -> Result<(), ConstraintViolation> {
+    pub fn validate_amx_tiles(&self, group: &FusionGroup) -> Result<(), ConstraintViolation> {
         use crate::compiler::hardware_profile::HardwareProfile;
         let hw = HardwareProfile::detect(&self.plan.profile);
         if !hw.has_amx() {
@@ -232,10 +238,7 @@ impl<'a> HwConstraintChecker<'a> {
     }
 
     /// Validate GPU tensor core generation requirement.
-    pub fn validate_tensor_core_gen(
-        &self,
-        required_gen: u32,
-    ) -> Result<(), ConstraintViolation> {
+    pub fn validate_tensor_core_gen(&self, required_gen: u32) -> Result<(), ConstraintViolation> {
         use crate::compiler::hardware_profile::HardwareProfile;
         let hw = HardwareProfile::detect(&self.plan.profile);
         let available = hw.tensor_core_gen();
@@ -281,18 +284,11 @@ impl<'a> HwConstraintChecker<'a> {
         groups: &[FusionGroup],
         graph: &CompilerGraph,
     ) -> Vec<HwConstraintResult> {
-        groups
-            .iter()
-            .map(|g| self.build_result(g, graph))
-            .collect()
+        groups.iter().map(|g| self.build_result(g, graph)).collect()
     }
 
     /// Build a detailed `HwConstraintResult` for a single group.
-    fn build_result(
-        &self,
-        group: &FusionGroup,
-        graph: &CompilerGraph,
-    ) -> HwConstraintResult {
+    fn build_result(&self, group: &FusionGroup, graph: &CompilerGraph) -> HwConstraintResult {
         let mut register_limit = self.plan.profile.num_simd_regs();
         let (l1, _, _) = self.plan.profile.cache_sizes();
         let l1_budget = (l1 as f64 * self.plan.profile.l1_budget_ratio()) as usize;
@@ -386,18 +382,21 @@ pub fn enforce_constraints(
             let old = groups.remove(i);
             // Split into per-op standalone groups
             for (j, &op_id) in old.ops.iter().enumerate() {
-                groups.insert(i + j, FusionGroup {
-                    id: old.id * 100 + j,
-                    anchor: op_id,
-                    epilogue: vec![],
-                    mode: FusionMode::Standalone,
-                    ops: vec![op_id],
-                    multi_output: MultiOutputConfig::single(),
-                    dominant_dtype: old.dominant_dtype,
-                    marker: old.marker.clone(),
-                    is_layer_group: old.is_layer_group,
-                    hetero_layer_type: old.hetero_layer_type,
-                });
+                groups.insert(
+                    i + j,
+                    FusionGroup {
+                        id: old.id * 100 + j,
+                        anchor: op_id,
+                        epilogue: vec![],
+                        mode: FusionMode::Standalone,
+                        ops: vec![op_id],
+                        multi_output: MultiOutputConfig::single(),
+                        dominant_dtype: old.dominant_dtype,
+                        marker: old.marker.clone(),
+                        is_layer_group: old.is_layer_group,
+                        hetero_layer_type: old.hetero_layer_type,
+                    },
+                );
             }
             i += old.ops.len();
         } else {
@@ -416,11 +415,14 @@ pub fn enforce_constraints(
 fn extract_gemm_dims(group: &FusionGroup, graph: &CompilerGraph) -> Option<(usize, usize, usize)> {
     let op = graph.op(group.anchor)?;
     op.op_gemm_dims(graph).map(|(m, n, k)| {
-        (m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model"), n, k)
+        (
+            m.max_for_allocation_strict()
+                .expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model"),
+            n,
+            k,
+        )
     })
 }
-
-
 
 /// Extract GEMM dtype from the anchor op.
 /// ARCH-DTYPE-FULLCHAIN-ORCH: uses graph-level dtype inference for QuantGemm and non-GEMM ops.
@@ -432,7 +434,8 @@ fn extract_gemm_dtype(group: &FusionGroup, graph: &CompilerGraph) -> crate::type
         } else {
             op.op_gemm_dtype(graph)
         }
-    }).unwrap_or_else(|| graph.infer_computation_dtype())
+    })
+    .unwrap_or_else(|| graph.infer_computation_dtype())
 }
 
 /// Estimate register pressure for a fusion group.
@@ -455,7 +458,10 @@ fn estimate_register_pressure(
         FusionMode::Standalone => {
             if let Some(op) = graph.op(group.anchor) {
                 let op_resolved = op.op_resolved(graph);
-                if matches!(op_resolved, Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_))) {
+                if matches!(
+                    op_resolved,
+                    Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_))
+                ) {
                     gemm_base_regs(plan, dtype)
                 } else {
                     2 // input + output
@@ -543,7 +549,9 @@ fn estimate_l1_working_set(
         a_panel + b_panel
     } else {
         // Elementwise: use the dtype of the group's anchor output tensor
-        let elem_bytes = group.ops.iter()
+        let elem_bytes = group
+            .ops
+            .iter()
             .find_map(|&oid| graph.op(oid))
             .and_then(|op| op.outputs.first())
             .and_then(|tid| graph.tensor(*tid))
@@ -558,7 +566,10 @@ fn estimate_l1_working_set(
 mod tests {
     use super::*;
     use crate::compiler::fusion::{self, GroupMarker};
-    use crate::compiler::graph::{CompilerGraph, OpId, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+    use crate::compiler::graph::{
+        AttentionGeometry, AttentionMask, AttentionSpec, CachedGqaSpec, CompilerGraph,
+        DualRopeSpec, GemmSpec, MlaSpec, NormSpec, Op, OpId, QuantGemmSpec, RopeSpec, SinksSpec,
+    };
     use crate::compiler::ir::LayerIR;
     use crate::compiler::planner::ExecutionPlan;
     use crate::compiler::registry::ScalarOpRegistry;
@@ -576,7 +587,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[32, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[32, 4096], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -605,7 +624,15 @@ mod tests {
         let gemm_out = g.add_tensor_concrete("gemm_out", &[32, 4096], dt);
         let silu_out = g.add_tensor_concrete("silu_out", &[32, 4096], dt);
 
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
@@ -625,9 +652,7 @@ mod tests {
             assert!(
                 r.valid,
                 "Group {} ({:?}) failed constraints: {:?}",
-                r.group_id,
-                plan.groups[r.group_id].mode,
-                r.violations
+                r.group_id, plan.groups[r.group_id].mode, r.violations
             );
         }
     }
@@ -648,9 +673,7 @@ mod tests {
             assert!(
                 r.valid,
                 "Group {} ({:?}) failed constraints: {:?}",
-                r.group_id,
-                plan.groups[r.group_id].mode,
-                r.violations
+                r.group_id, plan.groups[r.group_id].mode, r.violations
             );
         }
 
@@ -696,7 +719,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[32, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[32, 4096], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -727,7 +758,15 @@ mod tests {
         let gemm_out = g.add_tensor_concrete("gemm_out", &[32, 4096], dt);
         let silu_out = g.add_tensor_concrete("silu_out", &[32, 4096], dt);
 
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
@@ -828,7 +867,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[32, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[32, 4096], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -894,7 +941,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[32, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[32, 4096], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -935,12 +990,7 @@ mod tests {
 
         assert_eq!(results.len(), plan.groups.len());
         for r in &results {
-            assert!(
-                r.valid,
-                "Group {} failed: {:?}",
-                r.group_id,
-                r.violations
-            );
+            assert!(r.valid, "Group {} failed: {:?}", r.group_id, r.violations);
         }
     }
 
@@ -990,7 +1040,15 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[32, 4096], dt);
         let add_out = g.add_tensor_concrete("add_out", &[32, 4096], dt);
 
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
@@ -1076,7 +1134,10 @@ mod tests {
         if available_gen > 0 {
             // On a GPU with tensor cores, request a higher gen
             let result = checker.validate_tensor_core_gen(available_gen + 10);
-            assert!(result.is_err(), "Should fail when required_gen > available_gen");
+            assert!(
+                result.is_err(),
+                "Should fail when required_gen > available_gen"
+            );
             match result.unwrap_err() {
                 ConstraintViolation::TensorCoreUnsupported {
                     required_gen,
@@ -1150,7 +1211,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[32, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[32, 4096], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -1205,7 +1274,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[32, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[32, 4096], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -1301,7 +1378,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[32, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[32, 4096], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -1354,7 +1439,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[32, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[32, 4096], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -1386,7 +1479,8 @@ mod tests {
             assert!(
                 needed > available,
                 "needed ({}) should exceed available ({})",
-                needed, available
+                needed,
+                available
             );
         } else {
             // On very high reg count profiles this might still pass, which is acceptable
@@ -1406,7 +1500,15 @@ mod tests {
         let gemm_out = g.add_tensor_concrete("gemm_out", &[32, 4096], dt);
         let silu_out = g.add_tensor_concrete("silu_out", &[32, 4096], dt);
 
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
@@ -1442,7 +1544,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[16, 512], dt);
         let w = g.add_tensor_concrete("w", &[512, 1024], dt);
         let out = g.add_tensor_concrete("out", &[16, 1024], dt);
-        g.add_op(Op::GemmBias(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(16), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: true }),
+        g.add_op(
+            Op::GemmBias(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(16),
+                n: 1024,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: true,
+            }),
             vec![a, w],
             vec![out],
             "gemm_bias",
@@ -1465,7 +1575,11 @@ mod tests {
         let dims = extract_gemm_dims(&group, &g);
 
         // Assert
-        assert_eq!(dims, Some((16, 1024, 512)), "Should extract (m, n, k) from GemmBias");
+        assert_eq!(
+            dims,
+            Some((16, 1024, 512)),
+            "Should extract (m, n, k) from GemmBias"
+        );
     }
 
     /// TEST-HWC-12: L1 working set estimation for elementwise (non-GEMM) uses tile size.
@@ -1533,13 +1647,52 @@ mod tests {
     #[test]
     fn constraint_violation_debug_all_variants() {
         // Arrange & Act & Assert — just ensure Debug doesn't panic
-        let _ = format!("{:?}", ConstraintViolation::RegisterPressure { needed: 32, available: 16 });
-        let _ = format!("{:?}", ConstraintViolation::L1Overflow { working_set: 65536, l1_size: 32768 });
-        let _ = format!("{:?}", ConstraintViolation::EpilogueTooDeep { depth: 20, max: 8 });
-        let _ = format!("{:?}", ConstraintViolation::AmxTileOverflow { tiles_needed: 10, tiles_available: 8 });
-        let _ = format!("{:?}", ConstraintViolation::Sme2ZaOverflow { za_bytes: 32768, max_za_bytes: 16384 });
-        let _ = format!("{:?}", ConstraintViolation::SharedMemOverflow { tile_bytes: 65536, smem_bytes: 49152 });
-        let _ = format!("{:?}", ConstraintViolation::TensorCoreUnsupported { required_gen: 90, available_gen: 80 });
+        let _ = format!(
+            "{:?}",
+            ConstraintViolation::RegisterPressure {
+                needed: 32,
+                available: 16
+            }
+        );
+        let _ = format!(
+            "{:?}",
+            ConstraintViolation::L1Overflow {
+                working_set: 65536,
+                l1_size: 32768
+            }
+        );
+        let _ = format!(
+            "{:?}",
+            ConstraintViolation::EpilogueTooDeep { depth: 20, max: 8 }
+        );
+        let _ = format!(
+            "{:?}",
+            ConstraintViolation::AmxTileOverflow {
+                tiles_needed: 10,
+                tiles_available: 8
+            }
+        );
+        let _ = format!(
+            "{:?}",
+            ConstraintViolation::Sme2ZaOverflow {
+                za_bytes: 32768,
+                max_za_bytes: 16384
+            }
+        );
+        let _ = format!(
+            "{:?}",
+            ConstraintViolation::SharedMemOverflow {
+                tile_bytes: 65536,
+                smem_bytes: 49152
+            }
+        );
+        let _ = format!(
+            "{:?}",
+            ConstraintViolation::TensorCoreUnsupported {
+                required_gen: 90,
+                available_gen: 80
+            }
+        );
     }
 
     // ── Test 26: HwConstraintResult default-ish values ──
@@ -1552,8 +1705,18 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[8, 64], dt);
         let w = g.add_tensor_concrete("w", &[64, 64], dt);
         let out = g.add_tensor_concrete("out", &[8, 64], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(8), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![out], "gemm",
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(8),
+                n: 64,
+                k: 64,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![out],
+            "gemm",
         );
 
         let profile = DeviceProfile::detect();
@@ -1566,8 +1729,14 @@ mod tests {
         assert_eq!(results.len(), 1, "single GEMM should be 1 group");
         let r = &results[0];
         assert!(r.valid);
-        assert!(r.violations.is_empty(), "valid group should have no violations");
-        assert!(r.register_pressure > 0, "register pressure should be positive");
+        assert!(
+            r.violations.is_empty(),
+            "valid group should have no violations"
+        );
+        assert!(
+            r.register_pressure > 0,
+            "register pressure should be positive"
+        );
         assert!(r.register_limit > 0, "register limit should be positive");
         assert!(r.register_pressure <= r.register_limit);
         assert_eq!(r.epilogue_depth, 0, "standalone GEMM has no epilogue");
@@ -1583,8 +1752,18 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[8, 64], dt);
         let w = g.add_tensor_concrete("w", &[64, 64], dt);
         let out = g.add_tensor_concrete("out", &[8, 64], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(8), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![out], "gemm",
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(8),
+                n: 64,
+                k: 64,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![out],
+            "gemm",
         );
 
         let profile = DeviceProfile::detect();
@@ -1614,8 +1793,18 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[8, 64], dt);
         let w = g.add_tensor_concrete("w", &[64, 64], dt);
         let out = g.add_tensor_concrete("out", &[8, 64], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(8), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![out], "gemm",
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(8),
+                n: 64,
+                k: 64,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![out],
+            "gemm",
         );
 
         let profile = DeviceProfile::detect();
@@ -1635,7 +1824,10 @@ mod tests {
     #[test]
     fn constraint_violation_clone_roundtrip() {
         // Arrange
-        let violation = ConstraintViolation::RegisterPressure { needed: 20, available: 16 };
+        let violation = ConstraintViolation::RegisterPressure {
+            needed: 20,
+            available: 16,
+        };
 
         // Act
         let cloned = violation.clone();
@@ -1693,8 +1885,11 @@ mod tests {
         // Build a group with 0 epilogue to extract the max
         let g = CompilerGraph::new();
         let group = FusionGroup {
-            id: 0, anchor: OpId(0), epilogue: vec![],
-            mode: FusionMode::Standalone, ops: vec![OpId(0)],
+            id: 0,
+            anchor: OpId(0),
+            epilogue: vec![],
+            mode: FusionMode::Standalone,
+            ops: vec![OpId(0)],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
             marker: GroupMarker::None,
@@ -1753,8 +1948,18 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[8, 64], dt);
         let w = g.add_tensor_concrete("w", &[64, 64], dt);
         let out = g.add_tensor_concrete("out", &[8, 64], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(8), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![out], "gemm",
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(8),
+                n: 64,
+                k: 64,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![out],
+            "gemm",
         );
 
         let profile = DeviceProfile::detect();
@@ -1798,9 +2003,10 @@ mod tests {
             l1_budget_bytes: 32768,
             epilogue_depth: 20,
             max_epilogue_depth: 8,
-            violations: vec![
-                ConstraintViolation::RegisterPressure { needed: 64, available: 32 },
-            ],
+            violations: vec![ConstraintViolation::RegisterPressure {
+                needed: 64,
+                available: 32,
+            }],
         };
         assert!(!result.valid);
         assert_eq!(result.violations.len(), 1);
@@ -1817,9 +2023,13 @@ mod tests {
         g.add_op(Op::Silu, vec![a], vec![out], "silu");
 
         let group = FusionGroup {
-            id: 0, anchor: OpId(0), epilogue: vec![],
-            mode: FusionMode::LoopFusion, ops: vec![OpId(0)],
-            multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 0,
+            anchor: OpId(0),
+            epilogue: vec![],
+            mode: FusionMode::LoopFusion,
+            ops: vec![OpId(0)],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
@@ -1834,7 +2044,10 @@ mod tests {
         let profile = DeviceProfile::detect();
         let exec_plan = ExecutionPlan::from_profile(&profile);
         let regs = gemm_base_regs(&exec_plan, DType::F32);
-        assert!(regs >= 3, "base regs should be at least 3 (acc + a_panel + b), got {regs}");
+        assert!(
+            regs >= 3,
+            "base regs should be at least 3 (acc + a_panel + b), got {regs}"
+        );
     }
 
     // ── Test 38: gemm_base_regs returns positive for BF16 ──
@@ -1844,7 +2057,10 @@ mod tests {
         let profile = DeviceProfile::detect();
         let exec_plan = ExecutionPlan::from_profile(&profile);
         let regs = gemm_base_regs(&exec_plan, DType::BF16);
-        assert!(regs >= 1, "BF16 gemm_base_regs should be positive, got {regs}");
+        assert!(
+            regs >= 1,
+            "BF16 gemm_base_regs should be positive, got {regs}"
+        );
     }
 
     // ── Test 39: estimate_register_pressure for LoopFusion scales with ops ──
@@ -1856,24 +2072,35 @@ mod tests {
         let exec_plan = ExecutionPlan::from_profile(&profile);
 
         let small = FusionGroup {
-            id: 0, anchor: OpId(0), epilogue: vec![],
-            mode: FusionMode::LoopFusion, ops: vec![OpId(0), OpId(1)],
-            multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 0,
+            anchor: OpId(0),
+            epilogue: vec![],
+            mode: FusionMode::LoopFusion,
+            ops: vec![OpId(0), OpId(1)],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
         };
         let large = FusionGroup {
-            id: 1, anchor: OpId(0), epilogue: vec![],
-            mode: FusionMode::LoopFusion, ops: vec![OpId(0), OpId(1), OpId(2), OpId(3)],
-            multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 1,
+            anchor: OpId(0),
+            epilogue: vec![],
+            mode: FusionMode::LoopFusion,
+            ops: vec![OpId(0), OpId(1), OpId(2), OpId(3)],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
         };
         let small_rp = estimate_register_pressure(&small, &g, &exec_plan);
         let large_rp = estimate_register_pressure(&large, &g, &exec_plan);
-        assert!(large_rp > small_rp, "more ops should need more regs (small={small_rp}, large={large_rp})");
+        assert!(
+            large_rp > small_rp,
+            "more ops should need more regs (small={small_rp}, large={large_rp})"
+        );
     }
 
     // ── Test 40: ConstraintViolation Debug for all 7 variants ──
@@ -1881,13 +2108,31 @@ mod tests {
     #[test]
     fn constraint_violation_debug_all_seven_variants() {
         let violations = vec![
-            ConstraintViolation::RegisterPressure { needed: 1, available: 1 },
-            ConstraintViolation::L1Overflow { working_set: 1, l1_size: 1 },
+            ConstraintViolation::RegisterPressure {
+                needed: 1,
+                available: 1,
+            },
+            ConstraintViolation::L1Overflow {
+                working_set: 1,
+                l1_size: 1,
+            },
             ConstraintViolation::EpilogueTooDeep { depth: 1, max: 1 },
-            ConstraintViolation::AmxTileOverflow { tiles_needed: 1, tiles_available: 1 },
-            ConstraintViolation::Sme2ZaOverflow { za_bytes: 1, max_za_bytes: 1 },
-            ConstraintViolation::SharedMemOverflow { tile_bytes: 1, smem_bytes: 1 },
-            ConstraintViolation::TensorCoreUnsupported { required_gen: 1, available_gen: 1 },
+            ConstraintViolation::AmxTileOverflow {
+                tiles_needed: 1,
+                tiles_available: 1,
+            },
+            ConstraintViolation::Sme2ZaOverflow {
+                za_bytes: 1,
+                max_za_bytes: 1,
+            },
+            ConstraintViolation::SharedMemOverflow {
+                tile_bytes: 1,
+                smem_bytes: 1,
+            },
+            ConstraintViolation::TensorCoreUnsupported {
+                required_gen: 1,
+                available_gen: 1,
+            },
         ];
         for v in &violations {
             let debug = format!("{:?}", v);
@@ -1906,7 +2151,13 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[4, 128], dt);
         let w = g.add_tensor_concrete("w", &[128, 256], dt);
         let out = g.add_tensor_concrete("out", &[4, 256], dt);
-        g.add_op(Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(4), n: 256, k: 128, quant_type: crate::quant::QuantType::Q4K }),
+        g.add_op(
+            Op::QuantGemm(QuantGemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(4),
+                n: 256,
+                k: 128,
+                quant_type: crate::quant::QuantType::Q4K,
+            }),
             vec![a, w],
             vec![out],
             "quant_gemm",
@@ -1929,7 +2180,11 @@ mod tests {
         let dims = extract_gemm_dims(&group, &g);
 
         // Assert
-        assert_eq!(dims, Some((4, 256, 128)), "QuantGemm dims should be extracted");
+        assert_eq!(
+            dims,
+            Some((4, 256, 128)),
+            "QuantGemm dims should be extracted"
+        );
     }
 
     // ── Test 42: extract_gemm_dtype returns explicit dtype for Gemm ──
@@ -1942,7 +2197,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[8, 64], DType::BF16);
         let w = g.add_tensor_concrete("w", &[64, 64], DType::BF16);
         let out = g.add_tensor_concrete("out", &[8, 64], DType::BF16);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(8), n: 64, k: 64, dtype: DType::BF16, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(8),
+                n: 64,
+                k: 64,
+                dtype: DType::BF16,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -1965,7 +2228,11 @@ mod tests {
         let dtype = extract_gemm_dtype(&group, &g);
 
         // Assert
-        assert_eq!(dtype, DType::BF16, "extract_gemm_dtype should return the Gemm's explicit dtype");
+        assert_eq!(
+            dtype,
+            DType::BF16,
+            "extract_gemm_dtype should return the Gemm's explicit dtype"
+        );
     }
 
     // ── Test 43: register pressure for FFNBlock mode is gemm_base + 2 ──
@@ -1981,7 +2248,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[32, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[32, 4096], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -2023,7 +2298,8 @@ mod tests {
 
         // Assert: FFNBlock = gemm_base + 2
         assert_eq!(
-            ffn, base + 2,
+            ffn,
+            base + 2,
             "FFNBlock should add exactly 2 registers over base GEMM (base={base}, ffn={ffn})"
         );
     }
@@ -2041,7 +2317,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[32, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[32, 4096], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -2063,7 +2347,9 @@ mod tests {
             id: 1,
             anchor: OpId(0),
             epilogue: vec![],
-            mode: FusionMode::ComputeRoot { predecessor: OpId(0) },
+            mode: FusionMode::ComputeRoot {
+                predecessor: OpId(0),
+            },
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
@@ -2096,7 +2382,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[32, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[32, 4096], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -2150,7 +2444,15 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[64, 64], dt);
         let gemm_out = g.add_tensor_concrete("gemm_out", &[8, 64], dt);
         let silu_out = g.add_tensor_concrete("silu_out", &[8, 64], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(8), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(8),
+                n: 64,
+                k: 64,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
@@ -2248,7 +2550,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[32, 1024], dt);
         let w = g.add_tensor_concrete("w", &[1024, 2048], dt);
         let out = g.add_tensor_concrete("out", &[32, 2048], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 2048, k: 1024, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 2048,
+                k: 1024,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -2271,10 +2581,7 @@ mod tests {
         let ws = estimate_l1_working_set(&group, &g, &exec_plan);
 
         // Assert: GEMM working set must be positive (a_panel + b_panel)
-        assert!(
-            ws > 0,
-            "GEMM L1 working set should be positive, got {ws}"
-        );
+        assert!(ws > 0, "GEMM L1 working set should be positive, got {ws}");
     }
 
     // ── Test 50: register pressure for FusedQkvNormRope equals gemm_base ──
@@ -2290,7 +2597,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[32, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[32, 4096], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -2352,7 +2667,13 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[4, 128], dt);
         let w = g.add_tensor_concrete("w", &[128, 256], dt);
         let out = g.add_tensor_concrete("out", &[4, 256], dt);
-        g.add_op(Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(4), n: 256, k: 128, quant_type: crate::quant::QuantType::Q4K }),
+        g.add_op(
+            Op::QuantGemm(QuantGemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(4),
+                n: 256,
+                k: 128,
+                quant_type: crate::quant::QuantType::Q4K,
+            }),
             vec![a, w],
             vec![out],
             "quant_gemm",
@@ -2376,7 +2697,8 @@ mod tests {
 
         // Assert: QuantGemm delegates to infer_computation_dtype
         assert_eq!(
-            dtype, DType::F32,
+            dtype,
+            DType::F32,
             "QuantGemm should use graph.infer_computation_dtype()"
         );
     }
@@ -2429,7 +2751,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[32, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[32, 4096], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -2466,9 +2796,10 @@ mod tests {
         );
 
         // Check that at least EpilogueTooDeep is present
-        let has_depth = r.violations.iter().any(|v| {
-            matches!(v, ConstraintViolation::EpilogueTooDeep { .. })
-        });
+        let has_depth = r
+            .violations
+            .iter()
+            .any(|v| matches!(v, ConstraintViolation::EpilogueTooDeep { .. }));
         assert!(
             has_depth,
             "Should have EpilogueTooDeep violation among {:?}",
@@ -2491,7 +2822,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[32, 1024], dt);
         let w = g.add_tensor_concrete("w", &[1024, 1024], dt);
         let out = g.add_tensor_concrete("out", &[32, 1024], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 1024, k: 1024, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 1024,
+                k: 1024,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -2592,7 +2931,11 @@ mod tests {
         let hw = HardwareProfile::detect(&profile);
         if hw.has_amx() {
             assert!(result.is_err(), "32 epilogue ops should overflow AMX tiles");
-            if let Err(ConstraintViolation::AmxTileOverflow { tiles_needed, tiles_available }) = result {
+            if let Err(ConstraintViolation::AmxTileOverflow {
+                tiles_needed,
+                tiles_available,
+            }) = result
+            {
                 assert_eq!(tiles_needed, 10);
                 assert_eq!(tiles_available, 8);
             } else {
@@ -2617,7 +2960,15 @@ mod tests {
         let a32 = g_f32.add_tensor_concrete("a", &[32, 1024], DType::F32);
         let w32 = g_f32.add_tensor_concrete("w", &[1024, 2048], DType::F32);
         let o32 = g_f32.add_tensor_concrete("out", &[32, 2048], DType::F32);
-        g_f32.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 2048, k: 1024, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g_f32.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 2048,
+                k: 1024,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a32, w32],
             vec![o32],
             "gemm",
@@ -2628,7 +2979,15 @@ mod tests {
         let a16 = g_bf16.add_tensor_concrete("a", &[32, 1024], DType::BF16);
         let w16 = g_bf16.add_tensor_concrete("w", &[1024, 2048], DType::BF16);
         let o16 = g_bf16.add_tensor_concrete("out", &[32, 2048], DType::BF16);
-        g_bf16.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 2048, k: 1024, dtype: DType::BF16, trans_b: false, has_bias: false }),
+        g_bf16.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 2048,
+                k: 1024,
+                dtype: DType::BF16,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a16, w16],
             vec![o16],
             "gemm",
@@ -2653,8 +3012,14 @@ mod tests {
 
         // Assert: both must be positive; BF16 may use different (mr,nr,kc) due to wider simd_w,
         // but must be positive. The exact ratio depends on microkernel parameters.
-        assert!(ws_f32 > 0, "F32 GEMM working set must be positive, got {ws_f32}");
-        assert!(ws_bf16 > 0, "BF16 GEMM working set must be positive, got {ws_bf16}");
+        assert!(
+            ws_f32 > 0,
+            "F32 GEMM working set must be positive, got {ws_f32}"
+        );
+        assert!(
+            ws_bf16 > 0,
+            "BF16 GEMM working set must be positive, got {ws_bf16}"
+        );
         // Verify that the formula (mr*kc + kc*nr)*elem_bytes is at least plausible:
         // F32 elem_bytes=4, BF16 elem_bytes=2. Both must be multiples of their elem_bytes.
         assert_eq!(ws_f32 % 4, 0, "F32 working set should be 4-byte aligned");
@@ -2672,7 +3037,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[8, 64], dt);
         let w = g.add_tensor_concrete("w", &[64, 64], dt);
         let out = g.add_tensor_concrete("out", &[8, 64], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(8), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(8),
+                n: 64,
+                k: 64,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -2760,7 +3133,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[32, 1024], dt);
         let w = g.add_tensor_concrete("w", &[1024, 1024], dt);
         let out = g.add_tensor_concrete("out", &[32, 1024], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 1024, k: 1024, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 1024,
+                k: 1024,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -2806,7 +3187,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[16, 512], dt);
         let w = g.add_tensor_concrete("w", &[512, 256], dt);
         let out = g.add_tensor_concrete("out", &[16, 256], dt);
-        g.add_op(Op::GemmBias(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(16), n: 256, k: 512, dtype: DType::F32, trans_b: false, has_bias: true }),
+        g.add_op(
+            Op::GemmBias(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(16),
+                n: 256,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: true,
+            }),
             vec![a, w],
             vec![out],
             "gemm_bias",
@@ -2870,7 +3259,8 @@ mod tests {
 
         // Assert: non-GEMM falls through to graph.infer_computation_dtype()
         assert_eq!(
-            dtype, DType::F32,
+            dtype,
+            DType::F32,
             "Non-GEMM anchor should use graph.infer_computation_dtype()"
         );
     }
@@ -2888,7 +3278,15 @@ mod tests {
         let gemm_out = g.add_tensor_concrete("gemm_out", &[8, 64], dt);
         let silu_out = g.add_tensor_concrete("silu_out", &[8, 64], dt);
         let add_out = g.add_tensor_concrete("add_out", &[8, 64], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(8), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(8),
+                n: 64,
+                k: 64,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
@@ -2922,9 +3320,12 @@ mod tests {
         // Assert: split groups should use id pattern old_id * 100 + j
         for (j, group) in groups.iter().enumerate() {
             assert_eq!(
-                group.id, 5 * 100 + j,
+                group.id,
+                5 * 100 + j,
                 "Split group {} should have id={}, got {}",
-                j, 5 * 100 + j, group.id
+                j,
+                5 * 100 + j,
+                group.id
             );
         }
     }
@@ -2940,7 +3341,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[8, 64], dt);
         let w = g.add_tensor_concrete("w", &[64, 64], dt);
         let out = g.add_tensor_concrete("out", &[8, 64], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(8), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(8),
+                n: 64,
+                k: 64,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -2987,7 +3396,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[32, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[32, 4096], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -3122,9 +3539,13 @@ mod tests {
         let expected_f32 = tile_size * DType::F32.size_bytes() * 2;
         let expected_bf16 = tile_size * DType::BF16.size_bytes() * 2;
         assert_eq!(ws_f32, expected_f32, "F32 elementwise working set mismatch");
-        assert_eq!(ws_bf16, expected_bf16, "BF16 elementwise working set mismatch");
         assert_eq!(
-            ws_f32, ws_bf16 * 2,
+            ws_bf16, expected_bf16,
+            "BF16 elementwise working set mismatch"
+        );
+        assert_eq!(
+            ws_f32,
+            ws_bf16 * 2,
             "F32 elementwise working set should be exactly 2x BF16"
         );
     }
@@ -3142,7 +3563,15 @@ mod tests {
         let gemm_out = g.add_tensor_concrete("gemm_out", &[8, 64], dt);
         let silu_out = g.add_tensor_concrete("silu_out", &[8, 64], dt);
         let tanh_out = g.add_tensor_concrete("tanh_out", &[8, 64], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(8), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(8),
+                n: 64,
+                k: 64,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
@@ -3194,14 +3623,32 @@ mod tests {
         let add_out = g.add_tensor_concrete("add_out", &[8, 128], dt);
         let norm_out = g.add_tensor_concrete("norm_out", &[8, 128], dt);
 
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(8), n: 128, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(8),
+                n: 128,
+                k: 64,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
         );
         g.add_op(Op::Silu, vec![gemm_out], vec![silu_out], "silu");
         g.add_op(Op::Add, vec![silu_out, b], vec![add_out], "add");
-        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![add_out], vec![norm_out], "norm");
+        g.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![add_out],
+            vec![norm_out],
+            "norm",
+        );
 
         let profile = DeviceProfile::detect();
         let exec_plan = ExecutionPlan::from_profile(&profile);
@@ -3307,14 +3754,28 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[16, 256], dt);
         let w = g.add_tensor_concrete("w", &[256, 512], dt);
         let out = g.add_tensor_concrete("out", &[16, 512], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(16), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![out], "gemm",
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(16),
+                n: 512,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![out],
+            "gemm",
         );
 
         let group = FusionGroup {
-            id: 0, anchor: OpId(0), epilogue: vec![],
-            mode: FusionMode::Standalone, ops: vec![OpId(0)],
-            multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 0,
+            anchor: OpId(0),
+            epilogue: vec![],
+            mode: FusionMode::Standalone,
+            ops: vec![OpId(0)],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
@@ -3335,7 +3796,8 @@ mod tests {
         assert!(
             result.l1_working_set_bytes <= result.l1_budget_bytes,
             "GEMM working set ({}) should fit in L1 budget ({})",
-            result.l1_working_set_bytes, result.l1_budget_bytes
+            result.l1_working_set_bytes,
+            result.l1_budget_bytes
         );
     }
 
@@ -3396,14 +3858,28 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[16, 256], dt);
         let w = g.add_tensor_concrete("w", &[256, 128], dt);
         let out = g.add_tensor_concrete("out", &[16, 128], dt);
-        g.add_op(Op::GemmBias(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(16), n: 128, k: 256, dtype: DType::F32, trans_b: false, has_bias: true }),
-            vec![a, w], vec![out], "gemm_bias",
+        g.add_op(
+            Op::GemmBias(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(16),
+                n: 128,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: true,
+            }),
+            vec![a, w],
+            vec![out],
+            "gemm_bias",
         );
 
         let group = FusionGroup {
-            id: 0, anchor: OpId(0), epilogue: vec![],
-            mode: FusionMode::Standalone, ops: vec![OpId(0)],
-            multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 0,
+            anchor: OpId(0),
+            epilogue: vec![],
+            mode: FusionMode::Standalone,
+            ops: vec![OpId(0)],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
@@ -3430,14 +3906,20 @@ mod tests {
     #[test]
     fn constraint_violation_clone_l1_overflow() {
         // Arrange
-        let v = ConstraintViolation::L1Overflow { working_set: 98304, l1_size: 32768 };
+        let v = ConstraintViolation::L1Overflow {
+            working_set: 98304,
+            l1_size: 32768,
+        };
 
         // Act
         let cloned = v.clone();
 
         // Assert
         match cloned {
-            ConstraintViolation::L1Overflow { working_set, l1_size } => {
+            ConstraintViolation::L1Overflow {
+                working_set,
+                l1_size,
+            } => {
                 assert_eq!(working_set, 98304);
                 assert_eq!(l1_size, 32768);
             }
@@ -3490,8 +3972,18 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[32, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[32, 4096], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![out], "gemm",
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![out],
+            "gemm",
         );
 
         let profile = DeviceProfile::detect();
@@ -3500,21 +3992,25 @@ mod tests {
 
         // Build two groups: 1 epilogue vs 2 epilogue — both should be within free regs
         let g1 = FusionGroup {
-            id: 0, anchor: OpId(0),
+            id: 0,
+            anchor: OpId(0),
             epilogue: vec![OpId(1)],
             mode: FusionMode::EpilogueInjection,
             ops: vec![OpId(0), OpId(1)],
-            multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
         };
         let g2 = FusionGroup {
-            id: 1, anchor: OpId(0),
+            id: 1,
+            anchor: OpId(0),
             epilogue: vec![OpId(1), OpId(2)],
             mode: FusionMode::EpilogueInjection,
             ops: vec![OpId(0), OpId(1), OpId(2)],
-            multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
@@ -3525,9 +4021,18 @@ mod tests {
         let p2 = estimate_register_pressure(&g2, &g, &exec_plan);
 
         // Assert: both within register limit, and p2 >= p1
-        assert!(p1 <= regs, "1-epilogue pressure {p1} should fit in {regs} regs");
-        assert!(p2 <= regs, "2-epilogue pressure {p2} should fit in {regs} regs");
-        assert!(p2 >= p1, "2 epilogue ops should need at least as many regs as 1: p1={p1}, p2={p2}");
+        assert!(
+            p1 <= regs,
+            "1-epilogue pressure {p1} should fit in {regs} regs"
+        );
+        assert!(
+            p2 <= regs,
+            "2-epilogue pressure {p2} should fit in {regs} regs"
+        );
+        assert!(
+            p2 >= p1,
+            "2 epilogue ops should need at least as many regs as 1: p1={p1}, p2={p2}"
+        );
     }
 
     // ── Test 79: check_group for QuantGemm returns positive register_pressure ──
@@ -3541,14 +4046,26 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[4, 128], dt);
         let w = g.add_tensor_concrete("w", &[128, 256], dt);
         let out = g.add_tensor_concrete("out", &[4, 256], dt);
-        g.add_op(Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(4), n: 256, k: 128, quant_type: crate::quant::QuantType::Q4K }),
-            vec![a, w], vec![out], "quant_gemm",
+        g.add_op(
+            Op::QuantGemm(QuantGemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(4),
+                n: 256,
+                k: 128,
+                quant_type: crate::quant::QuantType::Q4K,
+            }),
+            vec![a, w],
+            vec![out],
+            "quant_gemm",
         );
 
         let group = FusionGroup {
-            id: 0, anchor: OpId(0), epilogue: vec![],
-            mode: FusionMode::Standalone, ops: vec![OpId(0)],
-            multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 0,
+            anchor: OpId(0),
+            epilogue: vec![],
+            mode: FusionMode::Standalone,
+            ops: vec![OpId(0)],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
@@ -3580,14 +4097,28 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[8, 64], dt);
         let w = g.add_tensor_concrete("w", &[64, 64], dt);
         let out = g.add_tensor_concrete("out", &[8, 64], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(8), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![out], "gemm",
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(8),
+                n: 64,
+                k: 64,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![out],
+            "gemm",
         );
 
         let group = FusionGroup {
-            id: 0, anchor: OpId(0), epilogue: vec![],
-            mode: FusionMode::Standalone, ops: vec![OpId(0)],
-            multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 0,
+            anchor: OpId(0),
+            epilogue: vec![],
+            mode: FusionMode::Standalone,
+            ops: vec![OpId(0)],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
@@ -3653,13 +4184,27 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[8, 64], dt);
         let w = g.add_tensor_concrete("w", &[64, 64], dt);
         let out = g.add_tensor_concrete("out", &[8, 64], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(8), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![out], "gemm",
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(8),
+                n: 64,
+                k: 64,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![out],
+            "gemm",
         );
         let group = FusionGroup {
-            id: 0, anchor: OpId(0), epilogue: vec![],
-            mode: FusionMode::Standalone, ops: vec![OpId(0)],
-            multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 0,
+            anchor: OpId(0),
+            epilogue: vec![],
+            mode: FusionMode::Standalone,
+            ops: vec![OpId(0)],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
@@ -3674,7 +4219,8 @@ mod tests {
         assert!(
             result.l1_budget_bytes < l1_raw,
             "L1 budget ({}) should be strictly less than raw L1 ({})",
-            result.l1_budget_bytes, l1_raw,
+            result.l1_budget_bytes,
+            l1_raw,
         );
     }
 
@@ -3692,8 +4238,18 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[32, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[32, 4096], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![out], "gemm",
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![out],
+            "gemm",
         );
 
         let epilogue_ops: Vec<OpId> = (1..=200).map(OpId).collect();
@@ -3722,7 +4278,10 @@ mod tests {
 
         // Assert: if it overflows, the violation must have correct fields
         if let Err(ConstraintViolation::RegisterPressure { needed, available }) = result {
-            assert!(needed > available, "needed ({needed}) should exceed available ({available})");
+            assert!(
+                needed > available,
+                "needed ({needed}) should exceed available ({available})"
+            );
         }
         // If it does not overflow on this profile, that is also acceptable —
         // the important thing is the function runs without panic.
@@ -3761,7 +4320,12 @@ mod tests {
         let result = checker.validate_epilogue_depth(&group);
 
         // Assert: exactly one beyond the limit should fail
-        assert!(result.is_err(), "depth {} should fail when max is {}", beyond, limit);
+        assert!(
+            result.is_err(),
+            "depth {} should fail when max is {}",
+            beyond,
+            limit
+        );
         if let Err(ConstraintViolation::EpilogueTooDeep { depth, max }) = result {
             assert_eq!(depth, beyond);
             assert_eq!(max, limit);
@@ -3779,8 +4343,18 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[32, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[32, 4096], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![out], "gemm",
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![out],
+            "gemm",
         );
 
         let epilogue_ops: Vec<OpId> = (1..=200).map(OpId).collect();
@@ -3830,7 +4404,10 @@ mod tests {
         enforce_constraints(&mut groups, &g, &exec_plan);
 
         // Assert: empty input produces empty output
-        assert!(groups.is_empty(), "empty groups should remain empty after enforce");
+        assert!(
+            groups.is_empty(),
+            "empty groups should remain empty after enforce"
+        );
     }
 
     // ── Test 87: L1 working set for BF16 GEMM is smaller than F32 GEMM ──
@@ -3846,30 +4423,58 @@ mod tests {
         let a32 = g32.add_tensor_concrete("a", &[16, 512], DType::F32);
         let w32 = g32.add_tensor_concrete("w", &[512, 256], DType::F32);
         let out32 = g32.add_tensor_concrete("out", &[16, 256], DType::F32);
-        g32.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(16), n: 256, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a32, w32], vec![out32], "gemm",
+        g32.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(16),
+                n: 256,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a32, w32],
+            vec![out32],
+            "gemm",
         );
 
         let mut g16 = CompilerGraph::new();
         let a16 = g16.add_tensor_concrete("a", &[16, 512], DType::BF16);
         let w16 = g16.add_tensor_concrete("w", &[512, 256], DType::BF16);
         let out16 = g16.add_tensor_concrete("out", &[16, 256], DType::BF16);
-        g16.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(16), n: 256, k: 512, dtype: DType::BF16, trans_b: false, has_bias: false }),
-            vec![a16, w16], vec![out16], "gemm",
+        g16.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(16),
+                n: 256,
+                k: 512,
+                dtype: DType::BF16,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a16, w16],
+            vec![out16],
+            "gemm",
         );
 
         let group32 = FusionGroup {
-            id: 0, anchor: OpId(0), epilogue: vec![],
-            mode: FusionMode::Standalone, ops: vec![OpId(0)],
-            multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 0,
+            anchor: OpId(0),
+            epilogue: vec![],
+            mode: FusionMode::Standalone,
+            ops: vec![OpId(0)],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
         };
         let group16 = FusionGroup {
-            id: 0, anchor: OpId(0), epilogue: vec![],
-            mode: FusionMode::Standalone, ops: vec![OpId(0)],
-            multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 0,
+            anchor: OpId(0),
+            epilogue: vec![],
+            mode: FusionMode::Standalone,
+            ops: vec![OpId(0)],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
@@ -3896,7 +4501,17 @@ mod tests {
         let dt = DType::F32;
         let a = g.add_tensor_concrete("a", &[128], dt);
         let out = g.add_tensor_concrete("out", &[128], dt);
-        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![a], vec![out], "norm");
+        g.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![a],
+            vec![out],
+            "norm",
+        );
 
         let group = FusionGroup {
             id: 0,
@@ -3919,7 +4534,11 @@ mod tests {
         let result = checker.validate_register_pressure(&group, &g);
 
         // Assert: 2 regs always fits within any positive register file
-        assert!(result.is_ok(), "non-GEMM standalone should pass register check: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "non-GEMM standalone should pass register check: {:?}",
+            result.err()
+        );
     }
 
     // ── Test 89: register pressure for missing anchor op defaults to 2 ──
@@ -3949,7 +4568,10 @@ mod tests {
         let pressure = estimate_register_pressure(&group, &g, &exec_plan);
 
         // Assert: missing anchor → falls through to default 2
-        assert_eq!(pressure, 2, "missing anchor op should default to 2 register pressure");
+        assert_eq!(
+            pressure, 2,
+            "missing anchor op should default to 2 register pressure"
+        );
     }
 
     // ── Test 90: gemm_base_regs with BF16 uses fewer or equal regs than F32 ──
@@ -3979,9 +4601,18 @@ mod tests {
     fn constraint_violation_debug_preserves_field_values() {
         // Arrange
         let violations = vec![
-            ConstraintViolation::AmxTileOverflow { tiles_needed: 10, tiles_available: 8 },
-            ConstraintViolation::Sme2ZaOverflow { za_bytes: 32768, max_za_bytes: 16384 },
-            ConstraintViolation::SharedMemOverflow { tile_bytes: 65536, smem_bytes: 49152 },
+            ConstraintViolation::AmxTileOverflow {
+                tiles_needed: 10,
+                tiles_available: 8,
+            },
+            ConstraintViolation::Sme2ZaOverflow {
+                za_bytes: 32768,
+                max_za_bytes: 16384,
+            },
+            ConstraintViolation::SharedMemOverflow {
+                tile_bytes: 65536,
+                smem_bytes: 49152,
+            },
         ];
 
         // Act
@@ -3990,17 +4621,44 @@ mod tests {
 
             // Assert: Debug output must contain the numeric values from the fields
             match v {
-                ConstraintViolation::AmxTileOverflow { tiles_needed, tiles_available } => {
-                    assert!(debug.contains(&tiles_needed.to_string()), "Debug should contain tiles_needed");
-                    assert!(debug.contains(&tiles_available.to_string()), "Debug should contain tiles_available");
+                ConstraintViolation::AmxTileOverflow {
+                    tiles_needed,
+                    tiles_available,
+                } => {
+                    assert!(
+                        debug.contains(&tiles_needed.to_string()),
+                        "Debug should contain tiles_needed"
+                    );
+                    assert!(
+                        debug.contains(&tiles_available.to_string()),
+                        "Debug should contain tiles_available"
+                    );
                 }
-                ConstraintViolation::Sme2ZaOverflow { za_bytes, max_za_bytes } => {
-                    assert!(debug.contains(&za_bytes.to_string()), "Debug should contain za_bytes");
-                    assert!(debug.contains(&max_za_bytes.to_string()), "Debug should contain max_za_bytes");
+                ConstraintViolation::Sme2ZaOverflow {
+                    za_bytes,
+                    max_za_bytes,
+                } => {
+                    assert!(
+                        debug.contains(&za_bytes.to_string()),
+                        "Debug should contain za_bytes"
+                    );
+                    assert!(
+                        debug.contains(&max_za_bytes.to_string()),
+                        "Debug should contain max_za_bytes"
+                    );
                 }
-                ConstraintViolation::SharedMemOverflow { tile_bytes, smem_bytes } => {
-                    assert!(debug.contains(&tile_bytes.to_string()), "Debug should contain tile_bytes");
-                    assert!(debug.contains(&smem_bytes.to_string()), "Debug should contain smem_bytes");
+                ConstraintViolation::SharedMemOverflow {
+                    tile_bytes,
+                    smem_bytes,
+                } => {
+                    assert!(
+                        debug.contains(&tile_bytes.to_string()),
+                        "Debug should contain tile_bytes"
+                    );
+                    assert!(
+                        debug.contains(&smem_bytes.to_string()),
+                        "Debug should contain smem_bytes"
+                    );
                 }
                 _ => {}
             }
@@ -4024,7 +4682,10 @@ mod tests {
             epilogue_depth: 20,
             max_epilogue_depth: 8,
             violations: vec![
-                ConstraintViolation::RegisterPressure { needed: 64, available: 32 },
+                ConstraintViolation::RegisterPressure {
+                    needed: 64,
+                    available: 32,
+                },
                 ConstraintViolation::EpilogueTooDeep { depth: 20, max: 8 },
             ],
         };
@@ -4036,9 +4697,16 @@ mod tests {
 
         // Assert: original is unaffected
         assert!(!original.valid, "original.valid should still be false");
-        assert_eq!(original.violations.len(), 2, "original violations should still have 2 entries");
+        assert_eq!(
+            original.violations.len(),
+            2,
+            "original violations should still have 2 entries"
+        );
         assert!(cloned.valid, "cloned.valid should be true after mutation");
-        assert!(cloned.violations.is_empty(), "cloned violations should be empty after clear");
+        assert!(
+            cloned.violations.is_empty(),
+            "cloned violations should be empty after clear"
+        );
     }
 
     // ── Test 93: validate_gpu_shared_mem passes for non-GEMM group ──
@@ -4130,7 +4798,15 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[16, 512], DType::BF16);
         let w = g.add_tensor_concrete("w", &[512, 256], DType::BF16);
         let out = g.add_tensor_concrete("out", &[16, 256], DType::BF16);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(16), n: 256, k: 512, dtype: DType::BF16, trans_b: false, has_bias: false }),
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(16),
+                n: 256,
+                k: 512,
+                dtype: DType::BF16,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -4213,22 +4889,40 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[8, 64], dt);
         let w = g.add_tensor_concrete("w", &[64, 64], dt);
         let out = g.add_tensor_concrete("out", &[8, 64], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(8), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![out], "gemm",
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(8),
+                n: 64,
+                k: 64,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![out],
+            "gemm",
         );
 
         let group_no_epi = FusionGroup {
-            id: 0, anchor: OpId(0), epilogue: vec![],
-            mode: FusionMode::Standalone, ops: vec![OpId(0)],
-            multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 0,
+            anchor: OpId(0),
+            epilogue: vec![],
+            mode: FusionMode::Standalone,
+            ops: vec![OpId(0)],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
         };
         let group_with_epi = FusionGroup {
-            id: 1, anchor: OpId(0), epilogue: vec![OpId(1), OpId(2)],
-            mode: FusionMode::EpilogueInjection, ops: vec![OpId(0), OpId(1), OpId(2)],
-            multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 1,
+            anchor: OpId(0),
+            epilogue: vec![OpId(1), OpId(2)],
+            mode: FusionMode::EpilogueInjection,
+            ops: vec![OpId(0), OpId(1), OpId(2)],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
@@ -4244,9 +4938,18 @@ mod tests {
         let r2 = checker.build_result(&group_with_epi, &g);
 
         // Assert: both results should report the same max_epilogue_depth
-        assert_eq!(r1.max_epilogue_depth, expected_max, "group_no_epi max depth mismatch");
-        assert_eq!(r2.max_epilogue_depth, expected_max, "group_with_epi max depth mismatch");
-        assert_eq!(r1.max_epilogue_depth, r2.max_epilogue_depth, "both groups should report same max");
+        assert_eq!(
+            r1.max_epilogue_depth, expected_max,
+            "group_no_epi max depth mismatch"
+        );
+        assert_eq!(
+            r2.max_epilogue_depth, expected_max,
+            "group_with_epi max depth mismatch"
+        );
+        assert_eq!(
+            r1.max_epilogue_depth, r2.max_epilogue_depth,
+            "both groups should report same max"
+        );
     }
 
     // ── Test 98: ConstraintViolation EpilogueTooDeep at boundary values ──
@@ -4273,7 +4976,10 @@ mod tests {
             other => panic!("expected EpilogueTooDeep, got {:?}", other),
         }
         // Debug format should contain the large values
-        assert!(debug.contains("EpilogueTooDeep"), "Debug should contain variant name");
+        assert!(
+            debug.contains("EpilogueTooDeep"),
+            "Debug should contain variant name"
+        );
     }
 
     // ── Test 99: validate_l1_working_set with QuantGemm anchor extracts dims ──
@@ -4288,7 +4994,13 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[4, 128], dt);
         let w = g.add_tensor_concrete("w", &[128, 256], dt);
         let out = g.add_tensor_concrete("out", &[4, 256], dt);
-        g.add_op(Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(4), n: 256, k: 128, quant_type: crate::quant::QuantType::Q4K }),
+        g.add_op(
+            Op::QuantGemm(QuantGemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(4),
+                n: 256,
+                k: 128,
+                quant_type: crate::quant::QuantType::Q4K,
+            }),
             vec![a, w],
             vec![out],
             "quant_gemm",
@@ -4323,7 +5035,10 @@ mod tests {
 
         // Verify working set is positive via estimate_l1_working_set
         let ws = estimate_l1_working_set(&group, &g, &exec_plan);
-        assert!(ws > 0, "QuantGemm L1 working set should be positive, got {ws}");
+        assert!(
+            ws > 0,
+            "QuantGemm L1 working set should be positive, got {ws}"
+        );
     }
 
     // ── Test 100: HwConstraintChecker lifetime borrows ExecutionPlan ──
@@ -4339,14 +5054,28 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[8, 64], dt);
         let w = g.add_tensor_concrete("w", &[64, 64], dt);
         let out = g.add_tensor_concrete("out", &[8, 64], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(8), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![out], "gemm",
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(8),
+                n: 64,
+                k: 64,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![out],
+            "gemm",
         );
 
         let group = FusionGroup {
-            id: 0, anchor: OpId(0), epilogue: vec![],
-            mode: FusionMode::Standalone, ops: vec![OpId(0)],
-            multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 0,
+            anchor: OpId(0),
+            epilogue: vec![],
+            mode: FusionMode::Standalone,
+            ops: vec![OpId(0)],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
@@ -4393,7 +5122,7 @@ mod tests {
                     dominant_dtype: None,
                     marker: GroupMarker::None,
                     is_layer_group: false,
-            hetero_layer_type: None,
+                    hetero_layer_type: None,
                 };
                 estimate_register_pressure(&group, &g, &exec_plan)
             })
@@ -4402,9 +5131,11 @@ mod tests {
         // Assert: each step should increase by exactly 1 (LoopFusion = 3 + ops.len())
         for i in 1..pressures.len() {
             assert_eq!(
-                pressures[i] - pressures[i - 1], 1,
+                pressures[i] - pressures[i - 1],
+                1,
                 "LoopFusion pressure should increase by 1 per op: {} -> {}",
-                pressures[i - 1], pressures[i]
+                pressures[i - 1],
+                pressures[i]
             );
         }
     }
@@ -4421,8 +5152,18 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[8, 64], dt);
         let w = g.add_tensor_concrete("w", &[64, 64], dt);
         let out = g.add_tensor_concrete("out", &[8, 64], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(8), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![out], "gemm",
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(8),
+                n: 64,
+                k: 64,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![out],
+            "gemm",
         );
 
         let group = FusionGroup {
@@ -4449,7 +5190,8 @@ mod tests {
         assert!(
             result.register_limit >= min_limit,
             "register_limit ({}) should be >= num_simd_regs ({})",
-            result.register_limit, min_limit
+            result.register_limit,
+            min_limit
         );
         // The difference must be 0 or 4 (memory-bound headroom)
         let delta = result.register_limit - min_limit;
@@ -4472,22 +5214,46 @@ mod tests {
         let a1 = g_small_k.add_tensor_concrete("a", &[16, 128], DType::F32);
         let w1 = g_small_k.add_tensor_concrete("w", &[128, 256], DType::F32);
         let o1 = g_small_k.add_tensor_concrete("out", &[16, 256], DType::F32);
-        g_small_k.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(16), n: 256, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a1, w1], vec![o1], "gemm",
+        g_small_k.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(16),
+                n: 256,
+                k: 128,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a1, w1],
+            vec![o1],
+            "gemm",
         );
 
         let mut g_large_k = CompilerGraph::new();
         let a2 = g_large_k.add_tensor_concrete("a", &[16, 1024], DType::F32);
         let w2 = g_large_k.add_tensor_concrete("w", &[1024, 256], DType::F32);
         let o2 = g_large_k.add_tensor_concrete("out", &[16, 256], DType::F32);
-        g_large_k.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(16), n: 256, k: 1024, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a2, w2], vec![o2], "gemm",
+        g_large_k.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(16),
+                n: 256,
+                k: 1024,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a2, w2],
+            vec![o2],
+            "gemm",
         );
 
         let group = FusionGroup {
-            id: 0, anchor: OpId(0), epilogue: vec![],
-            mode: FusionMode::Standalone, ops: vec![OpId(0)],
-            multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 0,
+            anchor: OpId(0),
+            epilogue: vec![],
+            mode: FusionMode::Standalone,
+            ops: vec![OpId(0)],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
@@ -4520,8 +5286,14 @@ mod tests {
         let r2_bf16 = gemm_base_regs(&exec_plan, DType::BF16);
 
         // Assert: identical inputs must produce identical outputs
-        assert_eq!(r1_f32, r2_f32, "gemm_base_regs(F32) should be deterministic");
-        assert_eq!(r1_bf16, r2_bf16, "gemm_base_regs(BF16) should be deterministic");
+        assert_eq!(
+            r1_f32, r2_f32,
+            "gemm_base_regs(F32) should be deterministic"
+        );
+        assert_eq!(
+            r1_bf16, r2_bf16,
+            "gemm_base_regs(BF16) should be deterministic"
+        );
     }
 
     // ── Test 105: validate_epilogue_depth returns correct error fields ──
@@ -4558,7 +5330,12 @@ mod tests {
         let result = checker.validate_epilogue_depth(&group);
 
         // Assert
-        assert!(result.is_err(), "depth {} should exceed max {}", beyond, limit);
+        assert!(
+            result.is_err(),
+            "depth {} should exceed max {}",
+            beyond,
+            limit
+        );
         match result.unwrap_err() {
             ConstraintViolation::EpilogueTooDeep { depth, max } => {
                 assert_eq!(depth, beyond, "error depth should equal epilogue length");
@@ -4579,14 +5356,28 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 1], dt);
         let w = g.add_tensor_concrete("w", &[1, 1], dt);
         let out = g.add_tensor_concrete("out", &[1, 1], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 1, k: 1, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![out], "gemm",
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 1,
+                k: 1,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![out],
+            "gemm",
         );
 
         let group = FusionGroup {
-            id: 0, anchor: OpId(0), epilogue: vec![],
-            mode: FusionMode::Standalone, ops: vec![OpId(0)],
-            multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 0,
+            anchor: OpId(0),
+            epilogue: vec![],
+            mode: FusionMode::Standalone,
+            ops: vec![OpId(0)],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
@@ -4617,7 +5408,10 @@ mod tests {
     #[test]
     fn constraint_violation_register_pressure_clone_preserves_fields() {
         // Arrange: construct with specific asymmetric values
-        let v = ConstraintViolation::RegisterPressure { needed: 37, available: 13 };
+        let v = ConstraintViolation::RegisterPressure {
+            needed: 37,
+            available: 13,
+        };
 
         // Act
         let cloned = v.clone();
@@ -4644,8 +5438,18 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[512, 256], dt);
         let gemm_out = g.add_tensor_concrete("gemm_out", &[16, 256], dt);
         let silu_out = g.add_tensor_concrete("silu_out", &[16, 256], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(16), n: 256, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![gemm_out], "gemm",
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(16),
+                n: 256,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![gemm_out],
+            "gemm",
         );
         g.add_op(Op::Silu, vec![gemm_out], vec![silu_out], "silu");
 
@@ -4661,7 +5465,8 @@ mod tests {
                 assert!(
                     r.violations.is_empty(),
                     "valid result for group {} should have zero violations, got {:?}",
-                    r.group_id, r.violations
+                    r.group_id,
+                    r.violations
                 );
                 assert!(
                     r.register_pressure > 0,
@@ -4676,7 +5481,9 @@ mod tests {
                 assert!(
                     r.register_pressure <= r.register_limit,
                     "register_pressure ({}) should not exceed limit ({}) for group {}",
-                    r.register_pressure, r.register_limit, r.group_id
+                    r.register_pressure,
+                    r.register_limit,
+                    r.group_id
                 );
             }
         }
@@ -4693,8 +5500,18 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[32, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[32, 4096], dt);
-        g.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(32), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![out], "gemm",
+        g.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(32),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![out],
+            "gemm",
         );
 
         let profile = DeviceProfile::detect();
@@ -4702,17 +5519,25 @@ mod tests {
         let available = profile.num_simd_regs();
 
         let standalone = FusionGroup {
-            id: 0, anchor: OpId(0), epilogue: vec![],
-            mode: FusionMode::Standalone, ops: vec![OpId(0)],
-            multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 0,
+            anchor: OpId(0),
+            epilogue: vec![],
+            mode: FusionMode::Standalone,
+            ops: vec![OpId(0)],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
         };
         let with_one = FusionGroup {
-            id: 1, anchor: OpId(0), epilogue: vec![OpId(1)],
-            mode: FusionMode::EpilogueInjection, ops: vec![OpId(0), OpId(1)],
-            multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 1,
+            anchor: OpId(0),
+            epilogue: vec![OpId(1)],
+            mode: FusionMode::EpilogueInjection,
+            ops: vec![OpId(0), OpId(1)],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
@@ -4749,13 +5574,27 @@ mod tests {
         let a1 = g1.add_tensor_concrete("a", &[8, 32], DType::F32);
         let w1 = g1.add_tensor_concrete("w", &[32, 64], DType::F32);
         let o1 = g1.add_tensor_concrete("out", &[8, 64], DType::F32);
-        g1.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(8), n: 64, k: 32, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a1, w1], vec![o1], "gemm",
+        g1.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(8),
+                n: 64,
+                k: 32,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a1, w1],
+            vec![o1],
+            "gemm",
         );
         let grp1 = FusionGroup {
-            id: 0, anchor: OpId(0), epilogue: vec![],
-            mode: FusionMode::Standalone, ops: vec![OpId(0)],
-            multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 0,
+            anchor: OpId(0),
+            epilogue: vec![],
+            mode: FusionMode::Standalone,
+            ops: vec![OpId(0)],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
@@ -4767,13 +5606,27 @@ mod tests {
         let a2 = g2.add_tensor_concrete("a", &[4, 16], DType::F32);
         let w2 = g2.add_tensor_concrete("w", &[16, 32], DType::F32);
         let o2 = g2.add_tensor_concrete("out", &[4, 32], DType::F32);
-        g2.add_op(Op::GemmBias(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(4), n: 32, k: 16, dtype: DType::F32, trans_b: false, has_bias: true }),
-            vec![a2, w2], vec![o2], "gemm_bias",
+        g2.add_op(
+            Op::GemmBias(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(4),
+                n: 32,
+                k: 16,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: true,
+            }),
+            vec![a2, w2],
+            vec![o2],
+            "gemm_bias",
         );
         let grp2 = FusionGroup {
-            id: 0, anchor: OpId(0), epilogue: vec![],
-            mode: FusionMode::Standalone, ops: vec![OpId(0)],
-            multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 0,
+            anchor: OpId(0),
+            epilogue: vec![],
+            mode: FusionMode::Standalone,
+            ops: vec![OpId(0)],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,
@@ -4785,13 +5638,25 @@ mod tests {
         let a3 = g3.add_tensor_concrete("a", &[2, 8], DType::F32);
         let w3 = g3.add_tensor_concrete("w", &[8, 16], DType::F32);
         let o3 = g3.add_tensor_concrete("out", &[2, 16], DType::F32);
-        g3.add_op(Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(2), n: 16, k: 8, quant_type: crate::quant::QuantType::Q4K }),
-            vec![a3, w3], vec![o3], "quant_gemm",
+        g3.add_op(
+            Op::QuantGemm(QuantGemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(2),
+                n: 16,
+                k: 8,
+                quant_type: crate::quant::QuantType::Q4K,
+            }),
+            vec![a3, w3],
+            vec![o3],
+            "quant_gemm",
         );
         let grp3 = FusionGroup {
-            id: 0, anchor: OpId(0), epilogue: vec![],
-            mode: FusionMode::Standalone, ops: vec![OpId(0)],
-            multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            id: 0,
+            anchor: OpId(0),
+            epilogue: vec![],
+            mode: FusionMode::Standalone,
+            ops: vec![OpId(0)],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None,
             marker: GroupMarker::None,
             is_layer_group: false,
             hetero_layer_type: None,

@@ -13,28 +13,31 @@
 //! - RmsNorm -> GEMM: norm output feeds GEMM input without memory writeback
 //! - FusedQkvNormRope (Gemma 4): QKV GEMMs + QkNorm(Q,K) + ValueNorm(V) + RoPE(Q,K)
 
-mod types;
 mod cost_model;
 mod helpers;
 mod pass;
 pub mod pdt;
 pub mod quant_aware;
 pub mod quant_aware_fusion;
+mod types;
 
 // ── Public re-exports ───────────────────────────────────────────────
-pub use types::{FusionGroup, FusionMode, FusionPlan, FusionCost, GroupMarker, HeteroLayerType};
 pub use cost_model::{estimate_fusion_cost, Cost, FusionCostModel};
 pub use pass::{fuse_with_dag, fuse_with_dag_prebuilt};
-pub use quant_aware_fusion::{FusionRule, FusionEngine};
+pub use quant_aware_fusion::{FusionEngine, FusionRule};
+pub use types::{FusionCost, FusionGroup, FusionMode, FusionPlan, GroupMarker, HeteroLayerType};
 
 // ── Crate-internal re-exports ───────────────────────────────────────
 pub(crate) use cost_model::is_memory_bound_group;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::cost_model::{chain_eliminated_bytes, compute_group_roofline_scale};
-    use crate::compiler::graph::{ CompilerGraph, OpId, Op, GemmSpec, MultiOutputConfig, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, MlaSpec };
+    use super::*;
+    use crate::compiler::graph::{
+        AttentionGeometry, AttentionMask, AttentionSpec, CompilerGraph, GemmSpec, MlaSpec,
+        MultiOutputConfig, NormSpec, Op, OpId, QuantGemmSpec, RopeSpec, SinksSpec,
+    };
     use crate::compiler::ir::LayerIR;
     use crate::compiler::planner::ExecutionPlan;
     use crate::dispatch::DeviceProfile;
@@ -85,7 +88,14 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 4096], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
@@ -112,7 +122,13 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 128], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::RoPE(RopeSpec { num_heads: 32, head_dim: 128, theta: 10000.0, partial: 1.0, rope_scaling: None }),
+            crate::compiler::graph::Op::RoPE(RopeSpec {
+                num_heads: 32,
+                head_dim: 128,
+                theta: 10000.0,
+                partial: 1.0,
+                rope_scaling: None,
+            }),
             vec![a, cos],
             vec![rope_out],
             "rope",
@@ -142,7 +158,12 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 4096], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, quant_type: crate::quant::QuantType::Q4_0 }),
+            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                quant_type: crate::quant::QuantType::Q4_0,
+            }),
             vec![a, w],
             vec![gemm_out],
             "qgemm",
@@ -166,7 +187,12 @@ mod tests {
         let out = g.add_tensor_concrete("out", &[1, 4096], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, quant_type: crate::quant::QuantType::Q4_0 }),
+            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                quant_type: crate::quant::QuantType::Q4_0,
+            }),
             vec![a, w],
             vec![out],
             "qgemm",
@@ -188,7 +214,11 @@ mod tests {
         let b = g.add_tensor_concrete("b_f32", &[4096], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::Dequantize { num_elements: 4096, block_size: 32, bits: 4 },
+            crate::compiler::graph::Op::Dequantize {
+                num_elements: 4096,
+                block_size: 32,
+                bits: 4,
+            },
             vec![a],
             vec![b],
             "dequant",
@@ -216,7 +246,14 @@ mod tests {
 
         g.add_op(Op::Softmax, vec![a], vec![softmax_out], "softmax");
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![softmax_out, w],
             vec![gemm_out],
             "gemm",
@@ -228,7 +265,11 @@ mod tests {
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
         // Softmax and GEMM must be in separate groups — no NormIntoGemm fusion
-        assert_eq!(plan.num_groups(), 2, "Softmax should not fuse as norm prefix");
+        assert_eq!(
+            plan.num_groups(),
+            2,
+            "Softmax should not fuse as norm prefix"
+        );
         for group in &plan.groups {
             assert_ne!(
                 group.mode,
@@ -251,18 +292,33 @@ mod tests {
         let swiglu_out = g.add_tensor_concrete("swiglu_out", &[1, 4096], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![other_out],
             "gemm_other",
         );
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![gemm_out],
             "gemm_main",
         );
-        g.add_op(Op::SwiGlu,
+        g.add_op(
+            Op::SwiGlu,
             vec![gemm_out, other_out],
             vec![swiglu_out],
             "swiglu",
@@ -273,15 +329,20 @@ mod tests {
         let exec_plan = ExecutionPlan::from_profile(&profile);
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
-        let gemm_main_group = plan.groups.iter().find(|grp| {
-            grp.ops.iter().any(|&oid| {
-                g.op(oid).map_or(false, |o| o.label == "gemm_main")
+        let gemm_main_group = plan
+            .groups
+            .iter()
+            .find(|grp| {
+                grp.ops
+                    .iter()
+                    .any(|&oid| g.op(oid).map_or(false, |o| o.label == "gemm_main"))
             })
-        }).expect("gemm_main should have a group");
+            .expect("gemm_main should have a group");
         assert!(
-            !gemm_main_group.ops.iter().any(|&oid| {
-                g.op(oid).map_or(false, |o| o.label == "swiglu")
-            }),
+            !gemm_main_group
+                .ops
+                .iter()
+                .any(|&oid| { g.op(oid).map_or(false, |o| o.label == "swiglu") }),
             "SwiGlu with external input must not be fused into GEMM epilogue (DAG path)"
         );
     }
@@ -295,9 +356,9 @@ mod tests {
         label: &str,
     ) -> Option<&'a FusionGroup> {
         plan.groups.iter().find(|grp| {
-            grp.ops.iter().any(|&oid| {
-                graph.op(oid).map_or(false, |o| o.label == label)
-            })
+            grp.ops
+                .iter()
+                .any(|&oid| graph.op(oid).map_or(false, |o| o.label == label))
         })
     }
 
@@ -321,21 +382,40 @@ mod tests {
             let w = g.add_tensor_concrete("w", &[k_large, k_large], dt);
             let gemm_out = g.add_tensor_concrete("gemm_out", &[1, k_large], dt);
 
-            g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![x], vec![norm_out], "rms_norm");
             g.add_op(
-                crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: k_large, k: k_large, dtype: DType::F32, trans_b: false, has_bias: false }),
+                Op::RmsNorm(NormSpec {
+                    feature_dim: 4096,
+                    eps: 1e-5,
+                    dtype: DType::F32,
+                    has_weight: true,
+                }),
+                vec![x],
+                vec![norm_out],
+                "rms_norm",
+            );
+            g.add_op(
+                crate::compiler::graph::Op::Gemm(GemmSpec {
+                    m: crate::compiler::graph::SymDim::Concrete(1),
+                    n: k_large,
+                    k: k_large,
+                    dtype: DType::F32,
+                    trans_b: false,
+                    has_bias: false,
+                }),
                 vec![norm_out, w],
                 vec![gemm_out],
                 "gemm",
             );
 
             let plan = fuse_with_dag(&g, &registry, &exec_plan);
-            let gemm_group = find_group_by_label(&plan, &g, "gemm")
-                .expect("GEMM should have a fusion group");
+            let gemm_group =
+                find_group_by_label(&plan, &g, "gemm").expect("GEMM should have a fusion group");
             assert!(
                 matches!(gemm_group.mode, FusionMode::TileLevelFusion { .. }),
                 "Expected TileLevelFusion for norm output ({} B) > 75% L1 ({} B), got {:?}",
-                k_large * 4, l1_budget, gemm_group.mode,
+                k_large * 4,
+                l1_budget,
+                gemm_group.mode,
             );
         }
 
@@ -355,21 +435,40 @@ mod tests {
                 "Test setup error: norm output {norm_bytes}B should be <= l1_budget {l1_budget}B"
             );
 
-            g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![x], vec![norm_out], "rms_norm");
             g.add_op(
-                crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: n_small, k: k_small, dtype: DType::F32, trans_b: false, has_bias: false }),
+                Op::RmsNorm(NormSpec {
+                    feature_dim: 4096,
+                    eps: 1e-5,
+                    dtype: DType::F32,
+                    has_weight: true,
+                }),
+                vec![x],
+                vec![norm_out],
+                "rms_norm",
+            );
+            g.add_op(
+                crate::compiler::graph::Op::Gemm(GemmSpec {
+                    m: crate::compiler::graph::SymDim::Concrete(1),
+                    n: n_small,
+                    k: k_small,
+                    dtype: DType::F32,
+                    trans_b: false,
+                    has_bias: false,
+                }),
                 vec![norm_out, w],
                 vec![gemm_out],
                 "gemm",
             );
 
             let plan = fuse_with_dag(&g, &registry, &exec_plan);
-            let gemm_group = find_group_by_label(&plan, &g, "gemm")
-                .expect("GEMM should have a fusion group");
+            let gemm_group =
+                find_group_by_label(&plan, &g, "gemm").expect("GEMM should have a fusion group");
             assert!(
                 matches!(gemm_group.mode, FusionMode::ComputeRoot { .. }),
                 "Expected ComputeRoot for norm output ({} B) <= 75% L1 ({} B), got {:?}",
-                norm_bytes, l1_budget, gemm_group.mode,
+                norm_bytes,
+                l1_budget,
+                gemm_group.mode,
             );
         }
     }
@@ -389,7 +488,14 @@ mod tests {
         let gelu_out = g.add_tensor_concrete("gelu_out", &[4, 4096], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(4), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(4),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
@@ -403,7 +509,11 @@ mod tests {
             FusionMode::EpilogueInjection,
             "GEMM + elementwise should produce EpilogueInjection"
         );
-        assert_eq!(plan.groups[0].epilogue.len(), 1, "epilogue should contain the Gelu op");
+        assert_eq!(
+            plan.groups[0].epilogue.len(),
+            1,
+            "epilogue should contain the Gelu op"
+        );
     }
 
     /// Consecutive elementwise ops get LoopFusion mode.
@@ -452,21 +562,52 @@ mod tests {
         let k_out = g.add_tensor_concrete("k_out", &[1, dim], dt);
         let v_out = g.add_tensor_concrete("v_out", &[1, dim], dt);
 
-        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![x], vec![norm_out], "rms_norm");
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: DType::F32, trans_b: false, has_bias: false }),
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![x],
+            vec![norm_out],
+            "rms_norm",
+        );
+        g.add_op(
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: dim,
+                k: dim,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![norm_out, wq],
             vec![q_out],
             "gemm_q",
         );
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: DType::F32, trans_b: false, has_bias: false }),
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: dim,
+                k: dim,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![norm_out, wk],
             vec![k_out],
             "gemm_k",
         );
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: DType::F32, trans_b: false, has_bias: false }),
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: dim,
+                k: dim,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![norm_out, wv],
             vec![v_out],
             "gemm_v",
@@ -474,13 +615,20 @@ mod tests {
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
-        let qkv_group = plan.groups.iter().find(|grp| grp.mode == FusionMode::QkvSharedInput);
+        let qkv_group = plan
+            .groups
+            .iter()
+            .find(|grp| grp.mode == FusionMode::QkvSharedInput);
         assert!(
             qkv_group.is_some(),
             "Expected QkvSharedInput group for 3 GEMMs sharing norm output"
         );
         let qkv = qkv_group.unwrap();
-        assert_eq!(qkv.ops.len(), 3, "QKV group should contain exactly 3 GEMM ops");
+        assert_eq!(
+            qkv.ops.len(),
+            3,
+            "QKV group should contain exactly 3 GEMM ops"
+        );
     }
 
     /// FFNBlock detection: Gate+Up GEMM (shared input) → Silu → Mul should fuse into FFNBlock.
@@ -503,18 +651,39 @@ mod tests {
         let mul_out = g.add_tensor_concrete("mul_out", &[1, inter], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: inter, k: hidden, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![x, w_gate], vec![gate_out], "gate_gemm",
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: inter,
+                k: hidden,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![x, w_gate],
+            vec![gate_out],
+            "gate_gemm",
         );
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: inter, k: hidden, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![x, w_up], vec![up_out], "up_gemm",
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: inter,
+                k: hidden,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![x, w_up],
+            vec![up_out],
+            "up_gemm",
         );
         g.add_op(Op::Silu, vec![gate_out], vec![act_out], "silu");
         g.add_op(Op::Mul, vec![act_out, up_out], vec![mul_out], "mul");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
-        let ffn = plan.groups.iter().find(|grp| matches!(grp.mode, FusionMode::FFNBlock { .. }));
+        let ffn = plan
+            .groups
+            .iter()
+            .find(|grp| matches!(grp.mode, FusionMode::FFNBlock { .. }));
         assert!(ffn.is_some(), "Expected FFNBlock group");
         assert_eq!(ffn.unwrap().ops.len(), 4, "FFNBlock should contain 4 ops");
     }
@@ -538,19 +707,43 @@ mod tests {
         let mul_out = g.add_tensor_concrete("mul_out", &[1, 11008], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 11008, k: hidden, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![x, w_gate], vec![gate_out], "gate_gemm",
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 11008,
+                k: hidden,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![x, w_gate],
+            vec![gate_out],
+            "gate_gemm",
         );
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 8192, k: hidden, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![x, w_up], vec![up_out], "up_gemm",
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 8192,
+                k: hidden,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![x, w_up],
+            vec![up_out],
+            "up_gemm",
         );
         g.add_op(Op::Silu, vec![gate_out], vec![act_out], "silu");
         g.add_op(Op::Mul, vec![act_out, up_out], vec![mul_out], "mul");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
-        let ffn = plan.groups.iter().find(|grp| matches!(grp.mode, FusionMode::FFNBlock { .. }));
-        assert!(ffn.is_none(), "FFNBlock must reject shape-mismatched Gate/Up GEMMs");
+        let ffn = plan
+            .groups
+            .iter()
+            .find(|grp| matches!(grp.mode, FusionMode::FFNBlock { .. }));
+        assert!(
+            ffn.is_none(),
+            "FFNBlock must reject shape-mismatched Gate/Up GEMMs"
+        );
     }
 
     /// Gemma 4 pattern: 3 QKV GEMMs + QkNorm(Q,K) + ValueNorm(V) + RoPE(Q,K)
@@ -575,7 +768,13 @@ mod tests {
         let cos_sin = g.add_tensor_concrete("cos_sin", &[head_dim / 2], dt);
 
         // RmsNorm → shared input for QKV
-        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }),
+        g.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
             vec![x],
             vec![norm_out],
             "rms_norm",
@@ -584,7 +783,14 @@ mod tests {
         // Q projection
         let q_out = g.add_tensor_concrete("q_out", &[1, dim], dt);
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: dt, trans_b: false, has_bias: false }),
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: dim,
+                k: dim,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![norm_out, wq],
             vec![q_out],
             "gemm_q",
@@ -593,7 +799,14 @@ mod tests {
         // K projection
         let k_out = g.add_tensor_concrete("k_out", &[1, dim], dt);
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: dt, trans_b: false, has_bias: false }),
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: dim,
+                k: dim,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![norm_out, wk],
             vec![k_out],
             "gemm_k",
@@ -602,7 +815,14 @@ mod tests {
         // V projection
         let v_out = g.add_tensor_concrete("v_out", &[1, dim], dt);
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: dt, trans_b: false, has_bias: false }),
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: dim,
+                k: dim,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![norm_out, wv],
             vec![v_out],
             "gemm_v",
@@ -611,7 +831,10 @@ mod tests {
         // QkNorm on Q
         let q_normed = g.add_tensor_concrete("q_normed", &[1, dim], dt);
         g.add_op(
-            crate::compiler::graph::Op::QkNorm { head_dim, eps: 1e-6 },
+            crate::compiler::graph::Op::QkNorm {
+                head_dim,
+                eps: 1e-6,
+            },
             vec![q_out],
             vec![q_normed],
             "qknorm_q",
@@ -620,7 +843,10 @@ mod tests {
         // QkNorm on K
         let k_normed = g.add_tensor_concrete("k_normed", &[1, dim], dt);
         g.add_op(
-            crate::compiler::graph::Op::QkNorm { head_dim, eps: 1e-6 },
+            crate::compiler::graph::Op::QkNorm {
+                head_dim,
+                eps: 1e-6,
+            },
             vec![k_out],
             vec![k_normed],
             "qknorm_k",
@@ -629,7 +855,12 @@ mod tests {
         // ValueNorm on V
         let v_normed = g.add_tensor_concrete("v_normed", &[1, dim], dt);
         g.add_op(
-            crate::compiler::graph::Op::ValueNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: false }),
+            crate::compiler::graph::Op::ValueNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-6,
+                dtype: DType::F32,
+                has_weight: false,
+            }),
             vec![v_out],
             vec![v_normed],
             "valuenorm_v",
@@ -638,7 +869,13 @@ mod tests {
         // RoPE on normalized Q
         let q_rope = g.add_tensor_concrete("q_rope", &[1, dim], dt);
         g.add_op(
-            crate::compiler::graph::Op::RoPE(RopeSpec { num_heads: dim / head_dim, head_dim, theta: 10000.0, partial: 1.0, rope_scaling: None }),
+            crate::compiler::graph::Op::RoPE(RopeSpec {
+                num_heads: dim / head_dim,
+                head_dim,
+                theta: 10000.0,
+                partial: 1.0,
+                rope_scaling: None,
+            }),
             vec![q_normed, cos_sin],
             vec![q_rope],
             "rope_q",
@@ -647,7 +884,13 @@ mod tests {
         // RoPE on normalized K
         let k_rope = g.add_tensor_concrete("k_rope", &[1, dim], dt);
         g.add_op(
-            crate::compiler::graph::Op::RoPE(RopeSpec { num_heads: dim / head_dim, head_dim, theta: 10000.0, partial: 1.0, rope_scaling: None }),
+            crate::compiler::graph::Op::RoPE(RopeSpec {
+                num_heads: dim / head_dim,
+                head_dim,
+                theta: 10000.0,
+                partial: 1.0,
+                rope_scaling: None,
+            }),
             vec![k_normed, cos_sin],
             vec![k_rope],
             "rope_k",
@@ -656,18 +899,26 @@ mod tests {
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
         // Should detect FusedQkvNormRope, NOT QkvSharedInput
-        let fused_group = plan.groups.iter().find(|grp| {
-            matches!(grp.mode, FusionMode::FusedQkvNormRope { .. })
-        });
+        let fused_group = plan
+            .groups
+            .iter()
+            .find(|grp| matches!(grp.mode, FusionMode::FusedQkvNormRope { .. }));
         assert!(
             fused_group.is_some(),
             "Expected FusedQkvNormRope group for Gemma 4 QKV+QkNorm+ValueNorm+RoPE pattern"
         );
         let fused = fused_group.unwrap();
-        assert_eq!(fused.ops.len(), 8, "FusedQkvNormRope should contain 8 ops (3 GEMMs + 2 QkNorm + 1 ValueNorm + 2 RoPE)");
+        assert_eq!(
+            fused.ops.len(),
+            8,
+            "FusedQkvNormRope should contain 8 ops (3 GEMMs + 2 QkNorm + 1 ValueNorm + 2 RoPE)"
+        );
 
         // No QkvSharedInput should exist (superset detected instead)
-        let qkv_group = plan.groups.iter().find(|grp| grp.mode == FusionMode::QkvSharedInput);
+        let qkv_group = plan
+            .groups
+            .iter()
+            .find(|grp| grp.mode == FusionMode::QkvSharedInput);
         assert!(
             qkv_group.is_none(),
             "QkvSharedInput should NOT be detected when FusedQkvNormRope covers the same GEMMs"
@@ -693,29 +944,71 @@ mod tests {
         let k_out = g.add_tensor_concrete("k_out", &[1, dim], dt);
         let v_out = g.add_tensor_concrete("v_out", &[1, dim], dt);
 
-        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![x], vec![norm_out], "rms_norm");
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: dt, trans_b: false, has_bias: false }),
-            vec![norm_out, wq], vec![q_out], "gemm_q",
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![x],
+            vec![norm_out],
+            "rms_norm",
         );
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: dt, trans_b: false, has_bias: false }),
-            vec![norm_out, wk], vec![k_out], "gemm_k",
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: dim,
+                k: dim,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![norm_out, wq],
+            vec![q_out],
+            "gemm_q",
         );
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: dt, trans_b: false, has_bias: false }),
-            vec![norm_out, wv], vec![v_out], "gemm_v",
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: dim,
+                k: dim,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![norm_out, wk],
+            vec![k_out],
+            "gemm_k",
+        );
+        g.add_op(
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: dim,
+                k: dim,
+                dtype: dt,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![norm_out, wv],
+            vec![v_out],
+            "gemm_v",
         );
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
         // Should be QkvSharedInput, NOT FusedQkvNormRope
         assert!(
-            plan.groups.iter().any(|grp| grp.mode == FusionMode::QkvSharedInput),
+            plan.groups
+                .iter()
+                .any(|grp| grp.mode == FusionMode::QkvSharedInput),
             "Standard QKV (no norms) should produce QkvSharedInput"
         );
         assert!(
-            !plan.groups.iter().any(|grp| matches!(grp.mode, FusionMode::FusedQkvNormRope { .. })),
+            !plan
+                .groups
+                .iter()
+                .any(|grp| matches!(grp.mode, FusionMode::FusedQkvNormRope { .. })),
             "Standard QKV (no norms) should NOT produce FusedQkvNormRope"
         );
     }
@@ -735,9 +1028,26 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[512, 512], dt);
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 512], dt);
 
-        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![x], vec![norm_out], "rms_norm");
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![x],
+            vec![norm_out],
+            "rms_norm",
+        );
+        g.add_op(
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![norm_out, w],
             vec![gemm_out],
             "gemm",
@@ -745,21 +1055,25 @@ mod tests {
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
-        let gemm_group = find_group_by_label(&plan, &g, "gemm")
-            .expect("GEMM should have a fusion group");
+        let gemm_group =
+            find_group_by_label(&plan, &g, "gemm").expect("GEMM should have a fusion group");
         let mode = &gemm_group.mode;
         assert!(
-            matches!(mode, FusionMode::ComputeRoot { .. } | FusionMode::TileLevelFusion { .. }),
+            matches!(
+                mode,
+                FusionMode::ComputeRoot { .. } | FusionMode::TileLevelFusion { .. }
+            ),
             "RmsNorm -> GEMM should produce ComputeRoot or TileLevelFusion, got {:?}",
             mode,
         );
         match mode {
-            FusionMode::ComputeRoot { predecessor } |
-            FusionMode::TileLevelFusion { predecessor, .. } => {
+            FusionMode::ComputeRoot { predecessor }
+            | FusionMode::TileLevelFusion { predecessor, .. } => {
                 let pred_op = g.op(*predecessor).expect("predecessor op should exist");
                 assert!(
                     matches!(&pred_op.op, crate::compiler::graph::Op::RmsNorm(_)),
-                    "predecessor should be RmsNorm, got {:?}", pred_op.op,
+                    "predecessor should be RmsNorm, got {:?}",
+                    pred_op.op,
                 );
             }
             _ => unreachable!(),
@@ -786,7 +1100,9 @@ mod tests {
                 micropanel_bytes <= l1_budget,
                 "L1 constraint violated for m={m} n={n} k={k}: \
                  KC({}) * (MR({mr}) + NR({nr})) * 4 = {micropanel_bytes}B > {:.0}% of L1 ({}B)",
-                b.kc, profile.l1_budget_ratio() * 100.0, l1_budget,
+                b.kc,
+                profile.l1_budget_ratio() * 100.0,
+                l1_budget,
             );
         }
     }
@@ -810,7 +1126,10 @@ mod tests {
                 a_panel_bytes <= l2_budget,
                 "L2 constraint violated for m={m} n={n} k={k}: \
                  MC({}) * KC({}) * 4 = {a_panel_bytes}B > {:.0}% of L2 ({}B)",
-                b.mc, b.kc, profile.l1_budget_ratio() * 100.0, l2_budget,
+                b.mc,
+                b.kc,
+                profile.l1_budget_ratio() * 100.0,
+                l2_budget,
             );
         }
     }
@@ -838,7 +1157,9 @@ mod tests {
                 b_panel_bytes <= l3 * 65 / 100,
                 "L3 constraint violated for m={m} n={n} k={k}: \
                  KC({}) * NC({}) * 4 = {b_panel_bytes}B > 65% of L3 ({}B)",
-                b.kc, b.nc, l3 * 65 / 100,
+                b.kc,
+                b.nc,
+                l3 * 65 / 100,
             );
         }
     }
@@ -860,28 +1181,56 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[k, k], dt);
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, k], dt);
 
-        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![x], vec![norm_out], "rms_norm");
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: k, k, dtype: DType::F32, trans_b: false, has_bias: false }),
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![x],
+            vec![norm_out],
+            "rms_norm",
+        );
+        g.add_op(
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: k,
+                k,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![norm_out, w],
             vec![gemm_out],
             "gemm",
         );
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
-        let gemm_group = find_group_by_label(&plan, &g, "gemm")
-            .expect("GEMM should have a fusion group");
+        let gemm_group =
+            find_group_by_label(&plan, &g, "gemm").expect("GEMM should have a fusion group");
 
         match &gemm_group.mode {
-            FusionMode::TileLevelFusion { predecessor, tile_rows } => {
+            FusionMode::TileLevelFusion {
+                predecessor,
+                tile_rows,
+            } => {
                 let pred_op = g.op(*predecessor).expect("predecessor should exist");
-                assert!(matches!(&pred_op.op, crate::compiler::graph::Op::RmsNorm(_)));
+                assert!(matches!(
+                    &pred_op.op,
+                    crate::compiler::graph::Op::RmsNorm(_)
+                ));
                 let blocking = profile.gemm_blocking(1, k, k, DType::F32);
-                assert_eq!(*tile_rows, blocking.mc, "tile_rows should equal MC from GEMM blocking");
+                assert_eq!(
+                    *tile_rows, blocking.mc,
+                    "tile_rows should equal MC from GEMM blocking"
+                );
             }
             other => panic!(
                 "Expected TileLevelFusion for norm output ({} B) > 75% L1 ({} B), got {:?}",
-                k * 4, l1_budget, other,
+                k * 4,
+                l1_budget,
+                other,
             ),
         }
     }
@@ -899,7 +1248,10 @@ mod tests {
         let k = l1_budget / 4;
         let n = 4096;
         let norm_bytes = k * 4;
-        assert!(norm_bytes <= l1_budget, "test setup: norm output should fit in L1 budget");
+        assert!(
+            norm_bytes <= l1_budget,
+            "test setup: norm output should fit in L1 budget"
+        );
 
         let mut g = CompilerGraph::new();
         let x = g.add_tensor_concrete("x", &[1, k], dt);
@@ -907,22 +1259,42 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[k, n], dt);
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, n], dt);
 
-        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![x], vec![norm_out], "rms_norm");
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n, k, dtype: DType::F32, trans_b: false, has_bias: false }),
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![x],
+            vec![norm_out],
+            "rms_norm",
+        );
+        g.add_op(
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n,
+                k,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![norm_out, w],
             vec![gemm_out],
             "gemm",
         );
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
-        let gemm_group = find_group_by_label(&plan, &g, "gemm")
-            .expect("GEMM should have a fusion group");
+        let gemm_group =
+            find_group_by_label(&plan, &g, "gemm").expect("GEMM should have a fusion group");
 
         match &gemm_group.mode {
             FusionMode::ComputeRoot { predecessor } => {
                 let pred_op = g.op(*predecessor).expect("predecessor should exist");
-                assert!(matches!(&pred_op.op, crate::compiler::graph::Op::RmsNorm(_)));
+                assert!(matches!(
+                    &pred_op.op,
+                    crate::compiler::graph::Op::RmsNorm(_)
+                ));
             }
             other => panic!(
                 "Expected ComputeRoot for norm output ({} B) <= 75% L1 ({} B), got {:?}",
@@ -958,11 +1330,17 @@ mod tests {
         assert!(
             plan.num_groups() > 1,
             "Expected chain split: {} groups for 3 ops with intermediate {} B > L1 budget {} B",
-            plan.num_groups(), dim * 4, l1_budget,
+            plan.num_groups(),
+            dim * 4,
+            l1_budget,
         );
 
         for op in &g.ops {
-            assert!(plan.op_to_group.contains_key(&op.id), "Op {} not in any group", op.id.0);
+            assert!(
+                plan.op_to_group.contains_key(&op.id),
+                "Op {} not in any group",
+                op.id.0
+            );
         }
     }
 
@@ -970,7 +1348,7 @@ mod tests {
 
     #[test]
     fn test_cost_compute_bound() {
-        use crate::compiler::trace::{OpTrace, ComputePattern, ScalarFnSignature, ScalarParam};
+        use crate::compiler::trace::{ComputePattern, OpTrace, ScalarFnSignature, ScalarParam};
 
         let profile = DeviceProfile::detect();
         let exec_plan = ExecutionPlan::from_profile(&profile);
@@ -999,7 +1377,9 @@ mod tests {
 
     #[test]
     fn test_cost_memory_bound() {
-        use crate::compiler::trace::{OpTrace, ComputePattern, ScalarFnSignature, ScalarParam, TraceOp, ValueId};
+        use crate::compiler::trace::{
+            ComputePattern, OpTrace, ScalarFnSignature, ScalarParam, TraceOp, ValueId,
+        };
 
         let profile = DeviceProfile::detect();
         let exec_plan = ExecutionPlan::from_profile(&profile);
@@ -1038,9 +1418,12 @@ mod tests {
 
         let eliminated = 2 * 4096 * 4;
         let benefit = Cost::fusion_benefit(eliminated, &exec_plan);
-        assert!(benefit > 0,
+        assert!(
+            benefit > 0,
             "Eliminating {} bytes should yield positive benefit, got {}",
-            eliminated, benefit);
+            eliminated,
+            benefit
+        );
 
         let eliminated_large = 2 * 4096 * 4096 * 4;
         let benefit_large = Cost::fusion_benefit(eliminated_large, &exec_plan);
@@ -1065,14 +1448,16 @@ mod tests {
         g.add_op(Op::Silu, vec![c], vec![d], "silu3");
 
         let anchor = g.op(OpId(0)).unwrap();
-        let chain: Vec<&crate::compiler::graph::CompilerOp> = vec![
-            g.op(OpId(1)).unwrap(),
-            g.op(OpId(2)).unwrap(),
-        ];
+        let chain: Vec<&crate::compiler::graph::CompilerOp> =
+            vec![g.op(OpId(1)).unwrap(), g.op(OpId(2)).unwrap()];
 
         let eliminated = chain_eliminated_bytes(&g, anchor, &chain);
-        assert_eq!(eliminated, 2 * 4096 * 4 * 2,
-            "Expected 2 intermediates eliminated, got {} bytes", eliminated);
+        assert_eq!(
+            eliminated,
+            2 * 4096 * 4 * 2,
+            "Expected 2 intermediates eliminated, got {} bytes",
+            eliminated
+        );
     }
 
     #[test]
@@ -1159,7 +1544,6 @@ mod tests {
 
     #[test]
     fn test_memory_bound_higher_fusion_benefit() {
-        
         let profile = DeviceProfile::detect();
         let exec_plan = ExecutionPlan::from_profile(&profile);
 
@@ -1170,7 +1554,9 @@ mod tests {
         let c1 = g1.add_tensor_concrete("C", &[1024], DType::F32);
         let op1 = g1.add_op(Op::Add, vec![a1, b1], vec![c1], "add");
         let group_mem = FusionGroup {
-            id: 0, anchor: op1, epilogue: vec![],
+            id: 0,
+            anchor: op1,
+            epilogue: vec![],
             mode: FusionMode::LoopFusion,
             ops: vec![op1],
             multi_output: MultiOutputConfig::single(),
@@ -1185,11 +1571,23 @@ mod tests {
         let a2 = g2.add_tensor_concrete("A", &[512, 512], DType::F32);
         let b2 = g2.add_tensor_concrete("B", &[512, 512], DType::F32);
         let c2 = g2.add_tensor_concrete("C", &[512, 512], DType::F32);
-        let op2 = g2.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(512), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a2, b2], vec![c2], "gemm",
+        let op2 = g2.add_op(
+            Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(512),
+                n: 512,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a2, b2],
+            vec![c2],
+            "gemm",
         );
         let group_compute = FusionGroup {
-            id: 0, anchor: op2, epilogue: vec![],
+            id: 0,
+            anchor: op2,
+            epilogue: vec![],
             mode: FusionMode::Standalone,
             ops: vec![op2],
             multi_output: MultiOutputConfig::single(),
@@ -1202,8 +1600,17 @@ mod tests {
         let scale_mem = compute_group_roofline_scale(&group_mem, &g1, &exec_plan, None);
         let scale_compute = compute_group_roofline_scale(&group_compute, &g2, &exec_plan, None);
 
-        assert!((scale_mem - 1.0).abs() < 1e-6, "memory-bound scale should be 1.0, got {}", scale_mem);
-        assert!(scale_compute < scale_mem, "compute-bound scale ({}) should be less than memory-bound ({})", scale_compute, scale_mem);
+        assert!(
+            (scale_mem - 1.0).abs() < 1e-6,
+            "memory-bound scale should be 1.0, got {}",
+            scale_mem
+        );
+        assert!(
+            scale_compute < scale_mem,
+            "compute-bound scale ({}) should be less than memory-bound ({})",
+            scale_compute,
+            scale_mem
+        );
     }
 
     // ── Standalone-equivalent tests (previously used old fuse()) ─────
@@ -1252,7 +1659,14 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 4096], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
@@ -1355,18 +1769,33 @@ mod tests {
         let swiglu_out = g.add_tensor_concrete("swiglu_out", &[1, 4096], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![other_out],
             "gemm_other",
         );
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![a, w],
             vec![gemm_out],
             "gemm_main",
         );
-        g.add_op(Op::SwiGlu,
+        g.add_op(
+            Op::SwiGlu,
             vec![gemm_out, other_out],
             vec![swiglu_out],
             "swiglu",
@@ -1376,15 +1805,20 @@ mod tests {
         let profile = DeviceProfile::detect();
         let exec_plan = ExecutionPlan::from_profile(&profile);
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
-        let gemm_main_group = plan.groups.iter().find(|grp| {
-            grp.ops.iter().any(|&oid| {
-                g.op(oid).map_or(false, |o| o.label == "gemm_main")
+        let gemm_main_group = plan
+            .groups
+            .iter()
+            .find(|grp| {
+                grp.ops
+                    .iter()
+                    .any(|&oid| g.op(oid).map_or(false, |o| o.label == "gemm_main"))
             })
-        }).expect("gemm_main should have a group");
+            .expect("gemm_main should have a group");
         assert!(
-            !gemm_main_group.ops.iter().any(|&oid| {
-                g.op(oid).map_or(false, |o| o.label == "swiglu")
-            }),
+            !gemm_main_group
+                .ops
+                .iter()
+                .any(|&oid| { g.op(oid).map_or(false, |o| o.label == "swiglu") }),
             "SwiGlu with external input must not be fused into GEMM epilogue"
         );
     }
@@ -1407,7 +1841,14 @@ mod tests {
         let token_id = g.add_tensor_concrete("token_id", &[1], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 32000, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 32000,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![hidden, w_lm],
             vec![logits],
             "lm_head",
@@ -1422,14 +1863,22 @@ mod tests {
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
         // lm_head + argmax should fuse into a single group
-        assert_eq!(plan.num_groups(), 1, "GEMM + Argmax should produce exactly 1 fusion group");
+        assert_eq!(
+            plan.num_groups(),
+            1,
+            "GEMM + Argmax should produce exactly 1 fusion group"
+        );
         let group = &plan.groups[0];
         assert_eq!(
             group.mode,
             FusionMode::EpilogueInjection,
             "GEMM + Argmax should produce EpilogueInjection"
         );
-        assert_eq!(group.ops.len(), 2, "Group should contain GEMM + Argmax (2 ops)");
+        assert_eq!(
+            group.ops.len(),
+            2,
+            "Group should contain GEMM + Argmax (2 ops)"
+        );
         assert_eq!(group.epilogue.len(), 1, "Argmax should be in epilogue");
 
         // Verify the epilogue op is Argmax
@@ -1457,7 +1906,14 @@ mod tests {
         let token_id = g.add_tensor_concrete("token_id", &[1], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 32000, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 32000,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![hidden, w_lm],
             vec![logits],
             "lm_head",
@@ -1472,9 +1928,17 @@ mod tests {
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
-        assert_eq!(plan.num_groups(), 1, "GEMM + SiLU + Argmax should produce 1 group");
+        assert_eq!(
+            plan.num_groups(),
+            1,
+            "GEMM + SiLU + Argmax should produce 1 group"
+        );
         let group = &plan.groups[0];
-        assert_eq!(group.ops.len(), 3, "Group should contain GEMM + SiLU + Argmax (3 ops)");
+        assert_eq!(
+            group.ops.len(),
+            3,
+            "Group should contain GEMM + SiLU + Argmax (3 ops)"
+        );
     }
 
     /// Argmax with multiple consumers should NOT be fused (must write to memory for all consumers).
@@ -1494,7 +1958,14 @@ mod tests {
         let consumer_b = g.add_tensor_concrete("consumer_b", &[1], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 1000, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 1000,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![hidden, w_lm],
             vec![logits],
             "lm_head",
@@ -1522,7 +1993,14 @@ mod tests {
         let other_out = g2.add_tensor_concrete("other_out", &[1, 1000], dt);
 
         g2.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 1000, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 1000,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![hidden2, w_lm2],
             vec![logits2],
             "lm_head",
@@ -1539,15 +2017,21 @@ mod tests {
         let plan = fuse_with_dag(&g2, &registry, &exec_plan);
 
         // Argmax should NOT be fused because logits has multiple consumers
-        let gemm_group = plan.groups.iter().find(|grp| {
-            grp.ops.iter().any(|&oid| {
-                g2.op(oid).map_or(false, |o| o.label == "lm_head")
+        let gemm_group = plan
+            .groups
+            .iter()
+            .find(|grp| {
+                grp.ops
+                    .iter()
+                    .any(|&oid| g2.op(oid).map_or(false, |o| o.label == "lm_head"))
             })
-        }).expect("GEMM should have a group");
+            .expect("GEMM should have a group");
 
         assert!(
             !gemm_group.ops.iter().any(|&oid| {
-                g2.op(oid).map_or(false, |o| matches!(&o.op, crate::compiler::graph::Op::Argmax { .. }))
+                g2.op(oid).map_or(false, |o| {
+                    matches!(&o.op, crate::compiler::graph::Op::Argmax { .. })
+                })
             }),
             "Argmax must NOT be fused when logits has multiple consumers"
         );
@@ -1574,28 +2058,62 @@ mod tests {
         let k_out = g.add_tensor_concrete("k_out", &[1, dim], dt);
         let v_out = g.add_tensor_concrete("v_out", &[1, dim], dt);
 
-        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![x], vec![norm_out], "rms_norm");
+        g.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![x],
+            vec![norm_out],
+            "rms_norm",
+        );
         // Q: Q4_0
         g.add_op(
-            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, quant_type: crate::quant::QuantType::Q4_0 }),
-            vec![norm_out, wq], vec![q_out], "gemm_q",
+            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: dim,
+                k: dim,
+                quant_type: crate::quant::QuantType::Q4_0,
+            }),
+            vec![norm_out, wq],
+            vec![q_out],
+            "gemm_q",
         );
         // K: Q6K (different quant type)
         g.add_op(
-            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, quant_type: crate::quant::QuantType::Q6K }),
-            vec![norm_out, wk], vec![k_out], "gemm_k",
+            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: dim,
+                k: dim,
+                quant_type: crate::quant::QuantType::Q6K,
+            }),
+            vec![norm_out, wk],
+            vec![k_out],
+            "gemm_k",
         );
         // V: Q4_0 (same as Q)
         g.add_op(
-            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, quant_type: crate::quant::QuantType::Q4_0 }),
-            vec![norm_out, wv], vec![v_out], "gemm_v",
+            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: dim,
+                k: dim,
+                quant_type: crate::quant::QuantType::Q4_0,
+            }),
+            vec![norm_out, wv],
+            vec![v_out],
+            "gemm_v",
         );
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
         // Should NOT detect QkvSharedInput — quant types are incompatible
         assert!(
-            !plan.groups.iter().any(|grp| grp.mode == FusionMode::QkvSharedInput),
+            !plan
+                .groups
+                .iter()
+                .any(|grp| grp.mode == FusionMode::QkvSharedInput),
             "Mixed quant Q4_0/Q6K QKV must NOT fuse as QkvSharedInput"
         );
     }
@@ -1620,20 +2138,40 @@ mod tests {
         let mul_out = g.add_tensor_concrete("mul_out", &[1, inter], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: inter, k: hidden, quant_type: crate::quant::QuantType::Q4_0 }),
-            vec![x, w_gate], vec![gate_out], "gate_gemm",
+            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: inter,
+                k: hidden,
+                quant_type: crate::quant::QuantType::Q4_0,
+            }),
+            vec![x, w_gate],
+            vec![gate_out],
+            "gate_gemm",
         );
         // Up GEMM: Q6K (different from Gate's Q4_0)
         g.add_op(
-            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: inter, k: hidden, quant_type: crate::quant::QuantType::Q6K }),
-            vec![x, w_up], vec![up_out], "up_gemm",
+            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: inter,
+                k: hidden,
+                quant_type: crate::quant::QuantType::Q6K,
+            }),
+            vec![x, w_up],
+            vec![up_out],
+            "up_gemm",
         );
         g.add_op(Op::Silu, vec![gate_out], vec![act_out], "silu");
         g.add_op(Op::Mul, vec![act_out, up_out], vec![mul_out], "mul");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
-        let ffn = plan.groups.iter().find(|grp| matches!(grp.mode, FusionMode::FFNBlock { .. }));
-        assert!(ffn.is_none(), "FFNBlock must reject mixed quant Gate(Q4_0)/Up(Q6K)");
+        let ffn = plan
+            .groups
+            .iter()
+            .find(|grp| matches!(grp.mode, FusionMode::FFNBlock { .. }));
+        assert!(
+            ffn.is_none(),
+            "FFNBlock must reject mixed quant Gate(Q4_0)/Up(Q6K)"
+        );
     }
 
     /// QKV with same quant type (all Q4_0) should still fuse as QkvSharedInput.
@@ -1655,25 +2193,58 @@ mod tests {
         let k_out = g.add_tensor_concrete("k_out", &[1, dim], dt);
         let v_out = g.add_tensor_concrete("v_out", &[1, dim], dt);
 
-        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![x], vec![norm_out], "rms_norm");
+        g.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![x],
+            vec![norm_out],
+            "rms_norm",
+        );
         // All Q4_0
         g.add_op(
-            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, quant_type: crate::quant::QuantType::Q4_0 }),
-            vec![norm_out, wq], vec![q_out], "gemm_q",
+            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: dim,
+                k: dim,
+                quant_type: crate::quant::QuantType::Q4_0,
+            }),
+            vec![norm_out, wq],
+            vec![q_out],
+            "gemm_q",
         );
         g.add_op(
-            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, quant_type: crate::quant::QuantType::Q4_0 }),
-            vec![norm_out, wk], vec![k_out], "gemm_k",
+            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: dim,
+                k: dim,
+                quant_type: crate::quant::QuantType::Q4_0,
+            }),
+            vec![norm_out, wk],
+            vec![k_out],
+            "gemm_k",
         );
         g.add_op(
-            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, quant_type: crate::quant::QuantType::Q4_0 }),
-            vec![norm_out, wv], vec![v_out], "gemm_v",
+            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: dim,
+                k: dim,
+                quant_type: crate::quant::QuantType::Q4_0,
+            }),
+            vec![norm_out, wv],
+            vec![v_out],
+            "gemm_v",
         );
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
         assert!(
-            plan.groups.iter().any(|grp| grp.mode == FusionMode::QkvSharedInput),
+            plan.groups
+                .iter()
+                .any(|grp| grp.mode == FusionMode::QkvSharedInput),
             "Same quant type Q4_0 QKV should fuse as QkvSharedInput"
         );
     }
@@ -1695,8 +2266,17 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 4096], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![gemm_out], "gemm",
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 4096,
+                k: 4096,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![gemm_out],
+            "gemm",
         );
         g.add_op(Op::Silu, vec![gemm_out], vec![silu_out], "silu");
 
@@ -1721,7 +2301,10 @@ mod tests {
             let group = plan.group_of(op.id);
             assert!(group.is_some(), "Op {} should belong to a group", op.id.0);
         }
-        assert!(plan.group_of(OpId(9999)).is_none(), "Nonexistent OpId should return None");
+        assert!(
+            plan.group_of(OpId(9999)).is_none(),
+            "Nonexistent OpId should return None"
+        );
     }
 
     /// FusionPlan::num_fused_ops returns positive count for decoder layer with QKV fusion.
@@ -1739,7 +2322,10 @@ mod tests {
             plan.num_fused_ops() > 0,
             "Decoder layer should have fused ops (QKV, GEMM epilogue, etc.)"
         );
-        assert!(plan.num_fused_ops() < graph.num_ops(), "Some ops should remain standalone");
+        assert!(
+            plan.num_fused_ops() < graph.num_ops(),
+            "Some ops should remain standalone"
+        );
     }
 
     /// Single standalone GEMM (no downstream consumer) produces exactly 1 Standalone group.
@@ -1756,8 +2342,17 @@ mod tests {
         let out = g.add_tensor_concrete("out", &[1, 512], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![out], "gemm",
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![out],
+            "gemm",
         );
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
@@ -1782,8 +2377,17 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 256], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![gemm_out], "gemm",
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![gemm_out],
+            "gemm",
         );
         g.add_op(Op::Tanh, vec![gemm_out], vec![tanh_out], "tanh");
         g.add_op(Op::Silu, vec![tanh_out], vec![silu_out], "silu");
@@ -1791,7 +2395,11 @@ mod tests {
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
         assert_eq!(plan.num_groups(), 1);
         assert_eq!(plan.groups[0].mode, FusionMode::EpilogueInjection);
-        assert_eq!(plan.groups[0].ops.len(), 3, "GEMM + Tanh + SiLU should be 3 ops in one group");
+        assert_eq!(
+            plan.groups[0].ops.len(),
+            3,
+            "GEMM + Tanh + SiLU should be 3 ops in one group"
+        );
     }
 
     /// Two independent GEMMs (different inputs) must produce two separate groups.
@@ -1811,16 +2419,38 @@ mod tests {
         let out2 = g.add_tensor_concrete("out2", &[1, 128], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 128, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a1, w1], vec![out1], "gemm1",
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 128,
+                k: 128,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a1, w1],
+            vec![out1],
+            "gemm1",
         );
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 128, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a2, w2], vec![out2], "gemm2",
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 128,
+                k: 128,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a2, w2],
+            vec![out2],
+            "gemm2",
         );
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
-        assert_eq!(plan.num_groups(), 2, "Independent GEMMs must be in separate groups");
+        assert_eq!(
+            plan.num_groups(),
+            2,
+            "Independent GEMMs must be in separate groups"
+        );
         for group in &plan.groups {
             assert_eq!(group.ops.len(), 1);
         }
@@ -1840,7 +2470,9 @@ mod tests {
         for group in &plan.groups {
             assert!(
                 group.ops.contains(&group.anchor),
-                "Group {} anchor Op({}) must be in ops list", group.id, group.anchor.0
+                "Group {} anchor Op({}) must be in ops list",
+                group.id,
+                group.anchor.0
             );
         }
     }
@@ -1859,13 +2491,23 @@ mod tests {
         let c = g.add_tensor_concrete("c_out", &[4096], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::Dequantize { num_elements: 4096, block_size: 32, bits: 4 },
-            vec![a], vec![b], "dequant",
+            crate::compiler::graph::Op::Dequantize {
+                num_elements: 4096,
+                block_size: 32,
+                bits: 4,
+            },
+            vec![a],
+            vec![b],
+            "dequant",
         );
         g.add_op(Op::Silu, vec![b], vec![c], "silu");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
-        assert_eq!(plan.num_groups(), 2, "Dequantize and SiLU form separate groups");
+        assert_eq!(
+            plan.num_groups(),
+            2,
+            "Dequantize and SiLU form separate groups"
+        );
         assert_eq!(plan.groups[0].ops.len(), 1);
         assert_eq!(plan.groups[1].ops.len(), 1);
     }
@@ -1884,17 +2526,39 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[512, 512], dt);
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 512], dt);
 
-        g.add_op(Op::LayerNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![x], vec![norm_out], "layer_norm");
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![norm_out, w], vec![gemm_out], "gemm",
+            Op::LayerNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![x],
+            vec![norm_out],
+            "layer_norm",
+        );
+        g.add_op(
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 512,
+                k: 512,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![norm_out, w],
+            vec![gemm_out],
+            "gemm",
         );
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
-        let gemm_group = find_group_by_label(&plan, &g, "gemm")
-            .expect("GEMM should have a fusion group");
+        let gemm_group =
+            find_group_by_label(&plan, &g, "gemm").expect("GEMM should have a fusion group");
         assert!(
-            matches!(gemm_group.mode, FusionMode::ComputeRoot { .. } | FusionMode::TileLevelFusion { .. }),
+            matches!(
+                gemm_group.mode,
+                FusionMode::ComputeRoot { .. } | FusionMode::TileLevelFusion { .. }
+            ),
             "LayerNorm -> GEMM should produce ComputeRoot or TileLevelFusion, got {:?}",
             gemm_group.mode,
         );
@@ -1915,16 +2579,34 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 256], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![gemm_out], "gemm",
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![gemm_out],
+            "gemm",
         );
         g.add_op(Op::Silu, vec![gemm_out], vec![silu_out], "silu");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
         let display = format!("{plan}");
-        assert!(display.contains("1 groups"), "Display should show group count: {display}");
-        assert!(display.contains("EpilogueInjection"), "Display should show mode: {display}");
-        assert!(display.contains("anchor"), "Display should show anchor: {display}");
+        assert!(
+            display.contains("1 groups"),
+            "Display should show group count: {display}"
+        );
+        assert!(
+            display.contains("EpilogueInjection"),
+            "Display should show mode: {display}"
+        );
+        assert!(
+            display.contains("anchor"),
+            "Display should show anchor: {display}"
+        );
     }
 
     // ── Additional edge-case tests ─────────────────────────────────────────
@@ -1940,7 +2622,11 @@ mod tests {
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
         assert_eq!(plan.num_groups(), 0, "Empty graph should produce 0 groups");
-        assert_eq!(plan.num_fused_ops(), 0, "Empty graph should have 0 fused ops");
+        assert_eq!(
+            plan.num_fused_ops(),
+            0,
+            "Empty graph should have 0 fused ops"
+        );
     }
 
     /// Single standalone elementwise op (SiLU with no successor) produces
@@ -1976,18 +2662,30 @@ mod tests {
         let mut g = CompilerGraph::new();
         let x = g.add_tensor_concrete("x", &[1, 512], dt);
         let norm_out = g.add_tensor_concrete("norm_out", &[1, 512], dt);
-        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![x], vec![norm_out], "rms_norm");
+        g.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![x],
+            vec![norm_out],
+            "rms_norm",
+        );
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
         assert_eq!(plan.num_groups(), 1);
         assert_eq!(
-            plan.groups[0].mode, FusionMode::Standalone,
-            "RmsNorm without downstream GEMM should be Standalone, got {:?}", plan.groups[0].mode,
+            plan.groups[0].mode,
+            FusionMode::Standalone,
+            "RmsNorm without downstream GEMM should be Standalone, got {:?}",
+            plan.groups[0].mode,
         );
     }
 
-        /// Large elementwise chain (4 SiLU ops, dim=4096) exceeds L1 budget and
+    /// Large elementwise chain (4 SiLU ops, dim=4096) exceeds L1 budget and
     /// is split into multiple sub-chains by split_elementwise_by_l1.
     /// All ops should still appear in LoopFusion groups (not Standalone).
     #[test]
@@ -2018,7 +2716,8 @@ mod tests {
         for grp in &plan.groups {
             assert!(
                 matches!(grp.mode, FusionMode::LoopFusion | FusionMode::Standalone),
-                "elementwise-only groups must be LoopFusion or Standalone, got {:?}", grp.mode,
+                "elementwise-only groups must be LoopFusion or Standalone, got {:?}",
+                grp.mode,
             );
         }
     }
@@ -2040,8 +2739,17 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 256], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![gemm_out], "gemm",
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![gemm_out],
+            "gemm",
         );
         g.add_op(Op::Tanh, vec![gemm_out], vec![tanh_out], "tanh");
         g.add_op(Op::Silu, vec![tanh_out], vec![silu_out], "silu");
@@ -2051,7 +2759,11 @@ mod tests {
         assert_eq!(plan.num_groups(), 1);
         assert_eq!(plan.groups[0].mode, FusionMode::EpilogueInjection);
         assert_eq!(plan.groups[0].ops.len(), 3, "GEMM + Tanh + SiLU = 3 ops");
-        assert_eq!(plan.groups[0].epilogue.len(), 2, "Tanh and SiLU should be epilogue");
+        assert_eq!(
+            plan.groups[0].epilogue.len(),
+            2,
+            "Tanh and SiLU should be epilogue"
+        );
     }
 
     /// GEMM output consumed by two different successors must NOT fuse the
@@ -2071,8 +2783,17 @@ mod tests {
         let add_out = g.add_tensor_concrete("add_out", &[1, 256], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![gemm_out], "gemm",
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![gemm_out],
+            "gemm",
         );
         // gemm_out has two consumers
         g.add_op(Op::Silu, vec![gemm_out], vec![silu_out], "silu");
@@ -2080,10 +2801,13 @@ mod tests {
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
-        let gemm_group = find_group_by_label(&plan, &g, "gemm")
-            .expect("GEMM should have a fusion group");
+        let gemm_group =
+            find_group_by_label(&plan, &g, "gemm").expect("GEMM should have a fusion group");
         assert!(
-            !gemm_group.ops.iter().any(|&oid| g.op(oid).map_or(false, |o| o.label == "tanh")),
+            !gemm_group
+                .ops
+                .iter()
+                .any(|&oid| g.op(oid).map_or(false, |o| o.label == "tanh")),
             "Tanh (second consumer) must NOT be fused into GEMM epilogue",
         );
     }
@@ -2103,8 +2827,17 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 128], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 128, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![gemm_out], "gemm",
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 128,
+                k: 128,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![gemm_out],
+            "gemm",
         );
         g.add_op(Op::Silu, vec![gemm_out], vec![silu_out], "silu");
 
@@ -2141,7 +2874,10 @@ mod tests {
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
         let total_ops: usize = plan.groups.iter().map(|g| g.ops.len()).sum();
-        assert!(total_ops >= 3, "all 3 unary ops should appear in groups, got {total_ops}");
+        assert!(
+            total_ops >= 3,
+            "all 3 unary ops should appear in groups, got {total_ops}"
+        );
         assert!(!plan.groups.is_empty(), "should have at least one group");
     }
 
@@ -2159,14 +2895,35 @@ mod tests {
         let norm1_out = g.add_tensor_concrete("norm1_out", &[1, 256], dt);
         let norm2_out = g.add_tensor_concrete("norm2_out", &[1, 256], dt);
 
-        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![x], vec![norm1_out], "norm1");
-        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![norm1_out], vec![norm2_out], "norm2");
+        g.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![x],
+            vec![norm1_out],
+            "norm1",
+        );
+        g.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![norm1_out],
+            vec![norm2_out],
+            "norm2",
+        );
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
         for group in &plan.groups {
             assert_ne!(
-                group.mode, FusionMode::NormIntoGemm,
+                group.mode,
+                FusionMode::NormIntoGemm,
                 "RmsNorm→RmsNorm must not produce NormIntoGemm",
             );
         }
@@ -2191,8 +2948,16 @@ mod tests {
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
-        assert_eq!(plan.num_groups(), 2, "Softmax blocks elementwise fusion with SiLU");
-        assert_eq!(plan.groups[0].mode, FusionMode::Standalone, "Softmax should be Standalone");
+        assert_eq!(
+            plan.num_groups(),
+            2,
+            "Softmax blocks elementwise fusion with SiLU"
+        );
+        assert_eq!(
+            plan.groups[0].mode,
+            FusionMode::Standalone,
+            "Softmax should be Standalone"
+        );
     }
 
     // ── Additional 10 unit tests ─────────────────────────────────────────────
@@ -2215,8 +2980,17 @@ mod tests {
         let tanh_out = g.add_tensor_concrete("tanh_out", &[1, 256], dt);
 
         g.add_op(
-            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![a, w], vec![gemm_out], "gemm",
+            crate::compiler::graph::Op::Gemm(GemmSpec {
+                m: crate::compiler::graph::SymDim::Concrete(1),
+                n: 256,
+                k: 256,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![a, w],
+            vec![gemm_out],
+            "gemm",
         );
         g.add_op(Op::Silu, vec![gemm_out], vec![silu_out], "silu");
         g.add_op(Op::Tanh, vec![silu_out], vec![tanh_out], "tanh");
@@ -2229,7 +3003,8 @@ mod tests {
         for &ep_id in &group.epilogue {
             assert!(
                 group.ops.contains(&ep_id),
-                "Epilogue op Op({}) must be in ops list", ep_id.0,
+                "Epilogue op Op({}) must be in ops list",
+                ep_id.0,
             );
         }
         // The anchor (GEMM) should not be in epilogue
@@ -2257,7 +3032,9 @@ mod tests {
         // Assert: for each group, every op in it must map back to that group's index
         for (group_idx, group) in plan.groups.iter().enumerate() {
             for &op_id in &group.ops {
-                let mapped_idx = plan.op_to_group.get(&op_id)
+                let mapped_idx = plan
+                    .op_to_group
+                    .get(&op_id)
                     .unwrap_or_else(|| panic!("Op({}) missing from op_to_group", op_id.0));
                 assert_eq!(
                     *mapped_idx, group_idx,
@@ -2318,10 +3095,7 @@ mod tests {
     #[test]
     fn test_fusion_engine_custom_rule_order_preserved() {
         // Arrange: deliberately non-priority order
-        let custom_order = vec![
-            FusionRule::Standard,
-            FusionRule::PdtGuided,
-        ];
+        let custom_order = vec![FusionRule::Standard, FusionRule::PdtGuided];
 
         // Act
         let engine = FusionEngine::new(custom_order.clone());
@@ -2332,7 +3106,11 @@ mod tests {
         assert_eq!(engine.rules[1], FusionRule::PdtGuided);
         // sorted_rules should re-order by priority
         let sorted = engine.sorted_rules();
-        assert_eq!(sorted[0], FusionRule::PdtGuided, "PdtGuided (80) should come before Standard (60)");
+        assert_eq!(
+            sorted[0],
+            FusionRule::PdtGuided,
+            "PdtGuided (80) should come before Standard (60)"
+        );
         assert_eq!(sorted[1], FusionRule::Standard);
     }
 
@@ -2359,8 +3137,14 @@ mod tests {
         let display = format!("{plan}");
 
         // Assert: display should mention group count and each group's anchor
-        assert!(display.contains("2 groups"), "Display should show 2 groups: {display}");
-        assert!(display.contains("anchor"), "Display should show anchor info: {display}");
+        assert!(
+            display.contains("2 groups"),
+            "Display should show 2 groups: {display}"
+        );
+        assert!(
+            display.contains("anchor"),
+            "Display should show anchor info: {display}"
+        );
     }
 
     /// FusionGroup with dominant_dtype set to Some(BF16) preserves the value
@@ -2383,7 +3167,10 @@ mod tests {
 
         // Act & Assert
         assert_eq!(group.id, 7);
-        assert_eq!(group.dominant_dtype, Some(crate::compiler::trace::QuantPrecision::BF16));
+        assert_eq!(
+            group.dominant_dtype,
+            Some(crate::compiler::trace::QuantPrecision::BF16)
+        );
         assert_eq!(group.ops.len(), 2);
         assert_eq!(group.epilogue.len(), 1);
     }
@@ -2421,7 +3208,10 @@ mod tests {
         assert!(plan.group_of(OpId(0)).is_none());
         assert!(plan.group_of(OpId(9999)).is_none());
         let display = format!("{plan}");
-        assert!(display.contains("0 groups"), "Empty plan display should mention 0 groups: {display}");
+        assert!(
+            display.contains("0 groups"),
+            "Empty plan display should mention 0 groups: {display}"
+        );
     }
 
     /// Single standalone Softmax op produces a FusionGroup with empty epilogue
@@ -2444,9 +3234,14 @@ mod tests {
 
         // Assert
         assert_eq!(plan.num_groups(), 1);
-        let group = plan.group_of(softmax_op).expect("softmax op should belong to a group");
+        let group = plan
+            .group_of(softmax_op)
+            .expect("softmax op should belong to a group");
         assert_eq!(group.mode, FusionMode::Standalone);
-        assert!(group.epilogue.is_empty(), "Standalone group should have empty epilogue");
+        assert!(
+            group.epilogue.is_empty(),
+            "Standalone group should have empty epilogue"
+        );
         assert_eq!(group.ops.len(), 1);
     }
 }

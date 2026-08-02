@@ -22,59 +22,57 @@
 
 use std::collections::HashMap;
 
-pub mod ir;
-pub mod planner;
-pub mod executable;
+pub mod accel_registry;
+pub mod backend_cap;
+pub mod buffer_alloc;
 pub mod cache;
 pub mod codegen;
-pub mod graph;
-pub mod rope_scaling;
-pub mod semantics;
+pub mod counters;
+pub mod executable;
 pub mod fusion;
 pub mod fwht_fusion;
-pub mod trace;
-pub mod registry;
-pub mod backend_cap;
-pub mod semantic_dag;
-pub mod symexec;
-pub mod hw_constraints;
-pub mod buffer_alloc;
-pub mod model_adapter;
-pub mod hotpatch;
-pub mod hardware_profile;
-pub mod jit_context;
-pub mod pain_point;
-pub mod accel_registry;
-pub mod layout_negotiator;
-pub mod virtual_tensor;
+pub mod graph;
 pub mod group_dep;
-pub mod virtual_activation;
+pub mod hardware_profile;
+pub mod hotpatch;
+pub mod hw_constraints;
+pub mod ir;
+pub mod jit_context;
+pub mod layout_negotiator;
+pub mod model_adapter;
 pub mod pack_map;
-pub mod counters;
-pub mod resource_estimator;
+pub mod pain_point;
 pub mod parallel_compile;
+pub mod planner;
+pub mod registry;
+pub mod resource_estimator;
+pub mod rope_scaling;
+pub mod semantic_dag;
+pub mod semantics;
+pub mod symexec;
+pub mod trace;
+pub mod virtual_activation;
+pub mod virtual_tensor;
 
-pub mod dump;
 pub mod diagnostics;
 pub mod dtype_chain;
+pub mod dump;
 pub mod graph_geometry;
 pub mod mega_kernel_abi;
-pub mod quant_ir;
-pub mod quant_convert;
-pub mod quant_format;
-pub mod quant_pipeline;
 #[cfg(test)]
 mod quant_activation_test;
+pub mod quant_convert;
+pub mod quant_format;
+pub mod quant_ir;
+pub mod quant_pipeline;
 
 // ── Public API re-exports (used by external consumers: gllm) ───────────
 pub use executable::CompiledLayer;
 pub use mega_kernel_abi::{
-    MegaKernelFn, KernelWeightLayout, BufferLayout,
-    PerLayerWeightLayout,
-    BusinessConfig, MtpKernelConfig, OutputMode, PoolMode, SgConfig, CotStepConfig,
-    CompileConfig, CompileTarget,
-    HeteroLayerConfig, HeteroKernelWeightLayout,
-    MEGA_KERNEL_PARAMS, MEGA_KERNEL_STACK_OFFSETS,
+    BufferLayout, BusinessConfig, CompileConfig, CompileTarget, CotStepConfig,
+    HeteroKernelWeightLayout, HeteroLayerConfig, KernelWeightLayout, MegaKernelFn, MtpKernelConfig,
+    OutputMode, PerLayerWeightLayout, PoolMode, SgConfig, MEGA_KERNEL_PARAMS,
+    MEGA_KERNEL_STACK_OFFSETS,
 };
 
 /// Output of `compile_mega_kernel()`: compiled layer code + layout metadata.
@@ -115,7 +113,8 @@ pub struct MegaKernelCompileOutput {
     /// BCE-20260629-006: Intermediate tensor sources (TensorId → TensorPtrSource)
     /// 供 DIAG harness 动态查询 intermediate tensor 的 scratchpad offset。
     /// 之前 compile 内部丢弃了 BufferAllocation.tensor_sources，现在透出。
-    pub tensor_sources: HashMap<crate::compiler::graph::TensorId, crate::compiler::buffer_alloc::TensorPtrSource>,
+    pub tensor_sources:
+        HashMap<crate::compiler::graph::TensorId, crate::compiler::buffer_alloc::TensorPtrSource>,
 }
 
 /// Output of GPU mega-kernel compilation (PTX/HIP/MSL source).
@@ -188,25 +187,27 @@ impl CompileOutput {
     }
 }
 
-pub use graph::{CompilerGraph, Op, RopeScaling, TensorId, WeightLayout, SymDim, ShapeBinding};
-pub use ir::MoeConfig;
-pub use rope_scaling::{compute_attention_scaling, compute_inv_freq, fill_cos_sin_table, fill_cos_sin_table_partial};
-pub use registry::ScalarOpRegistry;
-pub use semantic_dag::{SemanticDAG, Boundness};
+pub use crate::types::CompilerError;
 pub use fusion::FusionPlan;
+pub use graph::{CompilerGraph, Op, RopeScaling, ShapeBinding, SymDim, TensorId, WeightLayout};
+pub use ir::MoeConfig;
 pub use planner::ExecutionPlan;
 pub use planner::HwOptPlan;
 pub use planner::{
-    RooflineAnalyzer, CacheBudgetSolver, GemmSolver, AttentionSolver,
-    FusionSolver, ParallelismSolver, BatchSolver, FeatureRouter,
+    AttentionSolver, BatchSolver, CacheBudgetSolver, FeatureRouter, FusionSolver, GemmSolver,
+    ParallelismSolver, RooflineAnalyzer,
 };
-pub use crate::types::CompilerError;
+pub use registry::ScalarOpRegistry;
+pub use rope_scaling::{
+    compute_attention_scaling, compute_inv_freq, fill_cos_sin_table, fill_cos_sin_table_partial,
+};
+pub use semantic_dag::{Boundness, SemanticDAG};
 
 // ── Internal re-exports (pub within crate, not part of public API) ────
-pub(crate) use ir::LayerIR;
 pub(crate) use cache::CompilationCache;
+pub(crate) use ir::LayerIR;
 
-use crate::dispatch::{DeviceProfile, device_profile};
+use crate::dispatch::{device_profile, DeviceProfile};
 use crate::types::InferenceError;
 
 /// Global lock serializing JIT compilation and execution.
@@ -240,13 +241,18 @@ pub struct InferenceCompiler {
     cache: CompilationCache,
 }
 
-
 fn _gk_oom_rss_mb() -> usize {
     if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
         for line in s.lines() {
             if line.starts_with("VmRSS:") {
-                let kb: usize = line[6..].trim().split_whitespace().next().unwrap_or("0").parse().unwrap_or(0);
-                return kb/1024;
+                let kb: usize = line[6..]
+                    .trim()
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0);
+                return kb / 1024;
             }
         }
     }
@@ -254,9 +260,17 @@ fn _gk_oom_rss_mb() -> usize {
 }
 fn _gk_oom_log(tag: &str, extra: &str) {
     use std::io::Write;
-    let _ = std::fs::OpenOptions::new().create(true).append(true)
-        .open("/tmp/oomprobe_gk.log").and_then(|mut f| writeln!(f, "{:>30} | RSS={} MB | {}", tag, _gk_oom_rss_mb(), extra));
-    eprintln!("[OOMPROBE-GK] {:>30} | RSS={} MB | {}", tag, _gk_oom_rss_mb(), extra);
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/oomprobe_gk.log")
+        .and_then(|mut f| writeln!(f, "{:>30} | RSS={} MB | {}", tag, _gk_oom_rss_mb(), extra));
+    eprintln!(
+        "[OOMPROBE-GK] {:>30} | RSS={} MB | {}",
+        tag,
+        _gk_oom_rss_mb(),
+        extra
+    );
     // 强制刷新 stderr: cargo test harness 会缓冲 stdout/stderr, OOM kill 前未 flush 则探针丢失
     std::io::stderr().flush().ok();
 }
@@ -306,7 +320,8 @@ impl InferenceCompiler {
     /// Debug-only: outputs to stderr when GLLM_DEBUG_RESOURCE=1.
     pub fn print_resource_report(&self) {
         if std::env::var("GLLM_DEBUG_RESOURCE").as_deref() == Ok("1") {
-            eprintln!("[ResourceReport] cache_entries={} isa={:?}",
+            eprintln!(
+                "[ResourceReport] cache_entries={} isa={:?}",
                 self.cache.len(),
                 self.profile.isa,
             );
@@ -314,8 +329,8 @@ impl InferenceCompiler {
     }
 
     fn compute_hash(&self, ir: &LayerIR) -> u64 {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
 
@@ -374,7 +389,8 @@ impl InferenceCompiler {
     /// an error is returned.
     fn jit_compile(&self, ir: &LayerIR) -> Result<codegen::CodegenOutput, InferenceError> {
         // Build ExecutionPlan (HwOptPlan) — the single source of strategy decisions
-        let exec_plan = planner::ExecutionPlan::build(ir, &self.profile, &planner::StrategyBias::default());
+        let exec_plan =
+            planner::ExecutionPlan::build(ir, &self.profile, &planner::StrategyBias::default());
 
         // Build CompilerGraph DAG
         let graph = CompilerGraph::from_layer_ir(ir, &self.profile)
@@ -385,10 +401,18 @@ impl InferenceCompiler {
         let semantic_dag = SemanticDAG::from_graph(&graph, &registry);
 
         // Fusion decisions + HW constraint validation + buffer allocation
-        let mut fusion_plan = fusion::fuse_with_dag_prebuilt(&graph, &semantic_dag, &exec_plan, None, None);
+        let mut fusion_plan =
+            fusion::fuse_with_dag_prebuilt(&graph, &semantic_dag, &exec_plan, None, None);
         hw_constraints::enforce_constraints(&mut fusion_plan.groups, &graph, &exec_plan);
         let lifetimes = buffer_alloc::analyze_lifetimes(&graph, &fusion_plan, None, None);
-        let alloc = buffer_alloc::allocate_buffers_aligned(&lifetimes, self.profile.hw_info.cacheline_bytes, None, None, &graph, None);
+        let alloc = buffer_alloc::allocate_buffers_aligned(
+            &lifetimes,
+            self.profile.hw_info.cacheline_bytes,
+            None,
+            None,
+            &graph,
+            None,
+        );
 
         // SPEC/39 REQ-UMK-001: All compilation produces MegaKernelFn ABI code.
         // The 10-param ABI (CompiledLayerFn) is physically deleted.
@@ -398,14 +422,22 @@ impl InferenceCompiler {
         #[cfg(feature = "jit-x86")]
         {
             codegen::vm::plan_lower::compile_layer_with_sym_map(
-                &fusion_plan, &graph, &alloc, &exec_plan, Some(&registry), &sym_map,
-            ).map_err(InferenceError::CompileError)
+                &fusion_plan,
+                &graph,
+                &alloc,
+                &exec_plan,
+                Some(&registry),
+                &sym_map,
+            )
+            .map_err(InferenceError::CompileError)
         }
 
         #[cfg(not(feature = "jit-x86"))]
         {
             let _ = (fusion_plan, alloc, graph, sym_map);
-            Err(InferenceError::CompileError("JIT backend not enabled (feature jit-x86 required)".into()))
+            Err(InferenceError::CompileError(
+                "JIT backend not enabled (feature jit-x86 required)".into(),
+            ))
         }
     }
 
@@ -438,10 +470,9 @@ impl InferenceCompiler {
         let _guard = compile_lock();
 
         match config.target {
-            mega_kernel_abi::CompileTarget::Cpu => {
-                self.compile_cpu(graph, config, hetero_layout)
-                    .map(CompileOutput::Cpu)
-            }
+            mega_kernel_abi::CompileTarget::Cpu => self
+                .compile_cpu(graph, config, hetero_layout)
+                .map(CompileOutput::Cpu),
             mega_kernel_abi::CompileTarget::Gpu { sm_version } => {
                 #[cfg(any(feature = "jit-cuda", feature = "jit-hip"))]
                 {
@@ -470,38 +501,58 @@ impl InferenceCompiler {
     ) -> Result<MegaKernelCompileOutput, InferenceError> {
         let t0 = std::time::Instant::now();
         let alloc_max_seq = config.max_seq_len.min(buffer_alloc::ALLOC_SEQ_CAP);
-        static COMPILE_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static COMPILE_COUNTER: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
         let compile_id = COMPILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        eprintln!("[COMPILE-MEGA] compile(cpu) #{}, ops={}",
-            compile_id, graph.ops.len());
+        eprintln!(
+            "[COMPILE-MEGA] compile(cpu) #{}, ops={}",
+            compile_id,
+            graph.ops.len()
+        );
 
         // REQ-FAIL-TRIANG-001: IR-layer pre_check at compile() entry.
         // Validates graph structural invariants before any compilation proceeds.
         let ir_errors = diagnostics::pre_check(&graph);
         if !ir_errors.is_empty() {
-            let details: Vec<String> = ir_errors.iter()
-                .take(5)
-                .map(|e| format!("{}", e))
-                .collect();
+            let details: Vec<String> = ir_errors.iter().take(5).map(|e| format!("{}", e)).collect();
             return Err(InferenceError::CompileError(
-                format!("IR-ERR: {} precondition violation(s).\n{}",
-                    ir_errors.len(), details.join("\n")).into()
+                format!(
+                    "IR-ERR: {} precondition violation(s).\n{}",
+                    ir_errors.len(),
+                    details.join("\n")
+                )
+                .into(),
             ));
         }
 
         // REQ-DTYPE-CHAIN-005: Dtype chain validation gate.
         // Blocks Mega-Kernel generation if dtype breakpoints are detected.
-        let dtype_validation = dtype_chain::DtypeChainValidation::validate(&graph, &DeviceProfile::detect());
+        let dtype_validation =
+            dtype_chain::DtypeChainValidation::validate(&graph, &DeviceProfile::detect());
         if !dtype_validation.is_valid {
-            let details: Vec<String> = dtype_validation.breakpoints.iter()
+            let details: Vec<String> = dtype_validation
+                .breakpoints
+                .iter()
                 .take(5)
-                .map(|bp| format!("  op '{}' tensor {:?}: expected {:?}, got {:?} — {}",
-                    bp.op_label, bp.tensor_id, bp.expected_dtype, bp.actual_dtype, bp.suggestion))
+                .map(|bp| {
+                    format!(
+                        "  op '{}' tensor {:?}: expected {:?}, got {:?} — {}",
+                        bp.op_label,
+                        bp.tensor_id,
+                        bp.expected_dtype,
+                        bp.actual_dtype,
+                        bp.suggestion
+                    )
+                })
                 .collect();
-            return Err(InferenceError::CompileError(format!(
-                "DTYPE-CHAIN validation failed: {} breakpoint(s).\n{}",
-                dtype_validation.num_breakpoints, details.join("\n")
-            ).into()));
+            return Err(InferenceError::CompileError(
+                format!(
+                    "DTYPE-CHAIN validation failed: {} breakpoint(s).\n{}",
+                    dtype_validation.num_breakpoints,
+                    details.join("\n")
+                )
+                .into(),
+            ));
         }
 
         // REQ-BACKEND-CAP-003: Capability matrix gate.
@@ -513,12 +564,15 @@ impl InferenceCompiler {
             let cap_matrix = backend_cap::BackendCapMatrix::build(&self.profile, &registered_keys);
 
             // Collect all OpKindKeys from the graph
-            let graph_op_keys: Vec<_> = graph.ops.iter()
+            let graph_op_keys: Vec<_> = graph
+                .ops
+                .iter()
                 .map(|cop| ScalarOpRegistry::key_from_op(&cop.op))
                 .collect();
 
             let profile_label = format!("{:?} {:?}", self.profile.arch, self.profile.isa);
-            cap_matrix.validate_graph_ops(&graph_op_keys, self.profile.isa, &profile_label)
+            cap_matrix
+                .validate_graph_ops(&graph_op_keys, self.profile.isa, &profile_label)
                 .map_err(|cap_err| {
                     InferenceError::CompileError(CompilerError::CapabilityUnsupported {
                         op_kind: cap_err.op_kind,
@@ -532,37 +586,61 @@ impl InferenceCompiler {
         // SPEC/39 REQ-UMK-001: single compilation entry point handles all graph topologies.
         // All graphs (with or without layer loops) go through compile_mega_kernel_vm.
         // Simple graphs use LoopBegin { bound: Const(1) } + LoopEnd — single iteration, zero overhead.
-        let geometry = graph_geometry::GraphDerivedGeometry::from_graph(&graph, &DeviceProfile::detect())
-            .map_err(|e| InferenceError::CompileError(format!("GraphDerivedGeometry: {}", e).into()))?;
+        let geometry =
+            graph_geometry::GraphDerivedGeometry::from_graph(&graph, &DeviceProfile::detect())
+                .map_err(|e| {
+                    InferenceError::CompileError(format!("GraphDerivedGeometry: {}", e).into())
+                })?;
 
         // [FIX-PSC29] Determine SG presence from graph ops (SgDetect/SgInject).
         // When no SG ops exist, BufferLayout skips SG allocation entirely.
         let sg_enabled = graph.ops.iter().any(|op| {
-            matches!(op.op_resolved(&graph), Some(graph::Op::SgDetect { .. }) | Some(graph::Op::SgInject { .. }))
+            matches!(
+                op.op_resolved(&graph),
+                Some(graph::Op::SgDetect { .. }) | Some(graph::Op::SgInject { .. })
+            )
         });
 
         let mut buffer_layout = mega_kernel_abi::BufferLayout::from_graph_geometry(
-            &geometry, alloc_max_seq, sg_enabled,
+            &geometry,
+            alloc_max_seq,
+            sg_enabled,
         );
 
         // JIT pipeline
         let bottleneck_map = pain_point::PainPointAnalyzer::analyze(&graph, &self.profile);
-        eprintln!("[JIT-TIME] PainPointAnalyzer: {:.2}ms", t0.elapsed().as_secs_f64() * 1000.0);
+        eprintln!(
+            "[JIT-TIME] PainPointAnalyzer: {:.2}ms",
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
         let t1 = std::time::Instant::now();
         if std::env::var("GLLM_DEBUG_RESOURCE").is_ok() {
-            eprintln!("[R0/from_graph] PainPointAnalyzer: {} GEMMs analyzed, ridge={:.1}",
-                bottleneck_map.gemm_bottlenecks.len(), bottleneck_map.ridge_point);
+            eprintln!(
+                "[R0/from_graph] PainPointAnalyzer: {} GEMMs analyzed, ridge={:.1}",
+                bottleneck_map.gemm_bottlenecks.len(),
+                bottleneck_map.ridge_point
+            );
         }
-        let exec_plan = planner::ExecutionPlan::from_profile_with_bottlenecks(&self.profile, bottleneck_map);
+        let exec_plan =
+            planner::ExecutionPlan::from_profile_with_bottlenecks(&self.profile, bottleneck_map);
         let bottleneck_map = exec_plan.op_bottleneck_map.as_ref().unwrap();
 
-        eprintln!("[JIT-TIME] ExecutionPlan+SemanticDAG+Fusion+HW: {:.2}ms", t1.elapsed().as_secs_f64() * 1000.0);
+        eprintln!(
+            "[JIT-TIME] ExecutionPlan+SemanticDAG+Fusion+HW: {:.2}ms",
+            t1.elapsed().as_secs_f64() * 1000.0
+        );
         let t2 = std::time::Instant::now();
 
         let registry = ScalarOpRegistry::with_defaults();
         let semantic_dag = SemanticDAG::from_graph(&graph, &registry);
 
-        let mut fusion_plan = fusion::fuse_with_dag_prebuilt(&graph, &semantic_dag, &exec_plan, Some(bottleneck_map), None);
+        let mut fusion_plan = fusion::fuse_with_dag_prebuilt(
+            &graph,
+            &semantic_dag,
+            &exec_plan,
+            Some(bottleneck_map),
+            None,
+        );
         hw_constraints::enforce_constraints(&mut fusion_plan.groups, &graph, &exec_plan);
 
         // REQ-UMK-31: Analyze parallel scheduling plan for Phase 2/3.
@@ -576,34 +654,59 @@ impl InferenceCompiler {
 
         let accel_registry = accel_registry::AccelerationRegistry::new();
         let layout_assignment = layout_negotiator::LayoutNegotiator::negotiate(
-            &fusion_plan.groups, &accel_registry, &self.profile, &semantic_dag, bottleneck_map, &graph,
+            &fusion_plan.groups,
+            &accel_registry,
+            &self.profile,
+            &semantic_dag,
+            bottleneck_map,
+            &graph,
         );
 
         let virtual_tensor_map = virtual_tensor::DataFlowOptimizer::eliminate(
-            &graph, &fusion_plan, Some(&layout_assignment), &self.profile,
+            &graph,
+            &fusion_plan,
+            Some(&layout_assignment),
+            &self.profile,
         );
-        eprintln!("[JIT-TIME] VTM+LayoutNegotiate: {:.2}ms", t2.elapsed().as_secs_f64() * 1000.0);
+        eprintln!(
+            "[JIT-TIME] VTM+LayoutNegotiate: {:.2}ms",
+            t2.elapsed().as_secs_f64() * 1000.0
+        );
         let t3 = std::time::Instant::now();
         if std::env::var("GLLM_DEBUG_RESOURCE").is_ok() {
-            eprintln!("[VTM-mega] virtualized {} tensors, bytes_saved={}",
+            eprintln!(
+                "[VTM-mega] virtualized {} tensors, bytes_saved={}",
                 virtual_tensor_map.virtual_map.len(),
-                virtual_tensor_map.bytes_saved);
+                virtual_tensor_map.bytes_saved
+            );
             for (&tid, vt) in &virtual_tensor_map.virtual_map {
                 let name = graph.tensor(tid).map(|t| t.name.as_str()).unwrap_or("?");
-                let src_name = graph.tensor(vt.source).map(|t| t.name.as_str()).unwrap_or("?");
-                eprintln!("[VTM-mega]   {} ({:?}) -> virtual from {} ({:?})",
-                    name, tid, src_name, vt.source);
+                let src_name = graph
+                    .tensor(vt.source)
+                    .map(|t| t.name.as_str())
+                    .unwrap_or("?");
+                eprintln!(
+                    "[VTM-mega]   {} ({:?}) -> virtual from {} ({:?})",
+                    name, tid, src_name, vt.source
+                );
             }
         }
 
-        let virtual_activation = virtual_activation::VirtualActivationMap::analyze(&graph, &fusion_plan);
+        let virtual_activation =
+            virtual_activation::VirtualActivationMap::analyze(&graph, &fusion_plan);
 
         let lifetimes = buffer_alloc::analyze_lifetimes(
-            &graph, &fusion_plan, Some(&virtual_tensor_map), Some(&virtual_activation),
+            &graph,
+            &fusion_plan,
+            Some(&virtual_tensor_map),
+            Some(&virtual_activation),
         );
         let alloc = buffer_alloc::allocate_buffers_aligned(
-            &lifetimes, self.profile.hw_info.cacheline_bytes,
-            Some(&virtual_tensor_map), Some(&virtual_activation), &graph,
+            &lifetimes,
+            self.profile.hw_info.cacheline_bytes,
+            Some(&virtual_tensor_map),
+            Some(&virtual_activation),
+            &graph,
             Some(&layout_assignment),
         );
         // Ring-Buffer 逐层捕获: 从 BufferAllocation 复制 capture 区域到 BufferLayout (对外暴露).
@@ -615,10 +718,11 @@ impl InferenceCompiler {
         #[cfg(feature = "jit-x86")]
         {
             use codegen::vm::mega_kernel_emit::compile_mega_kernel_vm;
-            use codegen::vm::{isa_profile::IsaProfile, isa_hook, reg_alloc::RegAllocator,
-                              stack_frame::StackFrame, x86_lower::X86Lower,
-                              opt_pass::PassRegistry};
             use codegen::vm::resource_planner::plan_mega_kernel_resources;
+            use codegen::vm::{
+                isa_hook, isa_profile::IsaProfile, opt_pass::PassRegistry, reg_alloc::RegAllocator,
+                stack_frame::StackFrame, x86_lower::X86Lower,
+            };
 
             let profile = IsaProfile::from_device_profile(&self.profile);
             let hook = isa_hook::select_hook(&profile);
@@ -636,8 +740,13 @@ impl InferenceCompiler {
             let kv_dim = geometry.num_kv_heads * geometry.head_dim;
             let kv_bytes = alloc_max_seq * kv_dim * 2;
             let resource_plan = plan_mega_kernel_resources(
-                &graph, &fusion_plan, &profile, &alloc,
-                geometry.hidden, activation_bytes, kv_bytes,
+                &graph,
+                &fusion_plan,
+                &profile,
+                &alloc,
+                geometry.hidden,
+                activation_bytes,
+                kv_bytes,
             );
             if std::env::var("GLLM_DEBUG_RESOURCE").is_ok() {
                 eprintln!("[GRP] Resource plan: {} groups, scratchpad={} bytes, stack={} bytes, peak_vec={}, peak_gpr={}",
@@ -648,39 +757,61 @@ impl InferenceCompiler {
                     resource_plan.summary.peak_gpr_regs);
             }
 
-            let topology = codegen::vm::topology::GraphTopologyAnalysis::analyze(
-                &graph,
-            );
+            let topology = codegen::vm::topology::GraphTopologyAnalysis::analyze(&graph);
             // Extract output_float_elems before topology is moved into compile_mega_kernel_vm.
             // For SinglePass (non-generate) graphs, we need to copy output from scratchpad
             // back to the ABI output arg. The output tensor is determined by:
             // 1. topology.logits_output_tid (if Argmax is present → its input tensor)
             // 2. graph.outputs[0] (fallback: no Argmax, e.g. GEMM/embedding/reranker)
-            let output_float_elems = if matches!(topology.loop_topology, crate::compiler::codegen::vm::topology::LoopTopology::SinglePass) {
-                let output_tid = topology.logits_output_tid
+            let output_float_elems = if matches!(
+                topology.loop_topology,
+                crate::compiler::codegen::vm::topology::LoopTopology::SinglePass
+            ) {
+                let output_tid = topology
+                    .logits_output_tid
                     .or_else(|| graph.outputs.first().copied());
                 output_tid
                     .and_then(|tid| graph.tensor(tid))
-                    .map(|t| t.shape.iter().map(|d| match d {
-                        SymDim::Concrete(v) => *v,
-                        SymDim::Symbolic { max_value: Some(m), .. } => *m,
-                        _ => 1,
-                    }).product::<usize>())
+                    .map(|t| {
+                        t.shape
+                            .iter()
+                            .map(|d| match d {
+                                SymDim::Concrete(v) => *v,
+                                SymDim::Symbolic {
+                                    max_value: Some(m), ..
+                                } => *m,
+                                _ => 1,
+                            })
+                            .product::<usize>()
+                    })
                     .unwrap_or(0)
             } else {
                 0
             };
             let t4 = std::time::Instant::now();
             let (mut program, rope_cache, logits_scratch_offset) = compile_mega_kernel_vm(
-                &fusion_plan, &graph, &alloc, Some(&registry), &profile,
-                hook_ref, &buffer_layout, Some(bottleneck_map), Some(&virtual_activation),
-                Some(&virtual_tensor_map), Some(&layout_assignment),
+                &fusion_plan,
+                &graph,
+                &alloc,
+                Some(&registry),
+                &profile,
+                hook_ref,
+                &buffer_layout,
+                Some(bottleneck_map),
+                Some(&virtual_activation),
+                Some(&virtual_tensor_map),
+                Some(&layout_assignment),
                 config.debug_jit,
                 None, // mtp_config now derived from topology.mtp_config (SPEC/39)
                 Some(&resource_plan),
                 topology,
-            ).map_err(InferenceError::CompileError)?;
-            eprintln!("[JIT-TIME] compile_mega_kernel_vm: {:.2}ms ({} VmInstrs)", t4.elapsed().as_secs_f64() * 1000.0, program.len());
+            )
+            .map_err(InferenceError::CompileError)?;
+            eprintln!(
+                "[JIT-TIME] compile_mega_kernel_vm: {:.2}ms ({} VmInstrs)",
+                t4.elapsed().as_secs_f64() * 1000.0,
+                program.len()
+            );
             // Dump VmProgram for debugging
             {
                 use std::io::Write;
@@ -695,15 +826,26 @@ impl InferenceCompiler {
             pass_registry.run_all(&mut program, &profile, &*hook);
 
             let t5 = std::time::Instant::now();
-            let alloc_result = RegAllocator::new(&profile).allocate(&program)
+            let alloc_result = RegAllocator::new(&profile)
+                .allocate(&program)
                 .map_err(|e| InferenceError::CompileError(format!("RegAlloc: {}", e).into()))?;
-            eprintln!("[JIT-TIME] RegAllocator: {:.2}ms", t5.elapsed().as_secs_f64() * 1000.0);
+            eprintln!(
+                "[JIT-TIME] RegAllocator: {:.2}ms",
+                t5.elapsed().as_secs_f64() * 1000.0
+            );
             // Dump reg alloc for debugging
             {
                 use std::io::Write;
-                let mut f = std::fs::File::create(format!("/tmp/gllm_regalloc_dump_{}.txt", compile_id)).unwrap();
+                let mut f =
+                    std::fs::File::create(format!("/tmp/gllm_regalloc_dump_{}.txt", compile_id))
+                        .unwrap();
                 for spill in &alloc_result.spills {
-                    writeln!(f, "SPILL v{} offset={} size={}", spill.vreg.0, spill.offset, spill.size).unwrap();
+                    writeln!(
+                        f,
+                        "SPILL v{} offset={} size={}",
+                        spill.vreg.0, spill.offset, spill.size
+                    )
+                    .unwrap();
                 }
                 let mut regs: Vec<_> = alloc_result.mapping.iter().collect();
                 regs.sort_by_key(|(v, _)| v.0);
@@ -723,26 +865,41 @@ impl InferenceCompiler {
             let mut lowerer = X86Lower::with_sym_map(has_avx512, sym_slot_map);
             // NO-SILENT-FALLBACK + NO-HW-DEGRADATION: 注入 BF16/VNNI 独立特性标志,
             // 供 codegen 守卫 vcvtneps2bf16/vpdpbusd (非 AVX-512 子集,缺失会 SIGILL)。
-            if let codegen::vm::isa_profile::Platform::X86_64 { has_avx512fp16, has_bf16, has_vnni, .. } = &profile.platform {
+            if let codegen::vm::isa_profile::Platform::X86_64 {
+                has_avx512fp16,
+                has_bf16,
+                has_vnni,
+                ..
+            } = &profile.platform
+            {
                 lowerer.set_has_avx512fp16(*has_avx512fp16);
                 lowerer.set_has_bf16(*has_bf16);
                 lowerer.set_has_vnni(*has_vnni);
             }
-            lowerer.set_scratch_gprs(&profile.scratch_gprs)
+            lowerer
+                .set_scratch_gprs(&profile.scratch_gprs)
                 .map_err(InferenceError::CompileError)?;
-            lowerer.set_scratch_vec_regs(&profile.scratch_vec_regs)
+            lowerer
+                .set_scratch_vec_regs(&profile.scratch_vec_regs)
                 .map_err(InferenceError::CompileError)?;
             lowerer.precompute_zero_vregs(&program);
-            lowerer.emit_prologue(&frame, &alloc_result)
+            lowerer
+                .emit_prologue(&frame, &alloc_result)
                 .map_err(InferenceError::CompileError)?;
             // StackLayout 现在在 emit_prologue 内部直接构建，无需 set_spill_base
             let t6 = std::time::Instant::now();
             for instr in &program.instrs {
-                lowerer.lower_instr(instr, &alloc_result)
+                lowerer
+                    .lower_instr(instr, &alloc_result)
                     .map_err(InferenceError::CompileError)?;
             }
-            eprintln!("[JIT-TIME] X86Lower ({} instrs): {:.2}ms", program.len(), t6.elapsed().as_secs_f64() * 1000.0);
-            lowerer.emit_epilogue(&frame, &alloc_result)
+            eprintln!(
+                "[JIT-TIME] X86Lower ({} instrs): {:.2}ms",
+                program.len(),
+                t6.elapsed().as_secs_f64() * 1000.0
+            );
+            lowerer
+                .emit_epilogue(&frame, &alloc_result)
                 .map_err(InferenceError::CompileError)?;
             let lowerer_source_map = lowerer.take_source_map();
             // BCE-20260724-PLAN-C-RESIDUAL-BREAK: finalize_with_diag 返回
@@ -750,7 +907,8 @@ impl InferenceCompiler {
             // MegaKernelCompileOutput → MegaKernelExecutor → dump_offset_map。
             // 非 X86_64 后端无 finalize_with_diag (该 impl 仅 x86), 但 compile_cpu
             // 的 jit-x86 feature gate 保证此处只编译 x86 路径。
-            let (code, vm_instr_map, const_pool_audit) = lowerer.finalize_with_diag()
+            let (code, vm_instr_map, const_pool_audit) = lowerer
+                .finalize_with_diag()
                 .map_err(InferenceError::CompileError)?;
             eprintln!("[JIT-TIME] Total code size: {} bytes", code.len());
             // Dump JIT machine code for debugging
@@ -777,7 +935,8 @@ impl InferenceCompiler {
             // sizing remains covered independently by `single_pass_output_bytes`.
             let generate_logits_bytes = vocab_bytes;
             let single_pass_output_bytes = output_float_elems * elem_bytes;
-            let logits_end = logits_scratch_offset + generate_logits_bytes.max(single_pass_output_bytes);
+            let logits_end =
+                logits_scratch_offset + generate_logits_bytes.max(single_pass_output_bytes);
             let sg_end = if buffer_layout.sg_data_bytes > 0 {
                 let sg_start = (logits_scratch_offset + vocab_bytes + sampling_bytes + 63) & !63;
                 sg_start + geometry.hidden * elem_bytes * 2
@@ -786,7 +945,11 @@ impl InferenceCompiler {
             };
             // DWC padded buffer must fit within scratchpad (compute_dwc_requirement mirrors mega_kernel_emit).
             let dwc_end = match codegen::vm::plan_lower::compute_dwc_requirement(
-                &fusion_plan, &graph, &alloc, rope_cache.as_ref(), None,
+                &fusion_plan,
+                &graph,
+                &alloc,
+                rope_cache.as_ref(),
+                None,
             ) {
                 Ok(Some(req)) => req.padded_offset + req.total_bytes,
                 _ => 0,
@@ -829,7 +992,10 @@ impl InferenceCompiler {
             debug_assert!(
                 total_scratch >= logits_scratch_offset + output_float_elems * elem_bytes,
                 "scratchpad too small for output: total={} need offset={} + elems={} * {} = {}",
-                total_scratch, logits_scratch_offset, output_float_elems, elem_bytes,
+                total_scratch,
+                logits_scratch_offset,
+                output_float_elems,
+                elem_bytes,
                 logits_scratch_offset + output_float_elems * elem_bytes,
             );
 
@@ -860,7 +1026,9 @@ impl InferenceCompiler {
         #[cfg(not(feature = "jit-x86"))]
         {
             let _ = (fusion_plan, alloc);
-            Err(InferenceError::CompileError("JIT backend not enabled (feature jit-x86 required)".into()))
+            Err(InferenceError::CompileError(
+                "JIT backend not enabled (feature jit-x86 required)".into(),
+            ))
         }
     }
 
@@ -875,55 +1043,85 @@ impl InferenceCompiler {
         config: &mega_kernel_abi::CompileConfig,
         sm_version: u32,
     ) -> Result<GpuMegaKernelOutput, InferenceError> {
-        use codegen::vm::gpu_lower::{GpuLower, GpuDialect};
-        use codegen::vm::reg_alloc::RegAllocator;
-        use codegen::vm::stack_frame::StackFrame;
+        use codegen::vm::gpu_lower::{GpuDialect, GpuLower};
         use codegen::vm::isa_profile::IsaProfile;
         use codegen::vm::opt_pass::PassRegistry;
+        use codegen::vm::reg_alloc::RegAllocator;
+        use codegen::vm::stack_frame::StackFrame;
 
         let alloc_max_seq = config.max_seq_len.min(buffer_alloc::ALLOC_SEQ_CAP);
-        let geometry = graph_geometry::GraphDerivedGeometry::from_graph(&graph, &DeviceProfile::detect())
-            .map_err(|e| InferenceError::CompileError(format!("GraphDerivedGeometry: {}", e).into()))?;
+        let geometry =
+            graph_geometry::GraphDerivedGeometry::from_graph(&graph, &DeviceProfile::detect())
+                .map_err(|e| {
+                    InferenceError::CompileError(format!("GraphDerivedGeometry: {}", e).into())
+                })?;
 
         // [FIX-PSC29] Determine SG presence from graph ops (SgDetect/SgInject).
         // When no SG ops exist, BufferLayout skips SG allocation entirely.
         let sg_enabled = graph.ops.iter().any(|op| {
-            matches!(op.op_resolved(&graph), Some(graph::Op::SgDetect { .. }) | Some(graph::Op::SgInject { .. }))
+            matches!(
+                op.op_resolved(&graph),
+                Some(graph::Op::SgDetect { .. }) | Some(graph::Op::SgInject { .. })
+            )
         });
 
         let mut buffer_layout = mega_kernel_abi::BufferLayout::from_graph_geometry(
-            &geometry, alloc_max_seq, sg_enabled,
+            &geometry,
+            alloc_max_seq,
+            sg_enabled,
         );
 
         let bottleneck_map = pain_point::PainPointAnalyzer::analyze(&graph, &self.profile);
-        let exec_plan = planner::ExecutionPlan::from_profile_with_bottlenecks(&self.profile, bottleneck_map);
+        let exec_plan =
+            planner::ExecutionPlan::from_profile_with_bottlenecks(&self.profile, bottleneck_map);
         let bottleneck_map = exec_plan.op_bottleneck_map.as_ref().unwrap();
 
         let registry = ScalarOpRegistry::with_defaults();
         let semantic_dag = SemanticDAG::from_graph(&graph, &registry);
-        let mut fusion_plan = fusion::fuse_with_dag_prebuilt(&graph, &semantic_dag, &exec_plan, Some(bottleneck_map), None);
+        let mut fusion_plan = fusion::fuse_with_dag_prebuilt(
+            &graph,
+            &semantic_dag,
+            &exec_plan,
+            Some(bottleneck_map),
+            None,
+        );
         hw_constraints::enforce_constraints(&mut fusion_plan.groups, &graph, &exec_plan);
 
         let accel_registry = accel_registry::AccelerationRegistry::new();
         let layout_assignment = layout_negotiator::LayoutNegotiator::negotiate(
-            &fusion_plan.groups, &accel_registry, &self.profile, &semantic_dag, bottleneck_map, &graph,
+            &fusion_plan.groups,
+            &accel_registry,
+            &self.profile,
+            &semantic_dag,
+            bottleneck_map,
+            &graph,
         );
         let virtual_tensor_map = virtual_tensor::DataFlowOptimizer::eliminate(
-            &graph, &fusion_plan, Some(&layout_assignment), &self.profile,
+            &graph,
+            &fusion_plan,
+            Some(&layout_assignment),
+            &self.profile,
         );
         // [OOM-PROBE Stage 9] virtual_tensor map — GPU 空 mapping 疑点: 若 virtual_map 为空
         // 而 physical_set 接近全量 → DataFlowOptimizer 对 GPU 未消除反而全物化 (architect 疑点)。
-        _gk_oom_log("gpu-stage9-virtual-tensor", &format!(
-            "virtual_map={} physical_set={} pack_maps={} bytes_saved={} graph_tensors={}",
-            virtual_tensor_map.virtual_map.len(),
-            virtual_tensor_map.physical_set.len(),
-            virtual_tensor_map.pack_maps.len(),
-            virtual_tensor_map.bytes_saved,
-            graph.tensors.len(),
-        ));
-        let virtual_activation = virtual_activation::VirtualActivationMap::analyze(&graph, &fusion_plan);
+        _gk_oom_log(
+            "gpu-stage9-virtual-tensor",
+            &format!(
+                "virtual_map={} physical_set={} pack_maps={} bytes_saved={} graph_tensors={}",
+                virtual_tensor_map.virtual_map.len(),
+                virtual_tensor_map.physical_set.len(),
+                virtual_tensor_map.pack_maps.len(),
+                virtual_tensor_map.bytes_saved,
+                graph.tensors.len(),
+            ),
+        );
+        let virtual_activation =
+            virtual_activation::VirtualActivationMap::analyze(&graph, &fusion_plan);
         let lifetimes = buffer_alloc::analyze_lifetimes(
-            &graph, &fusion_plan, Some(&virtual_tensor_map), Some(&virtual_activation),
+            &graph,
+            &fusion_plan,
+            Some(&virtual_tensor_map),
+            Some(&virtual_activation),
         );
         // [OOM-PROBE Stage 11] lifetimes — empty virtual mapping 导致全活跃疑点 (architect 疑点 E)。
         // max_live_set = 单步并发活跃 tensor 数 (峰值); sum_size_bytes = 全 lifetime 字节和 (无复用)。
@@ -937,15 +1135,24 @@ impl InferenceCompiler {
                     events.push((l.last_use + 1, -1));
                 }
                 events.sort_by_key(|e| (e.0, e.1));
-                let mut cur = 0i32; let mut peak = 0i32;
-                for (_, d) in events { cur += d; if cur > peak { peak = cur; } }
+                let mut cur = 0i32;
+                let mut peak = 0i32;
+                for (_, d) in events {
+                    cur += d;
+                    if cur > peak {
+                        peak = cur;
+                    }
+                }
                 peak as usize
             };
             let max_single: usize = lifetimes.iter().map(|l| l.size_bytes).max().unwrap_or(0);
-            _gk_oom_log("gpu-stage11-lifetimes", &format!(
-                "lifetimes={} max_live_set={} sum_size_bytes={} max_single_buffer_bytes={}",
-                n, max_live, sum_size, max_single,
-            ));
+            _gk_oom_log(
+                "gpu-stage11-lifetimes",
+                &format!(
+                    "lifetimes={} max_live_set={} sum_size_bytes={} max_single_buffer_bytes={}",
+                    n, max_live, sum_size, max_single,
+                ),
+            );
         }
         // BCE-20260702-GPU-OOM: GPU buffer 物化预算门控 (NO-SILENT-FALLBACK)。
         // GPU RegAllocator 走空 mapping 快速路径 (ARCH-GPU-NO-LINEAR-SCAN, 11db587d) 是正确的
@@ -958,20 +1165,28 @@ impl InferenceCompiler {
         const GPU_BUFFER_HOST_HARD_CAP_BYTES: usize = 4 * 1024 * 1024 * 1024; // 4 GiB
         const GPU_BUFFER_DEVICE_BUDGET_BYTES: usize = 16 * 1024 * 1024 * 1024; // 16 GiB
         if let Some(total) = buffer_alloc::gpu_buffer_budget_exceeds(
-            &lifetimes, GPU_BUFFER_DEVICE_BUDGET_BYTES, GPU_BUFFER_HOST_HARD_CAP_BYTES,
+            &lifetimes,
+            GPU_BUFFER_DEVICE_BUDGET_BYTES,
+            GPU_BUFFER_HOST_HARD_CAP_BYTES,
         ) {
-            return Err(InferenceError::CompileError(format!(
-                "GPU buffer budget exceeded: naive total {total} bytes > host hard cap \
+            return Err(InferenceError::CompileError(
+                format!(
+                    "GPU buffer budget exceeded: naive total {total} bytes > host hard cap \
                  {GPU_BUFFER_HOST_HARD_CAP_BYTES} bytes. \
                  GPU RegAllocator uses empty-mapping fast path (ARCH-GPU-NO-LINEAR-SCAN), \
                  so all intermediate VRegs materialize to host scratchpad. \
                  Reduce max_seq_len (current={}) or enable virtual_tensor elimination for GPU.",
-                config.max_seq_len,
-            ).into()));
+                    config.max_seq_len,
+                )
+                .into(),
+            ));
         }
         let alloc = buffer_alloc::allocate_buffers_aligned(
-            &lifetimes, self.profile.hw_info.cacheline_bytes,
-            Some(&virtual_tensor_map), Some(&virtual_activation), &graph,
+            &lifetimes,
+            self.profile.hw_info.cacheline_bytes,
+            Some(&virtual_tensor_map),
+            Some(&virtual_activation),
+            &graph,
             Some(&layout_assignment),
         );
         // Ring-Buffer 逐层捕获: 从 BufferAllocation 复制 capture 区域到 BufferLayout (对外暴露).
@@ -1013,23 +1228,37 @@ impl InferenceCompiler {
         let kv_dim = geometry.num_kv_heads * geometry.head_dim;
         let kv_bytes = alloc_max_seq * kv_dim * 2;
         let resource_plan = codegen::vm::resource_planner::plan_mega_kernel_resources(
-            &graph, &fusion_plan, &profile, &alloc,
-            geometry.hidden, activation_bytes, kv_bytes,
-        );
-        let topology = codegen::vm::topology::GraphTopologyAnalysis::analyze(
             &graph,
+            &fusion_plan,
+            &profile,
+            &alloc,
+            geometry.hidden,
+            activation_bytes,
+            kv_bytes,
         );
+        let topology = codegen::vm::topology::GraphTopologyAnalysis::analyze(&graph);
         // BCE-20260623-001: Extract output_float_elems before topology is moved.
-        let gpu_output_float_elems = if matches!(topology.loop_topology, crate::compiler::codegen::vm::topology::LoopTopology::SinglePass) {
-            let output_tid = topology.logits_output_tid
+        let gpu_output_float_elems = if matches!(
+            topology.loop_topology,
+            crate::compiler::codegen::vm::topology::LoopTopology::SinglePass
+        ) {
+            let output_tid = topology
+                .logits_output_tid
                 .or_else(|| graph.outputs.first().copied());
             output_tid
                 .and_then(|tid| graph.tensor(tid))
-                .map(|t| t.shape.iter().map(|d| match d {
-                    SymDim::Concrete(v) => *v,
-                    SymDim::Symbolic { max_value: Some(m), .. } => *m,
-                    _ => 1,
-                }).product::<usize>())
+                .map(|t| {
+                    t.shape
+                        .iter()
+                        .map(|d| match d {
+                            SymDim::Concrete(v) => *v,
+                            SymDim::Symbolic {
+                                max_value: Some(m), ..
+                            } => *m,
+                            _ => 1,
+                        })
+                        .product::<usize>()
+                })
                 .unwrap_or(0)
         } else {
             0
@@ -1041,52 +1270,103 @@ impl InferenceCompiler {
         let hook = codegen::vm::isa_hook::select_hook(&profile);
         let hook_ref: Option<&dyn codegen::vm::isa_hook::IsaHook> = Some(&*hook);
 
-        _gk_oom_log("gpu-pre-vm-emit", &format!("max_seq_len={} hidden={}", config.max_seq_len, geometry.hidden));
+        _gk_oom_log(
+            "gpu-pre-vm-emit",
+            &format!(
+                "max_seq_len={} hidden={}",
+                config.max_seq_len, geometry.hidden
+            ),
+        );
         let (mut program, rope_cache, logits_scratch_offset) =
             codegen::vm::mega_kernel_emit::compile_mega_kernel_vm(
-                &fusion_plan, &graph, &alloc, Some(&registry), &profile,
-                hook_ref, &buffer_layout, Some(bottleneck_map),
-                Some(&virtual_activation), Some(&virtual_tensor_map), Some(&layout_assignment),
-                false, None, Some(&resource_plan),
+                &fusion_plan,
+                &graph,
+                &alloc,
+                Some(&registry),
+                &profile,
+                hook_ref,
+                &buffer_layout,
+                Some(bottleneck_map),
+                Some(&virtual_activation),
+                Some(&virtual_tensor_map),
+                Some(&layout_assignment),
+                false,
+                None,
+                Some(&resource_plan),
                 topology,
-            ).map_err(|e| InferenceError::CompileError(e.into()))?;
-        _gk_oom_log("gpu-post-vm-emit", &format!("instrs={} vregs={:?}", program.instrs.len(), program.vreg_counts_by_kind()));
+            )
+            .map_err(|e| InferenceError::CompileError(e.into()))?;
+        _gk_oom_log(
+            "gpu-post-vm-emit",
+            &format!(
+                "instrs={} vregs={:?}",
+                program.instrs.len(),
+                program.vreg_counts_by_kind()
+            ),
+        );
 
         let pass_registry = PassRegistry::with_defaults();
         pass_registry.run_all(&mut program, &profile, &*hook);
 
-        let alloc_result = RegAllocator::new(&profile).allocate(&program)
+        let alloc_result = RegAllocator::new(&profile)
+            .allocate(&program)
             .map_err(|e| InferenceError::CompileError(format!("RegAlloc: {}", e).into()))?;
-        _gk_oom_log("gpu-post-regalloc", &format!("spills={} mapping_entries={}", alloc_result.spills.len(), alloc_result.mapping.len()));
+        _gk_oom_log(
+            "gpu-post-regalloc",
+            &format!(
+                "spills={} mapping_entries={}",
+                alloc_result.spills.len(),
+                alloc_result.mapping.len()
+            ),
+        );
         let frame = StackFrame::compute(&alloc_result, &profile, 0);
 
         let dialect = if cfg!(feature = "jit-cuda") {
             GpuDialect::Ptx { sm_version }
         } else {
-            GpuDialect::Hip { gfx_arch: 942, wave_size: 64 } // MI300 default
+            GpuDialect::Hip {
+                gfx_arch: 942,
+                wave_size: 64,
+            } // MI300 default
         };
         let mut lowerer = GpuLower::new(dialect);
         let vreg_counts = program.vreg_counts_by_kind();
-        lowerer.emit_mega_kernel_prologue(&frame, &alloc_result, vreg_counts)
+        lowerer
+            .emit_mega_kernel_prologue(&frame, &alloc_result, vreg_counts)
             .map_err(|e| InferenceError::CompileError(e.into()))?;
         lowerer.set_vreg_kind_map(&program);
 
-        _gk_oom_log("gpu-pre-lower-instrs", &format!("instrs_to_lower={}", program.instrs.len()));
+        _gk_oom_log(
+            "gpu-pre-lower-instrs",
+            &format!("instrs_to_lower={}", program.instrs.len()),
+        );
         let mut _gk_lowered = 0usize;
         for instr in &program.instrs {
-            lowerer.lower_instr(instr, &alloc_result)
+            lowerer
+                .lower_instr(instr, &alloc_result)
                 .map_err(|e| InferenceError::CompileError(e.into()))?;
             _gk_lowered += 1;
             if _gk_lowered % 2000 == 0 {
-                _gk_oom_log("gpu-lower-progress", &format!("lowered={}/{}", _gk_lowered, program.instrs.len()));
+                _gk_oom_log(
+                    "gpu-lower-progress",
+                    &format!("lowered={}/{}", _gk_lowered, program.instrs.len()),
+                );
             }
         }
-        _gk_oom_log("gpu-post-lower-instrs", &format!("lowered_total={}", _gk_lowered));
-        lowerer.emit_epilogue(&frame, &alloc_result)
+        _gk_oom_log(
+            "gpu-post-lower-instrs",
+            &format!("lowered_total={}", _gk_lowered),
+        );
+        lowerer
+            .emit_epilogue(&frame, &alloc_result)
             .map_err(|e| InferenceError::CompileError(e.into()))?;
-        let gpu_code = lowerer.finalize()
+        let gpu_code = lowerer
+            .finalize()
             .map_err(|e| InferenceError::CompileError(e.into()))?;
-        _gk_oom_log("gpu-post-finalize", &format!("gpu_code_bytes={}", gpu_code.len()));
+        _gk_oom_log(
+            "gpu-post-finalize",
+            &format!("gpu_code_bytes={}", gpu_code.len()),
+        );
 
         let elem_bytes = geometry.compute_dtype.size_bytes();
         let vocab_bytes = geometry.vocab_size * elem_bytes;
@@ -1101,7 +1381,8 @@ impl InferenceCompiler {
         // sizing remains covered independently by `single_pass_output_bytes`.
         let generate_logits_bytes = vocab_bytes;
         let single_pass_output_bytes = gpu_output_float_elems * elem_bytes;
-        let logits_end = logits_scratch_offset + generate_logits_bytes.max(single_pass_output_bytes);
+        let logits_end =
+            logits_scratch_offset + generate_logits_bytes.max(single_pass_output_bytes);
         // [FIX-PSC5] GPU path must include sg_end and dwc_end in scratchpad sizing,
         // mirroring the CPU path (see compile_cpu sg_end/dwc_end calculation).
         // Without this, models with SG/DWC ops get insufficient scratchpad → OOB access.
@@ -1113,7 +1394,11 @@ impl InferenceCompiler {
         };
         // DWC padded buffer must fit within scratchpad (compute_dwc_requirement mirrors mega_kernel_emit).
         let dwc_end = match codegen::vm::plan_lower::compute_dwc_requirement(
-            &fusion_plan, &graph, &alloc, rope_cache.as_ref(), None,
+            &fusion_plan,
+            &graph,
+            &alloc,
+            rope_cache.as_ref(),
+            None,
         ) {
             Ok(Some(req)) => req.padded_offset + req.total_bytes,
             _ => 0,
@@ -1143,8 +1428,8 @@ impl InferenceCompiler {
     /// tensor shapes, and hardware fingerprint. Uses the standard library's
     /// `DefaultHasher` (SipHash-1-3) for collision resistance.
     fn graph_content_hash(&self, graph: &CompilerGraph) -> u64 {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
 
@@ -1190,8 +1475,8 @@ impl InferenceCompiler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::graph::{Op, GemmSpec, NormSpec, QuantGemmSpec};
-    use crate::types::{ModelConfig, DType};
+    use crate::compiler::graph::{GemmSpec, NormSpec, Op, QuantGemmSpec};
+    use crate::types::{DType, ModelConfig};
 
     #[test]
     fn test_compiler_new() {
@@ -1225,7 +1510,8 @@ mod tests {
             let lifetimes = buffer_alloc::analyze_lifetimes(&graph, &fusion_plan, None, None);
             let alloc = buffer_alloc::allocate_buffers(&lifetimes);
             let mut cg = codegen::X86CodeGen::new(&profile, graph.infer_computation_dtype());
-            let output = cg.emit_plan(&fusion_plan, &graph, &alloc, &exec_plan, Some(&registry))
+            let output = cg
+                .emit_plan(&fusion_plan, &graph, &alloc, &exec_plan, Some(&registry))
                 .expect("JIT codegen failed");
             let layer = CompiledLayer::from_code(&output.code, output.scratchpad_bytes, 0).unwrap();
             assert!(layer.code_size() > 0);
@@ -1268,7 +1554,8 @@ mod tests {
                 target: mega_kernel_abi::CompileTarget::Cpu,
             };
             let mut compiler = InferenceCompiler::with_profile(profile);
-            let output = compiler.compile(graph.clone(), &mk_config, None)
+            let output = compiler
+                .compile(graph.clone(), &mk_config, None)
                 .expect("compile (Cpu) failed")
                 .expect_cpu();
             assert!(output.layer_code.code_size() > 0);
@@ -1310,13 +1597,11 @@ mod tests {
 
         let config_a = ModelConfig::llama_7b();
         let ir_a = LayerIR::from_model_config(&config_a, 1);
-        let graph_a =
-            CompilerGraph::from_layer_ir(&ir_a, &profile).expect("from_layer_ir failed");
+        let graph_a = CompilerGraph::from_layer_ir(&ir_a, &profile).expect("from_layer_ir failed");
 
         let config_b = ModelConfig::gemma_2b();
         let ir_b = LayerIR::from_model_config(&config_b, 1);
-        let graph_b =
-            CompilerGraph::from_layer_ir(&ir_b, &profile).expect("from_layer_ir failed");
+        let graph_b = CompilerGraph::from_layer_ir(&ir_b, &profile).expect("from_layer_ir failed");
 
         let ha = compiler.graph_content_hash(&graph_a);
         let hb = compiler.graph_content_hash(&graph_b);
@@ -1337,10 +1622,14 @@ mod tests {
             target: mega_kernel_abi::CompileTarget::Cpu,
         };
         let mut compiler = InferenceCompiler::with_profile(profile);
-        let output = compiler.compile(graph, &mk_config, None)
+        let output = compiler
+            .compile(graph, &mk_config, None)
             .expect("compile (Cpu) failed")
             .expect_cpu();
-        assert_ne!(output.layer_code.config_hash, 0, "compile should produce a non-zero hash");
+        assert_ne!(
+            output.layer_code.config_hash, 0,
+            "compile should produce a non-zero hash"
+        );
     }
 
     // ── 13 new tests (+9 existing = 22 total) ──────────────────────────
@@ -1363,39 +1652,59 @@ mod tests {
             target: mega_kernel_abi::CompileTarget::Cpu,
         };
         let mut compiler = InferenceCompiler::with_profile(profile);
-        let compiled = compiler.compile(graph, &mk_config, None)
+        let compiled = compiler
+            .compile(graph, &mk_config, None)
             .expect("compile (Cpu) failed")
             .expect_cpu();
         let layer = compiled.layer_code;
 
         // Act: construct MegaKernelCompileOutput manually with explicit layouts
         let zero_per_layer = mega_kernel_abi::PerLayerWeightLayout {
-            attn_norm_offset: 0, attn_norm_bytes: 0,
-            w_q_offset: 0, w_q_bytes: 0,
-            w_k_offset: 0, w_k_bytes: 0,
-            w_v_offset: 0, w_v_bytes: 0,
-            w_o_offset: 0, w_o_bytes: 0,
-            w_q_norm_offset: 0, w_q_norm_bytes: 0,
-            w_k_norm_offset: 0, w_k_norm_bytes: 0,
-            ffn_norm_offset: 0, ffn_norm_bytes: 0,
-            w_gate_offset: 0, w_gate_bytes: 0,
-            w_up_offset: 0, w_up_bytes: 0,
-            w_down_offset: 0, w_down_bytes: 0,
+            attn_norm_offset: 0,
+            attn_norm_bytes: 0,
+            w_q_offset: 0,
+            w_q_bytes: 0,
+            w_k_offset: 0,
+            w_k_bytes: 0,
+            w_v_offset: 0,
+            w_v_bytes: 0,
+            w_o_offset: 0,
+            w_o_bytes: 0,
+            w_q_norm_offset: 0,
+            w_q_norm_bytes: 0,
+            w_k_norm_offset: 0,
+            w_k_norm_bytes: 0,
+            ffn_norm_offset: 0,
+            ffn_norm_bytes: 0,
+            w_gate_offset: 0,
+            w_gate_bytes: 0,
+            w_up_offset: 0,
+            w_up_bytes: 0,
+            w_down_offset: 0,
+            w_down_bytes: 0,
         };
         let weight_layout = mega_kernel_abi::KernelWeightLayout {
-            embed_offset: 0, embed_bytes: 0,
-            layer_0_offset: 0, layer_stride: 0,
+            embed_offset: 0,
+            embed_bytes: 0,
+            layer_0_offset: 0,
+            layer_stride: 0,
             per_layer: zero_per_layer,
-            final_norm_offset: 0, final_norm_bytes: 0,
-            logits_producer_offset: 0, logits_producer_bytes: 0,
+            final_norm_offset: 0,
+            final_norm_bytes: 0,
+            logits_producer_offset: 0,
+            logits_producer_bytes: 0,
             total_bytes: 0,
         };
         let buffer_layout = mega_kernel_abi::BufferLayout {
-            activation_a_offset: 0, activation_b_offset: 0,
+            activation_a_offset: 0,
+            activation_b_offset: 0,
             activation_bytes: 0,
-            logits_offset: 0, logits_bytes: 0,
-            sampling_workspace_offset: 0, sampling_workspace_bytes: 0,
-            sg_detect_offset: 0, sg_knowledge_offset: 0,
+            logits_offset: 0,
+            logits_bytes: 0,
+            sampling_workspace_offset: 0,
+            sampling_workspace_bytes: 0,
+            sg_detect_offset: 0,
+            sg_knowledge_offset: 0,
             sg_data_bytes: 0,
             layer_capture_offset: 0,
             layer_capture_stride: 0,
@@ -1559,9 +1868,21 @@ mod tests {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
-        let a = planner::GemmShape { m: 1, n: 4096, k: 4096 };
-        let b = planner::GemmShape { m: 1, n: 4096, k: 4096 };
-        let c = planner::GemmShape { m: 1, n: 4096, k: 2048 };
+        let a = planner::GemmShape {
+            m: 1,
+            n: 4096,
+            k: 4096,
+        };
+        let b = planner::GemmShape {
+            m: 1,
+            n: 4096,
+            k: 4096,
+        };
+        let c = planner::GemmShape {
+            m: 1,
+            n: 4096,
+            k: 2048,
+        };
 
         // Assert: equality
         assert_eq!(a, b);
@@ -1572,7 +1893,11 @@ mod tests {
         let mut hb = DefaultHasher::new();
         a.hash(&mut ha);
         b.hash(&mut hb);
-        assert_eq!(ha.finish(), hb.finish(), "equal shapes must have equal hashes");
+        assert_eq!(
+            ha.finish(),
+            hb.finish(),
+            "equal shapes must have equal hashes"
+        );
     }
 
     /// Verify MicrokernelChoice fields and PartialEq behavior.
@@ -1639,7 +1964,10 @@ mod tests {
     /// Verify MoeConfig: fields, Clone, Copy, Debug all work correctly.
     #[test]
     fn test_moe_config_and_derives() {
-        let moe = ir::MoeConfig { num_experts: 8, top_k: 2 };
+        let moe = ir::MoeConfig {
+            num_experts: 8,
+            top_k: 2,
+        };
 
         // Assert: fields
         assert_eq!(moe.num_experts, 8);
@@ -1703,7 +2031,9 @@ mod tests {
 
         // Assert: arithmetic on fields does not overflow
         let reg_product = base.mr.checked_mul(base.nr).expect("mr*nr overflow");
-        let total_regs = reg_product.checked_mul(base.nr_vecs).expect("mr*nr*nr_vecs overflow");
+        let total_regs = reg_product
+            .checked_mul(base.nr_vecs)
+            .expect("mr*nr*nr_vecs overflow");
         assert!(total_regs > 0, "register count product must be positive");
     }
 
@@ -1713,7 +2043,11 @@ mod tests {
     fn test_inference_compiler_with_profile_empty_cache() {
         let profile = DeviceProfile::detect();
         let compiler = InferenceCompiler::with_profile(profile);
-        assert_eq!(compiler.cache_size(), 0, "new compiler should have empty cache");
+        assert_eq!(
+            compiler.cache_size(),
+            0,
+            "new compiler should have empty cache"
+        );
     }
 
     #[test]
@@ -1743,7 +2077,10 @@ mod tests {
 
         let ha = compiler.compute_hash(&ir_a);
         let hb = compiler.compute_hash(&ir_b);
-        assert_ne!(ha, hb, "different hidden_size should produce different hashes");
+        assert_ne!(
+            ha, hb,
+            "different hidden_size should produce different hashes"
+        );
     }
 
     #[test]
@@ -1800,7 +2137,8 @@ mod tests {
             target: mega_kernel_abi::CompileTarget::Cpu,
         };
         let mut compiler = InferenceCompiler::with_profile(profile);
-        let compiled = compiler.compile(graph, &mk_config, None)
+        let compiled = compiler
+            .compile(graph, &mk_config, None)
             .expect("compile (Cpu) failed")
             .expect_cpu();
         let layer = compiled.layer_code;
@@ -1808,35 +2146,54 @@ mod tests {
         let output = MegaKernelCompileOutput {
             layer_code: layer,
             weight_layout: mega_kernel_abi::KernelWeightLayout {
-                embed_offset: 0, embed_bytes: 0,
-                layer_0_offset: 0, layer_stride: 0,
+                embed_offset: 0,
+                embed_bytes: 0,
+                layer_0_offset: 0,
+                layer_stride: 0,
                 per_layer: mega_kernel_abi::PerLayerWeightLayout {
-                    attn_norm_offset: 0, attn_norm_bytes: 0,
-                    w_q_offset: 0, w_q_bytes: 0,
-                    w_k_offset: 0, w_k_bytes: 0,
-                    w_v_offset: 0, w_v_bytes: 0,
-                    w_o_offset: 0, w_o_bytes: 0,
-                    w_q_norm_offset: 0, w_q_norm_bytes: 0,
-                    w_k_norm_offset: 0, w_k_norm_bytes: 0,
-                    ffn_norm_offset: 0, ffn_norm_bytes: 0,
-                    w_gate_offset: 0, w_gate_bytes: 0,
-                    w_up_offset: 0, w_up_bytes: 0,
-                    w_down_offset: 0, w_down_bytes: 0,
+                    attn_norm_offset: 0,
+                    attn_norm_bytes: 0,
+                    w_q_offset: 0,
+                    w_q_bytes: 0,
+                    w_k_offset: 0,
+                    w_k_bytes: 0,
+                    w_v_offset: 0,
+                    w_v_bytes: 0,
+                    w_o_offset: 0,
+                    w_o_bytes: 0,
+                    w_q_norm_offset: 0,
+                    w_q_norm_bytes: 0,
+                    w_k_norm_offset: 0,
+                    w_k_norm_bytes: 0,
+                    ffn_norm_offset: 0,
+                    ffn_norm_bytes: 0,
+                    w_gate_offset: 0,
+                    w_gate_bytes: 0,
+                    w_up_offset: 0,
+                    w_up_bytes: 0,
+                    w_down_offset: 0,
+                    w_down_bytes: 0,
                 },
-                final_norm_offset: 0, final_norm_bytes: 0,
-                logits_producer_offset: 0, logits_producer_bytes: 0,
+                final_norm_offset: 0,
+                final_norm_bytes: 0,
+                logits_producer_offset: 0,
+                logits_producer_bytes: 0,
                 total_bytes: 0,
             },
             buffer_layout: mega_kernel_abi::BufferLayout {
-                activation_a_offset: 0, activation_b_offset: 0,
+                activation_a_offset: 0,
+                activation_b_offset: 0,
                 activation_bytes: 0,
-                logits_offset: 0, logits_bytes: 0,
-                sampling_workspace_offset: 0, sampling_workspace_bytes: 0,
-                sg_detect_offset: 0, sg_knowledge_offset: 0,
+                logits_offset: 0,
+                logits_bytes: 0,
+                sampling_workspace_offset: 0,
+                sampling_workspace_bytes: 0,
+                sg_detect_offset: 0,
+                sg_knowledge_offset: 0,
                 sg_data_bytes: 0,
-            layer_capture_offset: 0,
-            layer_capture_stride: 0,
-            layer_capture_bytes: 0,
+                layer_capture_offset: 0,
+                layer_capture_stride: 0,
+                layer_capture_bytes: 0,
                 total_scratchpad_bytes: 0,
             },
             num_layers: 1,
@@ -1862,11 +2219,15 @@ mod tests {
     #[test]
     fn test_buffer_layout_default_values() {
         let layout = mega_kernel_abi::BufferLayout {
-            activation_a_offset: 0, activation_b_offset: 0,
+            activation_a_offset: 0,
+            activation_b_offset: 0,
             activation_bytes: 0,
-            logits_offset: 0, logits_bytes: 0,
-            sampling_workspace_offset: 0, sampling_workspace_bytes: 0,
-            sg_detect_offset: 0, sg_knowledge_offset: 0,
+            logits_offset: 0,
+            logits_bytes: 0,
+            sampling_workspace_offset: 0,
+            sampling_workspace_bytes: 0,
+            sg_detect_offset: 0,
+            sg_knowledge_offset: 0,
             sg_data_bytes: 0,
             layer_capture_offset: 0,
             layer_capture_stride: 0,
@@ -1921,17 +2282,28 @@ mod tests {
     #[test]
     fn test_per_layer_weight_layout_all_zeros() {
         let layout = mega_kernel_abi::PerLayerWeightLayout {
-            attn_norm_offset: 0, attn_norm_bytes: 0,
-            w_q_offset: 0, w_q_bytes: 0,
-            w_k_offset: 0, w_k_bytes: 0,
-            w_v_offset: 0, w_v_bytes: 0,
-            w_o_offset: 0, w_o_bytes: 0,
-            w_q_norm_offset: 0, w_q_norm_bytes: 0,
-            w_k_norm_offset: 0, w_k_norm_bytes: 0,
-            ffn_norm_offset: 0, ffn_norm_bytes: 0,
-            w_gate_offset: 0, w_gate_bytes: 0,
-            w_up_offset: 0, w_up_bytes: 0,
-            w_down_offset: 0, w_down_bytes: 0,
+            attn_norm_offset: 0,
+            attn_norm_bytes: 0,
+            w_q_offset: 0,
+            w_q_bytes: 0,
+            w_k_offset: 0,
+            w_k_bytes: 0,
+            w_v_offset: 0,
+            w_v_bytes: 0,
+            w_o_offset: 0,
+            w_o_bytes: 0,
+            w_q_norm_offset: 0,
+            w_q_norm_bytes: 0,
+            w_k_norm_offset: 0,
+            w_k_norm_bytes: 0,
+            ffn_norm_offset: 0,
+            ffn_norm_bytes: 0,
+            w_gate_offset: 0,
+            w_gate_bytes: 0,
+            w_up_offset: 0,
+            w_up_bytes: 0,
+            w_down_offset: 0,
+            w_down_bytes: 0,
         };
         assert_eq!(layout.w_q_offset, 0);
         assert_eq!(layout.w_down_bytes, 0);
@@ -1974,8 +2346,11 @@ mod tests {
         let variants = [amx, avx512, neon, scalar];
         for i in 0..variants.len() {
             for j in (i + 1)..variants.len() {
-                assert_ne!(variants[i], variants[j],
-                    "AttentionVariant at index {} and {} must differ", i, j);
+                assert_ne!(
+                    variants[i], variants[j],
+                    "AttentionVariant at index {} and {} must differ",
+                    i, j
+                );
             }
         }
 
@@ -2004,7 +2379,10 @@ mod tests {
         assert_eq!(partition.sm_per_partition, 36);
 
         // Assert: invariant — total = partitions * sm_per_partition
-        assert_eq!(partition.total_sm, partition.num_partitions * partition.sm_per_partition);
+        assert_eq!(
+            partition.total_sm,
+            partition.num_partitions * partition.sm_per_partition
+        );
 
         // Assert: Debug formats without panic
         let debug = format!("{:?}", partition);
@@ -2050,7 +2428,10 @@ mod tests {
         // Assert: field values
         assert_eq!(strategy.max_epilogue_depth, 3);
         assert_eq!(strategy.tile_fusion_threshold, 2048);
-        assert_eq!(strategy.ffn_strategy, planner::FfnFusionStrategy::GateSiLUInject);
+        assert_eq!(
+            strategy.ffn_strategy,
+            planner::FfnFusionStrategy::GateSiLUInject
+        );
         assert!(strategy.norm_into_gemm);
         assert!(strategy.qkv_shared_input);
         assert!(!strategy.cross_layer_residual);
@@ -2103,7 +2484,8 @@ mod tests {
         };
 
         // Act: sum L2 budgets
-        let l2_total = plan.l2_kv_budget
+        let l2_total = plan
+            .l2_kv_budget
             .checked_add(plan.l2_weight_budget)
             .and_then(|s| s.checked_add(plan.l2_activation_budget))
             .expect("L2 budget sum overflow");
@@ -2126,19 +2508,31 @@ mod tests {
         let stack_offset_count = mega_kernel_abi::MEGA_KERNEL_STACK_OFFSETS.len();
 
         // Assert: total params = 6 register params + stack params
-        assert_eq!(param_count, 6 + stack_offset_count,
+        assert_eq!(
+            param_count,
+            6 + stack_offset_count,
             "MEGA_KERNEL_PARAMS ({}) must equal 6 + MEGA_KERNEL_STACK_OFFSETS ({})",
-            param_count, stack_offset_count);
+            param_count,
+            stack_offset_count
+        );
 
         // Assert: well-known first and last param names
         assert_eq!(mega_kernel_abi::MEGA_KERNEL_PARAMS[0], "input_ids_ptr");
         assert_eq!(mega_kernel_abi::MEGA_KERNEL_PARAMS[5], "batch_size");
-        assert_eq!(mega_kernel_abi::MEGA_KERNEL_PARAMS[param_count - 1], "kv_page_header_ptr");
+        assert_eq!(
+            mega_kernel_abi::MEGA_KERNEL_PARAMS[param_count - 1],
+            "kv_page_header_ptr"
+        );
 
         // Assert: stack offsets are strictly increasing by 8
         for w in mega_kernel_abi::MEGA_KERNEL_STACK_OFFSETS.windows(2) {
-            assert_eq!(w[1] - w[0], 8,
-                "stack offsets must increase by 8: {} -> {}", w[0], w[1]);
+            assert_eq!(
+                w[1] - w[0],
+                8,
+                "stack offsets must increase by 8: {} -> {}",
+                w[0],
+                w[1]
+            );
         }
 
         // Assert: first stack offset is 16 (after rbp return address)
@@ -2207,7 +2601,10 @@ mod tests {
         let h4 = compiler.compute_hash(&ir_batch4);
 
         // Assert: different max_batch produces different hash
-        assert_ne!(h1, h4, "different max_batch should produce different hashes");
+        assert_ne!(
+            h1, h4,
+            "different max_batch should produce different hashes"
+        );
         assert_ne!(h1, 0);
         assert_ne!(h4, 0);
     }
@@ -2284,13 +2681,11 @@ mod tests {
 
         // Act: plan with decisions
         let with_features = planner::FeaturePlan {
-            decisions: vec![
-                planner::FeatureDecision {
-                    feature: "tma_2d".into(),
-                    enabled: false,
-                    reason: "SM < 90".into(),
-                },
-            ],
+            decisions: vec![planner::FeatureDecision {
+                feature: "tma_2d".into(),
+                enabled: false,
+                reason: "SM < 90".into(),
+            }],
             l1i_used: 1024,
             l1i_budget: 32 * 1024,
         };
@@ -2338,8 +2733,18 @@ mod tests {
             wave_count: 2,
             gpu_sm_partition: None,
             numa_bindings: vec![
-                planner::NumaBinding { node_id: 0, core_start: 0, core_end: 16, l3_bytes: 32 * 1024 * 1024 },
-                planner::NumaBinding { node_id: 1, core_start: 16, core_end: 32, l3_bytes: 32 * 1024 * 1024 },
+                planner::NumaBinding {
+                    node_id: 0,
+                    core_start: 0,
+                    core_end: 16,
+                    l3_bytes: 32 * 1024 * 1024,
+                },
+                planner::NumaBinding {
+                    node_id: 1,
+                    core_start: 16,
+                    core_end: 32,
+                    l3_bytes: 32 * 1024 * 1024,
+                },
             ],
             min_batch_tokens_per_wave: 256,
             min_decode_per_wave: 8,
@@ -2367,8 +2772,13 @@ mod tests {
 
         // Assert: output_modes has default Generate
         assert_eq!(config.output_modes.len(), 1);
-        assert!(matches!(&config.output_modes[0],
-            mega_kernel_abi::OutputMode::Generate { max_new_tokens: 512, eos_token_id: 2 }));
+        assert!(matches!(
+            &config.output_modes[0],
+            mega_kernel_abi::OutputMode::Generate {
+                max_new_tokens: 512,
+                eos_token_id: 2
+            }
+        ));
 
         // Assert: all boolean flags default to false
         assert!(!config.guardrail_enabled);
@@ -2454,10 +2864,18 @@ mod tests {
         let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
 
         let topo = graph.topological_sort();
-        assert_eq!(topo.len(), graph.num_ops(), "topo length must match num_ops");
+        assert_eq!(
+            topo.len(),
+            graph.num_ops(),
+            "topo length must match num_ops"
+        );
 
         let unique: std::collections::HashSet<_> = topo.iter().collect();
-        assert_eq!(unique.len(), topo.len(), "topo sort must have no duplicates");
+        assert_eq!(
+            unique.len(),
+            topo.len(),
+            "topo sort must have no duplicates"
+        );
     }
 
     /// Verify LayerIR head_dim is derived as hidden / num_heads.
@@ -2489,7 +2907,8 @@ mod tests {
         assert!(
             fplan.num_groups() < graph.num_ops(),
             "fusion should reduce {} ops to fewer groups (got {})",
-            graph.num_ops(), fplan.num_groups(),
+            graph.num_ops(),
+            fplan.num_groups(),
         );
     }
 
@@ -2540,7 +2959,11 @@ mod tests {
                 }
             }
         }
-        assert!(gemm_count > 0, "LLaMA-7B should have Gemm ops, found {}", gemm_count);
+        assert!(
+            gemm_count > 0,
+            "LLaMA-7B should have Gemm ops, found {}",
+            gemm_count
+        );
     }
 
     /// Verify graph.infer_computation_dtype() returns a dtype with positive size.
@@ -2552,7 +2975,10 @@ mod tests {
         let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
 
         let dtype = graph.infer_computation_dtype();
-        assert!(dtype.size_bytes() > 0, "computation dtype must have positive size");
+        assert!(
+            dtype.size_bytes() > 0,
+            "computation dtype must have positive size"
+        );
     }
 
     /// Verify graph_content_hash is identical for a cloned CompilerGraph.
@@ -2583,7 +3009,10 @@ mod tests {
         assert_eq!(graph.num_tensors(), 0, "empty graph must have zero tensors");
         assert!(graph.inputs.is_empty(), "empty graph must have no inputs");
         assert!(graph.outputs.is_empty(), "empty graph must have no outputs");
-        assert_eq!(graph.max_seq_len, 2048, "default max_seq_len should be 2048");
+        assert_eq!(
+            graph.max_seq_len, 2048,
+            "default max_seq_len should be 2048"
+        );
     }
 
     /// Verify Default trait produces the same result as ::new().
@@ -2615,11 +3044,19 @@ mod tests {
 
         // Assert: producer set on output
         let out_meta = graph.tensor(t_out).expect("output tensor must exist");
-        assert_eq!(out_meta.producer, Some(op_id), "output producer must be the Silu op");
+        assert_eq!(
+            out_meta.producer,
+            Some(op_id),
+            "output producer must be the Silu op"
+        );
 
         // Assert: consumer set on input
         let in_meta = graph.tensor(t_in).expect("input tensor must exist");
-        assert_eq!(in_meta.consumers.len(), 1, "input must have exactly one consumer");
+        assert_eq!(
+            in_meta.consumers.len(),
+            1,
+            "input must have exactly one consumer"
+        );
         assert_eq!(in_meta.consumers[0], op_id);
     }
 
@@ -2637,10 +3074,29 @@ mod tests {
         let t_skip = graph.add_tensor_concrete("skip", &[1, 512], DType::F32);
         graph.inputs.extend_from_slice(&[t0, t2, t_skip]);
 
-        let op_norm = graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![t0], vec![t1], "norm",
+        let op_norm = graph.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![t0],
+            vec![t1],
+            "norm",
         );
-        let op_gemm = graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }),
-            vec![t1, t2], vec![t3], "gemm",
+        let op_gemm = graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 512,
+                k: 128,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
+            vec![t1, t2],
+            vec![t3],
+            "gemm",
         );
         let op_silu = graph.add_op(Op::Silu, vec![t3], vec![t4], "silu");
         let op_res = graph.add_op(Op::Residual, vec![t4, t_skip], vec![t5], "residual");
@@ -2653,7 +3109,9 @@ mod tests {
 
         // Assert: dependency order — each op appears after its dependencies
         let pos = |id: crate::compiler::graph::OpId| {
-            topo.iter().position(|&x| x == id).expect("op must be in topo sort")
+            topo.iter()
+                .position(|&x| x == id)
+                .expect("op must be in topo sort")
         };
         assert!(pos(op_norm) < pos(op_gemm), "norm before gemm");
         assert!(pos(op_gemm) < pos(op_silu), "gemm before silu");
@@ -2668,7 +3126,13 @@ mod tests {
         let t_concrete = graph.add_tensor_concrete("c", &[2, 4, 8], DType::F32);
         let t_symbolic = graph.add_tensor(
             "s",
-            vec![SymDim::Symbolic { name: "seq".into(), max_value: Some(512) }, SymDim::Concrete(64)],
+            vec![
+                SymDim::Symbolic {
+                    name: "seq".into(),
+                    max_value: Some(512),
+                },
+                SymDim::Concrete(64),
+            ],
             DType::F32,
         );
 
@@ -2688,7 +3152,13 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let tensor = graph.add_tensor(
             "large_symbolic",
-            vec![SymDim::Symbolic { name: "seq".into(), max_value: Some(131_072) }, SymDim::Concrete(4)],
+            vec![
+                SymDim::Symbolic {
+                    name: "seq".into(),
+                    max_value: Some(131_072),
+                },
+                SymDim::Concrete(4),
+            ],
             DType::F32,
         );
 
@@ -2708,13 +3178,19 @@ mod tests {
         let display = format!("{}", graph);
 
         // Assert: must contain header with op and tensor counts
-        assert!(display.contains("CompilerGraph:"), "Display must contain header");
+        assert!(
+            display.contains("CompilerGraph:"),
+            "Display must contain header"
+        );
         assert!(display.contains("ops"), "Display must mention ops");
         assert!(display.contains("tensors"), "Display must mention tensors");
 
         // Assert: each op line contains the op label
         let num_lines = display.lines().count();
-        assert!(num_lines >= 2, "Display must have header + at least one op line");
+        assert!(
+            num_lines >= 2,
+            "Display must have header + at least one op line"
+        );
     }
 
     /// Verify Debug trait on CompilerGraph produces output without panic.
@@ -2732,7 +3208,10 @@ mod tests {
         // Assert: Debug output is non-empty and contains key field names
         assert!(!debug.is_empty(), "Debug output must not be empty");
         assert!(debug.contains("ops"), "Debug must contain 'ops' field");
-        assert!(debug.contains("tensors"), "Debug must contain 'tensors' field");
+        assert!(
+            debug.contains("tensors"),
+            "Debug must contain 'tensors' field"
+        );
     }
 
     /// Verify weight_layout returns offsets for all non-activation inputs.
@@ -2750,16 +3229,23 @@ mod tests {
         // Assert: number of offsets = inputs.len() - 1 (skip activation input)
         let expected_count = graph.inputs.len().saturating_sub(1);
         assert_eq!(
-            layout.offsets.len(), expected_count,
+            layout.offsets.len(),
+            expected_count,
             "weight_layout must cover all non-activation inputs",
         );
 
         // Assert: total_bytes is positive
-        assert!(layout.total_bytes > 0, "total weight bytes must be positive");
+        assert!(
+            layout.total_bytes > 0,
+            "total weight bytes must be positive"
+        );
 
         // Assert: offsets are strictly increasing (contiguous layout)
         for window in layout.offsets.windows(2) {
-            assert!(window[0].1 < window[1].1, "weight offsets must be strictly increasing");
+            assert!(
+                window[0].1 < window[1].1,
+                "weight offsets must be strictly increasing"
+            );
         }
     }
 
@@ -2781,7 +3267,10 @@ mod tests {
         let h2 = compiler.compute_hash(&ir2);
 
         // Assert
-        assert_ne!(h1, h2, "different hidden_size must produce different hashes");
+        assert_ne!(
+            h1, h2,
+            "different hidden_size must produce different hashes"
+        );
     }
 
     /// Verify topological sort on empty graph returns empty vec.
@@ -2794,7 +3283,10 @@ mod tests {
         let topo = graph.topological_sort();
 
         // Assert
-        assert!(topo.is_empty(), "empty graph topo sort must return empty vec");
+        assert!(
+            topo.is_empty(),
+            "empty graph topo sort must return empty vec"
+        );
     }
 
     // ── 10 additional tests (wave-13x02) ──────────────────────────────────
@@ -2875,7 +3367,10 @@ mod tests {
         let ir = LayerIR::from_model_config(&config, 1);
 
         // Assert: dtype should match config's dtype (BF16 for LLaMA-7B)
-        assert_eq!(ir.dtype, config.dtype, "LayerIR dtype must match ModelConfig dtype");
+        assert_eq!(
+            ir.dtype, config.dtype,
+            "LayerIR dtype must match ModelConfig dtype"
+        );
     }
 
     /// Verify LayerIR::from_model_config sets correct intermediate size.
@@ -2918,7 +3413,10 @@ mod tests {
         };
         let mut compiler_mut = InferenceCompiler::with_profile(profile);
         let result = compiler_mut.compile(graph, &mk_config, None);
-        assert!(result.is_ok(), "compile should succeed with provided profile");
+        assert!(
+            result.is_ok(),
+            "compile should succeed with provided profile"
+        );
     }
 
     /// Verify CompilerGraph with single Gemm op has correct topology.
@@ -2932,7 +3430,15 @@ mod tests {
         graph.inputs.extend_from_slice(&[t_in, t_w]);
 
         // Act
-        let _op_id = graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }),
+        let _op_id = graph.add_op(
+            Op::Gemm(GemmSpec {
+                m: SymDim::Concrete(1),
+                n: 256,
+                k: 128,
+                dtype: DType::F32,
+                trans_b: false,
+                has_bias: false,
+            }),
             vec![t_in, t_w],
             vec![t_out],
             "gemm",
@@ -2940,7 +3446,11 @@ mod tests {
 
         // Assert: single op in topo sort
         let topo = graph.topological_sort();
-        assert_eq!(topo.len(), 1, "single Gemm graph should have exactly 1 op in topo sort");
+        assert_eq!(
+            topo.len(),
+            1,
+            "single Gemm graph should have exactly 1 op in topo sort"
+        );
 
         // Assert: output tensor has producer set
         let out_meta = graph.tensor(t_out).expect("output must exist");
@@ -2970,13 +3480,28 @@ mod tests {
         }
 
         // Assert: each variant produces distinct debug output
-        assert_ne!(debug_outputs[0], debug_outputs[1], "different variants must produce different Debug");
-        assert_ne!(debug_outputs[1], debug_outputs[2], "different variants must produce different Debug");
+        assert_ne!(
+            debug_outputs[0], debug_outputs[1],
+            "different variants must produce different Debug"
+        );
+        assert_ne!(
+            debug_outputs[1], debug_outputs[2],
+            "different variants must produce different Debug"
+        );
 
         // Assert: Display contains key substrings
-        assert!(display_outputs[0].contains("invalid graph"), "InvalidGraph Display must contain 'invalid graph'");
-        assert!(display_outputs[1].contains("codegen violation"), "CodegenViolation Display must contain 'codegen violation'");
-        assert!(display_outputs[2].contains("feature disabled"), "FeatureDisabled Display must contain 'feature disabled'");
+        assert!(
+            display_outputs[0].contains("invalid graph"),
+            "InvalidGraph Display must contain 'invalid graph'"
+        );
+        assert!(
+            display_outputs[1].contains("codegen violation"),
+            "CodegenViolation Display must contain 'codegen violation'"
+        );
+        assert!(
+            display_outputs[2].contains("feature disabled"),
+            "FeatureDisabled Display must contain 'feature disabled'"
+        );
     }
 
     // ── 10 additional tests (wave-13x03) ──────────────────────────────────
@@ -3054,7 +3579,10 @@ mod tests {
     fn test_sym_dim_is_symbolic() {
         // Arrange
         let concrete = SymDim::Concrete(128);
-        let symbolic = SymDim::Symbolic { name: "seq".into(), max_value: Some(2048) };
+        let symbolic = SymDim::Symbolic {
+            name: "seq".into(),
+            max_value: Some(2048),
+        };
 
         // Assert
         assert!(!concrete.is_symbolic(), "Concrete should not be symbolic");
@@ -3066,7 +3594,10 @@ mod tests {
     fn test_sym_dim_as_concrete() {
         // Arrange
         let concrete = SymDim::Concrete(64);
-        let symbolic = SymDim::Symbolic { name: "batch".into(), max_value: Some(32) };
+        let symbolic = SymDim::Symbolic {
+            name: "batch".into(),
+            max_value: Some(32),
+        };
 
         // Assert
         assert_eq!(concrete.as_concrete(), Some(64));
@@ -3080,7 +3611,10 @@ mod tests {
         let binding = ShapeBinding::new();
 
         // Assert: empty
-        assert!(binding.get("seq_len").is_none(), "empty binding should return None");
+        assert!(
+            binding.get("seq_len").is_none(),
+            "empty binding should return None"
+        );
 
         // Act: bind values
         let binding = binding.bind("seq_len", 512).bind("batch_size", 4);
@@ -3126,7 +3660,17 @@ mod tests {
         let t_out = graph.add_tensor_concrete("output", &[4, 64], DType::F32);
         graph.inputs.push(t_in);
 
-        let op_norm = graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![t_in], vec![t_mid], "norm");
+        let op_norm = graph.add_op(
+            Op::RmsNorm(NormSpec {
+                feature_dim: 4096,
+                eps: 1e-5,
+                dtype: DType::F32,
+                has_weight: true,
+            }),
+            vec![t_in],
+            vec![t_mid],
+            "norm",
+        );
         let _op_silu = graph.add_op(Op::Silu, vec![t_mid], vec![t_out], "silu");
 
         // Act

@@ -11,12 +11,12 @@
 //! strategies, not hardcoded if/else lookup tables. The engine produces an
 //! immutable `ExecutionPlan` consumed by codegen, fusion, and scheduling.
 
-use std::collections::HashMap;
 use crate::compiler::ir::LayerIR;
 use crate::compiler::pain_point::OpBottleneckMap;
 use crate::dispatch::device_profile::DeviceProfile;
 use crate::traits::Activation;
 use crate::types::DType;
+use std::collections::HashMap;
 
 // ═══════════════════════════════════════════════════════════════
 //  Strategy Bias (from Strategy Arbiter)
@@ -724,7 +724,8 @@ impl HwOptEngine {
         let batch_plan = BatchSolver::solve(profile, &parallel_plan, &cache_budget, ir, bias);
 
         // ── Level 4: FeatureRouter ──
-        let feature_plan = FeatureRouter::solve(profile, &gemm_plan, &attention_plan, &parallel_plan, bias);
+        let feature_plan =
+            FeatureRouter::solve(profile, &gemm_plan, &attention_plan, &parallel_plan, bias);
 
         // ── Legacy fields (GEMM blocking, scratchpad, fusion list) ──
         let gemm_shapes = collect_gemm_shapes(ir);
@@ -739,10 +740,7 @@ impl HwOptEngine {
         let fusions = plan_fusions(ir);
 
         let k_unroll = profile.k_unroll_factor();
-        let (attn_tile_q, attn_tile_kv) = (
-            attention_plan.tile_q,
-            attention_plan.tile_kv,
-        );
+        let (attn_tile_q, attn_tile_kv) = (attention_plan.tile_q, attention_plan.tile_kv);
 
         ExecutionPlan {
             profile: profile.clone(),
@@ -794,14 +792,20 @@ impl HwOptEngine {
         // Refine global roofline using precise R0 data:
         // If any GEMM is memory-bound in R0, update the global classification
         if let Some(gemm_bn) = bottleneck_map.gemm_bottlenecks.values().find(|bn| {
-            matches!(bn.bottleneck, crate::compiler::pain_point::BottleneckType::MemoryBound { .. })
+            matches!(
+                bn.bottleneck,
+                crate::compiler::pain_point::BottleneckType::MemoryBound { .. }
+            )
         }) {
             // At least one GEMM is memory-bound → decode path is memory-bound
             plan.roofline.gemm_decode = BottleneckClass::MemoryBound;
             let _ = gemm_bn; // suppress unused warning
         }
         if let Some(gemm_bn) = bottleneck_map.gemm_bottlenecks.values().find(|bn| {
-            matches!(bn.bottleneck, crate::compiler::pain_point::BottleneckType::ComputeBound { .. })
+            matches!(
+                bn.bottleneck,
+                crate::compiler::pain_point::BottleneckType::ComputeBound { .. }
+            )
         }) {
             plan.roofline.gemm_prefill = BottleneckClass::ComputeBound;
             let _ = gemm_bn;
@@ -815,7 +819,10 @@ impl HwOptEngine {
     ///
     /// Same as `solve_profile_only` but uses the provided bias instead of
     /// neutral defaults. Called by `init_global_execution_plan_with_bias`.
-    pub fn solve_profile_only_with_bias(profile: &DeviceProfile, bias: &StrategyBias) -> ExecutionPlan {
+    pub fn solve_profile_only_with_bias(
+        profile: &DeviceProfile,
+        bias: &StrategyBias,
+    ) -> ExecutionPlan {
         // Synthesize a minimal IR with conservative defaults
         let default_ir = LayerIR {
             moe: None,
@@ -845,7 +852,11 @@ impl HwOptEngine {
     fn solve_roofline(profile: &DeviceProfile) -> RooflineResult {
         let peak_gflops = profile.peak_gflops(DType::F32);
         let peak_bw = profile.peak_bandwidth_gbs;
-        let ridge = if peak_bw > 0.0 { peak_gflops / peak_bw } else { 100.0 };
+        let ridge = if peak_bw > 0.0 {
+            peak_gflops / peak_bw
+        } else {
+            100.0
+        };
 
         // Classify operators by arithmetic intensity vs ridge point
         // GEMM prefill (M>=128): AI ≈ hidden_dim ≈ 4096 → always compute-bound
@@ -957,10 +968,20 @@ impl HwOptEngine {
         let base_scratch = num_regs.saturating_sub(acc_regs + ptr_regs);
         let k_depth = if bias.k_depth_preference >= 1.5 {
             // Strong pipeline preference: try depth 4, 2, 1
-            if base_scratch >= 8 { 4 } else if base_scratch >= 4 { 2 } else { 1 }
+            if base_scratch >= 8 {
+                4
+            } else if base_scratch >= 4 {
+                2
+            } else {
+                1
+            }
         } else if bias.k_depth_preference >= 0.8 {
             // Default: original logic (compute-bound → 2, else → 1)
-            if matches!(roofline.gemm_prefill, BottleneckClass::ComputeBound) && base_scratch >= 4 { 2 } else { 1 }
+            if matches!(roofline.gemm_prefill, BottleneckClass::ComputeBound) && base_scratch >= 4 {
+                2
+            } else {
+                1
+            }
         } else {
             // Low preference: always 1
             1
@@ -981,10 +1002,11 @@ impl HwOptEngine {
         } else {
             0
         };
-        let max_epi = ((base_max_epi as f64) * bias.epilogue_depth_preference)
-            .round() as usize;
+        let max_epi = ((base_max_epi as f64) * bias.epilogue_depth_preference).round() as usize;
         // Ensure at least 1 if base allowed it, clamp to available scratch
-        let max_epi = max_epi.max(if base_max_epi > 0 { 1 } else { 0 }).min(scratch);
+        let max_epi = max_epi
+            .max(if base_max_epi > 0 { 1 } else { 0 })
+            .min(scratch);
 
         // Strategy selection: evaluate candidates by cost
         let strategy = Self::select_gemm_strategy_cost_based(profile, roofline, cache);
@@ -1048,7 +1070,10 @@ impl HwOptEngine {
         // Cost evaluation: pick the highest-performing candidate
         // (candidates are ordered by preference — first match wins for now,
         //  future: full cost model evaluation)
-        candidates.into_iter().next().unwrap_or(GemmMicrokernelStrategy::Scalar)
+        candidates
+            .into_iter()
+            .next()
+            .unwrap_or(GemmMicrokernelStrategy::Scalar)
     }
 
     // ───────────────────────────────────────────────────────────
@@ -1092,9 +1117,13 @@ impl HwOptEngine {
                     (AttentionVariant::Avx512Loop, false, false)
                 } else {
                     #[cfg(target_arch = "aarch64")]
-                    { (AttentionVariant::NeonLoop, false, false) }
+                    {
+                        (AttentionVariant::NeonLoop, false, false)
+                    }
                     #[cfg(not(target_arch = "aarch64"))]
-                    { (AttentionVariant::ScalarLoop, false, false) }
+                    {
+                        (AttentionVariant::ScalarLoop, false, false)
+                    }
                 }
             }
         };
@@ -1137,7 +1166,10 @@ impl HwOptEngine {
 
     #[cfg(feature = "jit-cuda")]
     fn detect_cuda_sm() -> Option<u32> {
-        crate::gpu::cuda::CudaDriver::load().ok()?.compute_capability().ok()
+        crate::gpu::cuda::CudaDriver::load()
+            .ok()?
+            .compute_capability()
+            .ok()
     }
 
     // ───────────────────────────────────────────────────────────
@@ -1177,7 +1209,8 @@ impl HwOptEngine {
         } else {
             1.0
         };
-        let tile_threshold = (tile_threshold_base * tile_threshold_scale * bias.fusion_cost_scale) as usize;
+        let tile_threshold =
+            (tile_threshold_base * tile_threshold_scale * bias.fusion_cost_scale) as usize;
 
         // FFN strategy: inject SiLU into epilogue if scratch allows AND profile is aggressive enough.
         // Conservative profiles (AVX2, Generic) use SeparateGemm to avoid register spills.
@@ -1238,7 +1271,9 @@ impl HwOptEngine {
                 let mut best_wave = 1usize;
                 let mut best_score = f64::NEG_INFINITY;
                 for wc in [1usize, 2, 4] {
-                    if wc > max_waves { break; }
+                    if wc > max_waves {
+                        break;
+                    }
                     let sync_cost = wc as f64 * 2.0 * bias.parallelism_cost_scale;
                     let parallel_benefit = (wc as f64).ln() * total_sm as f64 * 0.1;
                     let score = parallel_benefit - sync_cost;
@@ -1467,7 +1502,9 @@ impl HwOptEngine {
 
 /// Compute the largest power of 2 ≤ n.
 fn prev_power_of_2(n: usize) -> usize {
-    if n == 0 { return 1; }
+    if n == 0 {
+        return 1;
+    }
     1usize << (usize::BITS - 1 - n.leading_zeros())
 }
 
@@ -1480,21 +1517,49 @@ fn collect_gemm_shapes(ir: &LayerIR) -> Vec<GemmShape> {
 
     let mut shapes = vec![
         // QKV projections (M=1 for single token, but plan for max_batch)
-        GemmShape { m: ir.max_batch, n: q, k: h },     // Q
-        GemmShape { m: ir.max_batch, n: kv, k: h },    // K, V
+        GemmShape {
+            m: ir.max_batch,
+            n: q,
+            k: h,
+        }, // Q
+        GemmShape {
+            m: ir.max_batch,
+            n: kv,
+            k: h,
+        }, // K, V
         // Output projection
-        GemmShape { m: ir.max_batch, n: h, k: q },     // O
+        GemmShape {
+            m: ir.max_batch,
+            n: h,
+            k: q,
+        }, // O
     ];
 
     // FFN GEMM shapes derived from activation type.
     if ir.activation.is_gated() {
         // Gated FFN (SwiGLU/GeGLU): gate, up, down
-        shapes.push(GemmShape { m: ir.max_batch, n: inter, k: h });  // gate, up
-        shapes.push(GemmShape { m: ir.max_batch, n: h, k: inter }); // down
+        shapes.push(GemmShape {
+            m: ir.max_batch,
+            n: inter,
+            k: h,
+        }); // gate, up
+        shapes.push(GemmShape {
+            m: ir.max_batch,
+            n: h,
+            k: inter,
+        }); // down
     } else {
         // Non-gated FFN (GELU/ReLU): up, down
-        shapes.push(GemmShape { m: ir.max_batch, n: inter, k: h });
-        shapes.push(GemmShape { m: ir.max_batch, n: h, k: inter });
+        shapes.push(GemmShape {
+            m: ir.max_batch,
+            n: inter,
+            k: h,
+        });
+        shapes.push(GemmShape {
+            m: ir.max_batch,
+            n: h,
+            k: inter,
+        });
     }
 
     shapes.sort_by_key(|s| (s.m, s.n, s.k));
@@ -1579,8 +1644,8 @@ fn plan_fusions(ir: &LayerIR) -> Vec<FusionDecision> {
 mod tests {
     use super::*;
     use crate::compiler::ir::{LayerIR, MoeConfig};
-    use crate::types::ModelConfig;
     use crate::dispatch::DeviceProfile;
+    use crate::types::ModelConfig;
 
     #[test]
     fn test_execution_plan_build() {
@@ -1605,26 +1670,43 @@ mod tests {
         assert!(plan.parallel_plan.wave_count >= 1);
         assert!(!plan.batch_plan.golden_sizes.is_empty());
 
-        eprintln!("Plan: {} threads, {} scratchpad bytes, {} fusions, {} GEMM shapes",
+        eprintln!(
+            "Plan: {} threads, {} scratchpad bytes, {} fusions, {} GEMM shapes",
             plan.num_threads,
             plan.scratchpad_bytes,
             plan.fusions.len(),
             plan.gemm_blocking.len(),
         );
-        eprintln!("  Roofline: ridge={:.1}, gemm_prefill={:?}, gemm_decode={:?}",
-            plan.roofline.ridge_point, plan.roofline.gemm_prefill, plan.roofline.gemm_decode);
-        eprintln!("  Cache: L1_tile={}KB, L2_kv={}KB, L3_model={}KB",
+        eprintln!(
+            "  Roofline: ridge={:.1}, gemm_prefill={:?}, gemm_decode={:?}",
+            plan.roofline.ridge_point, plan.roofline.gemm_prefill, plan.roofline.gemm_decode
+        );
+        eprintln!(
+            "  Cache: L1_tile={}KB, L2_kv={}KB, L3_model={}KB",
             plan.cache_budget.l1_tile_budget / 1024,
             plan.cache_budget.l2_kv_budget / 1024,
-            plan.cache_budget.l3_model_budget / 1024);
-        eprintln!("  GEMM: mr={}, nr={}, strategy={:?}, k_depth={}, max_epi={}",
-            plan.gemm_plan.mr, plan.gemm_plan.nr, plan.gemm_plan.strategy,
-            plan.gemm_plan.k_pipeline_depth, plan.gemm_plan.max_epilogue_depth);
-        eprintln!("  Attention: variant={:?}, tile_q={}, tile_kv={}, online_softmax={}",
-            plan.attention_plan.variant, plan.attention_plan.tile_q,
-            plan.attention_plan.tile_kv, plan.attention_plan.online_softmax);
-        eprintln!("  Parallel: waves={}, features={}",
-            plan.parallel_plan.wave_count, plan.feature_plan.decisions.len());
+            plan.cache_budget.l3_model_budget / 1024
+        );
+        eprintln!(
+            "  GEMM: mr={}, nr={}, strategy={:?}, k_depth={}, max_epi={}",
+            plan.gemm_plan.mr,
+            plan.gemm_plan.nr,
+            plan.gemm_plan.strategy,
+            plan.gemm_plan.k_pipeline_depth,
+            plan.gemm_plan.max_epilogue_depth
+        );
+        eprintln!(
+            "  Attention: variant={:?}, tile_q={}, tile_kv={}, online_softmax={}",
+            plan.attention_plan.variant,
+            plan.attention_plan.tile_q,
+            plan.attention_plan.tile_kv,
+            plan.attention_plan.online_softmax
+        );
+        eprintln!(
+            "  Parallel: waves={}, features={}",
+            plan.parallel_plan.wave_count,
+            plan.feature_plan.decisions.len()
+        );
     }
 
     #[test]
@@ -1664,8 +1746,13 @@ mod tests {
     fn test_cache_budget_sums_within_bounds() {
         let profile = DeviceProfile::detect();
         let ir = LayerIR::from_model_config(&ModelConfig::llama_7b(), 1);
-        let (l1, l2, l3) = (profile.kernel_config.l1d, profile.kernel_config.l2, profile.kernel_config.l3);
-        let budget = HwOptEngine::solve_cache_budget(&profile, l1, l2, l3, &ir, &StrategyBias::default());
+        let (l1, l2, l3) = (
+            profile.kernel_config.l1d,
+            profile.kernel_config.l2,
+            profile.kernel_config.l3,
+        );
+        let budget =
+            HwOptEngine::solve_cache_budget(&profile, l1, l2, l3, &ir, &StrategyBias::default());
 
         // L1: tile + scratch ≤ total
         assert!(budget.l1_tile_budget + budget.l1_fusion_scratch <= l1);
@@ -1679,10 +1766,28 @@ mod tests {
     fn test_gemm_solver_register_budget() {
         let profile = DeviceProfile::detect();
         let roofline = HwOptEngine::solve_roofline(&profile);
-        let (l1, l2, l3) = (profile.kernel_config.l1d, profile.kernel_config.l2, profile.kernel_config.l3);
-        let cache = HwOptEngine::solve_cache_budget(&profile, l1, l2, l3, &LayerIR::from_model_config(&ModelConfig::llama_7b(), 1), &StrategyBias::default());
+        let (l1, l2, l3) = (
+            profile.kernel_config.l1d,
+            profile.kernel_config.l2,
+            profile.kernel_config.l3,
+        );
+        let cache = HwOptEngine::solve_cache_budget(
+            &profile,
+            l1,
+            l2,
+            l3,
+            &LayerIR::from_model_config(&ModelConfig::llama_7b(), 1),
+            &StrategyBias::default(),
+        );
         let kc = &profile.kernel_config;
-        let gemm = HwOptEngine::solve_gemm(&profile, &roofline, &cache, kc.mr, kc.nr, &StrategyBias::default());
+        let gemm = HwOptEngine::solve_gemm(
+            &profile,
+            &roofline,
+            &cache,
+            kc.mr,
+            kc.nr,
+            &StrategyBias::default(),
+        );
 
         // Register budget constraint: acc + ptr + scratch ≤ total
         assert!(gemm.acc_regs + 2 + gemm.scratch_regs <= profile.num_simd_regs());
@@ -1692,10 +1797,16 @@ mod tests {
     fn test_batch_plan_has_golden_sizes() {
         let profile = DeviceProfile::detect();
         let ir = LayerIR::from_model_config(&ModelConfig::llama_7b(), 1);
-        let (l1, l2, l3) = (profile.kernel_config.l1d, profile.kernel_config.l2, profile.kernel_config.l3);
-        let cache = HwOptEngine::solve_cache_budget(&profile, l1, l2, l3, &ir, &StrategyBias::default());
+        let (l1, l2, l3) = (
+            profile.kernel_config.l1d,
+            profile.kernel_config.l2,
+            profile.kernel_config.l3,
+        );
+        let cache =
+            HwOptEngine::solve_cache_budget(&profile, l1, l2, l3, &ir, &StrategyBias::default());
         let parallel = HwOptEngine::solve_parallelism(&profile, &cache, &StrategyBias::default());
-        let batch = HwOptEngine::solve_batch(&profile, &parallel, &cache, &ir, &StrategyBias::default());
+        let batch =
+            HwOptEngine::solve_batch(&profile, &parallel, &cache, &ir, &StrategyBias::default());
 
         assert!(!batch.golden_sizes.is_empty());
         // Golden sizes should be powers of 2
@@ -1749,9 +1860,21 @@ mod tests {
 
     #[test]
     fn gemm_shape_equality() {
-        let a = GemmShape { m: 1, n: 4096, k: 4096 };
-        let b = GemmShape { m: 1, n: 4096, k: 4096 };
-        let c = GemmShape { m: 512, n: 4096, k: 4096 };
+        let a = GemmShape {
+            m: 1,
+            n: 4096,
+            k: 4096,
+        };
+        let b = GemmShape {
+            m: 1,
+            n: 4096,
+            k: 4096,
+        };
+        let c = GemmShape {
+            m: 512,
+            n: 4096,
+            k: 4096,
+        };
         assert_eq!(a, b);
         assert_ne!(a, c);
     }
@@ -1801,8 +1924,14 @@ mod tests {
 
     #[test]
     fn ffn_fusion_strategy_variants() {
-        assert_eq!(FfnFusionStrategy::GateSiLUInject, FfnFusionStrategy::GateSiLUInject);
-        assert_ne!(FfnFusionStrategy::GateSiLUInject, FfnFusionStrategy::SeparateGemm);
+        assert_eq!(
+            FfnFusionStrategy::GateSiLUInject,
+            FfnFusionStrategy::GateSiLUInject
+        );
+        assert_ne!(
+            FfnFusionStrategy::GateSiLUInject,
+            FfnFusionStrategy::SeparateGemm
+        );
     }
 
     #[test]
@@ -1841,8 +1970,16 @@ mod tests {
 
     #[test]
     fn gemm_shape_hash_consistency() {
-        let a = GemmShape { m: 1, n: 4096, k: 4096 };
-        let b = GemmShape { m: 1, n: 4096, k: 4096 };
+        let a = GemmShape {
+            m: 1,
+            n: 4096,
+            k: 4096,
+        };
+        let b = GemmShape {
+            m: 1,
+            n: 4096,
+            k: 4096,
+        };
         let mut map = HashMap::new();
         map.insert(a, (64, 128, 256));
         assert_eq!(map.get(&b), Some(&(64, 128, 256)));
@@ -1892,7 +2029,11 @@ mod tests {
 
     #[test]
     fn compute_blocking_aligns_to_microkernel_tiles() {
-        let shape = GemmShape { m: 17, n: 17, k: 17 };
+        let shape = GemmShape {
+            m: 17,
+            n: 17,
+            k: 17,
+        };
         let (kc, mc, nc) = compute_blocking(&shape, 64, 64, 64, 6, 8);
         assert_eq!(kc, 17);
         assert_eq!(mc % 6, 0);
@@ -1992,10 +2133,18 @@ mod tests {
     fn batch_plan_zero_flexibility_forces_single() {
         let profile = DeviceProfile::detect();
         let ir = LayerIR::from_model_config(&ModelConfig::llama_7b(), 1);
-        let (l1, l2, l3) = (profile.kernel_config.l1d, profile.kernel_config.l2, profile.kernel_config.l3);
-        let cache = HwOptEngine::solve_cache_budget(&profile, l1, l2, l3, &ir, &StrategyBias::default());
+        let (l1, l2, l3) = (
+            profile.kernel_config.l1d,
+            profile.kernel_config.l2,
+            profile.kernel_config.l3,
+        );
+        let cache =
+            HwOptEngine::solve_cache_budget(&profile, l1, l2, l3, &ir, &StrategyBias::default());
         let parallel = HwOptEngine::solve_parallelism(&profile, &cache, &StrategyBias::default());
-        let zero_bias = StrategyBias { batch_flexibility: 0.0, ..StrategyBias::default() };
+        let zero_bias = StrategyBias {
+            batch_flexibility: 0.0,
+            ..StrategyBias::default()
+        };
         let batch = HwOptEngine::solve_batch(&profile, &parallel, &cache, &ir, &zero_bias);
 
         assert_eq!(batch.max_chunk_size, 1);
@@ -2041,7 +2190,11 @@ mod tests {
     fn cache_budget_plan_all_nonzero() {
         let profile = DeviceProfile::detect();
         let ir = LayerIR::from_model_config(&ModelConfig::llama_7b(), 1);
-        let (l1, l2, l3) = (profile.kernel_config.l1d, profile.kernel_config.l2, profile.kernel_config.l3);
+        let (l1, l2, l3) = (
+            profile.kernel_config.l1d,
+            profile.kernel_config.l2,
+            profile.kernel_config.l3,
+        );
         let plan = CacheBudgetSolver::solve(&profile, l1, l2, l3, &ir, &StrategyBias::default());
         assert!(plan.l1_tile_budget > 0);
         assert!(plan.l2_kv_budget > 0);
@@ -2144,7 +2297,13 @@ mod tests {
     #[test]
     fn gemm_shape_hash_roundtrip() {
         use std::collections::HashSet;
-        let shapes: Vec<GemmShape> = (0..10).map(|i| GemmShape { m: i, n: i * 2, k: i * 3 }).collect();
+        let shapes: Vec<GemmShape> = (0..10)
+            .map(|i| GemmShape {
+                m: i,
+                n: i * 2,
+                k: i * 3,
+            })
+            .collect();
         let set: HashSet<GemmShape> = shapes.iter().copied().collect();
         assert_eq!(set.len(), 10);
         assert!(set.contains(&GemmShape { m: 3, n: 6, k: 9 }));
@@ -2161,7 +2320,11 @@ mod tests {
     #[test]
     fn compute_blocking_caps_kc_to_shape_k() {
         // When shape.k < default_kc, kc should equal shape.k
-        let shape = GemmShape { m: 64, n: 64, k: 32 };
+        let shape = GemmShape {
+            m: 64,
+            n: 64,
+            k: 32,
+        };
         let (kc, _mc, _nc) = compute_blocking(&shape, 256, 64, 64, 6, 8);
         assert_eq!(kc, 32, "kc must be min(default_kc, shape.k)");
     }
@@ -2250,8 +2413,12 @@ mod tests {
         let ir = LayerIR::from_model_config(&ModelConfig::llama_7b(), 1);
         let l1 = profile.kernel_config.l1d;
         let budget = CacheBudgetSolver::solve(
-            &profile, l1, profile.kernel_config.l2, profile.kernel_config.l3,
-            &ir, &StrategyBias::default(),
+            &profile,
+            l1,
+            profile.kernel_config.l2,
+            profile.kernel_config.l3,
+            &ir,
+            &StrategyBias::default(),
         );
         // Act: compute sum
         let l1_sum = budget.l1_tile_budget + budget.l1_fusion_scratch;
@@ -2273,15 +2440,15 @@ mod tests {
             gemm_bottlenecks: std::collections::HashMap::new(),
             ridge_point: 0.0,
         };
-        let plan = ExecutionPlan::from_profile_with_bottlenecks(
-            &profile,
-            empty_bottleneck_map,
-        );
+        let plan = ExecutionPlan::from_profile_with_bottlenecks(&profile, empty_bottleneck_map);
         // NOTE: from_profile_with_bottlenecks uses default bias, so we verify
         // that the plan's strategy_bias field is populated
         assert!(!plan.strategy_bias.fusion_cost_scale.is_nan());
         assert!(!plan.strategy_bias.k_depth_preference.is_nan());
-        assert!(plan.op_bottleneck_map.is_some(), "bottleneck map should be present");
+        assert!(
+            plan.op_bottleneck_map.is_some(),
+            "bottleneck map should be present"
+        );
     }
 
     #[test]
@@ -2311,8 +2478,10 @@ mod tests {
         // Assert: both positive and equal (same hidden/intermediate/batch dimensions)
         assert!(dec_scratch > 0);
         assert!(enc_scratch > 0);
-        assert_eq!(dec_scratch, enc_scratch,
-            "Decoder and Encoder with same dimensions should have equal scratchpad");
+        assert_eq!(
+            dec_scratch, enc_scratch,
+            "Decoder and Encoder with same dimensions should have equal scratchpad"
+        );
     }
 
     #[test]
@@ -2320,16 +2489,30 @@ mod tests {
         // Arrange
         let profile = DeviceProfile::detect();
         let ir = LayerIR::from_model_config(&ModelConfig::llama_7b(), 1);
-        let (l1, l2, l3) = (profile.kernel_config.l1d, profile.kernel_config.l2, profile.kernel_config.l3);
-        let cache = HwOptEngine::solve_cache_budget(&profile, l1, l2, l3, &ir, &StrategyBias::default());
+        let (l1, l2, l3) = (
+            profile.kernel_config.l1d,
+            profile.kernel_config.l2,
+            profile.kernel_config.l3,
+        );
+        let cache =
+            HwOptEngine::solve_cache_budget(&profile, l1, l2, l3, &ir, &StrategyBias::default());
         let parallel = HwOptEngine::solve_parallelism(&profile, &cache, &StrategyBias::default());
-        let batch = HwOptEngine::solve_batch(&profile, &parallel, &cache, &ir, &StrategyBias::default());
+        let batch =
+            HwOptEngine::solve_batch(&profile, &parallel, &cache, &ir, &StrategyBias::default());
         // Act & Assert: golden sizes must be strictly ascending and each a power of 2
         for window in batch.golden_sizes.windows(2) {
-            assert!(window[0] < window[1], "golden_sizes must be strictly ascending");
+            assert!(
+                window[0] < window[1],
+                "golden_sizes must be strictly ascending"
+            );
         }
         for &size in &batch.golden_sizes {
-            assert_eq!(size.count_ones(), 1, "each golden size must be a power of 2, got {}", size);
+            assert_eq!(
+                size.count_ones(),
+                1,
+                "each golden size must be a power of 2, got {}",
+                size
+            );
         }
     }
 
@@ -2359,15 +2542,24 @@ mod tests {
         // Assert: must contain FFN gate/up (n=intermediate) and down (k=intermediate) shapes
         let has_gate = shapes.iter().any(|s| s.n == 256);
         let has_down = shapes.iter().any(|s| s.k == 256);
-        assert!(has_gate, "decoder must have gate/up GEMM shape with n=intermediate");
-        assert!(has_down, "decoder must have down GEMM shape with k=intermediate");
+        assert!(
+            has_gate,
+            "decoder must have gate/up GEMM shape with n=intermediate"
+        );
+        assert!(
+            has_down,
+            "decoder must have down GEMM shape with k=intermediate"
+        );
     }
 
     #[test]
     fn collect_gemm_shapes_moe_uses_decoder_path() {
         // Arrange: DecoderMoE with a small expert count
         let ir = LayerIR {
-            moe: Some(MoeConfig { num_experts: 8, top_k: 2 }),
+            moe: Some(MoeConfig {
+                num_experts: 8,
+                top_k: 2,
+            }),
             hidden: 64,
             num_heads: 2,
             num_kv_heads: 2,
@@ -2385,14 +2577,20 @@ mod tests {
         // Act
         let shapes = collect_gemm_shapes(&ir);
         // Assert: DecoderMoE falls into the same Decoder arm, so FFN shapes present
-        assert!(shapes.iter().any(|s| s.n == 128), "MoE decoder must have FFN gate shape");
+        assert!(
+            shapes.iter().any(|s| s.n == 128),
+            "MoE decoder must have FFN gate shape"
+        );
     }
 
     #[test]
     fn plan_fusions_moe_decoder_uses_swiglu() {
         // Arrange
         let ir = LayerIR {
-            moe: Some(MoeConfig { num_experts: 4, top_k: 1 }),
+            moe: Some(MoeConfig {
+                num_experts: 4,
+                top_k: 1,
+            }),
             hidden: 64,
             num_heads: 2,
             num_kv_heads: 2,
@@ -2459,13 +2657,20 @@ mod tests {
         let scratch_b1 = compute_scratchpad(&ir_b1);
         let scratch_b4 = compute_scratchpad(&ir_b4);
         // Assert: batch=4 scratchpad is larger than batch=1
-        assert!(scratch_b4 > scratch_b1, "larger batch must need more scratchpad");
+        assert!(
+            scratch_b4 > scratch_b1,
+            "larger batch must need more scratchpad"
+        );
     }
 
     #[test]
     fn compute_blocking_large_shape_uses_defaults() {
         // Arrange: shape larger than all defaults
-        let shape = GemmShape { m: 4096, n: 4096, k: 4096 };
+        let shape = GemmShape {
+            m: 4096,
+            n: 4096,
+            k: 4096,
+        };
         // Act
         let (kc, mc, nc) = compute_blocking(&shape, 256, 96, 1024, 6, 16);
         // Assert: kc capped at default_kc, mc aligned to mr, nc aligned to nr
@@ -2529,8 +2734,14 @@ mod tests {
         let global_ref = global_execution_plan() as *const ExecutionPlan;
         // Assert: inside scope we got the custom plan, outside we get global default
         let custom_ptr = Arc::as_ptr(&custom_plan);
-        assert_eq!(plan_ref, custom_ptr, "inside scope must see the custom plan");
-        assert_ne!(plan_ref, global_ref, "outside scope must see a different plan");
+        assert_eq!(
+            plan_ref, custom_ptr,
+            "inside scope must see the custom plan"
+        );
+        assert_ne!(
+            plan_ref, global_ref,
+            "outside scope must see a different plan"
+        );
     }
 
     #[test]
@@ -2561,7 +2772,11 @@ mod tests {
         // triggering the normalization branch (lines 910-912)
         let profile = DeviceProfile::detect();
         let ir = LayerIR::from_model_config(&ModelConfig::llama_7b(), 1);
-        let (l1, l2, l3) = (profile.kernel_config.l1d, profile.kernel_config.l2, profile.kernel_config.l3);
+        let (l1, l2, l3) = (
+            profile.kernel_config.l1d,
+            profile.kernel_config.l2,
+            profile.kernel_config.l3,
+        );
         let high_bias = StrategyBias {
             kv_cache_budget_scale: 3.0,
             weight_prefetch_budget_scale: 3.0,
@@ -2617,13 +2832,23 @@ mod tests {
             activation: Activation::Silu,
         };
         let profile = DeviceProfile::detect();
-        let (l1, l2, l3) = (profile.kernel_config.l1d, profile.kernel_config.l2, profile.kernel_config.l3);
-        let cache = HwOptEngine::solve_cache_budget(&profile, l1, l2, l3, &ir, &StrategyBias::default());
+        let (l1, l2, l3) = (
+            profile.kernel_config.l1d,
+            profile.kernel_config.l2,
+            profile.kernel_config.l3,
+        );
+        let cache =
+            HwOptEngine::solve_cache_budget(&profile, l1, l2, l3, &ir, &StrategyBias::default());
         let parallel = HwOptEngine::solve_parallelism(&profile, &cache, &StrategyBias::default());
         // Act
-        let batch = HwOptEngine::solve_batch(&profile, &parallel, &cache, &ir, &StrategyBias::default());
+        let batch =
+            HwOptEngine::solve_batch(&profile, &parallel, &cache, &ir, &StrategyBias::default());
         // Assert: fallback golden size of 64 is used since 16 > max_seq=8
-        assert_eq!(batch.golden_sizes, vec![64], "max_seq < 16 must trigger fallback golden size");
+        assert_eq!(
+            batch.golden_sizes,
+            vec![64],
+            "max_seq < 16 must trigger fallback golden size"
+        );
         assert_eq!(batch.max_chunk_size, 64);
     }
 
@@ -2663,11 +2888,11 @@ mod tests {
     #[test]
     fn solve_profile_with_bottlenecks_memory_bound_refines_decode() {
         // Arrange: construct an OpBottleneckMap with a memory-bound GEMM entry
-        use crate::compiler::pain_point::{
-            OpBottleneckMap, GemmBottleneck, BottleneckType, GemmRole,
-            FusionPriority, ExecPattern, ParallelismDesc,
-        };
         use crate::compiler::graph::OpId;
+        use crate::compiler::pain_point::{
+            BottleneckType, ExecPattern, FusionPriority, GemmBottleneck, GemmRole, OpBottleneckMap,
+            ParallelismDesc,
+        };
         let mut gemm_bottlenecks = std::collections::HashMap::new();
         gemm_bottlenecks.insert(
             OpId(0),
@@ -2676,7 +2901,9 @@ mod tests {
                 shape: (1, 4096, 4096),
                 arithmetic_intensity: 1.5,
                 ridge_point: 10.0,
-                bottleneck: BottleneckType::MemoryBound { bandwidth_utilization: 0.9 },
+                bottleneck: BottleneckType::MemoryBound {
+                    bandwidth_utilization: 0.9,
+                },
                 optimal_fusion: FusionPriority::EpilogueInjection,
                 fusion_benefits: std::collections::HashMap::new(),
                 exec_pattern: ExecPattern::ScalarLoop,
@@ -2702,11 +2929,11 @@ mod tests {
     #[test]
     fn solve_profile_with_bottlenecks_compute_bound_refines_prefill() {
         // Arrange: construct an OpBottleneckMap with a compute-bound GEMM entry
-        use crate::compiler::pain_point::{
-            OpBottleneckMap, GemmBottleneck, BottleneckType, GemmRole,
-            FusionPriority, ExecPattern, ParallelismDesc,
-        };
         use crate::compiler::graph::OpId;
+        use crate::compiler::pain_point::{
+            BottleneckType, ExecPattern, FusionPriority, GemmBottleneck, GemmRole, OpBottleneckMap,
+            ParallelismDesc,
+        };
         let mut gemm_bottlenecks = std::collections::HashMap::new();
         gemm_bottlenecks.insert(
             OpId(1),
@@ -2715,7 +2942,9 @@ mod tests {
                 shape: (512, 4096, 4096),
                 arithmetic_intensity: 50.0,
                 ridge_point: 10.0,
-                bottleneck: BottleneckType::ComputeBound { compute_utilization: 0.85 },
+                bottleneck: BottleneckType::ComputeBound {
+                    compute_utilization: 0.85,
+                },
                 optimal_fusion: FusionPriority::EpilogueInjection,
                 fusion_benefits: std::collections::HashMap::new(),
                 exec_pattern: ExecPattern::ScalarLoop,
@@ -2748,9 +2977,15 @@ mod tests {
         // Act
         let plan = ExecutionPlan::build(&ir, &profile, &low_spec_bias);
         // Assert: speculative_decoding feature must be disabled
-        let spec_decision = plan.feature_plan.decisions.iter()
+        let spec_decision = plan
+            .feature_plan
+            .decisions
+            .iter()
             .find(|d| d.feature == "speculative_decoding");
-        assert!(spec_decision.is_some(), "speculative_decoding decision must exist");
+        assert!(
+            spec_decision.is_some(),
+            "speculative_decoding decision must exist"
+        );
         assert!(
             !spec_decision.unwrap().enabled,
             "speculative_decoding must be disabled when benefit <= 0.5"
@@ -2766,8 +3001,16 @@ mod tests {
         let (kc, mc, nc) = compute_blocking(&shape, 128, 64, 64, 6, 16);
         // Assert: kc capped at shape.k, mc >= mr (6), nc >= nr (16)
         assert_eq!(kc, 64, "kc must be min(default_kc, shape.k)");
-        assert!(mc >= 6, "mc must be >= mr=6 even when shape.m=3, got {}", mc);
-        assert!(nc >= 16, "nc must be >= nr=16 even when shape.n=5, got {}", nc);
+        assert!(
+            mc >= 6,
+            "mc must be >= mr=6 even when shape.m=3, got {}",
+            mc
+        );
+        assert!(
+            nc >= 16,
+            "nc must be >= nr=16 even when shape.n=5, got {}",
+            nc
+        );
     }
 
     #[test]
@@ -2798,7 +3041,8 @@ mod tests {
         assert!(
             scratch >= scores_bytes,
             "scratchpad must account for attention scores: scratch={}, scores={}",
-            scratch, scores_bytes
+            scratch,
+            scores_bytes
         );
     }
 
@@ -2808,8 +3052,13 @@ mod tests {
         // so it does NOT enter the batch_flexibility == 0.0 early-return branch.
         let profile = DeviceProfile::detect();
         let ir = LayerIR::from_model_config(&ModelConfig::llama_7b(), 1);
-        let (l1, l2, l3) = (profile.kernel_config.l1d, profile.kernel_config.l2, profile.kernel_config.l3);
-        let cache = HwOptEngine::solve_cache_budget(&profile, l1, l2, l3, &ir, &StrategyBias::default());
+        let (l1, l2, l3) = (
+            profile.kernel_config.l1d,
+            profile.kernel_config.l2,
+            profile.kernel_config.l3,
+        );
+        let cache =
+            HwOptEngine::solve_cache_budget(&profile, l1, l2, l3, &ir, &StrategyBias::default());
         let parallel = HwOptEngine::solve_parallelism(&profile, &cache, &StrategyBias::default());
         let low_flex_bias = StrategyBias {
             batch_flexibility: 0.01,
@@ -2898,8 +3147,14 @@ mod tests {
         // Assert: encoder must also have FFN gate/up (n=intermediate) and down (k=intermediate)
         let has_gate = shapes.iter().any(|s| s.n == 256);
         let has_down = shapes.iter().any(|s| s.k == 256);
-        assert!(has_gate, "encoder must have FFN gate/up GEMM shape with n=intermediate");
-        assert!(has_down, "encoder must have FFN down GEMM shape with k=intermediate");
+        assert!(
+            has_gate,
+            "encoder must have FFN gate/up GEMM shape with n=intermediate"
+        );
+        assert!(
+            has_down,
+            "encoder must have FFN down GEMM shape with k=intermediate"
+        );
     }
 
     #[test]
@@ -2927,8 +3182,11 @@ mod tests {
         let f32_scratch = compute_scratchpad(&f32_ir);
         let bf16_scratch = compute_scratchpad(&bf16_ir);
         // Assert: BF16 uses 2 bytes per element vs 4 for F32, so scratchpad is exactly half
-        assert_eq!(bf16_scratch * 2, f32_scratch,
-            "BF16 scratchpad must be exactly half of F32 scratchpad for identical dimensions");
+        assert_eq!(
+            bf16_scratch * 2,
+            f32_scratch,
+            "BF16 scratchpad must be exactly half of F32 scratchpad for identical dimensions"
+        );
     }
 
     #[test]
@@ -2940,7 +3198,8 @@ mod tests {
         let plan = ExecutionPlan::build(&ir, &profile, &StrategyBias::default());
         // Assert: prefetch_a_l2 = prefetch_a_l1 * 2 (line 752)
         assert_eq!(
-            plan.prefetch_a_l2, plan.prefetch_a_l1 * 2,
+            plan.prefetch_a_l2,
+            plan.prefetch_a_l1 * 2,
             "L2 prefetch distance must be 2x L1 prefetch distance"
         );
     }
@@ -2950,13 +3209,20 @@ mod tests {
         // Arrange
         let profile = DeviceProfile::detect();
         let ir = LayerIR::from_model_config(&ModelConfig::llama_7b(), 1);
-        let (l1, l2, l3) = (profile.kernel_config.l1d, profile.kernel_config.l2, profile.kernel_config.l3);
-        let cache = HwOptEngine::solve_cache_budget(&profile, l1, l2, l3, &ir, &StrategyBias::default());
+        let (l1, l2, l3) = (
+            profile.kernel_config.l1d,
+            profile.kernel_config.l2,
+            profile.kernel_config.l3,
+        );
+        let cache =
+            HwOptEngine::solve_cache_budget(&profile, l1, l2, l3, &ir, &StrategyBias::default());
         let parallel = HwOptEngine::solve_parallelism(&profile, &cache, &StrategyBias::default());
-        let batch = HwOptEngine::solve_batch(&profile, &parallel, &cache, &ir, &StrategyBias::default());
+        let batch =
+            HwOptEngine::solve_batch(&profile, &parallel, &cache, &ir, &StrategyBias::default());
         // Assert: max_chunks_per_batch = wave_count * 4 (line 1355)
         assert_eq!(
-            batch.max_chunks_per_batch, parallel.wave_count * 4,
+            batch.max_chunks_per_batch,
+            parallel.wave_count * 4,
             "max_chunks_per_batch must equal wave_count * 4"
         );
     }
@@ -2968,8 +3234,12 @@ mod tests {
         let ir = LayerIR::from_model_config(&ModelConfig::llama_7b(), 1);
         let l3 = profile.kernel_config.l3;
         let budget = CacheBudgetSolver::solve(
-            &profile, profile.kernel_config.l1d, profile.kernel_config.l2, l3,
-            &ir, &StrategyBias::default(),
+            &profile,
+            profile.kernel_config.l1d,
+            profile.kernel_config.l2,
+            l3,
+            &ir,
+            &StrategyBias::default(),
         );
         // Act & Assert: L3 model budget = 70% of total (line 920), KV cold = 20% (line 921)
         let expected_model = (l3 as f64 * 0.70) as usize;
@@ -2990,14 +3260,20 @@ mod tests {
         // Act
         bias.validate();
         // Assert: pipeline_cost_scale clamped to 0.2 (line 66)
-        assert!((bias.pipeline_cost_scale - 0.2).abs() < 1e-10,
-            "pipeline_cost_scale must be clamped to 0.2");
+        assert!(
+            (bias.pipeline_cost_scale - 0.2).abs() < 1e-10,
+            "pipeline_cost_scale must be clamped to 0.2"
+        );
         // parallelism_cost_scale clamped to 0.1 (line 67)
-        assert!((bias.parallelism_cost_scale - 0.1).abs() < 1e-10,
-            "parallelism_cost_scale must be clamped to 0.1");
+        assert!(
+            (bias.parallelism_cost_scale - 0.1).abs() < 1e-10,
+            "parallelism_cost_scale must be clamped to 0.1"
+        );
         // expert_prefetch_priority clamped to 0.1 (line 75)
-        assert!((bias.expert_prefetch_priority - 0.1).abs() < 1e-10,
-            "expert_prefetch_priority must be clamped to 0.1");
+        assert!(
+            (bias.expert_prefetch_priority - 0.1).abs() < 1e-10,
+            "expert_prefetch_priority must be clamped to 0.1"
+        );
     }
 
     #[test]
@@ -3016,8 +3292,13 @@ mod tests {
         // Arrange: decode_ratio_scale = 2.0 (upper clamp bound)
         let profile = DeviceProfile::detect();
         let ir = LayerIR::from_model_config(&ModelConfig::llama_7b(), 1);
-        let (l1, l2, l3) = (profile.kernel_config.l1d, profile.kernel_config.l2, profile.kernel_config.l3);
-        let cache = HwOptEngine::solve_cache_budget(&profile, l1, l2, l3, &ir, &StrategyBias::default());
+        let (l1, l2, l3) = (
+            profile.kernel_config.l1d,
+            profile.kernel_config.l2,
+            profile.kernel_config.l3,
+        );
+        let cache =
+            HwOptEngine::solve_cache_budget(&profile, l1, l2, l3, &ir, &StrategyBias::default());
         let parallel = HwOptEngine::solve_parallelism(&profile, &cache, &StrategyBias::default());
         let high_decode_bias = StrategyBias {
             decode_ratio_scale: 2.0,
@@ -3039,7 +3320,11 @@ mod tests {
     #[test]
     fn gemm_shape_debug_output_contains_all_dimensions() {
         // Arrange
-        let shape = GemmShape { m: 1, n: 4096, k: 4096 };
+        let shape = GemmShape {
+            m: 1,
+            n: 4096,
+            k: 4096,
+        };
         // Act
         let debug_str = format!("{:?}", shape);
         // Assert: Debug output must contain m, n, k values
@@ -3097,7 +3382,12 @@ mod tests {
         // Act & Assert
         for (variant, expected) in variants {
             let dbg = format!("{:?}", variant);
-            assert!(dbg.contains(expected), "Debug for {:?} must contain {}", variant, expected);
+            assert!(
+                dbg.contains(expected),
+                "Debug for {:?} must contain {}",
+                variant,
+                expected
+            );
         }
     }
 
@@ -3106,7 +3396,10 @@ mod tests {
         // Arrange
         let strategies = [
             (GemmMicrokernelStrategy::AmxTile, "AmxTile"),
-            (GemmMicrokernelStrategy::Avx512NativeBf16, "Avx512NativeBf16"),
+            (
+                GemmMicrokernelStrategy::Avx512NativeBf16,
+                "Avx512NativeBf16",
+            ),
             (GemmMicrokernelStrategy::BlisAvx512, "BlisAvx512"),
             (GemmMicrokernelStrategy::BlisAvx2, "BlisAvx2"),
             (GemmMicrokernelStrategy::BlisNeon, "BlisNeon"),
@@ -3118,7 +3411,12 @@ mod tests {
         // Act & Assert
         for (strategy, expected) in strategies {
             let dbg = format!("{:?}", strategy);
-            assert!(dbg.contains(expected), "Debug for {:?} must contain {}", strategy, expected);
+            assert!(
+                dbg.contains(expected),
+                "Debug for {:?} must contain {}",
+                strategy,
+                expected
+            );
         }
     }
 
@@ -3190,7 +3488,10 @@ mod tests {
         // Assert
         assert_eq!(plan.decisions.len(), 2);
         assert_eq!(plan.l1i_used, 4096);
-        assert!(plan.l1i_used < plan.l1i_budget, "L1i used must be within budget");
+        assert!(
+            plan.l1i_used < plan.l1i_budget,
+            "L1i used must be within budget"
+        );
     }
 
     #[test]
@@ -3232,7 +3533,11 @@ mod tests {
     #[test]
     fn compute_blocking_very_large_matrix_uses_full_defaults() {
         // Arrange: 16384x16384x16384 matrix, larger than all defaults
-        let shape = GemmShape { m: 16384, n: 16384, k: 16384 };
+        let shape = GemmShape {
+            m: 16384,
+            n: 16384,
+            k: 16384,
+        };
         // Act
         let (kc, mc, nc) = compute_blocking(&shape, 256, 96, 1024, 6, 16);
         // Assert: defaults used as-is (shape larger than all), aligned to mr/nr
@@ -3244,7 +3549,11 @@ mod tests {
     #[test]
     fn compute_blocking_misaligned_dimensions_get_aligned_to_microkernel() {
         // Arrange: dimensions not aligned to mr=6, nr=16
-        let shape = GemmShape { m: 100, n: 100, k: 100 };
+        let shape = GemmShape {
+            m: 100,
+            n: 100,
+            k: 100,
+        };
         // Act
         let (kc, mc, nc) = compute_blocking(&shape, 256, 64, 64, 6, 16);
         // Assert: mc aligned down to multiple of mr, nc to multiple of nr (lines 1515-1516)
@@ -3257,19 +3566,63 @@ mod tests {
     fn gemm_shape_ordering_and_sorting() {
         // Arrange: shapes with different m, n, k values
         let shapes = vec![
-            GemmShape { m: 1, n: 4096, k: 4096 },
-            GemmShape { m: 1, n: 2048, k: 4096 },
-            GemmShape { m: 1, n: 4096, k: 2048 },
-            GemmShape { m: 512, n: 4096, k: 4096 },
+            GemmShape {
+                m: 1,
+                n: 4096,
+                k: 4096,
+            },
+            GemmShape {
+                m: 1,
+                n: 2048,
+                k: 4096,
+            },
+            GemmShape {
+                m: 1,
+                n: 4096,
+                k: 2048,
+            },
+            GemmShape {
+                m: 512,
+                n: 4096,
+                k: 4096,
+            },
         ];
         // Act: sort by (m, n, k) as done in collect_gemm_shapes (line 1496)
         let mut sorted = shapes.clone();
         sorted.sort_by_key(|s| (s.m, s.n, s.k));
         // Assert: sorted order is by m first, then n, then k
-        assert_eq!(sorted[0], GemmShape { m: 1, n: 2048, k: 4096 });
-        assert_eq!(sorted[1], GemmShape { m: 1, n: 4096, k: 2048 });
-        assert_eq!(sorted[2], GemmShape { m: 1, n: 4096, k: 4096 });
-        assert_eq!(sorted[3], GemmShape { m: 512, n: 4096, k: 4096 });
+        assert_eq!(
+            sorted[0],
+            GemmShape {
+                m: 1,
+                n: 2048,
+                k: 4096
+            }
+        );
+        assert_eq!(
+            sorted[1],
+            GemmShape {
+                m: 1,
+                n: 4096,
+                k: 2048
+            }
+        );
+        assert_eq!(
+            sorted[2],
+            GemmShape {
+                m: 1,
+                n: 4096,
+                k: 4096
+            }
+        );
+        assert_eq!(
+            sorted[3],
+            GemmShape {
+                m: 512,
+                n: 4096,
+                k: 4096
+            }
+        );
     }
 
     #[test]
@@ -3279,7 +3632,7 @@ mod tests {
             moe: None,
             hidden: 512,
             num_heads: 8,
-            num_kv_heads: 2,  // GQA: fewer KV heads
+            num_kv_heads: 2, // GQA: fewer KV heads
             head_dim: 64,
             intermediate: 1024,
             quant: None,
@@ -3300,11 +3653,15 @@ mod tests {
         assert_eq!(q_dim, 512);
         assert_eq!(kv_dim, 128);
         // Q projection: n = q_dim
-        assert!(shapes.iter().any(|s| s.n == q_dim && s.k == ir.hidden),
-            "must have Q projection shape with n=q_dim");
+        assert!(
+            shapes.iter().any(|s| s.n == q_dim && s.k == ir.hidden),
+            "must have Q projection shape with n=q_dim"
+        );
         // K/V projection: n = kv_dim
-        assert!(shapes.iter().any(|s| s.n == kv_dim && s.k == ir.hidden),
-            "must have K/V projection shape with n=kv_dim");
+        assert!(
+            shapes.iter().any(|s| s.n == kv_dim && s.k == ir.hidden),
+            "must have K/V projection shape with n=kv_dim"
+        );
     }
 
     #[test]
@@ -3332,11 +3689,17 @@ mod tests {
         let scratch_b1 = compute_scratchpad(&ir_b1);
         let scratch_b8 = compute_scratchpad(&ir_b8);
         // Assert: scratchpad scales linearly with batch (all terms have b factor)
-        assert!(scratch_b8 > scratch_b1, "larger batch needs more scratchpad");
+        assert!(
+            scratch_b8 > scratch_b1,
+            "larger batch needs more scratchpad"
+        );
         // The ratio should be approximately 8x (exact if all terms scale with batch)
         let ratio = scratch_b8 as f64 / scratch_b1 as f64;
-        assert!(ratio >= 7.5 && ratio <= 8.5,
-            "scratchpad should scale ~8x, got ratio={}", ratio);
+        assert!(
+            ratio >= 7.5 && ratio <= 8.5,
+            "scratchpad should scale ~8x, got ratio={}",
+            ratio
+        );
     }
 
     #[test]
@@ -3383,7 +3746,8 @@ mod tests {
         for shape in &shapes {
             assert!(
                 plan.gemm_blocking.contains_key(shape),
-                "gemm_blocking must have entry for shape {:?}", shape
+                "gemm_blocking must have entry for shape {:?}",
+                shape
             );
             let (kc, mc, nc) = plan.gemm_blocking[shape];
             assert!(kc >= 1, "kc must be >= 1");
@@ -3483,7 +3847,9 @@ pub fn compute_execution_plan_with_bias(bias: &StrategyBias) -> Arc<ExecutionPla
 pub fn with_execution_plan<R>(plan: Arc<ExecutionPlan>, f: impl FnOnce() -> R) -> R {
     CURRENT_PLAN.with(|stack| stack.borrow_mut().push(plan));
     let result = f();
-    CURRENT_PLAN.with(|stack| { stack.borrow_mut().pop(); });
+    CURRENT_PLAN.with(|stack| {
+        stack.borrow_mut().pop();
+    });
     result
 }
 

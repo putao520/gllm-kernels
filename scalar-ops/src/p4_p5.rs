@@ -232,7 +232,9 @@ pub unsafe extern "C" fn scalar_vrange_quant(
             // Quantize + dequantize each element
             for i in 0..block_len {
                 let x = *input.add(block_start + i);
-                let q = ((x - b_min) * inv_range * levels).round().clamp(0.0, levels);
+                let q = ((x - b_min) * inv_range * levels)
+                    .round()
+                    .clamp(0.0, levels);
                 *output.add(block_start + i) = q / levels * range + b_min;
             }
 
@@ -324,7 +326,13 @@ mod tests {
         let activation = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0];
         let gate = vec![0.5_f32, -0.1, 1.0, 0.0, 2.0];
         let mut output = vec![0.0_f32; 5];
-        scalar_gate_mask(activation.as_ptr(), gate.as_ptr(), output.as_mut_ptr(), 5, 0.0);
+        scalar_gate_mask(
+            activation.as_ptr(),
+            gate.as_ptr(),
+            output.as_mut_ptr(),
+            5,
+            0.0,
+        );
         assert_eq!(output, vec![1.0, 0.0, 3.0, 0.0, 5.0]);
     }
 
@@ -333,7 +341,13 @@ mod tests {
         let activation = vec![10.0_f32, 20.0, 30.0];
         let gate = vec![0.3_f32, 0.5, 0.7];
         let mut output = vec![0.0_f32; 3];
-        scalar_gate_mask(activation.as_ptr(), gate.as_ptr(), output.as_mut_ptr(), 3, 0.5);
+        scalar_gate_mask(
+            activation.as_ptr(),
+            gate.as_ptr(),
+            output.as_mut_ptr(),
+            3,
+            0.5,
+        );
         assert_eq!(output, vec![0.0, 0.0, 30.0]);
     }
 
@@ -382,7 +396,11 @@ mod tests {
 
         // All softmax values should be 0.25
         for i in 0..4 {
-            assert!((output[i] - 0.25).abs() < 1e-5, "uniform softmax[{i}] = {}", output[i]);
+            assert!(
+                (output[i] - 0.25).abs() < 1e-5,
+                "uniform softmax[{i}] = {}",
+                output[i]
+            );
         }
 
         // Entropy should be ln(4) ≈ 1.386
@@ -390,7 +408,8 @@ mod tests {
         assert!(
             (output[4] - expected_entropy).abs() < 1e-4,
             "entropy = {}, expected = {}",
-            output[4], expected_entropy
+            output[4],
+            expected_entropy
         );
     }
 
@@ -427,7 +446,8 @@ mod tests {
             assert!(
                 (output[i] - input[i]).abs() < 0.01,
                 "block0[{i}]: got {}, expected {}",
-                output[i], input[i]
+                output[i],
+                input[i]
             );
         }
 
@@ -440,7 +460,8 @@ mod tests {
             assert!(
                 (output[i] - input[i]).abs() < 0.01,
                 "block1[{i}]: got {}, expected {}",
-                output[i], input[i]
+                output[i],
+                input[i]
             );
         }
     }
@@ -473,9 +494,7 @@ mod tests {
         let input = vec![1.0_f32, 2.0, 10.0, 20.0, 30.0]; // concatenated
         let lengths = vec![2.0_f32, 3.0_f32];
         let mut output = vec![0.0_f32; 8]; // 2 x 4
-        scalar_variable_length_batch(
-            input.as_ptr(), output.as_mut_ptr(), lengths.as_ptr(), 2, 4,
-        );
+        scalar_variable_length_batch(input.as_ptr(), output.as_mut_ptr(), lengths.as_ptr(), 2, 4);
 
         // Row 0: [1, 2, 0, 0]
         assert_eq!(output[0], 1.0);
@@ -496,9 +515,7 @@ mod tests {
         let input = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0];
         let lengths = vec![5.0_f32];
         let mut output = vec![0.0_f32; 3]; // max_len=3
-        scalar_variable_length_batch(
-            input.as_ptr(), output.as_mut_ptr(), lengths.as_ptr(), 1, 3,
-        );
+        scalar_variable_length_batch(input.as_ptr(), output.as_mut_ptr(), lengths.as_ptr(), 1, 3);
 
         // Row 0: [1, 2, 3] (truncated from 5 to 3)
         assert_eq!(output[0], 1.0);

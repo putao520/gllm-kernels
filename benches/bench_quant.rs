@@ -4,9 +4,7 @@
 //! 对比: 量化 vs f32 标量
 //! 报告: GFLOPS (throughput = 2*M*N*K FLOPs)
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::time::Duration;
 
 #[path = "utils.rs"]
@@ -21,9 +19,9 @@ fn bench_gemv_q8(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(3));
 
     let sizes: &[(usize, usize)] = &[
-        (4096, 4096),     // LLaMA-7B hidden
-        (4096, 11008),    // LLaMA-7B FFN
-        (4096, 16384),    // 大 FFN
+        (4096, 4096),  // LLaMA-7B hidden
+        (4096, 11008), // LLaMA-7B FFN
+        (4096, 16384), // 大 FFN
     ];
 
     for &(k, n) in sizes {
@@ -66,10 +64,7 @@ fn bench_gemv_q4(c: &mut Criterion) {
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(3));
 
-    let sizes: &[(usize, usize)] = &[
-        (4096, 4096),
-        (4096, 11008),
-    ];
+    let sizes: &[(usize, usize)] = &[(4096, 4096), (4096, 11008)];
 
     for &(k, n) in sizes {
         let flops = 2 * k as u64 * n as u64;
@@ -111,10 +106,7 @@ fn bench_gemv_f32(c: &mut Criterion) {
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(3));
 
-    let sizes: &[(usize, usize)] = &[
-        (4096, 4096),
-        (4096, 11008),
-    ];
+    let sizes: &[(usize, usize)] = &[(4096, 4096), (4096, 11008)];
 
     for &(k, n) in sizes {
         let flops = 2 * k as u64 * n as u64;
@@ -155,11 +147,7 @@ fn bench_gemm_q8(c: &mut Criterion) {
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(5));
 
-    let sizes: &[(usize, usize, usize)] = &[
-        (32, 4096, 4096),
-        (64, 4096, 4096),
-        (128, 4096, 4096),
-    ];
+    let sizes: &[(usize, usize, usize)] = &[(32, 4096, 4096), (64, 4096, 4096), (128, 4096, 4096)];
 
     for &(m, n, k) in sizes {
         let flops = utils::gemm_flops(m, n, k);
@@ -200,11 +188,7 @@ fn bench_gemm_q4(c: &mut Criterion) {
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(5));
 
-    let sizes: &[(usize, usize, usize)] = &[
-        (32, 4096, 4096),
-        (64, 4096, 4096),
-        (128, 4096, 4096),
-    ];
+    let sizes: &[(usize, usize, usize)] = &[(32, 4096, 4096), (64, 4096, 4096), (128, 4096, 4096)];
 
     for &(m, n, k) in sizes {
         let flops = utils::gemm_flops(m, n, k);
@@ -246,10 +230,7 @@ fn bench_gemm_f32_baseline(c: &mut Criterion) {
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(5));
 
-    let sizes: &[(usize, usize, usize)] = &[
-        (32, 4096, 4096),
-        (64, 4096, 4096),
-    ];
+    let sizes: &[(usize, usize, usize)] = &[(32, 4096, 4096), (64, 4096, 4096)];
 
     for &(m, n, k) in sizes {
         let flops = utils::gemm_flops(m, n, k);
@@ -292,10 +273,7 @@ fn bench_kquant_matmul(c: &mut Criterion) {
     let block_size: usize = 256;
     let block_bytes: usize = 144;
 
-    let sizes: &[(usize, usize, usize)] = &[
-        (1, 4096, 4096),
-        (32, 4096, 4096),
-    ];
+    let sizes: &[(usize, usize, usize)] = &[(1, 4096, 4096), (32, 4096, 4096)];
 
     for &(m, n, k) in sizes {
         let flops = utils::gemm_flops(m, n, k);

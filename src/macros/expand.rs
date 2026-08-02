@@ -7,11 +7,11 @@
 macro_rules! expand_isa_impls {
     ($module_name:ident, $isa:ident, $elem:ident) => {
         pub mod $module_name {
-            use crate::traits::Element;
-            #[allow(unused_imports)]
-            use half::{f16, bf16};
             #[allow(unused_imports)]
             use crate::macros::simd_primitive;
+            use crate::traits::Element;
+            #[allow(unused_imports)]
+            use half::{bf16, f16};
 
             // Include Layer 2 templates
             crate::define_element_wise_ops!($isa, $elem);
@@ -23,7 +23,6 @@ macro_rules! expand_isa_impls {
             crate::define_matmul_op!($isa, $elem);
             crate::define_gemv_streaming_op!($isa, $elem);
             crate::define_gemm_skinny_op!($isa, $elem);
-
         }
     };
 }

@@ -31,7 +31,10 @@
 
 use super::instr::*;
 use super::trace_opt::TracePassPipeline;
-use crate::compiler::trace::{CmpOp, ComputePattern, Fp8Format, QuantPrecision, ReduceKind, ScaleSelector, TraceOp, TypedSlot, infer_result_dtype, ValueId};
+use crate::compiler::trace::{
+    infer_result_dtype, CmpOp, ComputePattern, Fp8Format, QuantPrecision, ReduceKind,
+    ScaleSelector, TraceOp, TypedSlot, ValueId,
+};
 use crate::quant::QuantType;
 use crate::quant_format::{PackedScaleAlgorithm, QuantDataKind, ZeroLayout};
 use crate::types::CompilerError;
@@ -64,7 +67,10 @@ pub fn auto_lower_trace_typed(
     for op in body {
         let result_dtype = infer_result_dtype(op, &slots);
         let vreg = dispatch_trace_op_typed(prog, op, &slots, &vreg_inputs, width, result_dtype)?;
-        slots.push(TypedSlot { vreg, dtype: result_dtype });
+        slots.push(TypedSlot {
+            vreg,
+            dtype: result_dtype,
+        });
     }
     Ok(slots)
 }
@@ -82,17 +88,17 @@ fn dispatch_trace_op_typed(
     let slots: Vec<VRegId> = typed_slots.iter().map(|ts| ts.vreg).collect();
     let n = typed_slots.len();
     match op {
-        TraceOp::Input(idx) => inputs
-            .get(*idx as usize)
-            .copied()
-            .ok_or_else(|| CompilerError::CodegenViolation(format!(
-                "TraceOp::Input({}) 越界", idx
-            ))),
+        TraceOp::Input(idx) => inputs.get(*idx as usize).copied().ok_or_else(|| {
+            CompilerError::CodegenViolation(format!("TraceOp::Input({}) 越界", idx))
+        }),
 
         TraceOp::Const(val) => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::Broadcast {
-                dst: r, src: ScalarExpr::Const(*val as f32), width, dtype,
+                dst: r,
+                src: ScalarExpr::Const(*val as f32),
+                width,
+                dtype,
             });
             Ok(r)
         }
@@ -104,11 +110,25 @@ fn dispatch_trace_op_typed(
         TraceOp::Pow(a, b) => {
             // pow(base, exp) = exp(log(base) * exp)
             let log_base = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Transcendental { dst: log_base, src: slots[a.0 as usize], func: TranscendentalFn::Log });
+            prog.emit(VmInstr::Transcendental {
+                dst: log_base,
+                src: slots[a.0 as usize],
+                func: TranscendentalFn::Log,
+            });
             let mul_result = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecBinOp { dst: mul_result, a: log_base, b: slots[b.0 as usize], op: VecOp::Mul, dtype });
+            prog.emit(VmInstr::VecBinOp {
+                dst: mul_result,
+                a: log_base,
+                b: slots[b.0 as usize],
+                op: VecOp::Mul,
+                dtype,
+            });
             let r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Transcendental { dst: r, src: mul_result, func: TranscendentalFn::Exp });
+            prog.emit(VmInstr::Transcendental {
+                dst: r,
+                src: mul_result,
+                func: TranscendentalFn::Exp,
+            });
             Ok(r)
         }
         TraceOp::Max(a, b) => emit_binop_dtype(prog, &slots, *a, *b, VecOp::Max, width, dtype),
@@ -117,7 +137,11 @@ fn dispatch_trace_op_typed(
         TraceOp::Fma(a, b, c) => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::Fma {
-                dst: r, acc: slots[c.0 as usize], a: slots[a.0 as usize], b: slots[b.0 as usize], dtype,
+                dst: r,
+                acc: slots[c.0 as usize],
+                a: slots[a.0 as usize],
+                b: slots[b.0 as usize],
+                dtype,
             });
             Ok(r)
         }
@@ -131,7 +155,9 @@ fn dispatch_trace_op_typed(
         TraceOp::Exp(a) => emit_transcendental(prog, &slots, *a, TranscendentalFn::Exp, width),
         TraceOp::Tanh(a) => emit_transcendental(prog, &slots, *a, TranscendentalFn::Tanh, width),
         TraceOp::Log(a) => emit_transcendental(prog, &slots, *a, TranscendentalFn::Log, width),
-        TraceOp::Sigmoid(a) => emit_transcendental(prog, &slots, *a, TranscendentalFn::Sigmoid, width),
+        TraceOp::Sigmoid(a) => {
+            emit_transcendental(prog, &slots, *a, TranscendentalFn::Sigmoid, width)
+        }
 
         // @trace REQ-AIS-003 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/compare]
         TraceOp::Compare { a, b, op: cmp_op } => emit_cmp(prog, &slots, *a, *b, *cmp_op, width),
@@ -141,7 +167,12 @@ fn dispatch_trace_op_typed(
             let from_bits = quant_precision_bits(from);
             let to_bits = quant_precision_bits(to);
             let r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecCast { dst: r, src: slots[src.0 as usize], from_bits, to_bits });
+            prog.emit(VmInstr::VecCast {
+                dst: r,
+                src: slots[src.0 as usize],
+                from_bits,
+                to_bits,
+            });
             Ok(r)
         }
 
@@ -149,8 +180,10 @@ fn dispatch_trace_op_typed(
         TraceOp::ConditionalBranch(mask, true_val, false_val) => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::ConditionalSelect {
-                dst: r, mask: slots[mask.0 as usize],
-                true_val: slots[true_val.0 as usize], false_val: slots[false_val.0 as usize],
+                dst: r,
+                mask: slots[mask.0 as usize],
+                true_val: slots[true_val.0 as usize],
+                false_val: slots[false_val.0 as usize],
             });
             Ok(r)
         }
@@ -163,19 +196,29 @@ fn dispatch_trace_op_typed(
                 ReduceKind::Min => ReduceOp::Min,
                 ReduceKind::Prod => ReduceOp::Prod,
                 ReduceKind::LogSum => ReduceOp::LogSum,
-                other => return Err(CompilerError::CodegenViolation(format!(
-                    "auto_lower_trace_typed: HReduce {:?} 尚未实现", other
-                ))),
+                other => {
+                    return Err(CompilerError::CodegenViolation(format!(
+                        "auto_lower_trace_typed: HReduce {:?} 尚未实现",
+                        other
+                    )))
+                }
             };
             let r = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
-            prog.emit(VmInstr::HReduce { dst: r, src: slots[src.0 as usize], op: red });
+            prog.emit(VmInstr::HReduce {
+                dst: r,
+                src: slots[src.0 as usize],
+                op: red,
+            });
             Ok(r)
         }
 
         TraceOp::BroadcastScalar { src } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::Broadcast {
-                dst: r, src: ScalarExpr::ExtractLane0(slots[src.0 as usize]), width, dtype,
+                dst: r,
+                src: ScalarExpr::ExtractLane0(slots[src.0 as usize]),
+                width,
+                dtype,
             });
             Ok(r)
         }
@@ -188,13 +231,20 @@ fn dispatch_trace_op_typed(
 fn emit_binop_dtype(
     prog: &mut VmProgram,
     slots: &[VRegId],
-    a: ValueId, b: ValueId,
+    a: ValueId,
+    b: ValueId,
     op: VecOp,
     width: SimdWidth,
     dtype: QuantPrecision,
 ) -> Result<VRegId, CompilerError> {
     let r = prog.alloc_vreg(VRegKind::Vec, width);
-    prog.emit(VmInstr::VecBinOp { dst: r, a: slots[a.0 as usize], b: slots[b.0 as usize], op, dtype });
+    prog.emit(VmInstr::VecBinOp {
+        dst: r,
+        a: slots[a.0 as usize],
+        b: slots[b.0 as usize],
+        op,
+        dtype,
+    });
     Ok(r)
 }
 
@@ -374,34 +424,71 @@ fn dispatch_trace_op_into(
     match op {
         TraceOp::Input(n) => {
             let src = *inputs.get(*n as usize).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!(
-                    "TraceOp::Input({}) 越界", n
-                ))
+                CompilerError::CodegenViolation(format!("TraceOp::Input({}) 越界", n))
             })?;
-            if src != dst { copy_vreg(prog, dst, src, default_dtype); }
+            if src != dst {
+                copy_vreg(prog, dst, src, default_dtype);
+            }
             Ok(())
         }
         TraceOp::Const(val) => {
-            prog.emit(VmInstr::Broadcast { dst, src: ScalarExpr::Const(*val as f32), width, dtype: default_dtype, });
+            prog.emit(VmInstr::Broadcast {
+                dst,
+                src: ScalarExpr::Const(*val as f32),
+                width,
+                dtype: default_dtype,
+            });
             Ok(())
         }
-        TraceOp::Add(a, b) => emit_binop_into(prog, slots, *a, *b, VecOp::Add, dst, width, default_dtype),
-        TraceOp::Sub(a, b) => emit_binop_into(prog, slots, *a, *b, VecOp::Sub, dst, width, default_dtype),
-        TraceOp::Mul(a, b) => emit_binop_into(prog, slots, *a, *b, VecOp::Mul, dst, width, default_dtype),
-        TraceOp::Div(a, b) => emit_binop_into(prog, slots, *a, *b, VecOp::Div, dst, width, default_dtype),
+        TraceOp::Add(a, b) => {
+            emit_binop_into(prog, slots, *a, *b, VecOp::Add, dst, width, default_dtype)
+        }
+        TraceOp::Sub(a, b) => {
+            emit_binop_into(prog, slots, *a, *b, VecOp::Sub, dst, width, default_dtype)
+        }
+        TraceOp::Mul(a, b) => {
+            emit_binop_into(prog, slots, *a, *b, VecOp::Mul, dst, width, default_dtype)
+        }
+        TraceOp::Div(a, b) => {
+            emit_binop_into(prog, slots, *a, *b, VecOp::Div, dst, width, default_dtype)
+        }
         TraceOp::Pow(a, b) => {
             // pow(base, exp) = exp(log(base) * exp) — lower into dst
             let log_base = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Transcendental { dst: log_base, src: slots[a.0 as usize], func: TranscendentalFn::Log });
+            prog.emit(VmInstr::Transcendental {
+                dst: log_base,
+                src: slots[a.0 as usize],
+                func: TranscendentalFn::Log,
+            });
             let mul_result = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecBinOp { dst: mul_result, a: log_base, b: slots[b.0 as usize], op: VecOp::Mul, dtype: default_dtype });
-            prog.emit(VmInstr::Transcendental { dst, src: mul_result, func: TranscendentalFn::Exp });
+            prog.emit(VmInstr::VecBinOp {
+                dst: mul_result,
+                a: log_base,
+                b: slots[b.0 as usize],
+                op: VecOp::Mul,
+                dtype: default_dtype,
+            });
+            prog.emit(VmInstr::Transcendental {
+                dst,
+                src: mul_result,
+                func: TranscendentalFn::Exp,
+            });
             Ok(())
         }
-        TraceOp::Max(a, b) => emit_binop_into(prog, slots, *a, *b, VecOp::Max, dst, width, default_dtype),
-        TraceOp::Min(a, b) => emit_binop_into(prog, slots, *a, *b, VecOp::Min, dst, width, default_dtype),
+        TraceOp::Max(a, b) => {
+            emit_binop_into(prog, slots, *a, *b, VecOp::Max, dst, width, default_dtype)
+        }
+        TraceOp::Min(a, b) => {
+            emit_binop_into(prog, slots, *a, *b, VecOp::Min, dst, width, default_dtype)
+        }
         TraceOp::Fma(a, b, c) => {
-            prog.emit(VmInstr::Fma { dst, acc: slots[c.0 as usize], a: slots[a.0 as usize], b: slots[b.0 as usize], dtype: default_dtype, });
+            prog.emit(VmInstr::Fma {
+                dst,
+                acc: slots[c.0 as usize],
+                a: slots[a.0 as usize],
+                b: slots[b.0 as usize],
+                dtype: default_dtype,
+            });
             Ok(())
         }
         TraceOp::Neg(a) => emit_unary_into(prog, slots, *a, VecUnaryOp::Neg, dst, width),
@@ -409,12 +496,25 @@ fn dispatch_trace_op_into(
         TraceOp::Sqrt(a) => emit_unary_into(prog, slots, *a, VecUnaryOp::Sqrt, dst, width),
         TraceOp::Rsqrt(a) => emit_unary_into(prog, slots, *a, VecUnaryOp::Rsqrt, dst, width),
         TraceOp::Recip(a) => emit_unary_into(prog, slots, *a, VecUnaryOp::Recip, dst, width),
-        TraceOp::Exp(a) => emit_transcendental_into(prog, slots, *a, TranscendentalFn::Exp, dst, width),
-        TraceOp::Tanh(a) => emit_transcendental_into(prog, slots, *a, TranscendentalFn::Tanh, dst, width),
-        TraceOp::Log(a) => emit_transcendental_into(prog, slots, *a, TranscendentalFn::Log, dst, width),
-        TraceOp::Sigmoid(a) => emit_transcendental_into(prog, slots, *a, TranscendentalFn::Sigmoid, dst, width),
+        TraceOp::Exp(a) => {
+            emit_transcendental_into(prog, slots, *a, TranscendentalFn::Exp, dst, width)
+        }
+        TraceOp::Tanh(a) => {
+            emit_transcendental_into(prog, slots, *a, TranscendentalFn::Tanh, dst, width)
+        }
+        TraceOp::Log(a) => {
+            emit_transcendental_into(prog, slots, *a, TranscendentalFn::Log, dst, width)
+        }
+        TraceOp::Sigmoid(a) => {
+            emit_transcendental_into(prog, slots, *a, TranscendentalFn::Sigmoid, dst, width)
+        }
         TraceOp::BroadcastScalar { src } => {
-            prog.emit(VmInstr::Broadcast { dst, src: ScalarExpr::ExtractLane0(slots[src.0 as usize]), width, dtype: default_dtype, });
+            prog.emit(VmInstr::Broadcast {
+                dst,
+                src: ScalarExpr::ExtractLane0(slots[src.0 as usize]),
+                width,
+                dtype: default_dtype,
+            });
             Ok(())
         }
         // 不支持 into 模式的操作（宽度变化、多输出等）：回退到 alloc + copy
@@ -444,9 +544,9 @@ pub fn auto_lower_trace(
     let mut optimized = body.to_vec();
     get_opt_pipeline().optimize(&mut optimized);
     let slots = auto_lower_trace_raw(prog, &optimized, inputs, width, default_dtype)?;
-    let primary = *inputs.first().ok_or_else(|| {
-        CompilerError::CodegenViolation("auto_lower_trace: inputs 为空".into())
-    })?;
+    let primary = *inputs
+        .first()
+        .ok_or_else(|| CompilerError::CodegenViolation("auto_lower_trace: inputs 为空".into()))?;
     if let Some(&last) = slots.last() {
         copy_vreg(prog, primary, last, default_dtype);
     }
@@ -482,7 +582,8 @@ pub fn auto_lower_trace_multi(
         if slot_idx >= slots.len() {
             return Err(CompilerError::CodegenViolation(format!(
                 "auto_lower_trace_multi: slot_index {} 越界 (body 产生 {} 个 slot)",
-                slot_idx, slots.len()
+                slot_idx,
+                slots.len()
             )));
         }
         copy_vreg(prog, target, slots[slot_idx], default_dtype);
@@ -493,7 +594,11 @@ pub fn auto_lower_trace_multi(
 /// 寄存器拷贝: dst = src (Mov 指令，mov-elimination 友好)
 fn copy_vreg(prog: &mut VmProgram, target: VRegId, src: VRegId, dtype: QuantPrecision) {
     if src != target {
-        prog.emit(VmInstr::Mov { dst: target, src, dtype });
+        prog.emit(VmInstr::Mov {
+            dst: target,
+            src,
+            dtype,
+        });
     }
 }
 
@@ -512,105 +617,293 @@ fn dispatch_trace_op(
     default_dtype: QuantPrecision,
 ) -> Result<VRegId, CompilerError> {
     match op_ref {
-        TraceOp::Input(..) => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::Const(..) => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::Add(..) => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::Sub(..) => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::Mul(..) => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::Div(..) => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::Pow(..) => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::Max(..) => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::Min(..) => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::Fma(..) => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Input(..) => {
+            dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::Const(..) => {
+            dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::Add(..) => {
+            dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::Sub(..) => {
+            dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::Mul(..) => {
+            dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::Div(..) => {
+            dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::Pow(..) => {
+            dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::Max(..) => {
+            dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::Min(..) => {
+            dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::Fma(..) => {
+            dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
         TraceOp::Neg(..) => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
         TraceOp::Abs(..) => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::Sqrt(..) => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::Rsqrt(..) => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::Recip(..) => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Sqrt(..) => {
+            dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::Rsqrt(..) => {
+            dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::Recip(..) => {
+            dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
         TraceOp::Exp(..) => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::Tanh(..) => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Tanh(..) => {
+            dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
         TraceOp::Log(..) => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::Sigmoid(..) => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::Compare { .. } => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::Cast { .. } => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::ConditionalBranch(..) => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::HReduce { .. } => dispatch_reduction(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::ScalarLoad { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::StrideMul { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::PtrAdd { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::VecLoadIndexed { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::VecStoreIndexed { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantFma { .. } => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::BlockScale { .. } => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::Prefetch { .. } => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::NonTemporalStore => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::BitExtract { .. } => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::Permute { .. } => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::MaskedOp { .. } => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::AtomicAdd { .. } => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::BroadcastScalar { .. } => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::BroadcastLoad { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::GatherLoad { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::ScatterStore { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::TableLookup { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::Mxfp4Dequant { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::BitAnd(..) => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::FWHT { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantBitAnd { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantBitOr { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantBroadcast { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantCastF16toF32 { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantCastI8toF32 { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantCastFp8toF32 { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantCodebookLookup { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantExtractBits { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantDequantFma { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantIntDivConst { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantIntMul { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantInterleave { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantConcatSeq { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantQ3KDecode { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantQ6KDecode { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantQ5Decode { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantQ5KDecode { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantQ4KDecode { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantPtrAddOffset { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantPtrAddDynamic { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantScalarLoad { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantAndMask { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantKQuantPackedScaleLookup { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantLoadF16toF32 { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantLoadI8toF32 { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantLoadBytesVec { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantShiftLeft { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantShiftRight { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantE2m1LutDecode { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantScaleLoad { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantDataLoad { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantZeroLoad { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantSubScaleLoad { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantHighBitsLoad { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantCodebookDequant { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::Loop { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::PanelLoad { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::PanelStore { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::PackBuffer { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::SharedMemDeclare { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::AsyncCopyToShared { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::Tma2DCopy { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::AsyncWaitGroup { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::SyncBarrier { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::TileConfig { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Sigmoid(..) => {
+            dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::Compare { .. } => {
+            dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::Cast { .. } => {
+            dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::ConditionalBranch(..) => {
+            dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::HReduce { .. } => {
+            dispatch_reduction(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::ScalarLoad { .. } => {
+            dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::StrideMul { .. } => {
+            dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::PtrAdd { .. } => {
+            dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::VecLoadIndexed { .. } => {
+            dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::VecStoreIndexed { .. } => {
+            dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantFma { .. } => {
+            dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::BlockScale { .. } => {
+            dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::Prefetch { .. } => {
+            dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::NonTemporalStore => {
+            dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::BitExtract { .. } => {
+            dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::Permute { .. } => {
+            dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::MaskedOp { .. } => {
+            dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::AtomicAdd { .. } => {
+            dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::BroadcastScalar { .. } => {
+            dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::BroadcastLoad { .. } => {
+            dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::GatherLoad { .. } => {
+            dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::ScatterStore { .. } => {
+            dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::TableLookup { .. } => {
+            dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::Mxfp4Dequant { .. } => {
+            dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::BitAnd(..) => {
+            dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::FWHT { .. } => {
+            dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantBitAnd { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantBitOr { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantBroadcast { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantCastF16toF32 { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantCastI8toF32 { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantCastFp8toF32 { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantCodebookLookup { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantExtractBits { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantDequantFma { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantIntDivConst { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantIntMul { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantInterleave { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantConcatSeq { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantQ3KDecode { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantQ6KDecode { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantQ5Decode { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantQ5KDecode { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantQ4KDecode { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantPtrAddOffset { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantPtrAddDynamic { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantScalarLoad { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantAndMask { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantKQuantPackedScaleLookup { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantLoadF16toF32 { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantLoadI8toF32 { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantLoadBytesVec { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantShiftLeft { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantShiftRight { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantE2m1LutDecode { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantScaleLoad { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantDataLoad { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantZeroLoad { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantSubScaleLoad { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantHighBitsLoad { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantCodebookDequant { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::Loop { .. } => {
+            dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::PanelLoad { .. } => {
+            dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::PanelStore { .. } => {
+            dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::PackBuffer { .. } => {
+            dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::SharedMemDeclare { .. } => {
+            dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::AsyncCopyToShared { .. } => {
+            dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::Tma2DCopy { .. } => {
+            dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::AsyncWaitGroup { .. } => {
+            dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::SyncBarrier { .. } => {
+            dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::TileConfig { .. } => {
+            dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype)
+        }
         TraceOp::TileMma { .. } => dispatch_gemm(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::TileRelease => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::Softmax { .. } => dispatch_normlike(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::EpilogueChain { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantGather { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::QuantGemm { .. } => dispatch_gemm(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::MtpDraft { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::MlaAttnScore { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::MlaRopeMerge { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
-        TraceOp::DynamicPrecisionSelect { .. } => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::TileRelease => {
+            dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::Softmax { .. } => {
+            dispatch_normlike(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::EpilogueChain { .. } => {
+            dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantGather { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::QuantGemm { .. } => {
+            dispatch_gemm(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::MtpDraft { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::MlaAttnScore { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::MlaRopeMerge { .. } => {
+            dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype)
+        }
+        TraceOp::DynamicPrecisionSelect { .. } => {
+            dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype)
+        }
     }
 }
 
@@ -625,16 +918,13 @@ fn dispatch_elementwise(
     default_dtype: QuantPrecision,
 ) -> Result<VRegId, CompilerError> {
     match op {
-        TraceOp::Input(n) => inputs
-            .get(*n as usize)
-            .copied()
-            .ok_or_else(|| {
-                CompilerError::CodegenViolation(format!(
-                    "TraceOp::Input({}) 越界: 调用方仅提供 {} 个输入 VReg",
-                    n,
-                    inputs.len()
-                ))
-            }),
+        TraceOp::Input(n) => inputs.get(*n as usize).copied().ok_or_else(|| {
+            CompilerError::CodegenViolation(format!(
+                "TraceOp::Input({}) 越界: 调用方仅提供 {} 个输入 VReg",
+                n,
+                inputs.len()
+            ))
+        }),
 
         TraceOp::Const(val) => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
@@ -655,15 +945,9 @@ fn dispatch_elementwise(
         TraceOp::Recip(a) => emit_unary(prog, slots, *a, VecUnaryOp::Recip, width),
 
         // ── 超越函数 → Transcendental ──
-        TraceOp::Exp(a) => {
-            emit_transcendental(prog, slots, *a, TranscendentalFn::Exp, width)
-        }
-        TraceOp::Tanh(a) => {
-            emit_transcendental(prog, slots, *a, TranscendentalFn::Tanh, width)
-        }
-        TraceOp::Log(a) => {
-            emit_transcendental(prog, slots, *a, TranscendentalFn::Log, width)
-        }
+        TraceOp::Exp(a) => emit_transcendental(prog, slots, *a, TranscendentalFn::Exp, width),
+        TraceOp::Tanh(a) => emit_transcendental(prog, slots, *a, TranscendentalFn::Tanh, width),
+        TraceOp::Log(a) => emit_transcendental(prog, slots, *a, TranscendentalFn::Log, width),
         TraceOp::Sigmoid(a) => {
             emit_transcendental(prog, slots, *a, TranscendentalFn::Sigmoid, width)
         }
@@ -704,21 +988,15 @@ fn dispatch_elementwise(
             // Prefetch 不产生新值，调用方不消费返回的 slot。
             // 返回 inputs[0] 作为占位（语义：无输出）。
             inputs.first().copied().ok_or_else(|| {
-                CompilerError::CodegenViolation(
-                    "Prefetch: 需要 inputs 作为占位 slot".into(),
-                )
+                CompilerError::CodegenViolation("Prefetch: 需要 inputs 作为占位 slot".into())
             })
         }
 
         // NonTemporalStore: 性能提示，绕过缓存写入。
         // 不产生新值，返回 inputs[0] 占位。
-        TraceOp::NonTemporalStore => {
-            inputs.first().copied().ok_or_else(|| {
-                CompilerError::CodegenViolation(
-                    "NonTemporalStore: 需要 inputs 作为占位 slot".into(),
-                )
-            })
-        }
+        TraceOp::NonTemporalStore => inputs.first().copied().ok_or_else(|| {
+            CompilerError::CodegenViolation("NonTemporalStore: 需要 inputs 作为占位 slot".into())
+        }),
 
         // ── 位操作 (量化解包) ──
 
@@ -761,11 +1039,25 @@ fn dispatch_binary_elementwise(
         TraceOp::Pow(a, b) => {
             // pow(base, exp) = exp(log(base) * exp)
             let log_base = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Transcendental { dst: log_base, src: slots[a.0 as usize], func: TranscendentalFn::Log });
+            prog.emit(VmInstr::Transcendental {
+                dst: log_base,
+                src: slots[a.0 as usize],
+                func: TranscendentalFn::Log,
+            });
             let mul_result = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecBinOp { dst: mul_result, a: log_base, b: slots[b.0 as usize], op: VecOp::Mul, dtype: default_dtype });
+            prog.emit(VmInstr::VecBinOp {
+                dst: mul_result,
+                a: log_base,
+                b: slots[b.0 as usize],
+                op: VecOp::Mul,
+                dtype: default_dtype,
+            });
             let r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Transcendental { dst: r, src: mul_result, func: TranscendentalFn::Exp });
+            prog.emit(VmInstr::Transcendental {
+                dst: r,
+                src: mul_result,
+                func: TranscendentalFn::Exp,
+            });
             Ok(r)
         }
         TraceOp::Max(a, b) => emit_binop(prog, slots, *a, *b, VecOp::Max, width, default_dtype),
@@ -785,7 +1077,9 @@ fn dispatch_binary_elementwise(
         }
 
         // ── 一元操作 → VecUnaryOp ──
-        TraceOp::QuantFma { acc, act, weight, .. } => {
+        TraceOp::QuantFma {
+            acc, act, weight, ..
+        } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::Fma {
                 dst: r,
@@ -809,13 +1103,11 @@ fn dispatch_binary_elementwise(
         // Prefetch: 性能提示，不影响正确性。
         // Prefetch 没有数据输出，返回一个 dummy slot（不产生新值）。
         // ISA Lowering 根据 CacheLevel 映射: prefetcht0/t1/nta / prfm / prefetch.global.L2。
-        TraceOp::BitExtract { offset, width, .. } => {
-            Err(CompilerError::CodegenViolation(format!(
-                "BitExtract: 需要 shift+mask 整数操作，f32 SIMD 管线不支持 \
+        TraceOp::BitExtract { offset, width, .. } => Err(CompilerError::CodegenViolation(format!(
+            "BitExtract: 需要 shift+mask 整数操作，f32 SIMD 管线不支持 \
                  (offset={offset}, width={width}). \
                  量化解包应使用 QuantBlockLoad 或整数专用路径"
-            )))
-        }
+        ))),
 
         // Permute: 向量排列/洗牌。
         // 按 indices 重排 src 的元素。
@@ -826,7 +1118,9 @@ fn dispatch_binary_elementwise(
             prog.emit(VmInstr::VecShuffle {
                 dst: r,
                 src: slots[src.0 as usize],
-                mask: VecShuffleMask::Dynamic { ctrl: slots[indices.0 as usize] },
+                mask: VecShuffleMask::Dynamic {
+                    ctrl: slots[indices.0 as usize],
+                },
                 width,
             });
             Ok(r)
@@ -842,9 +1136,7 @@ fn dispatch_binary_elementwise(
             // masked_result[i] = (mask[i] != 0) ? inner[i] : original[i]
             // original = 内部 op 的第一个输入（slot 中最后一个 Input）
             let original = slots.last().copied().ok_or_else(|| {
-                CompilerError::CodegenViolation(
-                    "MaskedOp: slots 为空，无法确定 original 值".into(),
-                )
+                CompilerError::CodegenViolation("MaskedOp: slots 为空，无法确定 original 值".into())
             })?;
             let r = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::ConditionalSelect {
@@ -879,7 +1171,13 @@ fn dispatch_binary_elementwise(
         // 映射到 VmInstr::Broadcast { src: ExtractLane0(src_vreg) }。
         TraceOp::BitAnd(a, b) => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecBinOp { dst: r, a: slots[a.0 as usize], b: slots[b.0 as usize], op: VecOp::And, dtype: default_dtype, });
+            prog.emit(VmInstr::VecBinOp {
+                dst: r,
+                a: slots[a.0 as usize],
+                b: slots[b.0 as usize],
+                op: VecOp::And,
+                dtype: default_dtype,
+            });
             Ok(r)
         }
 
@@ -889,16 +1187,21 @@ fn dispatch_binary_elementwise(
         // butterfly 网络: 逐级加减。
         // 展开为 log2(dim) 级，每级 dim/2 对 Add/Sub。
         // dim 必须是 2 的幂。
-        TraceOp::DynamicPrecisionSelect { tensor, candidates, thresholds } => {
+        TraceOp::DynamicPrecisionSelect {
+            tensor,
+            candidates,
+            thresholds,
+        } => {
             if candidates.len() != thresholds.len() {
                 return Err(CompilerError::CodegenViolation(format!(
                     "DynamicPrecisionSelect: candidates({}) 与 thresholds({}) 长度不匹配",
-                    candidates.len(), thresholds.len()
+                    candidates.len(),
+                    thresholds.len()
                 )));
             }
             if candidates.is_empty() {
                 return Err(CompilerError::CodegenViolation(
-                    "DynamicPrecisionSelect: candidates 不能为空".into()
+                    "DynamicPrecisionSelect: candidates 不能为空".into(),
                 ));
             }
 
@@ -1031,18 +1334,24 @@ fn dispatch_injective(
                 base: slots[base.0 as usize],
                 offset: OffsetExpr::LoopOffset(slots[offset.0 as usize]),
                 width,
-                dtype: default_dtype, predicate: None,
+                dtype: default_dtype,
+                predicate: None,
             });
             Ok(r)
         }
 
-        TraceOp::VecStoreIndexed { base, offset, value } => {
+        TraceOp::VecStoreIndexed {
+            base,
+            offset,
+            value,
+        } => {
             prog.emit(VmInstr::VecStore {
                 base: slots[base.0 as usize],
                 offset: OffsetExpr::LoopOffset(slots[offset.0 as usize]),
                 src: slots[value.0 as usize],
                 width,
-                dtype: default_dtype, predicate: None,
+                dtype: default_dtype,
+                predicate: None,
             });
             // Store doesn't produce a new value; return the value slot.
             Ok(slots[value.0 as usize])
@@ -1071,26 +1380,39 @@ fn dispatch_injective(
         // ── 向量索引内存操作 (Gather / Scatter) ──
 
         // GatherLoad: 从 base + indices[i]*stride 加载元素到向量。
-        TraceOp::GatherLoad { base, indices, stride } => {
+        TraceOp::GatherLoad {
+            base,
+            indices,
+            stride,
+        } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::GatherLoad {
                 dst: r,
                 base: slots[base.0 as usize],
                 indices: slots[indices.0 as usize],
                 stride: *stride,
-                width, dtype: default_dtype, predicate: None,
+                width,
+                dtype: default_dtype,
+                predicate: None,
             });
             Ok(r)
         }
 
         // ScatterStore: 将 value 的元素按 indices 写入 base + indices[i]*stride。
-        TraceOp::ScatterStore { base, indices, value, stride } => {
+        TraceOp::ScatterStore {
+            base,
+            indices,
+            value,
+            stride,
+        } => {
             prog.emit(VmInstr::ScatterStore {
                 base: slots[base.0 as usize],
                 indices: slots[indices.0 as usize],
                 src: slots[value.0 as usize],
                 stride: *stride,
-                width, dtype: default_dtype, predicate: None,
+                width,
+                dtype: default_dtype,
+                predicate: None,
             });
             // Store doesn't produce a new value; return the value slot.
             Ok(slots[value.0 as usize])
@@ -1100,7 +1422,11 @@ fn dispatch_injective(
 
         // TableLookup: 从 base + row_index * row_bytes 加载一行。
         // 映射到 VmInstr::TableLookup（组合 IntMulStride + PtrAdd + VecLoad）。
-        TraceOp::TableLookup { base, row_index, row_bytes } => {
+        TraceOp::TableLookup {
+            base,
+            row_index,
+            row_bytes,
+        } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::TableLookup {
                 dst: r,
@@ -1117,20 +1443,48 @@ fn dispatch_injective(
         // Mxfp4Dequant: packed 4-bit blocks → f32 × per-block scale。
         // 映射到 VmInstr::QuantBlockLoad { unpack: Mxfp4 } (REQ-VR-001)。
         // 偏移公式: slots[off_a]*stride_a + slots[off_b]*stride_b + slots[off_c] + const_off
-        TraceOp::Mxfp4Dequant { data, scales, off_a, stride_a, off_b, stride_b, off_c, const_off, block_size } => {
+        TraceOp::Mxfp4Dequant {
+            data,
+            scales,
+            off_a,
+            stride_a,
+            off_b,
+            stride_b,
+            off_c,
+            const_off,
+            block_size,
+        } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
             let mut parts: Vec<OffsetExpr> = Vec::new();
-            if off_a.is_some() { parts.push(OffsetExpr::Mul(Box::new(OffsetExpr::ScalarVReg(slots[off_a.unwrap().0 as usize])), *stride_a)); }
-            if off_b.is_some() { parts.push(OffsetExpr::Mul(Box::new(OffsetExpr::ScalarVReg(slots[off_b.unwrap().0 as usize])), *stride_b)); }
-            if off_c.is_some() { parts.push(OffsetExpr::ScalarVReg(slots[off_c.unwrap().0 as usize])); }
-            if *const_off != 0 { parts.push(OffsetExpr::Const(*const_off)); }
-            let offset = parts.into_iter().reduce(|a, b| OffsetExpr::Add(Box::new(a), Box::new(b)))
+            if off_a.is_some() {
+                parts.push(OffsetExpr::Mul(
+                    Box::new(OffsetExpr::ScalarVReg(slots[off_a.unwrap().0 as usize])),
+                    *stride_a,
+                ));
+            }
+            if off_b.is_some() {
+                parts.push(OffsetExpr::Mul(
+                    Box::new(OffsetExpr::ScalarVReg(slots[off_b.unwrap().0 as usize])),
+                    *stride_b,
+                ));
+            }
+            if off_c.is_some() {
+                parts.push(OffsetExpr::ScalarVReg(slots[off_c.unwrap().0 as usize]));
+            }
+            if *const_off != 0 {
+                parts.push(OffsetExpr::Const(*const_off));
+            }
+            let offset = parts
+                .into_iter()
+                .reduce(|a, b| OffsetExpr::Add(Box::new(a), Box::new(b)))
                 .unwrap_or(OffsetExpr::Const(0));
             prog.emit(VmInstr::QuantBlockLoad {
                 dst: r,
                 base: slots[data.0 as usize],
                 offset,
-                unpack: BlockUnpackMode::Mxfp4 { scale_src: slots[scales.0 as usize] },
+                unpack: BlockUnpackMode::Mxfp4 {
+                    scale_src: slots[scales.0 as usize],
+                },
                 width,
             });
             let _ = block_size;
@@ -1139,13 +1493,14 @@ fn dispatch_injective(
 
         // BitAnd: 逐位与运算 (低位掩码等)。
         // 映射到 VmInstr::VecBinOp { op: VecOp::And }。
-        TraceOp::FWHT { src, dim } => {
-            emit_fwht(prog, slots, *src, *dim, width, default_dtype)
-        }
+        TraceOp::FWHT { src, dim } => emit_fwht(prog, slots, *src, *dim, width, default_dtype),
 
         // ── SPEC 23-QUANT-CODEGEN-ALGO §3: Quant* 解码 TraceOp 分派 ──
-
-        TraceOp::Loop { bound, step_bytes, body } => {
+        TraceOp::Loop {
+            bound,
+            step_bytes,
+            body,
+        } => {
             let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
             let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
             prog.emit(VmInstr::LoopBegin {
@@ -1158,38 +1513,57 @@ fn dispatch_injective(
             });
             // 递归处理 Loop body — body 内的 TraceOp 走同样的 dispatch
             for body_op in body.iter() {
-                let _body_result = dispatch_trace_op(prog, body_op, slots, inputs, width, default_dtype)?;
+                let _body_result =
+                    dispatch_trace_op(prog, body_op, slots, inputs, width, default_dtype)?;
                 // body 内的结果不 push 到外层 slots — 它们是循环局部值
             }
             prog.emit(VmInstr::LoopEnd);
             Ok(counter)
         }
 
-        TraceOp::PanelLoad { base, offset, rows: _, cols: _ } => {
+        TraceOp::PanelLoad {
+            base,
+            offset,
+            rows: _,
+            cols: _,
+        } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::VecLoad {
                 dst: r,
                 base: slots[base.0 as usize],
                 offset: OffsetExpr::ScalarVReg(slots[offset.0 as usize]),
                 width,
-                dtype: default_dtype, predicate: None,
+                dtype: default_dtype,
+                predicate: None,
             });
             Ok(r)
         }
 
-        TraceOp::PanelStore { base, offset, rows: _, cols: _ } => {
+        TraceOp::PanelStore {
+            base,
+            offset,
+            rows: _,
+            cols: _,
+        } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::VecStore {
                 base: slots[base.0 as usize],
                 offset: OffsetExpr::ScalarVReg(slots[offset.0 as usize]),
                 src: r,
                 width,
-                dtype: default_dtype, predicate: None,
+                dtype: default_dtype,
+                predicate: None,
             });
             Ok(r)
         }
 
-        TraceOp::PackBuffer { src, dst: _, rows: _, cols: _, layout: _ } => {
+        TraceOp::PackBuffer {
+            src,
+            dst: _,
+            rows: _,
+            cols: _,
+            layout: _,
+        } => {
             let tmp = prog.alloc_vreg(VRegKind::Vec, width);
             let _ = src;
             Ok(tmp)
@@ -1204,7 +1578,11 @@ fn dispatch_injective(
             Ok(r)
         }
 
-        TraceOp::AsyncCopyToShared { name, src_offset, bytes } => {
+        TraceOp::AsyncCopyToShared {
+            name,
+            src_offset,
+            bytes,
+        } => {
             prog.emit(VmInstr::SharedMemAsyncStore {
                 name: name.clone(),
                 dst_offset: OffsetExpr::ScalarVReg(slots[src_offset.0 as usize]),
@@ -1217,7 +1595,12 @@ fn dispatch_injective(
             Ok(r)
         }
 
-        TraceOp::Tma2DCopy { desc, coord_x, coord_y, bytes: _ } => {
+        TraceOp::Tma2DCopy {
+            desc,
+            coord_x,
+            coord_y,
+            bytes: _,
+        } => {
             prog.emit(VmInstr::Tma2DCopy {
                 desc_name: desc.clone(),
                 smem_name: format!("tma_{}", desc),
@@ -1230,9 +1613,7 @@ fn dispatch_injective(
         }
 
         TraceOp::AsyncWaitGroup { n } => {
-            prog.emit(VmInstr::SharedMemAsyncWaitGroup {
-                n: *n,
-            });
+            prog.emit(VmInstr::SharedMemAsyncWaitGroup { n: *n });
             let r = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
             Ok(r)
         }
@@ -1267,7 +1648,6 @@ fn dispatch_injective(
         // ── SPEC 24-QUANT-PIPELINE-JIT §1.3: QuantGather/QuantGemm structural ──
         // These structural ops expand to full loop nests with block decode.
         // The 3 preceding Input ops in the trace provide the pointer VRegIds.
-
         _ => unreachable_pattern(op),
     }
 }
@@ -1308,7 +1688,6 @@ fn dispatch_reduction(
         }
 
         // ── 结构型内存操作 (ARCH-AUTO-INSTR-SELECT structural) ──
-
         _ => unreachable_pattern(op),
     }
 }
@@ -1393,15 +1772,28 @@ fn dispatch_gemm(
             Ok(r)
         }
 
-        TraceOp::QuantGemm { quant_type, m, n, k } => {
+        TraceOp::QuantGemm {
+            quant_type,
+            m,
+            n,
+            k,
+        } => {
             // Trace structure: [Input(0):input_ptr, Input(1):weight_ptr, Input(2):output_ptr, QuantGemm]
             let input_ptr = slots[0];
             let weight_ptr = slots[1];
             let output_ptr = slots[2];
             let m_bound = BoundExpr::Const(*m);
             super::moe_quant_emit::emit_quant_gemm_inline(
-                prog, m_bound, *n, *k, *quant_type,
-                width, input_ptr, weight_ptr, output_ptr, default_dtype,
+                prog,
+                m_bound,
+                *n,
+                *k,
+                *quant_type,
+                width,
+                input_ptr,
+                weight_ptr,
+                output_ptr,
+                default_dtype,
                 crate::dispatch::device_profile::DotProductCap::SimdAssisted,
             )?;
             Ok(output_ptr)
@@ -1426,44 +1818,82 @@ fn dispatch_quant_decode(
     match op {
         TraceOp::QuantBitAnd { lhs, rhs } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecBinOp { dst: r, a: slots[lhs.0 as usize], b: slots[rhs.0 as usize], op: VecOp::And, dtype: default_dtype });
+            prog.emit(VmInstr::VecBinOp {
+                dst: r,
+                a: slots[lhs.0 as usize],
+                b: slots[rhs.0 as usize],
+                op: VecOp::And,
+                dtype: default_dtype,
+            });
             Ok(r)
         }
 
         TraceOp::QuantBitOr { lhs, rhs } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecBinOp { dst: r, a: slots[lhs.0 as usize], b: slots[rhs.0 as usize], op: VecOp::Or, dtype: default_dtype });
+            prog.emit(VmInstr::VecBinOp {
+                dst: r,
+                a: slots[lhs.0 as usize],
+                b: slots[rhs.0 as usize],
+                op: VecOp::Or,
+                dtype: default_dtype,
+            });
             Ok(r)
         }
 
         TraceOp::QuantBroadcast { src, lanes: _ } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
             // src is Vec (quant scale from QuantLoadF16toF32), extract lane 0 then broadcast.
-            prog.emit(VmInstr::Broadcast { dst: r, src: ScalarExpr::ExtractLane0(slots[src.0 as usize]), width, dtype: default_dtype });
+            prog.emit(VmInstr::Broadcast {
+                dst: r,
+                src: ScalarExpr::ExtractLane0(slots[src.0 as usize]),
+                width,
+                dtype: default_dtype,
+            });
             Ok(r)
         }
 
         TraceOp::QuantCastF16toF32 { src } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
             // Vec F16 → Vec F32 conversion (vcvtph2ps / fcvtl)
-            prog.emit(VmInstr::VecCast { dst: r, src: slots[src.0 as usize], from_bits: 16, to_bits: 32 });
+            prog.emit(VmInstr::VecCast {
+                dst: r,
+                src: slots[src.0 as usize],
+                from_bits: 16,
+                to_bits: 32,
+            });
             Ok(r)
         }
 
         TraceOp::QuantCastI8toF32 { src } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecUnaryOp { dst: r, a: slots[src.0 as usize], op: VecUnaryOp::IntToFloat });
+            prog.emit(VmInstr::VecUnaryOp {
+                dst: r,
+                a: slots[src.0 as usize],
+                op: VecUnaryOp::IntToFloat,
+            });
             Ok(r)
         }
 
         TraceOp::QuantCastFp8toF32 { src, format } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
-            let op = match format { Fp8Format::E4M3 => VecUnaryOp::Fp8E4M3ToFloat, Fp8Format::E5M2 => VecUnaryOp::Fp8E5M2ToFloat };
-            prog.emit(VmInstr::VecUnaryOp { dst: r, a: slots[src.0 as usize], op });
+            let op = match format {
+                Fp8Format::E4M3 => VecUnaryOp::Fp8E4M3ToFloat,
+                Fp8Format::E5M2 => VecUnaryOp::Fp8E5M2ToFloat,
+            };
+            prog.emit(VmInstr::VecUnaryOp {
+                dst: r,
+                a: slots[src.0 as usize],
+                op,
+            });
             Ok(r)
         }
 
-        TraceOp::QuantCodebookLookup { indices, codebook_data, vector_size, bits_per_entry } => {
+        TraceOp::QuantCodebookLookup {
+            indices,
+            codebook_data,
+            vector_size,
+            bits_per_entry,
+        } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::QuantCodebookLookup {
                 dst: r,
@@ -1476,9 +1906,19 @@ fn dispatch_quant_decode(
             Ok(r)
         }
 
-        TraceOp::QuantExtractBits { src, bit_offset, bit_width } => {
+        TraceOp::QuantExtractBits {
+            src,
+            bit_offset,
+            bit_width,
+        } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::QuantExtractBits { dst: r, src: slots[src.0 as usize], bit_offset: *bit_offset, bit_width: *bit_width, width });
+            prog.emit(VmInstr::QuantExtractBits {
+                dst: r,
+                src: slots[src.0 as usize],
+                bit_offset: *bit_offset,
+                bit_width: *bit_width,
+                width,
+            });
             Ok(r)
         }
 
@@ -1489,37 +1929,75 @@ fn dispatch_quant_decode(
             // dst and acc to the same physical register as intermediate broadcast
             // results (scale), corrupting the FMA operands.
             let acc_vreg = slots[acc.0 as usize];
-            prog.emit(VmInstr::Fma { dst: acc_vreg, acc: acc_vreg, a: slots[a.0 as usize], b: slots[b.0 as usize], dtype: default_dtype });
+            prog.emit(VmInstr::Fma {
+                dst: acc_vreg,
+                acc: acc_vreg,
+                a: slots[a.0 as usize],
+                b: slots[b.0 as usize],
+                dtype: default_dtype,
+            });
             Ok(acc_vreg)
         }
 
         TraceOp::QuantIntDivConst { src, divisor } => {
             let r = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprBinOp { dst: r, a: slots[src.0 as usize], b: GprOperand::Imm(*divisor), op: GprOp::Div });
+            prog.emit(VmInstr::GprBinOp {
+                dst: r,
+                a: slots[src.0 as usize],
+                b: GprOperand::Imm(*divisor),
+                op: GprOp::Div,
+            });
             Ok(r)
         }
 
         TraceOp::QuantIntMul { src, factor } => {
             let r = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprBinOp { dst: r, a: slots[src.0 as usize], b: GprOperand::Imm(*factor), op: GprOp::Mul });
+            prog.emit(VmInstr::GprBinOp {
+                dst: r,
+                a: slots[src.0 as usize],
+                b: GprOperand::Imm(*factor),
+                op: GprOp::Mul,
+            });
             Ok(r)
         }
 
         TraceOp::QuantInterleave { lo, hi } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::QuantInterleave { dst: r, lo: slots[lo.0 as usize], hi: slots[hi.0 as usize], width });
+            prog.emit(VmInstr::QuantInterleave {
+                dst: r,
+                lo: slots[lo.0 as usize],
+                hi: slots[hi.0 as usize],
+                width,
+            });
             Ok(r)
         }
 
         TraceOp::QuantConcatSeq { lo, hi } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::QuantConcatSeq { dst: r, lo: slots[lo.0 as usize], hi: slots[hi.0 as usize], width });
+            prog.emit(VmInstr::QuantConcatSeq {
+                dst: r,
+                lo: slots[lo.0 as usize],
+                hi: slots[hi.0 as usize],
+                width,
+            });
             Ok(r)
         }
 
-        TraceOp::QuantQ3KDecode { block_base, lane_offset, d_slot, qs_offset, hmask_offset } => {
+        TraceOp::QuantQ3KDecode {
+            block_base,
+            lane_offset,
+            d_slot,
+            qs_offset,
+            hmask_offset,
+        } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
-            let lanes = if matches!(width, SimdWidth::W512) { 16 } else if matches!(width, SimdWidth::W256) { 8 } else { 4 };
+            let lanes = if matches!(width, SimdWidth::W512) {
+                16
+            } else if matches!(width, SimdWidth::W256) {
+                8
+            } else {
+                4
+            };
             prog.emit(VmInstr::Q3KDecodeStep {
                 dst: r,
                 block_base: slots[block_base.0 as usize],
@@ -1533,9 +2011,21 @@ fn dispatch_quant_decode(
             Ok(r)
         }
 
-        TraceOp::QuantQ6KDecode { block_base, lane_offset, d_slot, qs_offset, qh_offset } => {
+        TraceOp::QuantQ6KDecode {
+            block_base,
+            lane_offset,
+            d_slot,
+            qs_offset,
+            qh_offset,
+        } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
-            let lanes = if matches!(width, SimdWidth::W512) { 16 } else if matches!(width, SimdWidth::W256) { 8 } else { 4 };
+            let lanes = if matches!(width, SimdWidth::W512) {
+                16
+            } else if matches!(width, SimdWidth::W256) {
+                8
+            } else {
+                4
+            };
             prog.emit(VmInstr::Q6KDecodeStep {
                 dst: r,
                 block_base: slots[block_base.0 as usize],
@@ -1549,9 +2039,22 @@ fn dispatch_quant_decode(
             Ok(r)
         }
 
-        TraceOp::QuantQ5Decode { block_base, lane_offset, d_slot, qs_offset, qh_offset, has_min } => {
+        TraceOp::QuantQ5Decode {
+            block_base,
+            lane_offset,
+            d_slot,
+            qs_offset,
+            qh_offset,
+            has_min,
+        } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
-            let lanes = if matches!(width, SimdWidth::W512) { 16 } else if matches!(width, SimdWidth::W256) { 8 } else { 4 };
+            let lanes = if matches!(width, SimdWidth::W512) {
+                16
+            } else if matches!(width, SimdWidth::W256) {
+                8
+            } else {
+                4
+            };
             prog.emit(VmInstr::Q5DecodeStep {
                 dst: r,
                 block_base: slots[block_base.0 as usize],
@@ -1566,9 +2069,21 @@ fn dispatch_quant_decode(
             Ok(r)
         }
 
-        TraceOp::QuantQ5KDecode { block_base, lane_offset, d_slot, qs_offset, qh_offset } => {
+        TraceOp::QuantQ5KDecode {
+            block_base,
+            lane_offset,
+            d_slot,
+            qs_offset,
+            qh_offset,
+        } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
-            let lanes = if matches!(width, SimdWidth::W512) { 16 } else if matches!(width, SimdWidth::W256) { 8 } else { 4 };
+            let lanes = if matches!(width, SimdWidth::W512) {
+                16
+            } else if matches!(width, SimdWidth::W256) {
+                8
+            } else {
+                4
+            };
             prog.emit(VmInstr::Q5KDecodeStep {
                 dst: r,
                 block_base: slots[block_base.0 as usize],
@@ -1582,9 +2097,20 @@ fn dispatch_quant_decode(
             Ok(r)
         }
 
-        TraceOp::QuantQ4KDecode { block_base, lane_offset, d_slot, qs_offset } => {
+        TraceOp::QuantQ4KDecode {
+            block_base,
+            lane_offset,
+            d_slot,
+            qs_offset,
+        } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
-            let lanes = if matches!(width, SimdWidth::W512) { 16 } else if matches!(width, SimdWidth::W256) { 8 } else { 4 };
+            let lanes = if matches!(width, SimdWidth::W512) {
+                16
+            } else if matches!(width, SimdWidth::W256) {
+                8
+            } else {
+                4
+            };
             prog.emit(VmInstr::Q4KDecodeStep {
                 dst: r,
                 block_base: slots[block_base.0 as usize],
@@ -1599,34 +2125,67 @@ fn dispatch_quant_decode(
 
         TraceOp::QuantPtrAddOffset { base, offset_bytes } => {
             let r = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::AddPtr { dst: r, base: slots[base.0 as usize], offset: *offset_bytes as usize });
+            prog.emit(VmInstr::AddPtr {
+                dst: r,
+                base: slots[base.0 as usize],
+                offset: *offset_bytes as usize,
+            });
             Ok(r)
         }
 
         TraceOp::QuantPtrAddDynamic { base, index } => {
             let r = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprBinOp { dst: r, a: slots[base.0 as usize], b: GprOperand::VReg(slots[index.0 as usize] ), op: GprOp::Add });
+            prog.emit(VmInstr::GprBinOp {
+                dst: r,
+                a: slots[base.0 as usize],
+                b: GprOperand::VReg(slots[index.0 as usize]),
+                op: GprOp::Add,
+            });
             Ok(r)
         }
 
         TraceOp::QuantScalarLoad { ptr, offset_bytes } => {
             // ScalarLoad dst must be GPR; load scalar then broadcast to Vec.
             let scalar = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::ScalarLoad { dst: scalar, base: slots[ptr.0 as usize], offset: OffsetExpr::Const(*offset_bytes as usize) });
+            prog.emit(VmInstr::ScalarLoad {
+                dst: scalar,
+                base: slots[ptr.0 as usize],
+                offset: OffsetExpr::Const(*offset_bytes as usize),
+            });
             let r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Broadcast { dst: r, src: ScalarExpr::VReg(scalar), width, dtype: default_dtype });
+            prog.emit(VmInstr::Broadcast {
+                dst: r,
+                src: ScalarExpr::VReg(scalar),
+                width,
+                dtype: default_dtype,
+            });
             Ok(r)
         }
 
         TraceOp::QuantAndMask { src, mask } => {
             let mask_vreg = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::QuantBroadcastInt { dst: mask_vreg, value: *mask, width });
+            prog.emit(VmInstr::QuantBroadcastInt {
+                dst: mask_vreg,
+                value: *mask,
+                width,
+            });
             let r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecBinOp { dst: r, a: slots[src.0 as usize], b: mask_vreg, op: VecOp::And, dtype: default_dtype });
+            prog.emit(VmInstr::VecBinOp {
+                dst: r,
+                a: slots[src.0 as usize],
+                b: mask_vreg,
+                op: VecOp::And,
+                dtype: default_dtype,
+            });
             Ok(r)
         }
 
-        TraceOp::QuantKQuantPackedScaleLookup { scales_base, sub_block_idx, scale_algo, selector } => {
+        TraceOp::QuantKQuantPackedScaleLookup {
+            scales_base,
+            sub_block_idx,
+            scale_algo,
+            selector,
+        } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::GgufKQuantScaleLoad {
                 dst: r,
@@ -1642,40 +2201,84 @@ fn dispatch_quant_decode(
 
         TraceOp::QuantLoadF16toF32 { ptr, offset_bytes } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::QuantScalarCvtLoad { dst: r, base: slots[ptr.0 as usize], offset: *offset_bytes, src_dtype: ScalarCvtSource::F16, width });
+            prog.emit(VmInstr::QuantScalarCvtLoad {
+                dst: r,
+                base: slots[ptr.0 as usize],
+                offset: *offset_bytes,
+                src_dtype: ScalarCvtSource::F16,
+                width,
+            });
             Ok(r)
         }
 
         TraceOp::QuantLoadI8toF32 { ptr, offset_bytes } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::QuantScalarCvtLoad { dst: r, base: slots[ptr.0 as usize], offset: *offset_bytes, src_dtype: ScalarCvtSource::I8, width });
+            prog.emit(VmInstr::QuantScalarCvtLoad {
+                dst: r,
+                base: slots[ptr.0 as usize],
+                offset: *offset_bytes,
+                src_dtype: ScalarCvtSource::I8,
+                width,
+            });
             Ok(r)
         }
 
-        TraceOp::QuantLoadBytesVec { ptr, offset_bytes, count, signed } => {
+        TraceOp::QuantLoadBytesVec {
+            ptr,
+            offset_bytes,
+            count,
+            signed,
+        } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::QuantLoadBytesVec { dst: r, base: slots[ptr.0 as usize], offset: *offset_bytes, count: *count, signed: *signed, width });
+            prog.emit(VmInstr::QuantLoadBytesVec {
+                dst: r,
+                base: slots[ptr.0 as usize],
+                offset: *offset_bytes,
+                count: *count,
+                signed: *signed,
+                width,
+            });
             Ok(r)
         }
 
         TraceOp::QuantShiftLeft { src, amount } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecShiftImm { dst: r, a: slots[src.0 as usize], amount: *amount as u8, op: VecShiftDir::Left, width });
+            prog.emit(VmInstr::VecShiftImm {
+                dst: r,
+                a: slots[src.0 as usize],
+                amount: *amount as u8,
+                op: VecShiftDir::Left,
+                width,
+            });
             Ok(r)
         }
 
         TraceOp::QuantShiftRight { src, amount } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecShiftImm { dst: r, a: slots[src.0 as usize], amount: *amount as u8, op: VecShiftDir::Right, width });
+            prog.emit(VmInstr::VecShiftImm {
+                dst: r,
+                a: slots[src.0 as usize],
+                amount: *amount as u8,
+                op: VecShiftDir::Right,
+                width,
+            });
             Ok(r)
         }
 
-        TraceOp::QuantE2m1LutDecode { packed_data_ptr, scale_byte, nvfp4_mode } => {
+        TraceOp::QuantE2m1LutDecode {
+            packed_data_ptr,
+            scale_byte,
+            nvfp4_mode,
+        } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
             let unpack = if *nvfp4_mode {
-                BlockUnpackMode::Nvfp4 { scale_src: slots[scale_byte.0 as usize] }
+                BlockUnpackMode::Nvfp4 {
+                    scale_src: slots[scale_byte.0 as usize],
+                }
             } else {
-                BlockUnpackMode::Mxfp4 { scale_src: slots[scale_byte.0 as usize] }
+                BlockUnpackMode::Mxfp4 {
+                    scale_src: slots[scale_byte.0 as usize],
+                }
             };
             prog.emit(VmInstr::QuantBlockLoad {
                 dst: r,
@@ -1689,16 +2292,31 @@ fn dispatch_quant_decode(
 
         // ── SPEC 24-QUANT-PIPELINE-JIT §1.3: quant block-level load TraceOps ──
         // T2 将完善为完整的 auto_select 映射，此处先确保编译通过。
+        TraceOp::QuantScaleLoad {
+            source,
+            offset,
+            dtype,
+        } => emit_quant_scale_load(prog, slots[source.0 as usize], *offset, dtype, width),
 
-        TraceOp::QuantScaleLoad { source, offset, dtype } => {
-            emit_quant_scale_load(prog, slots[source.0 as usize], *offset, dtype, width)
-        }
+        TraceOp::QuantDataLoad {
+            source,
+            offset,
+            quant_type,
+            block_size,
+        } => emit_quant_data_load(
+            prog,
+            slots[source.0 as usize],
+            *offset,
+            *quant_type,
+            *block_size,
+            width,
+        ),
 
-        TraceOp::QuantDataLoad { source, offset, quant_type, block_size } => {
-            emit_quant_data_load(prog, slots[source.0 as usize], *offset, *quant_type, *block_size, width)
-        }
-
-        TraceOp::QuantZeroLoad { source, offset, zp_type } => {
+        TraceOp::QuantZeroLoad {
+            source,
+            offset,
+            zp_type,
+        } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
             let base = slots[source.0 as usize];
             match zp_type {
@@ -1720,28 +2338,43 @@ fn dispatch_quant_decode(
                 }
                 ZeroLayout::BlockScalar { offset_bytes, .. } => {
                     let off = OffsetExpr::Const(*offset_bytes + offset);
-                    prog.emit(VmInstr::QuantBlockLoad { dst: r, base, offset: off, unpack: BlockUnpackMode::F16Broadcast, width });
+                    prog.emit(VmInstr::QuantBlockLoad {
+                        dst: r,
+                        base,
+                        offset: off,
+                        unpack: BlockUnpackMode::F16Broadcast,
+                        width,
+                    });
                 }
                 ZeroLayout::BlockMin { offset_bytes, .. } => {
                     let off = OffsetExpr::Const(*offset_bytes + offset);
-                    prog.emit(VmInstr::QuantBlockLoad { dst: r, base, offset: off, unpack: BlockUnpackMode::F16Broadcast, width });
+                    prog.emit(VmInstr::QuantBlockLoad {
+                        dst: r,
+                        base,
+                        offset: off,
+                        unpack: BlockUnpackMode::F16Broadcast,
+                        width,
+                    });
                 }
                 ZeroLayout::Hierarchical { .. } => {
                     return Err(CompilerError::CodegenViolation(
-                        "QuantZeroLoad: Hierarchical zero layout not yet supported in auto_select".into()
+                        "QuantZeroLoad: Hierarchical zero layout not yet supported in auto_select"
+                            .into(),
                     ));
                 }
             }
             Ok(r)
         }
 
-        TraceOp::QuantSubScaleLoad { .. } => {
-            Err(CompilerError::CodegenViolation(
-                "QuantSubScaleLoad: K-Quant sub-scale not yet implemented in auto_select".into()
-            ))
-        }
+        TraceOp::QuantSubScaleLoad { .. } => Err(CompilerError::CodegenViolation(
+            "QuantSubScaleLoad: K-Quant sub-scale not yet implemented in auto_select".into(),
+        )),
 
-        TraceOp::QuantHighBitsLoad { block_ptr, byte_offset, bits_per_elem } => {
+        TraceOp::QuantHighBitsLoad {
+            block_ptr,
+            byte_offset,
+            bits_per_elem,
+        } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
             let base = slots[block_ptr.0 as usize];
             // 计算 extra_base: base + byte_offset (高 bit 平面偏移)
@@ -1755,9 +2388,11 @@ fn dispatch_quant_decode(
                 3 => BiPlaneMode::Q3Merge,
                 5 => BiPlaneMode::Low5,
                 6 => BiPlaneMode::Low6,
-                other => return Err(CompilerError::CodegenViolation(format!(
-                    "QuantHighBitsLoad: unsupported bits_per_elem={other}, expected 3/5/6"
-                ))),
+                other => {
+                    return Err(CompilerError::CodegenViolation(format!(
+                        "QuantHighBitsLoad: unsupported bits_per_elem={other}, expected 3/5/6"
+                    )))
+                }
             };
             prog.emit(VmInstr::QuantBiPlaneLoad {
                 dst: r,
@@ -1770,7 +2405,12 @@ fn dispatch_quant_decode(
             Ok(r)
         }
 
-        TraceOp::QuantCodebookDequant { indices, codebook_ptr, vector_size, bits_per_entry } => {
+        TraceOp::QuantCodebookDequant {
+            indices,
+            codebook_ptr,
+            vector_size,
+            bits_per_entry,
+        } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::QuantCodebookLookup {
                 dst: r,
@@ -1785,8 +2425,11 @@ fn dispatch_quant_decode(
         }
 
         // ── SPEC 27 AT-003: 结构型 TraceOp → VmInstr 映射 ──
-
-        TraceOp::QuantGather { quant_type, vocab_size, hidden_dim } => {
+        TraceOp::QuantGather {
+            quant_type,
+            vocab_size,
+            hidden_dim,
+        } => {
             // Trace structure: [Input(0):indices_ptr, Input(1):embed_ptr, Input(2):output_ptr, QuantGather]
             // After processing 3 Input ops, slots = [indices_ptr, embed_ptr, output_ptr]
             let indices_ptr = slots[0];
@@ -1797,21 +2440,39 @@ fn dispatch_quant_decode(
             // context is available.
             let seq_bound = BoundExpr::Const(1);
             super::quant_gather_emit::emit_quant_gather_inline(
-                prog, seq_bound, *vocab_size, *hidden_dim, *quant_type,
-                width, indices_ptr, embed_ptr, output_ptr, default_dtype,
+                prog,
+                seq_bound,
+                *vocab_size,
+                *hidden_dim,
+                *quant_type,
+                width,
+                indices_ptr,
+                embed_ptr,
+                output_ptr,
+                default_dtype,
                 None,
             )?;
             Ok(output_ptr)
         }
 
-        TraceOp::MtpDraft { depth, hidden_size, vocab_size } => {
+        TraceOp::MtpDraft {
+            depth,
+            hidden_size,
+            vocab_size,
+        } => {
             let hidden_ptr = slots[0];
             let weight_ptr = slots[1];
             let output_tokens_ptr = slots[2];
             super::mega_kernel_emit::emit_mtp_draft_inline(
-                prog, *depth, *hidden_size, *vocab_size,
-                hidden_ptr, weight_ptr, output_tokens_ptr,
-                width, default_dtype,
+                prog,
+                *depth,
+                *hidden_size,
+                *vocab_size,
+                hidden_ptr,
+                weight_ptr,
+                output_tokens_ptr,
+                width,
+                default_dtype,
             )?;
             Ok(output_tokens_ptr)
         }
@@ -1820,22 +2481,36 @@ fn dispatch_quant_decode(
         // MlaAttnScore: online softmax attention in compressed d_c space + per-head V restore.
         // Trace structure: [Input(0):q_absorbed_ptr, Input(1):kv_cache_ptr,
         //   Input(2):w_uv_ptr, Input(3):output_ptr], kv_len passed as VRegId
-        TraceOp::MlaAttnScore { num_heads, head_dim, d_c, d_rope } => {
+        TraceOp::MlaAttnScore {
+            num_heads,
+            head_dim,
+            d_c,
+            d_rope,
+        } => {
             let kv_len_vreg = slots[4];
             super::mla_emit::emit_mla_attn_score_inline(
-                prog, *num_heads, *head_dim, *d_c, *d_rope,
-                &slots[..4], kv_len_vreg, width, default_dtype,
+                prog,
+                *num_heads,
+                *head_dim,
+                *d_c,
+                *d_rope,
+                &slots[..4],
+                kv_len_vreg,
+                width,
+                default_dtype,
             )
         }
         // MlaRopeMerge: replace c_KV[d_c-d_rope..d_c] with RoPE(k_pe).
         // Trace structure: [Input(0):c_kv_ptr, Input(1):k_pe_ptr,
         //   Input(2):output_ptr, Input(3):cos_ptr, Input(4):sin_ptr, Input(5):position]
-        TraceOp::MlaRopeMerge { d_c, d_rope } => {
-            super::mla_emit::emit_mla_rope_merge_inline(
-                prog, *d_c, *d_rope,
-                slots, width, default_dtype,
-            )
-        }
+        TraceOp::MlaRopeMerge { d_c, d_rope } => super::mla_emit::emit_mla_rope_merge_inline(
+            prog,
+            *d_c,
+            *d_rope,
+            slots,
+            width,
+            default_dtype,
+        ),
 
         // ── SPEC 37 REQ-HWACC-007: DynamicPrecisionSelect ──
         // GEMM prologue: 分析 tensor 统计量 → 运行时选择精度。
@@ -1852,10 +2527,10 @@ fn dispatch_quant_decode(
 /// ComputePattern handler 兜底：理论上不可达 (顶层 dispatch 已覆盖所有变体)。
 fn unreachable_pattern(op: &TraceOp) -> Result<VRegId, CompilerError> {
     Err(CompilerError::CodegenViolation(format!(
-        "dispatch_trace_op: 未分类的 TraceOp 变体 {:?} (ComputePattern 分类缺失)", op
+        "dispatch_trace_op: 未分类的 TraceOp 变体 {:?} (ComputePattern 分类缺失)",
+        op
     )))
 }
-
 
 /// QuantScaleLoad emit helper (SPEC 24-QUANT-PIPELINE-JIT §4.1)。
 /// 从 quant block 加载 scale，按 QuantType 分派解码路径。
@@ -1870,9 +2545,12 @@ fn emit_quant_scale_load(
     let offset_val = offset;
     match dtype {
         // f16 scale: load f16 scalar → convert to f32 → broadcast
-        QuantType::Q4_0 | QuantType::Q4_1
-        | QuantType::Q5_0 | QuantType::Q5_1
-        | QuantType::Q8_0 | QuantType::Q8_1 => {
+        QuantType::Q4_0
+        | QuantType::Q4_1
+        | QuantType::Q5_0
+        | QuantType::Q5_1
+        | QuantType::Q8_0
+        | QuantType::Q8_1 => {
             prog.emit(VmInstr::QuantScalarCvtLoad {
                 dst: r,
                 base,
@@ -1882,45 +2560,49 @@ fn emit_quant_scale_load(
             });
             Ok(r)
         }
-        QuantType::Q2K | QuantType::Q3K | QuantType::Q4K
-        | QuantType::Q5K | QuantType::Q6K | QuantType::Q8K => {
-            Err(CompilerError::CodegenViolation(
-                "QuantScaleLoad: K-Quant formats use QuantKQuantPackedScaleLookup TraceOp".into()
-            ))
-        }
-        QuantType::Mxfp4 { .. } | QuantType::Nvfp4 => {
-            Err(CompilerError::CodegenViolation(
-                "QuantScaleLoad: MXFP/NVFP formats use QuantE2m1LutDecode path".into()
-            ))
-        }
-        qt @ (QuantType::IQ1S | QuantType::IQ1M | QuantType::IQ2XXS
-             | QuantType::IQ2XS | QuantType::IQ2S
-             | QuantType::IQ3XXS | QuantType::IQ3S
-             | QuantType::IQ4NL | QuantType::IQ4XS) => {
-            Err(CompilerError::CodegenViolation(format!(
-                "QuantScaleLoad: IQ format {:?} uses codebook dequant path", qt
-            )))
-        }
+        QuantType::Q2K
+        | QuantType::Q3K
+        | QuantType::Q4K
+        | QuantType::Q5K
+        | QuantType::Q6K
+        | QuantType::Q8K => Err(CompilerError::CodegenViolation(
+            "QuantScaleLoad: K-Quant formats use QuantKQuantPackedScaleLookup TraceOp".into(),
+        )),
+        QuantType::Mxfp4 { .. } | QuantType::Nvfp4 => Err(CompilerError::CodegenViolation(
+            "QuantScaleLoad: MXFP/NVFP formats use QuantE2m1LutDecode path".into(),
+        )),
+        qt @ (QuantType::IQ1S
+        | QuantType::IQ1M
+        | QuantType::IQ2XXS
+        | QuantType::IQ2XS
+        | QuantType::IQ2S
+        | QuantType::IQ3XXS
+        | QuantType::IQ3S
+        | QuantType::IQ4NL
+        | QuantType::IQ4XS) => Err(CompilerError::CodegenViolation(format!(
+            "QuantScaleLoad: IQ format {:?} uses codebook dequant path",
+            qt
+        ))),
         QuantType::F32 | QuantType::F16 | QuantType::Bf16 => {
             Err(CompilerError::CodegenViolation(format!(
-                "QuantScaleLoad: native float type {:?} has no scale to load", dtype
+                "QuantScaleLoad: native float type {:?} has no scale to load",
+                dtype
             )))
         }
         QuantType::AWQ4 | QuantType::GPTQ4 | QuantType::Squeeze => {
             Err(CompilerError::CodegenViolation(format!(
-                "QuantScaleLoad: external format {:?} not yet supported", dtype
+                "QuantScaleLoad: external format {:?} not yet supported",
+                dtype
             )))
         }
-        QuantType::TQ1_0 | QuantType::TQ2_0 => {
-            Err(CompilerError::CodegenViolation(format!(
-                "QuantScaleLoad: ternary format {:?} not yet supported", dtype
-            )))
-        }
-        QuantType::Fp8E4M3 | QuantType::Fp8E5M2 => {
-            Err(CompilerError::CodegenViolation(format!(
-                "QuantScaleLoad: FP8 {:?} has no scale (native float)", dtype
-            )))
-        }
+        QuantType::TQ1_0 | QuantType::TQ2_0 => Err(CompilerError::CodegenViolation(format!(
+            "QuantScaleLoad: ternary format {:?} not yet supported",
+            dtype
+        ))),
+        QuantType::Fp8E4M3 | QuantType::Fp8E5M2 => Err(CompilerError::CodegenViolation(format!(
+            "QuantScaleLoad: FP8 {:?} has no scale (native float)",
+            dtype
+        ))),
     }
 }
 
@@ -1940,46 +2622,139 @@ fn emit_quant_data_load(
     match desc.data_kind {
         QuantDataKind::SignedPackedInt4 => {
             let r_lo = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::QuantBlockLoad { dst: r_lo, base, offset: OffsetExpr::Const(offset_val), unpack: BlockUnpackMode::SignedNibbleLow, width });
+            prog.emit(VmInstr::QuantBlockLoad {
+                dst: r_lo,
+                base,
+                offset: OffsetExpr::Const(offset_val),
+                unpack: BlockUnpackMode::SignedNibbleLow,
+                width,
+            });
             let r_hi = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::QuantBlockLoad { dst: r_hi, base, offset: OffsetExpr::Const(offset_val), unpack: BlockUnpackMode::SignedNibbleHigh, width });
-            prog.emit(VmInstr::QuantInterleave { dst: r, lo: r_lo, hi: r_hi, width });
+            prog.emit(VmInstr::QuantBlockLoad {
+                dst: r_hi,
+                base,
+                offset: OffsetExpr::Const(offset_val),
+                unpack: BlockUnpackMode::SignedNibbleHigh,
+                width,
+            });
+            prog.emit(VmInstr::QuantInterleave {
+                dst: r,
+                lo: r_lo,
+                hi: r_hi,
+                width,
+            });
         }
         QuantDataKind::PackedInt4 => {
             let r_lo = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::QuantBlockLoad { dst: r_lo, base, offset: OffsetExpr::Const(offset_val), unpack: BlockUnpackMode::UnsignedNibbleLow, width });
+            prog.emit(VmInstr::QuantBlockLoad {
+                dst: r_lo,
+                base,
+                offset: OffsetExpr::Const(offset_val),
+                unpack: BlockUnpackMode::UnsignedNibbleLow,
+                width,
+            });
             let r_hi = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::QuantBlockLoad { dst: r_hi, base, offset: OffsetExpr::Const(offset_val), unpack: BlockUnpackMode::UnsignedNibbleHigh, width });
-            prog.emit(VmInstr::QuantInterleave { dst: r, lo: r_lo, hi: r_hi, width });
+            prog.emit(VmInstr::QuantBlockLoad {
+                dst: r_hi,
+                base,
+                offset: OffsetExpr::Const(offset_val),
+                unpack: BlockUnpackMode::UnsignedNibbleHigh,
+                width,
+            });
+            prog.emit(VmInstr::QuantInterleave {
+                dst: r,
+                lo: r_lo,
+                hi: r_hi,
+                width,
+            });
         }
         QuantDataKind::Int8 => {
-            prog.emit(VmInstr::QuantBlockLoad { dst: r, base, offset: OffsetExpr::Const(offset_val), unpack: BlockUnpackMode::Int8, width });
+            prog.emit(VmInstr::QuantBlockLoad {
+                dst: r,
+                base,
+                offset: OffsetExpr::Const(offset_val),
+                unpack: BlockUnpackMode::Int8,
+                width,
+            });
         }
         QuantDataKind::PackedInt5 => {
             let bytes = prog.alloc_vreg(VRegKind::Vec, width);
             let count = width.f32_lanes().min(32);
-            prog.emit(VmInstr::QuantLoadBytesVec { dst: bytes, base, offset: offset_val as i64, count, signed: false, width });
+            prog.emit(VmInstr::QuantLoadBytesVec {
+                dst: bytes,
+                base,
+                offset: offset_val as i64,
+                count,
+                signed: false,
+                width,
+            });
             let mask = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::QuantBroadcastInt { dst: mask, value: 0x1F, width });
+            prog.emit(VmInstr::QuantBroadcastInt {
+                dst: mask,
+                value: 0x1F,
+                width,
+            });
             let extracted = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecBinOp { dst: extracted, a: bytes, b: mask, op: VecOp::And, dtype: QuantPrecision::F32 });
-            prog.emit(VmInstr::VecUnaryOp { dst: r, a: extracted, op: VecUnaryOp::IntToFloat });
+            prog.emit(VmInstr::VecBinOp {
+                dst: extracted,
+                a: bytes,
+                b: mask,
+                op: VecOp::And,
+                dtype: QuantPrecision::F32,
+            });
+            prog.emit(VmInstr::VecUnaryOp {
+                dst: r,
+                a: extracted,
+                op: VecUnaryOp::IntToFloat,
+            });
         }
         QuantDataKind::PackedInt6 => {
             let bytes = prog.alloc_vreg(VRegKind::Vec, width);
             let count = width.f32_lanes().min(32);
-            prog.emit(VmInstr::QuantLoadBytesVec { dst: bytes, base, offset: offset_val as i64, count, signed: false, width });
+            prog.emit(VmInstr::QuantLoadBytesVec {
+                dst: bytes,
+                base,
+                offset: offset_val as i64,
+                count,
+                signed: false,
+                width,
+            });
             let mask = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::QuantBroadcastInt { dst: mask, value: 0x3F, width });
+            prog.emit(VmInstr::QuantBroadcastInt {
+                dst: mask,
+                value: 0x3F,
+                width,
+            });
             let extracted = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecBinOp { dst: extracted, a: bytes, b: mask, op: VecOp::And, dtype: QuantPrecision::F32 });
-            prog.emit(VmInstr::VecUnaryOp { dst: r, a: extracted, op: VecUnaryOp::IntToFloat });
+            prog.emit(VmInstr::VecBinOp {
+                dst: extracted,
+                a: bytes,
+                b: mask,
+                op: VecOp::And,
+                dtype: QuantPrecision::F32,
+            });
+            prog.emit(VmInstr::VecUnaryOp {
+                dst: r,
+                a: extracted,
+                op: VecUnaryOp::IntToFloat,
+            });
         }
         QuantDataKind::SuperLowBit => {
             let bytes = prog.alloc_vreg(VRegKind::Vec, width);
             let count = width.f32_lanes().min(32);
-            prog.emit(VmInstr::QuantLoadBytesVec { dst: bytes, base, offset: offset_val as i64, count, signed: false, width });
-            let codebook_data = desc.codebook.as_ref().map(|cb| cb.codebook_data).unwrap_or(&[]);
+            prog.emit(VmInstr::QuantLoadBytesVec {
+                dst: bytes,
+                base,
+                offset: offset_val as i64,
+                count,
+                signed: false,
+                width,
+            });
+            let codebook_data = desc
+                .codebook
+                .as_ref()
+                .map(|cb| cb.codebook_data)
+                .unwrap_or(&[]);
             prog.emit(VmInstr::QuantCodebookLookup {
                 dst: r,
                 indices: bytes,
@@ -1991,13 +2766,25 @@ fn emit_quant_data_load(
         }
         QuantDataKind::Float4 | QuantDataKind::Nvfp4 => {
             let scale_src = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::QuantScalarCvtLoad { dst: scale_src, base, offset: offset_val as i64, src_dtype: ScalarCvtSource::U8, width });
+            prog.emit(VmInstr::QuantScalarCvtLoad {
+                dst: scale_src,
+                base,
+                offset: offset_val as i64,
+                src_dtype: ScalarCvtSource::U8,
+                width,
+            });
             let unpack = if matches!(desc.data_kind, QuantDataKind::Nvfp4) {
                 BlockUnpackMode::Nvfp4 { scale_src }
             } else {
                 BlockUnpackMode::Mxfp4 { scale_src }
             };
-            prog.emit(VmInstr::QuantBlockLoad { dst: r, base, offset: OffsetExpr::Const(offset_val), unpack, width });
+            prog.emit(VmInstr::QuantBlockLoad {
+                dst: r,
+                base,
+                offset: OffsetExpr::Const(offset_val),
+                unpack,
+                width,
+            });
         }
         other => {
             return Err(CompilerError::CodegenViolation(format!(
@@ -2008,7 +2795,6 @@ fn emit_quant_data_load(
     }
     Ok(r)
 }
-
 
 // ────────────────────────────────────────────────────────────────────────────
 // 辅助函数：消除 match arm 中的 alloc_vreg + emit 重复代码
@@ -2044,7 +2830,13 @@ fn emit_binop_into(
     width: SimdWidth,
     dtype: QuantPrecision,
 ) -> Result<(), CompilerError> {
-    prog.emit(VmInstr::VecBinOp { dst, a: slots[a.0 as usize], b: slots[b.0 as usize], op, dtype });
+    prog.emit(VmInstr::VecBinOp {
+        dst,
+        a: slots[a.0 as usize],
+        b: slots[b.0 as usize],
+        op,
+        dtype,
+    });
     Ok(())
 }
 
@@ -2072,7 +2864,11 @@ fn emit_unary_into(
     dst: VRegId,
     width: SimdWidth,
 ) -> Result<(), CompilerError> {
-    prog.emit(VmInstr::VecUnaryOp { dst, a: slots[a.0 as usize], op });
+    prog.emit(VmInstr::VecUnaryOp {
+        dst,
+        a: slots[a.0 as usize],
+        op,
+    });
     Ok(())
 }
 
@@ -2084,7 +2880,11 @@ fn emit_transcendental(
     width: SimdWidth,
 ) -> Result<VRegId, CompilerError> {
     let r = prog.alloc_vreg(VRegKind::Vec, width);
-    prog.emit(VmInstr::Transcendental { dst: r, src: slots[a.0 as usize], func });
+    prog.emit(VmInstr::Transcendental {
+        dst: r,
+        src: slots[a.0 as usize],
+        func,
+    });
     Ok(r)
 }
 
@@ -2096,7 +2896,11 @@ fn emit_transcendental_into(
     dst: VRegId,
     width: SimdWidth,
 ) -> Result<(), CompilerError> {
-    prog.emit(VmInstr::Transcendental { dst, src: slots[a.0 as usize], func });
+    prog.emit(VmInstr::Transcendental {
+        dst,
+        src: slots[a.0 as usize],
+        func,
+    });
     Ok(())
 }
 
@@ -2196,47 +3000,92 @@ fn emit_fwht(
         });
         // Butterfly pair: sum = current + shuffled, diff = current - shuffled.
         let sum = prog.alloc_vreg(VRegKind::Vec, width);
-        prog.emit(VmInstr::VecBinOp { dst: sum, a: current, b: shuffled, op: VecOp::Add, dtype });
+        prog.emit(VmInstr::VecBinOp {
+            dst: sum,
+            a: current,
+            b: shuffled,
+            op: VecOp::Add,
+            dtype,
+        });
         let diff = prog.alloc_vreg(VRegKind::Vec, width);
-        prog.emit(VmInstr::VecBinOp { dst: diff, a: current, b: shuffled, op: VecOp::Sub, dtype });
+        prog.emit(VmInstr::VecBinOp {
+            dst: diff,
+            a: current,
+            b: shuffled,
+            op: VecOp::Sub,
+            dtype,
+        });
         // Reconstruct: result[i] = sum[i] where (i % 2*stride) < stride, else diff[i].
         let mut select_vals: Vec<u32> = Vec::with_capacity(lanes);
         for i in 0..lanes {
-            select_vals.push(if (i % (2 * stride)) < stride { 0xFFFFFFFF } else { 0 });
+            select_vals.push(if (i % (2 * stride)) < stride {
+                0xFFFFFFFF
+            } else {
+                0
+            });
         }
         let sel_mask = prog.alloc_vreg(VRegKind::Vec, width);
-        prog.emit(VmInstr::VecLoadConst { dst: sel_mask, values: select_vals, dtype, width });
+        prog.emit(VmInstr::VecLoadConst {
+            dst: sel_mask,
+            values: select_vals,
+            dtype,
+            width,
+        });
         let result = prog.alloc_vreg(VRegKind::Vec, width);
-        prog.emit(VmInstr::ConditionalSelect { dst: result, mask: sel_mask, true_val: sum, false_val: diff });
+        prog.emit(VmInstr::ConditionalSelect {
+            dst: result,
+            mask: sel_mask,
+            true_val: sum,
+            false_val: diff,
+        });
         current = result;
     }
 
     // Normalization: 1/sqrt(dim).
     let inv_sqrt = 1.0 / (dim as f32).sqrt();
     let scale = prog.alloc_vreg(VRegKind::Vec, width);
-    prog.emit(VmInstr::Broadcast { dst: scale, src: ScalarExpr::Const(inv_sqrt), width, dtype });
+    prog.emit(VmInstr::Broadcast {
+        dst: scale,
+        src: ScalarExpr::Const(inv_sqrt),
+        width,
+        dtype,
+    });
     let scaled = prog.alloc_vreg(VRegKind::Vec, width);
-    prog.emit(VmInstr::VecBinOp { dst: scaled, a: current, b: scale, op: VecOp::Mul, dtype });
+    prog.emit(VmInstr::VecBinOp {
+        dst: scaled,
+        a: current,
+        b: scale,
+        op: VecOp::Mul,
+        dtype,
+    });
     Ok(scaled)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::trace::{DTypeKind, PackingFormat, QuantPrecision, TraceOp, ValueId};
     use crate::compiler::codegen::vm::instr::{SimdWidth, VRegKind, VmInstr};
+    use crate::compiler::trace::{DTypeKind, PackingFormat, QuantPrecision, TraceOp, ValueId};
 
     fn raw_prog(body: &[TraceOp]) -> (VmProgram, Vec<VRegId>) {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let slots = auto_lower_trace_raw(&mut prog, body, &[input], SimdWidth::W256, QuantPrecision::F32).unwrap();
+        let slots = auto_lower_trace_raw(
+            &mut prog,
+            body,
+            &[input],
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
         (prog, slots)
     }
 
     #[test]
     fn empty_body_returns_empty_slots() {
         let mut prog = VmProgram::new();
-        let slots = auto_lower_trace_raw(&mut prog, &[], &[], SimdWidth::W256, QuantPrecision::F32).unwrap();
+        let slots = auto_lower_trace_raw(&mut prog, &[], &[], SimdWidth::W256, QuantPrecision::F32)
+            .unwrap();
         assert!(slots.is_empty());
     }
 
@@ -2252,28 +3101,50 @@ mod tests {
     fn const_broadcast_produces_broadcast_instr() {
         let (prog, slots) = raw_prog(&[TraceOp::Const(42.0)]);
         assert_eq!(slots.len(), 1);
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::Broadcast { .. })));
+        assert!(prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::Broadcast { .. })));
     }
 
     #[test]
     fn add_binop_produces_vec_binop() {
-        let body = &[TraceOp::Input(0), TraceOp::Const(1.0), TraceOp::Add(ValueId(0), ValueId(1))];
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::Const(1.0),
+            TraceOp::Add(ValueId(0), ValueId(1)),
+        ];
         let (prog, slots) = raw_prog(body);
         assert_eq!(slots.len(), 3);
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::VecBinOp { op: VecOp::Add, .. })));
+        assert!(prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecBinOp { op: VecOp::Add, .. })));
     }
 
     #[test]
     fn mul_binop_produces_vec_mul() {
-        let body = &[TraceOp::Input(0), TraceOp::Input(0), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::Input(0),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
         let (prog, slots) = raw_prog(body);
         assert_eq!(slots.len(), 3);
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::VecBinOp { op: VecOp::Mul, .. })));
+        assert!(prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecBinOp { op: VecOp::Mul, .. })));
     }
 
     #[test]
     fn fma_produces_fma_instr() {
-        let body = &[TraceOp::Input(0), TraceOp::Input(0), TraceOp::Input(0), TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2))];
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::Input(0),
+            TraceOp::Input(0),
+            TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2)),
+        ];
         let (prog, slots) = raw_prog(body);
         assert_eq!(slots.len(), 4);
         assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::Fma { .. })));
@@ -2283,33 +3154,51 @@ mod tests {
     fn neg_unary_produces_unary_instr() {
         let body = &[TraceOp::Input(0), TraceOp::Neg(ValueId(0))];
         let (prog, _slots) = raw_prog(body);
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::VecUnaryOp { op: VecUnaryOp::Neg, .. })));
+        assert!(prog.instrs.iter().any(|i| matches!(
+            i,
+            VmInstr::VecUnaryOp {
+                op: VecUnaryOp::Neg,
+                ..
+            }
+        )));
     }
 
     #[test]
     fn sqrt_unary_produces_sqrt() {
         let body = &[TraceOp::Input(0), TraceOp::Sqrt(ValueId(0))];
         let (prog, _slots) = raw_prog(body);
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::VecUnaryOp { op: VecUnaryOp::Sqrt, .. })));
+        assert!(prog.instrs.iter().any(|i| matches!(
+            i,
+            VmInstr::VecUnaryOp {
+                op: VecUnaryOp::Sqrt,
+                ..
+            }
+        )));
     }
 
     #[test]
     fn exp_transcendental_produces_exp() {
         let body = &[TraceOp::Input(0), TraceOp::Exp(ValueId(0))];
         let (prog, _slots) = raw_prog(body);
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::Transcendental { func: TranscendentalFn::Exp, .. })));
+        assert!(prog.instrs.iter().any(|i| matches!(
+            i,
+            VmInstr::Transcendental {
+                func: TranscendentalFn::Exp,
+                ..
+            }
+        )));
     }
 
     #[test]
     fn chained_ops_produce_correct_slot_count() {
         // x → x*2 → x*2+3 → sqrt(x*2+3)
         let body = &[
-            TraceOp::Input(0),       // slot 0
-            TraceOp::Const(2.0),     // slot 1
+            TraceOp::Input(0),                    // slot 0
+            TraceOp::Const(2.0),                  // slot 1
             TraceOp::Mul(ValueId(0), ValueId(1)), // slot 2
-            TraceOp::Const(3.0),     // slot 3
+            TraceOp::Const(3.0),                  // slot 3
             TraceOp::Add(ValueId(2), ValueId(3)), // slot 4
-            TraceOp::Sqrt(ValueId(4)),             // slot 5
+            TraceOp::Sqrt(ValueId(4)),            // slot 5
         ];
         let (_prog, slots) = raw_prog(body);
         assert_eq!(slots.len(), 6);
@@ -2320,8 +3209,20 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let body = &[TraceOp::Input(0), TraceOp::Const(1.0), TraceOp::Add(ValueId(0), ValueId(1))];
-        auto_lower_trace_into(&mut prog, body, &[input], dst, SimdWidth::W256, QuantPrecision::F32).unwrap();
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::Const(1.0),
+            TraceOp::Add(ValueId(0), ValueId(1)),
+        ];
+        auto_lower_trace_into(
+            &mut prog,
+            body,
+            &[input],
+            dst,
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
         // The final result should be written to `dst` directly
         assert!(!prog.instrs.is_empty());
     }
@@ -2333,10 +3234,13 @@ mod tests {
         use crate::compiler::trace::TypedSlot;
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let inputs = &[TypedSlot { vreg: input, dtype: QuantPrecision::BF16 }];
+        let inputs = &[TypedSlot {
+            vreg: input,
+            dtype: QuantPrecision::BF16,
+        }];
         let body = &[
-            TraceOp::Input(0),       // slot 0 (F32 fallback — no prior slots)
-            TraceOp::Const(2.0),     // slot 1 (F32)
+            TraceOp::Input(0),                    // slot 0 (F32 fallback — no prior slots)
+            TraceOp::Const(2.0),                  // slot 1 (F32)
             TraceOp::Mul(ValueId(0), ValueId(1)), // slot 2 (promote F32,F32 = F32)
         ];
         let slots = auto_lower_trace_typed(&mut prog, body, inputs, SimdWidth::W256).unwrap();
@@ -2354,7 +3258,13 @@ mod tests {
         let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let body = &[TraceOp::Input(1)];
         // Act
-        let result = auto_lower_trace_raw(&mut prog, body, &[input], SimdWidth::W256, QuantPrecision::F32);
+        let result = auto_lower_trace_raw(
+            &mut prog,
+            body,
+            &[input],
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        );
         // Assert
         assert!(result.is_err());
     }
@@ -2365,10 +3275,12 @@ mod tests {
         let (prog, slots) = raw_prog(&[TraceOp::Const(0.0)]);
         // Assert: still produces a Broadcast instruction with 0.0
         assert_eq!(slots.len(), 1);
-        let has_broadcast = prog.instrs.iter().any(|i| matches!(
-            i,
-            VmInstr::Broadcast { src: ScalarExpr::Const(v), .. } if *v == 0.0f32
-        ));
+        let has_broadcast = prog.instrs.iter().any(|i| {
+            matches!(
+                i,
+                VmInstr::Broadcast { src: ScalarExpr::Const(v), .. } if *v == 0.0f32
+            )
+        });
         assert!(has_broadcast);
     }
 
@@ -2377,31 +3289,47 @@ mod tests {
         // Arrange: negative float
         let (prog, slots) = raw_prog(&[TraceOp::Const(-3.14)]);
         assert_eq!(slots.len(), 1);
-        let has_broadcast = prog.instrs.iter().any(|i| matches!(
-            i,
-            VmInstr::Broadcast { src: ScalarExpr::Const(v), .. } if *v == -3.14f32
-        ));
+        let has_broadcast = prog.instrs.iter().any(|i| {
+            matches!(
+                i,
+                VmInstr::Broadcast { src: ScalarExpr::Const(v), .. } if *v == -3.14f32
+            )
+        });
         assert!(has_broadcast);
     }
 
     #[test]
     fn sub_binop_produces_vec_sub() {
         // Arrange: a - b
-        let body = &[TraceOp::Input(0), TraceOp::Const(5.0), TraceOp::Sub(ValueId(0), ValueId(1))];
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::Const(5.0),
+            TraceOp::Sub(ValueId(0), ValueId(1)),
+        ];
         let (prog, slots) = raw_prog(body);
         // Assert
         assert_eq!(slots.len(), 3);
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::VecBinOp { op: VecOp::Sub, .. })));
+        assert!(prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecBinOp { op: VecOp::Sub, .. })));
     }
 
     #[test]
     fn div_binop_produces_vec_div() {
         // Arrange: a / b
-        let body = &[TraceOp::Input(0), TraceOp::Const(2.0), TraceOp::Div(ValueId(0), ValueId(1))];
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::Const(2.0),
+            TraceOp::Div(ValueId(0), ValueId(1)),
+        ];
         let (prog, slots) = raw_prog(body);
         // Assert
         assert_eq!(slots.len(), 3);
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::VecBinOp { op: VecOp::Div, .. })));
+        assert!(prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecBinOp { op: VecOp::Div, .. })));
     }
 
     #[test]
@@ -2410,7 +3338,13 @@ mod tests {
         let body = &[TraceOp::Input(0), TraceOp::Abs(ValueId(0))];
         let (prog, _slots) = raw_prog(body);
         // Assert
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::VecUnaryOp { op: VecUnaryOp::Abs, .. })));
+        assert!(prog.instrs.iter().any(|i| matches!(
+            i,
+            VmInstr::VecUnaryOp {
+                op: VecUnaryOp::Abs,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -2419,7 +3353,13 @@ mod tests {
         let body = &[TraceOp::Input(0), TraceOp::Rsqrt(ValueId(0))];
         let (prog, _slots) = raw_prog(body);
         // Assert
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::VecUnaryOp { op: VecUnaryOp::Rsqrt, .. })));
+        assert!(prog.instrs.iter().any(|i| matches!(
+            i,
+            VmInstr::VecUnaryOp {
+                op: VecUnaryOp::Rsqrt,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -2428,7 +3368,13 @@ mod tests {
         let body = &[TraceOp::Input(0), TraceOp::Recip(ValueId(0))];
         let (prog, _slots) = raw_prog(body);
         // Assert
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::VecUnaryOp { op: VecUnaryOp::Recip, .. })));
+        assert!(prog.instrs.iter().any(|i| matches!(
+            i,
+            VmInstr::VecUnaryOp {
+                op: VecUnaryOp::Recip,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -2437,7 +3383,13 @@ mod tests {
         let body = &[TraceOp::Input(0), TraceOp::Tanh(ValueId(0))];
         let (prog, _slots) = raw_prog(body);
         // Assert
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::Transcendental { func: TranscendentalFn::Tanh, .. })));
+        assert!(prog.instrs.iter().any(|i| matches!(
+            i,
+            VmInstr::Transcendental {
+                func: TranscendentalFn::Tanh,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -2446,7 +3398,13 @@ mod tests {
         let body = &[TraceOp::Input(0), TraceOp::Sigmoid(ValueId(0))];
         let (prog, _slots) = raw_prog(body);
         // Assert
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::Transcendental { func: TranscendentalFn::Sigmoid, .. })));
+        assert!(prog.instrs.iter().any(|i| matches!(
+            i,
+            VmInstr::Transcendental {
+                func: TranscendentalFn::Sigmoid,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -2455,27 +3413,47 @@ mod tests {
         let body = &[TraceOp::Input(0), TraceOp::Log(ValueId(0))];
         let (prog, _slots) = raw_prog(body);
         // Assert
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::Transcendental { func: TranscendentalFn::Log, .. })));
+        assert!(prog.instrs.iter().any(|i| matches!(
+            i,
+            VmInstr::Transcendental {
+                func: TranscendentalFn::Log,
+                ..
+            }
+        )));
     }
 
     #[test]
     fn max_binop_produces_vec_max() {
         // Arrange: max(a, b)
-        let body = &[TraceOp::Input(0), TraceOp::Input(0), TraceOp::Max(ValueId(0), ValueId(1))];
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::Input(0),
+            TraceOp::Max(ValueId(0), ValueId(1)),
+        ];
         let (prog, slots) = raw_prog(body);
         // Assert
         assert_eq!(slots.len(), 3);
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::VecBinOp { op: VecOp::Max, .. })));
+        assert!(prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecBinOp { op: VecOp::Max, .. })));
     }
 
     #[test]
     fn min_binop_produces_vec_min() {
         // Arrange: min(a, b)
-        let body = &[TraceOp::Input(0), TraceOp::Input(0), TraceOp::Min(ValueId(0), ValueId(1))];
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::Input(0),
+            TraceOp::Min(ValueId(0), ValueId(1)),
+        ];
         let (prog, slots) = raw_prog(body);
         // Assert
         assert_eq!(slots.len(), 3);
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::VecBinOp { op: VecOp::Min, .. })));
+        assert!(prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecBinOp { op: VecOp::Min, .. })));
     }
 
     // @trace REQ-AIS-003 [req:REQ-AIS-003] [level:unit]
@@ -2483,11 +3461,25 @@ mod tests {
     fn compare_produces_vec_cmp() {
         // Arrange: compare a < b
         use crate::compiler::trace::CmpOp;
-        let body = &[TraceOp::Input(0), TraceOp::Const(1.0), TraceOp::Compare { a: ValueId(0), b: ValueId(1), op: CmpOp::Lt }];
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::Const(1.0),
+            TraceOp::Compare {
+                a: ValueId(0),
+                b: ValueId(1),
+                op: CmpOp::Lt,
+            },
+        ];
         let (prog, slots) = raw_prog(body);
         // Assert
         assert_eq!(slots.len(), 3);
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::VecCmp { pred: CmpPredicate::Lt, .. })));
+        assert!(prog.instrs.iter().any(|i| matches!(
+            i,
+            VmInstr::VecCmp {
+                pred: CmpPredicate::Lt,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -2497,7 +3489,13 @@ mod tests {
         let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let instrs_before = prog.instrs.len();
         // Act: empty body should succeed with no-op
-        let result = auto_lower_trace(&mut prog, &[], &[input], SimdWidth::W256, QuantPrecision::F32);
+        let result = auto_lower_trace(
+            &mut prog,
+            &[],
+            &[input],
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        );
         // Assert: no new instructions emitted for empty body
         assert!(result.is_ok());
         assert_eq!(prog.instrs.len(), instrs_before);
@@ -2508,9 +3506,20 @@ mod tests {
         // Arrange: Input(0), Const(7.0), Mul → result should be copied back to inputs[0]
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let body = &[TraceOp::Input(0), TraceOp::Const(7.0), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::Const(7.0),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
         // Act
-        auto_lower_trace(&mut prog, body, &[input], SimdWidth::W256, QuantPrecision::F32).unwrap();
+        auto_lower_trace(
+            &mut prog,
+            body,
+            &[input],
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
         // Assert: last instruction should be a Mov writing back to inputs[0]
         let last = prog.instrs.last().expect("should have instructions");
         assert!(matches!(last, VmInstr::Mov { dst, .. } if *dst == input));
@@ -2524,7 +3533,14 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let instrs_before = prog.instrs.len();
         // Act
-        let result = auto_lower_trace_into(&mut prog, &[], &[input], dst, SimdWidth::W256, QuantPrecision::F32);
+        let result = auto_lower_trace_into(
+            &mut prog,
+            &[],
+            &[input],
+            dst,
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        );
         // Assert: no new instructions emitted for empty body
         assert!(result.is_ok());
         assert_eq!(prog.instrs.len(), instrs_before);
@@ -2537,17 +3553,34 @@ mod tests {
         let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let dst_a = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let dst_b = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let body = &[TraceOp::Input(0), TraceOp::Input(0), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::Input(0),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
         // Act: copy slot 0 (Input) → dst_a, slot 2 (Mul result) → dst_b
         auto_lower_trace_multi(
-            &mut prog, body, &[input],
+            &mut prog,
+            body,
+            &[input],
             &[(dst_a, 0), (dst_b, 2)],
-            SimdWidth::W256, QuantPrecision::F32,
-        ).unwrap();
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
         // Assert: should have Mov instructions for both targets
-        let movs: Vec<_> = prog.instrs.iter().filter(|i| matches!(i, VmInstr::Mov { .. })).cloned().collect();
-        assert!(movs.iter().any(|i| matches!(i, VmInstr::Mov { dst, .. } if *dst == dst_a)));
-        assert!(movs.iter().any(|i| matches!(i, VmInstr::Mov { dst, .. } if *dst == dst_b)));
+        let movs: Vec<_> = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::Mov { .. }))
+            .cloned()
+            .collect();
+        assert!(movs
+            .iter()
+            .any(|i| matches!(i, VmInstr::Mov { dst, .. } if *dst == dst_a)));
+        assert!(movs
+            .iter()
+            .any(|i| matches!(i, VmInstr::Mov { dst, .. } if *dst == dst_b)));
     }
 
     #[test]
@@ -2559,9 +3592,12 @@ mod tests {
         let body = &[TraceOp::Input(0), TraceOp::Const(1.0)];
         // Act
         let result = auto_lower_trace_multi(
-            &mut prog, body, &[input],
+            &mut prog,
+            body,
+            &[input],
             &[(dst, 5)],
-            SimdWidth::W256, QuantPrecision::F32,
+            SimdWidth::W256,
+            QuantPrecision::F32,
         );
         // Assert
         assert!(result.is_err());
@@ -2573,7 +3609,10 @@ mod tests {
         use crate::compiler::trace::TypedSlot;
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let inputs = &[TypedSlot { vreg: input, dtype: QuantPrecision::F32 }];
+        let inputs = &[TypedSlot {
+            vreg: input,
+            dtype: QuantPrecision::F32,
+        }];
         // Act
         let result = auto_lower_trace_typed(&mut prog, &[], inputs, SimdWidth::W256).unwrap();
         // Assert
@@ -2584,17 +3623,24 @@ mod tests {
     #[test]
     fn cast_traceop_produces_vec_cast() {
         // Arrange: cast from F16 (16 bits) to F32 (32 bits)
-        let body = &[TraceOp::Input(0), TraceOp::Cast {
-            src: ValueId(0),
-            from: QuantPrecision::F16,
-            to: QuantPrecision::F32,
-        }];
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::Cast {
+                src: ValueId(0),
+                from: QuantPrecision::F16,
+                to: QuantPrecision::F32,
+            },
+        ];
         let (prog, slots) = raw_prog(body);
         // Assert
         assert_eq!(slots.len(), 2);
         assert!(prog.instrs.iter().any(|i| matches!(
             i,
-            VmInstr::VecCast { from_bits: 16, to_bits: 32, .. }
+            VmInstr::VecCast {
+                from_bits: 16,
+                to_bits: 32,
+                ..
+            }
         )));
     }
 
@@ -2603,15 +3649,18 @@ mod tests {
     fn conditional_branch_produces_conditional_select() {
         // Arrange: mask, true_val, false_val
         let body = &[
-            TraceOp::Input(0),  // slot 0: mask
-            TraceOp::Const(1.0),  // slot 1: true_val
-            TraceOp::Const(0.0),  // slot 2: false_val
-            TraceOp::ConditionalBranch(ValueId(0), ValueId(1), ValueId(2)),  // slot 3
+            TraceOp::Input(0),                                              // slot 0: mask
+            TraceOp::Const(1.0),                                            // slot 1: true_val
+            TraceOp::Const(0.0),                                            // slot 2: false_val
+            TraceOp::ConditionalBranch(ValueId(0), ValueId(1), ValueId(2)), // slot 3
         ];
         let (prog, slots) = raw_prog(body);
         // Assert
         assert_eq!(slots.len(), 4);
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::ConditionalSelect { .. })));
+        assert!(prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::ConditionalSelect { .. })));
     }
 
     // @trace REQ-AIS-004 [req:REQ-AIS-004] [level:unit]
@@ -2619,11 +3668,23 @@ mod tests {
     fn hreduce_sum_produces_hreduce_instr() {
         // Arrange
         use crate::compiler::trace::ReduceKind;
-        let body = &[TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Sum }];
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::HReduce {
+                src: ValueId(0),
+                op: ReduceKind::Sum,
+            },
+        ];
         let (prog, slots) = raw_prog(body);
         // Assert: scalar-width output
         assert_eq!(slots.len(), 2);
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::HReduce { op: ReduceOp::Sum, .. })));
+        assert!(prog.instrs.iter().any(|i| matches!(
+            i,
+            VmInstr::HReduce {
+                op: ReduceOp::Sum,
+                ..
+            }
+        )));
     }
 
     // @trace REQ-AIS-004 [req:REQ-AIS-004] [level:unit]
@@ -2631,11 +3692,23 @@ mod tests {
     fn hreduce_unsupported_kind_returns_error() {
         // Arrange: ArgMax is not supported in auto_select
         use crate::compiler::trace::ReduceKind;
-        let body = &[TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::ArgMax }];
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::HReduce {
+                src: ValueId(0),
+                op: ReduceKind::ArgMax,
+            },
+        ];
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         // Act
-        let result = auto_lower_trace_raw(&mut prog, body, &[input], SimdWidth::W256, QuantPrecision::F32);
+        let result = auto_lower_trace_raw(
+            &mut prog,
+            body,
+            &[input],
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        );
         // Assert
         assert!(result.is_err());
     }
@@ -2698,13 +3771,22 @@ mod tests {
     #[test]
     fn vreg_kind_all_variants_are_distinct() {
         let kinds = [
-            VRegKind::Ptr, VRegKind::Vec, VRegKind::Scalar,
-            VRegKind::Counter, VRegKind::ByteOffset, VRegKind::Tile, VRegKind::Mask,
+            VRegKind::Ptr,
+            VRegKind::Vec,
+            VRegKind::Scalar,
+            VRegKind::Counter,
+            VRegKind::ByteOffset,
+            VRegKind::Tile,
+            VRegKind::Mask,
         ];
         // Assert all pairwise distinct
         for i in 0..kinds.len() {
             for j in (i + 1)..kinds.len() {
-                assert_ne!(kinds[i], kinds[j], "VRegKind variants {} and {} should differ", i, j);
+                assert_ne!(
+                    kinds[i], kinds[j],
+                    "VRegKind variants {} and {} should differ",
+                    i, j
+                );
             }
         }
     }
@@ -2727,7 +3809,10 @@ mod tests {
     #[test]
     fn quant_precision_struct_update_syntax() {
         // Arrange: derive from F32, change kind only
-        let custom = QuantPrecision { kind: DTypeKind::INT8, ..QuantPrecision::F32 };
+        let custom = QuantPrecision {
+            kind: DTypeKind::INT8,
+            ..QuantPrecision::F32
+        };
         // Assert
         assert_eq!(custom.kind, DTypeKind::INT8);
         assert_eq!(custom.packing, PackingFormat::Plain);
@@ -2797,12 +3882,20 @@ mod tests {
             let body = &[
                 TraceOp::Input(0),
                 TraceOp::Const(1.0),
-                TraceOp::Compare { a: ValueId(0), b: ValueId(1), op: cmp_op },
+                TraceOp::Compare {
+                    a: ValueId(0),
+                    b: ValueId(1),
+                    op: cmp_op,
+                },
             ];
             let (prog, _slots) = raw_prog(body);
             assert!(
-                prog.instrs.iter().any(|i| matches!(i, VmInstr::VecCmp { pred, .. } if *pred == expected_pred)),
-                "CmpOp::{:?} should produce CmpPredicate::{:?}", cmp_op, expected_pred,
+                prog.instrs
+                    .iter()
+                    .any(|i| matches!(i, VmInstr::VecCmp { pred, .. } if *pred == expected_pred)),
+                "CmpOp::{:?} should produce CmpPredicate::{:?}",
+                cmp_op,
+                expected_pred,
             );
         }
     }
@@ -2810,7 +3903,13 @@ mod tests {
     #[test]
     fn fwht_dim1_returns_identity() {
         // Arrange: FWHT with dim=1 should return the source slot unchanged
-        let body = &[TraceOp::Input(0), TraceOp::FWHT { src: ValueId(0), dim: 1 }];
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::FWHT {
+                src: ValueId(0),
+                dim: 1,
+            },
+        ];
         let (prog, slots) = raw_prog(body);
         // Assert: no extra instructions (just the Input passthrough), slot unchanged
         assert_eq!(slots.len(), 2);
@@ -2820,11 +3919,23 @@ mod tests {
     #[test]
     fn fwht_dim0_returns_error() {
         // Arrange: dim=0 is invalid (must be power of 2 and > 0)
-        let body = &[TraceOp::Input(0), TraceOp::FWHT { src: ValueId(0), dim: 0 }];
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::FWHT {
+                src: ValueId(0),
+                dim: 0,
+            },
+        ];
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         // Act
-        let result = auto_lower_trace_raw(&mut prog, body, &[input], SimdWidth::W256, QuantPrecision::F32);
+        let result = auto_lower_trace_raw(
+            &mut prog,
+            body,
+            &[input],
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        );
         // Assert
         assert!(result.is_err());
     }
@@ -2832,11 +3943,23 @@ mod tests {
     #[test]
     fn fwht_non_power_of_two_returns_error() {
         // Arrange: dim=3 is not a power of 2
-        let body = &[TraceOp::Input(0), TraceOp::FWHT { src: ValueId(0), dim: 3 }];
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::FWHT {
+                src: ValueId(0),
+                dim: 3,
+            },
+        ];
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         // Act
-        let result = auto_lower_trace_raw(&mut prog, body, &[input], SimdWidth::W256, QuantPrecision::F32);
+        let result = auto_lower_trace_raw(
+            &mut prog,
+            body,
+            &[input],
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        );
         // Assert
         assert!(result.is_err());
     }
@@ -2847,12 +3970,15 @@ mod tests {
         use crate::compiler::trace::TypedSlot;
         let mut prog = VmProgram::new();
         let v0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let inputs = &[TypedSlot { vreg: v0, dtype: QuantPrecision::BF16 }];
+        let inputs = &[TypedSlot {
+            vreg: v0,
+            dtype: QuantPrecision::BF16,
+        }];
         let body = &[
-            TraceOp::Input(0),       // slot 0
-            TraceOp::Input(0),       // slot 1
-            TraceOp::Input(0),       // slot 2
-            TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2)),  // slot 3
+            TraceOp::Input(0),                                // slot 0
+            TraceOp::Input(0),                                // slot 1
+            TraceOp::Input(0),                                // slot 2
+            TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2)), // slot 3
         ];
         // Act
         let slots = auto_lower_trace_typed(&mut prog, body, inputs, SimdWidth::W256).unwrap();
@@ -2870,15 +3996,19 @@ mod tests {
         let body = &[
             TraceOp::Input(0), // slot 0: base
             TraceOp::Input(0), // slot 1: indices
-            TraceOp::GatherLoad { base: ValueId(0), indices: ValueId(1), stride: 4 },
+            TraceOp::GatherLoad {
+                base: ValueId(0),
+                indices: ValueId(1),
+                stride: 4,
+            },
         ];
         let (prog, slots) = raw_prog(body);
         // Assert
         assert_eq!(slots.len(), 3);
-        assert!(prog.instrs.iter().any(|i| matches!(
-            i,
-            VmInstr::GatherLoad { stride: 4, .. }
-        )));
+        assert!(prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::GatherLoad { stride: 4, .. })));
     }
 
     #[test]
@@ -2888,15 +4018,20 @@ mod tests {
             TraceOp::Input(0), // slot 0: base
             TraceOp::Input(0), // slot 1: indices
             TraceOp::Input(0), // slot 2: value
-            TraceOp::ScatterStore { base: ValueId(0), indices: ValueId(1), value: ValueId(2), stride: 8 },
+            TraceOp::ScatterStore {
+                base: ValueId(0),
+                indices: ValueId(1),
+                value: ValueId(2),
+                stride: 8,
+            },
         ];
         let (prog, slots) = raw_prog(body);
         // Assert
         assert_eq!(slots.len(), 4);
-        assert!(prog.instrs.iter().any(|i| matches!(
-            i,
-            VmInstr::ScatterStore { stride: 8, .. }
-        )));
+        assert!(prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::ScatterStore { stride: 8, .. })));
     }
 
     #[test]
@@ -2905,15 +4040,19 @@ mod tests {
         let body = &[
             TraceOp::Input(0), // slot 0: base
             TraceOp::Input(0), // slot 1: row_index
-            TraceOp::TableLookup { base: ValueId(0), row_index: ValueId(1), row_bytes: 256 },
+            TraceOp::TableLookup {
+                base: ValueId(0),
+                row_index: ValueId(1),
+                row_bytes: 256,
+            },
         ];
         let (prog, slots) = raw_prog(body);
         // Assert
         assert_eq!(slots.len(), 3);
-        assert!(prog.instrs.iter().any(|i| matches!(
-            i,
-            VmInstr::TableLookup { row_bytes: 256, .. }
-        )));
+        assert!(prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::TableLookup { row_bytes: 256, .. })));
     }
 
     #[test]
@@ -2922,14 +4061,20 @@ mod tests {
         let body = &[
             TraceOp::Input(0), // slot 0: src
             TraceOp::Input(0), // slot 1: indices
-            TraceOp::Permute { src: ValueId(0), indices: ValueId(1) },
+            TraceOp::Permute {
+                src: ValueId(0),
+                indices: ValueId(1),
+            },
         ];
         let (prog, slots) = raw_prog(body);
         // Assert
         assert_eq!(slots.len(), 3);
         assert!(prog.instrs.iter().any(|i| matches!(
             i,
-            VmInstr::VecShuffle { mask: VecShuffleMask::Dynamic { .. }, .. }
+            VmInstr::VecShuffle {
+                mask: VecShuffleMask::Dynamic { .. },
+                ..
+            }
         )));
     }
 
@@ -2944,26 +4089,50 @@ mod tests {
         let (prog, slots) = raw_prog(body);
         // Assert
         assert_eq!(slots.len(), 3);
-        assert!(prog.instrs.iter().any(|i| matches!(
-            i,
-            VmInstr::VecBinOp { op: VecOp::And, .. }
-        )));
+        assert!(prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecBinOp { op: VecOp::And, .. })));
     }
 
     #[test]
     fn fwht_dim2_produces_shuffle_add_sub_normalize() {
         // Arrange: FWHT with dim=2 should generate butterfly + normalize
-        let body = &[TraceOp::Input(0), TraceOp::FWHT { src: ValueId(0), dim: 2 }];
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::FWHT {
+                src: ValueId(0),
+                dim: 2,
+            },
+        ];
         let (prog, _slots) = raw_prog(body);
         // Assert: should contain VecShuffle + Add + Sub + ConditionalSelect + Mul (normalize)
-        let has_shuffle = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecShuffle { .. }));
-        let has_add = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecBinOp { op: VecOp::Add, .. }));
-        let has_sub = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecBinOp { op: VecOp::Sub, .. }));
-        let has_mul = prog.instrs.iter().any(|i| matches!(i, VmInstr::VecBinOp { op: VecOp::Mul, .. }));
-        assert!(has_shuffle, "FWHT dim=2 should produce VecShuffle for butterfly");
+        let has_shuffle = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecShuffle { .. }));
+        let has_add = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecBinOp { op: VecOp::Add, .. }));
+        let has_sub = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecBinOp { op: VecOp::Sub, .. }));
+        let has_mul = prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::VecBinOp { op: VecOp::Mul, .. }));
+        assert!(
+            has_shuffle,
+            "FWHT dim=2 should produce VecShuffle for butterfly"
+        );
         assert!(has_add, "FWHT dim=2 should produce Add for sum");
         assert!(has_sub, "FWHT dim=2 should produce Sub for diff");
-        assert!(has_mul, "FWHT dim=2 should produce Mul for 1/sqrt(2) normalization");
+        assert!(
+            has_mul,
+            "FWHT dim=2 should produce Mul for 1/sqrt(2) normalization"
+        );
     }
 
     #[test]
@@ -2972,14 +4141,20 @@ mod tests {
         let body = &[
             TraceOp::Input(0), // slot 0: base
             TraceOp::Input(0), // slot 1: offset
-            TraceOp::BroadcastLoad { base: ValueId(0), offset: ValueId(1) },
+            TraceOp::BroadcastLoad {
+                base: ValueId(0),
+                offset: ValueId(1),
+            },
         ];
         let (prog, slots) = raw_prog(body);
         // Assert
         assert_eq!(slots.len(), 3);
         assert!(prog.instrs.iter().any(|i| matches!(
             i,
-            VmInstr::Broadcast { src: ScalarExpr::MemLoad(..), .. }
+            VmInstr::Broadcast {
+                src: ScalarExpr::MemLoad(..),
+                ..
+            }
         )));
     }
 
@@ -2995,7 +4170,15 @@ mod tests {
             TraceOp::Add(ValueId(0), ValueId(1)),
         ];
         // Act
-        auto_lower_trace_into(&mut prog, body, &[input], dst, SimdWidth::W256, QuantPrecision::F32).unwrap();
+        auto_lower_trace_into(
+            &mut prog,
+            body,
+            &[input],
+            dst,
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
         // Assert: last instruction should be VecBinOp with dst == provided dst
         let last = prog.instrs.last().expect("should have instructions");
         assert!(matches!(
@@ -3010,12 +4193,18 @@ mod tests {
         let body = &[
             TraceOp::Input(0), // slot 0: lo
             TraceOp::Input(0), // slot 1: hi
-            TraceOp::QuantInterleave { lo: ValueId(0), hi: ValueId(1) },
+            TraceOp::QuantInterleave {
+                lo: ValueId(0),
+                hi: ValueId(1),
+            },
         ];
         let (prog, slots) = raw_prog(body);
         // Assert
         assert_eq!(slots.len(), 3);
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::QuantInterleave { .. })));
+        assert!(prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::QuantInterleave { .. })));
     }
 
     #[test]
@@ -3023,16 +4212,27 @@ mod tests {
         // Arrange: body with ops but no targets — should succeed with no copies
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let body = &[TraceOp::Input(0), TraceOp::Const(1.0), TraceOp::Add(ValueId(0), ValueId(1))];
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::Const(1.0),
+            TraceOp::Add(ValueId(0), ValueId(1)),
+        ];
         // Act: no targets requested
         let result = auto_lower_trace_multi(
-            &mut prog, body, &[input],
+            &mut prog,
+            body,
+            &[input],
             &[], // empty targets
-            SimdWidth::W256, QuantPrecision::F32,
+            SimdWidth::W256,
+            QuantPrecision::F32,
         );
         // Assert: should succeed, no Mov instructions for targets
         assert!(result.is_ok());
-        let mov_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::Mov { .. })).count();
+        let mov_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::Mov { .. }))
+            .count();
         assert_eq!(mov_count, 0, "no targets means no Mov copies");
     }
 
@@ -3050,7 +4250,10 @@ mod tests {
         assert_eq!(slots.len(), 2);
         assert!(prog.instrs.iter().any(|i| matches!(
             i,
-            VmInstr::Broadcast { src: ScalarExpr::ExtractLane0(_), .. }
+            VmInstr::Broadcast {
+                src: ScalarExpr::ExtractLane0(_),
+                ..
+            }
         )));
     }
 
@@ -3060,12 +4263,18 @@ mod tests {
         let body = &[
             TraceOp::Input(0), // slot 0: base
             TraceOp::Input(0), // slot 1: offset
-            TraceOp::ScalarLoad { base: ValueId(0), offset: ValueId(1) },
+            TraceOp::ScalarLoad {
+                base: ValueId(0),
+                offset: ValueId(1),
+            },
         ];
         let (prog, slots) = raw_prog(body);
         // Assert
         assert_eq!(slots.len(), 3);
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::ScalarLoad { .. })));
+        assert!(prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::ScalarLoad { .. })));
     }
 
     #[test]
@@ -3073,15 +4282,18 @@ mod tests {
         // Arrange: StrideMul computes value * stride
         let body = &[
             TraceOp::Input(0), // slot 0: value
-            TraceOp::StrideMul { value: ValueId(0), stride: 128 },
+            TraceOp::StrideMul {
+                value: ValueId(0),
+                stride: 128,
+            },
         ];
         let (prog, slots) = raw_prog(body);
         // Assert
         assert_eq!(slots.len(), 2);
-        assert!(prog.instrs.iter().any(|i| matches!(
-            i,
-            VmInstr::IntMulStride { stride: 128, .. }
-        )));
+        assert!(prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::IntMulStride { stride: 128, .. })));
     }
 
     #[test]
@@ -3090,12 +4302,18 @@ mod tests {
         let body = &[
             TraceOp::Input(0), // slot 0: base
             TraceOp::Input(0), // slot 1: offset
-            TraceOp::PtrAdd { base: ValueId(0), offset: ValueId(1) },
+            TraceOp::PtrAdd {
+                base: ValueId(0),
+                offset: ValueId(1),
+            },
         ];
         let (prog, slots) = raw_prog(body);
         // Assert
         assert_eq!(slots.len(), 3);
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::LoadPtr { .. })));
+        assert!(prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::LoadPtr { .. })));
     }
 
     #[test]
@@ -3103,12 +4321,22 @@ mod tests {
         // Arrange: BitExtract is not supported in f32 SIMD pipeline
         let body = &[
             TraceOp::Input(0),
-            TraceOp::BitExtract { src: ValueId(0), offset: 4, width: 2 },
+            TraceOp::BitExtract {
+                src: ValueId(0),
+                offset: 4,
+                width: 2,
+            },
         ];
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         // Act
-        let result = auto_lower_trace_raw(&mut prog, body, &[input], SimdWidth::W256, QuantPrecision::F32);
+        let result = auto_lower_trace_raw(
+            &mut prog,
+            body,
+            &[input],
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        );
         // Assert
         assert!(result.is_err());
     }
@@ -3119,14 +4347,20 @@ mod tests {
         use crate::compiler::trace::ReduceKind;
         let body = &[
             TraceOp::Input(0),
-            TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Max },
+            TraceOp::HReduce {
+                src: ValueId(0),
+                op: ReduceKind::Max,
+            },
         ];
         let (prog, slots) = raw_prog(body);
         // Assert
         assert_eq!(slots.len(), 2);
         assert!(prog.instrs.iter().any(|i| matches!(
             i,
-            VmInstr::HReduce { op: ReduceOp::Max, .. }
+            VmInstr::HReduce {
+                op: ReduceOp::Max,
+                ..
+            }
         )));
     }
 
@@ -3141,12 +4375,23 @@ mod tests {
             TraceOp::Add(ValueId(0), ValueId(1)),
         ];
         // Act
-        let slots = auto_lower_trace_raw(&mut prog, body, &[input], SimdWidth::W256, QuantPrecision::BF16).unwrap();
+        let slots = auto_lower_trace_raw(
+            &mut prog,
+            body,
+            &[input],
+            SimdWidth::W256,
+            QuantPrecision::BF16,
+        )
+        .unwrap();
         // Assert: VecBinOp should carry BF16 dtype
         assert_eq!(slots.len(), 3);
         assert!(prog.instrs.iter().any(|i| matches!(
             i,
-            VmInstr::VecBinOp { op: VecOp::Add, dtype: QuantPrecision::BF16, .. }
+            VmInstr::VecBinOp {
+                op: VecOp::Add,
+                dtype: QuantPrecision::BF16,
+                ..
+            }
         )));
     }
 
@@ -3161,10 +4406,11 @@ mod tests {
         let (prog, slots) = raw_prog(body);
         // Assert: 3 slots, at least one VecBinOp::Mul, no VecBinOp with other ops
         assert_eq!(slots.len(), 3);
-        let mul_count = prog.instrs.iter().filter(|i| matches!(
-            i,
-            VmInstr::VecBinOp { op: VecOp::Mul, .. }
-        )).count();
+        let mul_count = prog
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, VmInstr::VecBinOp { op: VecOp::Mul, .. }))
+            .count();
         assert_eq!(mul_count, 1, "exactly one Mul VecBinOp should be emitted");
     }
 
@@ -3176,7 +4422,15 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let body = &[TraceOp::Const(5.0)];
         // Act
-        auto_lower_trace_into(&mut prog, body, &[input], dst, SimdWidth::W256, QuantPrecision::F32).unwrap();
+        auto_lower_trace_into(
+            &mut prog,
+            body,
+            &[input],
+            dst,
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        )
+        .unwrap();
         // Assert: last instruction should be Broadcast with dst == provided dst
         let last = prog.instrs.last().expect("should have instructions");
         assert!(matches!(
@@ -3189,7 +4443,11 @@ mod tests {
     fn auto_lower_trace_no_inputs_returns_error() {
         // Arrange: auto_lower_trace requires at least one input for writeback
         let mut prog = VmProgram::new();
-        let body = &[TraceOp::Const(1.0), TraceOp::Const(2.0), TraceOp::Add(ValueId(0), ValueId(1))];
+        let body = &[
+            TraceOp::Const(1.0),
+            TraceOp::Const(2.0),
+            TraceOp::Add(ValueId(0), ValueId(1)),
+        ];
         // Act: empty inputs slice
         let result = auto_lower_trace(&mut prog, body, &[], SimdWidth::W256, QuantPrecision::F32);
         // Assert: should fail because inputs is empty (no primary to write back to)
@@ -3205,9 +4463,22 @@ mod tests {
         use crate::compiler::trace::ComputePattern;
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let body = &[TraceOp::Input(0), TraceOp::Const(2.0), TraceOp::Mul(ValueId(0), ValueId(1))];
-        let pattern = ComputePattern::Elementwise { body: body.to_vec() };
-        let result = auto_lower_elementwise(&mut prog, body, &[input], SimdWidth::W256, QuantPrecision::F32, &pattern);
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::Const(2.0),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
+        let pattern = ComputePattern::Elementwise {
+            body: body.to_vec(),
+        };
+        let result = auto_lower_elementwise(
+            &mut prog,
+            body,
+            &[input],
+            SimdWidth::W256,
+            QuantPrecision::F32,
+            &pattern,
+        );
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 3);
     }
@@ -3217,14 +4488,31 @@ mod tests {
         use crate::compiler::trace::ComputePattern;
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let body = &[TraceOp::Input(0), TraceOp::Input(0), TraceOp::Add(ValueId(0), ValueId(1))];
-        let pattern = ComputePattern::BinaryElementwise { body: body.to_vec() };
-        let result = auto_lower_elementwise(&mut prog, body, &[input], SimdWidth::W256, QuantPrecision::BF16, &pattern);
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::Input(0),
+            TraceOp::Add(ValueId(0), ValueId(1)),
+        ];
+        let pattern = ComputePattern::BinaryElementwise {
+            body: body.to_vec(),
+        };
+        let result = auto_lower_elementwise(
+            &mut prog,
+            body,
+            &[input],
+            SimdWidth::W256,
+            QuantPrecision::BF16,
+            &pattern,
+        );
         assert!(result.is_ok());
         // Verify BF16 dtype propagated
         assert!(prog.instrs.iter().any(|i| matches!(
             i,
-            VmInstr::VecBinOp { op: VecOp::Add, dtype: QuantPrecision::BF16, .. }
+            VmInstr::VecBinOp {
+                op: VecOp::Add,
+                dtype: QuantPrecision::BF16,
+                ..
+            }
         )));
     }
 
@@ -3234,8 +4522,19 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let body = &[TraceOp::Input(0), TraceOp::Sqrt(ValueId(0))];
-        let pattern = ComputePattern::Injective { body: body.to_vec(), num_inputs: 1, num_outputs: 1 };
-        let result = auto_lower_elementwise(&mut prog, body, &[input], SimdWidth::W256, QuantPrecision::F32, &pattern);
+        let pattern = ComputePattern::Injective {
+            body: body.to_vec(),
+            num_inputs: 1,
+            num_outputs: 1,
+        };
+        let result = auto_lower_elementwise(
+            &mut prog,
+            body,
+            &[input],
+            SimdWidth::W256,
+            QuantPrecision::F32,
+            &pattern,
+        );
         assert!(result.is_ok());
     }
 
@@ -3244,14 +4543,27 @@ mod tests {
         use crate::compiler::trace::ComputePattern;
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let body = &[TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Sum }];
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::HReduce {
+                src: ValueId(0),
+                op: ReduceKind::Sum,
+            },
+        ];
         let pattern = ComputePattern::Reduction {
             identity: 0.0,
             combine: body.to_vec(),
             second_pass: None,
             normalize: None,
         };
-        let result = auto_lower_elementwise(&mut prog, body, &[input], SimdWidth::W256, QuantPrecision::F32, &pattern);
+        let result = auto_lower_elementwise(
+            &mut prog,
+            body,
+            &[input],
+            SimdWidth::W256,
+            QuantPrecision::F32,
+            &pattern,
+        );
         assert!(result.is_err());
     }
 
@@ -3260,7 +4572,14 @@ mod tests {
         use crate::compiler::trace::ComputePattern;
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let result = auto_lower_elementwise(&mut prog, &[], &[input], SimdWidth::W256, QuantPrecision::F32, &ComputePattern::Gemm);
+        let result = auto_lower_elementwise(
+            &mut prog,
+            &[],
+            &[input],
+            SimdWidth::W256,
+            QuantPrecision::F32,
+            &ComputePattern::Gemm,
+        );
         assert!(result.is_err());
     }
 
@@ -3269,14 +4588,28 @@ mod tests {
         use crate::compiler::trace::ComputePattern;
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let combine_body = &[TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Sum }];
+        let combine_body = &[
+            TraceOp::Input(0),
+            TraceOp::HReduce {
+                src: ValueId(0),
+                op: ReduceKind::Sum,
+            },
+        ];
         let pattern = ComputePattern::Reduction {
             identity: 0.0,
             combine: combine_body.to_vec(),
             second_pass: None,
             normalize: None,
         };
-        let result = auto_lower_reduction(&mut prog, combine_body, None, &[input], SimdWidth::W256, QuantPrecision::F32, &pattern);
+        let result = auto_lower_reduction(
+            &mut prog,
+            combine_body,
+            None,
+            &[input],
+            SimdWidth::W256,
+            QuantPrecision::F32,
+            &pattern,
+        );
         assert!(result.is_ok());
     }
 
@@ -3285,13 +4618,27 @@ mod tests {
         use crate::compiler::trace::ComputePattern;
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let reduce_body = &[TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Max }];
+        let reduce_body = &[
+            TraceOp::Input(0),
+            TraceOp::HReduce {
+                src: ValueId(0),
+                op: ReduceKind::Max,
+            },
+        ];
         let pattern = ComputePattern::NormLike {
             reduce: reduce_body.to_vec(),
             finalize: vec![],
             transform: vec![],
         };
-        let result = auto_lower_reduction(&mut prog, reduce_body, None, &[input], SimdWidth::W256, QuantPrecision::F32, &pattern);
+        let result = auto_lower_reduction(
+            &mut prog,
+            reduce_body,
+            None,
+            &[input],
+            SimdWidth::W256,
+            QuantPrecision::F32,
+            &pattern,
+        );
         assert!(result.is_ok());
     }
 
@@ -3300,15 +4647,33 @@ mod tests {
         use crate::compiler::trace::ComputePattern;
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let combine_body = &[TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Sum }];
-        let normalize_body = &[TraceOp::Input(0), TraceOp::Const(0.5), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let combine_body = &[
+            TraceOp::Input(0),
+            TraceOp::HReduce {
+                src: ValueId(0),
+                op: ReduceKind::Sum,
+            },
+        ];
+        let normalize_body = &[
+            TraceOp::Input(0),
+            TraceOp::Const(0.5),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
         let pattern = ComputePattern::Reduction {
             identity: 0.0,
             combine: combine_body.to_vec(),
             second_pass: None,
             normalize: Some(normalize_body.to_vec()),
         };
-        let result = auto_lower_reduction(&mut prog, combine_body, Some(normalize_body), &[input], SimdWidth::W256, QuantPrecision::F32, &pattern);
+        let result = auto_lower_reduction(
+            &mut prog,
+            combine_body,
+            Some(normalize_body),
+            &[input],
+            SimdWidth::W256,
+            QuantPrecision::F32,
+            &pattern,
+        );
         assert!(result.is_ok());
     }
 
@@ -3317,9 +4682,23 @@ mod tests {
         use crate::compiler::trace::ComputePattern;
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let body = &[TraceOp::Input(0), TraceOp::Const(2.0), TraceOp::Mul(ValueId(0), ValueId(1))];
-        let pattern = ComputePattern::Elementwise { body: body.to_vec() };
-        let result = auto_lower_reduction(&mut prog, body, None, &[input], SimdWidth::W256, QuantPrecision::F32, &pattern);
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::Const(2.0),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
+        let pattern = ComputePattern::Elementwise {
+            body: body.to_vec(),
+        };
+        let result = auto_lower_reduction(
+            &mut prog,
+            body,
+            None,
+            &[input],
+            SimdWidth::W256,
+            QuantPrecision::F32,
+            &pattern,
+        );
         assert!(result.is_err());
     }
 
@@ -3331,11 +4710,24 @@ mod tests {
         let body = &[
             TraceOp::Input(0),
             TraceOp::Input(1),
-            TraceOp::GatherLoad { base: ValueId(0), indices: ValueId(1), stride: 4 },
+            TraceOp::GatherLoad {
+                base: ValueId(0),
+                indices: ValueId(1),
+                stride: 4,
+            },
         ];
-        let result = auto_lower_structural(&mut prog, body, &[base, indices], SimdWidth::W256, QuantPrecision::F32);
+        let result = auto_lower_structural(
+            &mut prog,
+            body,
+            &[base, indices],
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        );
         assert!(result.is_ok());
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::GatherLoad { stride: 4, .. })));
+        assert!(prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::GatherLoad { stride: 4, .. })));
     }
 
     #[test]
@@ -3346,11 +4738,24 @@ mod tests {
         let body = &[
             TraceOp::Input(0),
             TraceOp::Input(1),
-            TraceOp::TableLookup { base: ValueId(0), row_index: ValueId(1), row_bytes: 256 },
+            TraceOp::TableLookup {
+                base: ValueId(0),
+                row_index: ValueId(1),
+                row_bytes: 256,
+            },
         ];
-        let result = auto_lower_structural(&mut prog, body, &[base, row_idx], SimdWidth::W256, QuantPrecision::F32);
+        let result = auto_lower_structural(
+            &mut prog,
+            body,
+            &[base, row_idx],
+            SimdWidth::W256,
+            QuantPrecision::F32,
+        );
         assert!(result.is_ok());
-        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::TableLookup { row_bytes: 256, .. })));
+        assert!(prog
+            .instrs
+            .iter()
+            .any(|i| matches!(i, VmInstr::TableLookup { row_bytes: 256, .. })));
     }
 
     #[test]
@@ -3361,13 +4766,26 @@ mod tests {
         let body = &[
             TraceOp::Input(0),
             TraceOp::Input(1),
-            TraceOp::VecLoadIndexed { base: ValueId(0), offset: ValueId(1) },
+            TraceOp::VecLoadIndexed {
+                base: ValueId(0),
+                offset: ValueId(1),
+            },
         ];
-        let result = auto_lower_structural(&mut prog, body, &[base, offset], SimdWidth::W256, QuantPrecision::BF16);
+        let result = auto_lower_structural(
+            &mut prog,
+            body,
+            &[base, offset],
+            SimdWidth::W256,
+            QuantPrecision::BF16,
+        );
         assert!(result.is_ok());
         assert!(prog.instrs.iter().any(|i| matches!(
             i,
-            VmInstr::VecLoad { dtype: QuantPrecision::BF16, predicate: None, .. }
+            VmInstr::VecLoad {
+                dtype: QuantPrecision::BF16,
+                predicate: None,
+                ..
+            }
         )));
     }
 
@@ -3380,22 +4798,38 @@ mod tests {
         let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
         // Elementwise body: Input(0), Const(2.0), Mul
-        let body = &[TraceOp::Input(0), TraceOp::Const(2.0), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::Const(2.0),
+            TraceOp::Mul(ValueId(0), ValueId(1)),
+        ];
         let pattern = classify_pattern(body);
 
         // classify_pattern should produce Elementwise or Injective
         let result = match &pattern {
             ComputePattern::Elementwise { .. }
             | ComputePattern::BinaryElementwise { .. }
-            | ComputePattern::Injective { .. } => {
-                auto_lower_elementwise(&mut prog, body, &[input], SimdWidth::W256, QuantPrecision::BF16, &pattern)
-            }
-            _ => panic!("Expected Elementwise/BinaryElementwise/Injective, got {:?}", pattern),
+            | ComputePattern::Injective { .. } => auto_lower_elementwise(
+                &mut prog,
+                body,
+                &[input],
+                SimdWidth::W256,
+                QuantPrecision::BF16,
+                &pattern,
+            ),
+            _ => panic!(
+                "Expected Elementwise/BinaryElementwise/Injective, got {:?}",
+                pattern
+            ),
         };
         assert!(result.is_ok());
         assert!(prog.instrs.iter().any(|i| matches!(
             i,
-            VmInstr::VecBinOp { op: VecOp::Mul, dtype: QuantPrecision::BF16, .. }
+            VmInstr::VecBinOp {
+                op: VecOp::Mul,
+                dtype: QuantPrecision::BF16,
+                ..
+            }
         )));
     }
 }
