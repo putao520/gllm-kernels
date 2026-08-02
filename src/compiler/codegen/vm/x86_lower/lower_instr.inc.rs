@@ -964,6 +964,18 @@ impl X86Lower {
         }
     }
 
+    fn ymm_reduce_op(asm: &mut CodeAssembler, op: ReduceOp, dst: AsmRegisterYmm, src: AsmRegisterYmm) -> Result<(), CompilerError> {
+        match op {
+            ReduceOp::Sum => asm.vaddps(dst, dst, src).map_err(Self::err),
+            ReduceOp::Max => asm.vmaxps(dst, dst, src).map_err(Self::err),
+            ReduceOp::Min => asm.vminps(dst, dst, src).map_err(Self::err),
+            ReduceOp::Prod => asm.vmulps(dst, dst, src).map_err(Self::err),
+            ReduceOp::LogSum => Err(CompilerError::CodegenViolation(
+                "LogSum requires multi-instruction sequence (Exp+Sum+Log), use HReduce trace".into(),
+            )),
+        }
+    }
+
     fn xmm_ss_reduce_op(asm: &mut CodeAssembler, op: ReduceOp, dst: AsmRegisterXmm, src: AsmRegisterXmm) -> Result<(), CompilerError> {
         match op {
             ReduceOp::Sum => asm.vaddss(dst, dst, src).map_err(Self::err),
@@ -1002,8 +1014,10 @@ impl X86Lower {
         let xm_hi = Self::ymm_to_xmm(ymm_hi); // reduce scratch (复用 ymm_hi 的 xmm 视图)
         // ymm_hi = zmm 高 256 位 (lanes 8-15)
         self.asm.vextractf64x4(ymm_hi, zmm_reg, 1i32).map_err(Self::err)?;
-        // 16→8: ymm_lo = op(ymm_lo, ymm_hi) (lanes 0-7 ← op(lanes 0-7, lanes 8-15))
-        Self::xmm_reduce_op(&mut self.asm, op, xm_lo, xm_hi)?;
+        // 16→8: ymm_lo = op(ymm_lo, ymm_hi) (lanes 0-7 ← op(lanes 0-7, lanes 8-15)).
+        // This must stay a YMM operation: an XMM op only combines lanes 0-3
+        // and silently drops lanes 4-7 (and their high-half counterparts).
+        Self::ymm_reduce_op(&mut self.asm, op, ymm_lo, ymm_hi)?;
         // 8→4: vextractf128 + op
         self.safe_vextractf128(xm_hi, ymm_lo, 1i32)?;
         Self::xmm_reduce_op(&mut self.asm, op, xm_lo, xm_hi)?;
